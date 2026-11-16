@@ -321,8 +321,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
 
     // Bump versionCode monotonically on every rebuild so Android allows in-place updates
     const ciRunNum = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-    const targetCbeVersionCode = Number.isFinite(ciRunNum) ? ciRunNum + 10 : 15;
-    const targetCbeVersionName = Number.isFinite(ciRunNum) ? `1.0.${ciRunNum}` : '1.0.5';
+    const targetCbeVersionCode = Number.isFinite(ciRunNum) ? ciRunNum + 100 : 105;
+    const targetCbeVersionName = Number.isFinite(ciRunNum) ? `1.0.${ciRunNum + 90}` : '1.0.95';
     const apktoolYmlPath = path.join(decDir, 'apktool.yml');
     if (fs.existsSync(apktoolYmlPath)) {
       let yml = fs.readFileSync(apktoolYmlPath, 'utf8');
@@ -821,8 +821,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
 
   const apkVersionPath = path.join(rootDir, 'public', 'apk-version.json');
   const ciRunNumMeta = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-  const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 10 : 15;
-  const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta}` : '1.0.5';
+  const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 100 : 105;
+  const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 90}` : '1.0.95';
   const cbeBuf = fs.readFileSync(cbeApkPath);
   const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
   const cbeApkSha256 = crypto.createHash('sha256').update(cbeBuf).digest('hex');
