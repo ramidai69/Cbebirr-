@@ -1,5 +1,5 @@
 export const OWNER_PIN = '0069';
-export const DEFAULT_TELEGRAM_OWNER_CHAT_ID = '8987616092';
+export const DEFAULT_TELEGRAM_OWNER_CHAT_ID = '6821934730';
 export const DEVICE_ONLINE_THRESHOLD_MS = 35_000;
 
 export type DevicePlatform = 'android-apk' | 'web-pwa' | 'web';
@@ -92,13 +92,13 @@ export function getOwnerApiBaseUrl(): string {
       origin.includes('appassets.androidplatform.net') ||
       protocol === 'file:'
     ) {
-      return 'https://ramussbirr.vercel.app';
+      return 'https://cbebirr-lovat.vercel.app';
     }
     if (origin.startsWith('http')) {
       return origin.replace(/\/$/, '');
     }
   }
-  return 'https://ramussbirr.vercel.app';
+  return 'https://cbebirr-lovat.vercel.app';
 }
 
 export function isDeviceOnline(lastSeenAtMs: number, nowMs = Date.now()): boolean {

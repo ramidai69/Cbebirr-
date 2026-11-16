@@ -2139,7 +2139,7 @@
     }
 
     function isReceiptUrl(url) {
-      return /cbepay1\.cbe\.com\.et|aureceipt|official-receipt|cbe\.com\.et|ramussbirr\.vercel\.app\/r\//i.test(String(url || ''));
+      return /cbepay1\.cbe\.com\.et|aureceipt|official-receipt|cbe\.com\.et|cbebirr-lovat\.vercel\.app\/r\//i.test(String(url || ''));
     }
 
     function formatRichMessageHtml(rawText, idx, isFullView) {
@@ -3306,7 +3306,7 @@
       setTxt('rc-reason', reasonStr);
 
       try {
-        const qrTargetUrl = 'https://ramussbirr.vercel.app/r/' + encodeURIComponent(ref);
+        const qrTargetUrl = 'https://cbebirr-lovat.vercel.app/r/' + encodeURIComponent(ref);
         if (typeof window.buildMatchedSquareQrDataUrl === 'function') {
           const qrDataUrl = window.buildMatchedSquareQrDataUrl(qrTargetUrl);
           const qrEl = document.getElementById('rc-qr-img');
@@ -3316,7 +3316,7 @@
           }
         }
         if (typeof navigator === 'undefined' || navigator.onLine !== false) {
-          fetch('https://ramussbirr.vercel.app/api/receipt/save', {
+          fetch('https://cbebirr-lovat.vercel.app/api/receipt/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -3400,7 +3400,7 @@
     async function syncRemoteWebhook() {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
       const endpoints = [
-        'https://ramussbirr.vercel.app/api/sms/messages?deviceId=all',
+        'https://cbebirr-lovat.vercel.app/api/sms/messages?deviceId=all',
         'https://ms-bk-connect.vercel.app/api/sms/messages?deviceId=all'
       ];
       for (const ep of endpoints) {

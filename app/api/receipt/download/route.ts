@@ -130,7 +130,7 @@ export async function GET(req: NextRequest) {
       !reqOrigin.includes('127.0.0.1') &&
       !reqOrigin.includes('0.0.0.0')
         ? reqOrigin.replace(/\/$/, '')
-        : 'https://ramussbirr.vercel.app';
+        : 'https://cbebirr-lovat.vercel.app';
     const qrTargetUrl = `${qrBase}/r/${encodeURIComponent(resolvedRef)}`;
     const qrBuffer = await generateMatchedSquareQrPngBuffer(qrTargetUrl, 208);
 

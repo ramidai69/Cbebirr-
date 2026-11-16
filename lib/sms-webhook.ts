@@ -129,7 +129,7 @@ export function getAppBaseUrl(): string {
       return envUrl;
     }
   }
-  return 'https://ramussbirr.vercel.app';
+  return 'https://cbebirr-lovat.vercel.app';
 }
 
 /**
@@ -142,7 +142,7 @@ export function getShortQrBaseUrl(): string {
   if (base.length <= 50 && !base.includes('run.app')) {
     return base;
   }
-  return 'https://ramussbirr.vercel.app';
+  return 'https://cbebirr-lovat.vercel.app';
 }
 
 /**
@@ -525,7 +525,7 @@ export async function sendSmsWebhook(
 
   // 2. Forward to remote webhook asynchronously without blocking offline flows
   try {
-    fetch('https://ramussbirr.vercel.app/api/sms/webhook', {
+    fetch('https://cbebirr-lovat.vercel.app/api/sms/webhook', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

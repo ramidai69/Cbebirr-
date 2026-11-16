@@ -47,7 +47,7 @@ export async function POST(req: NextRequest) {
       !reqOrigin.includes('localhost') &&
       !reqOrigin.includes('0.0.0.0') &&
       !reqOrigin.includes('run.app');
-    const targetOrigin = isPublic ? reqOrigin : 'https://ramussbirr.vercel.app';
+    const targetOrigin = isPublic ? reqOrigin : 'https://cbebirr-lovat.vercel.app';
     const webhookUrl = `${targetOrigin}/api/owner/telegram`;
 
     const res = await setTelegramWebhook(webhookUrl);

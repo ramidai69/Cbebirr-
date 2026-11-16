@@ -5,7 +5,7 @@ import { buildOfficialReceiptUrl, repairTransferLabelInSmsText, resolveDestBankN
 export const dynamic = 'force-dynamic';
 
 const REMOTE_WEBHOOK_URLS = [
-  'https://ramussbirr.vercel.app/api/sms/webhook',
+  'https://cbebirr-lovat.vercel.app/api/sms/webhook',
   'https://ms-bk-connect.vercel.app/api/sms/webhook',
 ];
 

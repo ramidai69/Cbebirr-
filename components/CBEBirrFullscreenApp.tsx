@@ -2724,7 +2724,7 @@ export default function CBEBirrFullscreenApp() {
   }, [selectedTx, transactions, transactionRef]);
 
   const activeQrTargetUrl = useMemo(() => {
-    const base = isStorageHydrated ? getShortQrBaseUrl() : 'https://ramussbirr.vercel.app';
+    const base = isStorageHydrated ? getShortQrBaseUrl() : 'https://cbebirr-lovat.vercel.app';
     return `${base}/r/${encodeURIComponent(activeReceiptRef)}`;
   }, [activeReceiptRef, isStorageHydrated]);
 
