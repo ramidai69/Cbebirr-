@@ -5,7 +5,7 @@ import sharp from 'sharp';
 import { jsPDF } from 'jspdf';
 
 export const dynamic = 'force-dynamic';
-import { getReceipt } from '@/lib/receipt-store';
+import { getReceiptAsync } from '@/lib/receipt-store';
 import { generateMatchedSquareQrPngBuffer } from '@/lib/styled-qr';
 
 function escapeXml(unsafe: string): string {
@@ -68,7 +68,7 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = req.nextUrl;
     const ref = searchParams.get('TID') || searchParams.get('ref') || '-';
-    const stored = getReceipt(ref);
+    const stored = await getReceiptAsync(ref);
 
     const rawAmt = searchParams.get('amt') || (stored && stored.amt) || '0.00';
     const date = searchParams.get('date') || (stored && stored.date) || '-';

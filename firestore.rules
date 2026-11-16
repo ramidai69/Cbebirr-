@@ -152,6 +152,35 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidReceiptRecord(data) {
+      return data.keys().hasAll([
+          'receiptId', 'ref', 'amt', 'date', 'rec', 'name', 'user', 'acc', 'reason', 'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'receiptId', 'ref', 'orderId', 'amt', 'date', 'rec', 'name', 'user', 'acc', 'reason',
+          'bank', 'status', 'serviceCharge', 'vat', 'totalCharges', 'totalPaidAmount', 'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.receiptId)
+        && data.ref is string && data.ref.size() >= 1 && data.ref.size() <= 64
+        && (!data.keys().hasAny(['orderId']) || (data.orderId is string && data.orderId.size() <= 64))
+        && data.amt is string && data.amt.size() <= 32
+        && data.date is string && data.date.size() <= 64
+        && data.rec is string && data.rec.size() <= 64
+        && data.name is string && data.name.size() <= 120
+        && data.user is string && data.user.size() <= 120
+        && data.acc is string && data.acc.size() <= 64
+        && data.reason is string && data.reason.size() <= 200
+        && (!data.keys().hasAny(['bank']) || (data.bank is string && data.bank.size() <= 80))
+        && (!data.keys().hasAny(['status']) || (data.status is string && data.status.size() <= 32))
+        && (!data.keys().hasAny(['serviceCharge']) || (data.serviceCharge is string && data.serviceCharge.size() <= 32))
+        && (!data.keys().hasAny(['vat']) || (data.vat is string && data.vat.size() <= 32))
+        && (!data.keys().hasAny(['totalCharges']) || (data.totalCharges is string && data.totalCharges.size() <= 32))
+        && (!data.keys().hasAny(['totalPaidAmount']) || (data.totalPaidAmount is string && data.totalPaidAmount.size() <= 32))
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Collection: /admins/{userId}
     match /admins/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (request.auth.uid == userId || isBootstrappedAdmin());
@@ -274,6 +303,33 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['globalLocked', 'globalLockMessage', 'updatedBy', 'updatedAt'])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(configId) && isAdmin();
+    }
+
+    // Collection: /receipts/{receiptId}
+    match /receipts/{receiptId} {
+      allow get: if isVerifiedUser() && isValidId(receiptId) && (isOwner(existing()) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && existing().ownerId == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(receiptId)
+        && isValidReceiptRecord(incoming())
+        && incoming().receiptId == receiptId
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerifiedUser()
+        && isValidId(receiptId)
+        && isValidReceiptRecord(incoming())
+        && incoming().receiptId == existing().receiptId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'ref', 'orderId', 'amt', 'date', 'rec', 'name', 'user', 'acc', 'reason',
+          'bank', 'status', 'serviceCharge', 'vat', 'totalCharges', 'totalPaidAmount', 'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(receiptId) && isAdmin();
     }
   }
 }

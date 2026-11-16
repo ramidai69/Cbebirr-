@@ -82,10 +82,12 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
 
-  // Skip non-GET requests, dynamic API endpoints, SW script itself, or APK binaries
+  // Skip cross-origin requests (e.g. Firebase/Firestore/Google Auth), non-GET requests, dynamic API endpoints, short QR receipt routes, SW script itself, or APK binaries
   if (
+    url.origin !== self.location.origin ||
     req.method !== 'GET' ||
     url.pathname === '/sw.js' ||
+    url.pathname.startsWith('/r/') ||
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/download/') ||
     url.pathname.endsWith('.apk')
@@ -161,6 +163,9 @@ self.addEventListener('fetch', (event) => {
         : req
     )
       .then((networkResponse) => {
+        if (isNavigation && networkResponse && networkResponse.redirected && networkResponse.url) {
+          return fetch(new Request(networkResponse.url, { cache: 'no-store', credentials: 'same-origin' }));
+        }
         if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
           const responseToCache = networkResponse.clone();
           const cacheKey = isNavigation ? url.pathname : req;

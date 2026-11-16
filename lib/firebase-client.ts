@@ -11,6 +11,7 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  initializeFirestore,
   Firestore,
   doc,
   getDocFromServer,
@@ -57,7 +58,17 @@ export function getFirebaseClient(): {
     cachedApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
   }
   if (!cachedDb) {
-    cachedDb = getFirestore(cachedApp, firebaseConfig.firestoreDatabaseId);
+    try {
+      cachedDb = initializeFirestore(
+        cachedApp,
+        {
+          experimentalForceLongPolling: true,
+        },
+        firebaseConfig.firestoreDatabaseId
+      );
+    } catch {
+      cachedDb = getFirestore(cachedApp, firebaseConfig.firestoreDatabaseId);
+    }
   }
   if (!cachedAuth) {
     cachedAuth = getAuth(cachedApp);
@@ -94,15 +105,39 @@ export function handleFirestoreError(
 
 export async function testFirestoreConnection(): Promise<boolean> {
   if (connectionTested) return true;
+  if (typeof window === 'undefined') return false;
+  if (
+    window.location?.protocol === 'file:' ||
+    window.location?.hostname?.includes('appassets.androidplatform.net') ||
+    (typeof navigator !== 'undefined' && navigator.onLine === false)
+  ) {
+    return false;
+  }
   connectionTested = true;
-  try {
+
+  const attemptProbe = async (): Promise<boolean> => {
     const { db } = getFirebaseClient();
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
+  };
+
+  try {
+    return await attemptProbe();
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-      return false;
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('the client is offline') || msg.includes('unavailable')) {
+      // Retry once after brief delay in case initial connection was still negotiating
+      await new Promise((r) => setTimeout(r, 1200));
+      try {
+        return await attemptProbe();
+      } catch (retryError) {
+        const retryMsg = retryError instanceof Error ? retryError.message : String(retryError);
+        if (retryMsg.includes('the client is offline')) {
+          console.error('Please check your Firebase configuration.');
+          return false;
+        }
+        return true;
+      }
     }
     // Permission error on 'test/connection' proves server connectivity succeeded
     return true;

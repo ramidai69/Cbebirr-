@@ -55,7 +55,7 @@ export async function POST(req: NextRequest) {
     if (action === 'lock_all' || action === 'unlock_all') {
       const locked = action === 'lock_all';
       const config = await setGlobalLock(locked, 'app_0069', body.message);
-      sendTelegramMessage(
+      await sendTelegramMessage(
         locked
           ? `🔒 <b>ALL devices LOCKED</b> via App Owner (<code>0069</code>).`
           : `🔓 <b>ALL devices UNLOCKED</b> via App Owner (<code>0069</code>).`
@@ -74,7 +74,7 @@ export async function POST(req: NextRequest) {
       }
       const esc = (s: string) =>
         String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      sendTelegramMessage(
+      await sendTelegramMessage(
         `${locked ? '🔒 LOCKED' : '🔓 UNLOCKED'} device <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>) via App Owner (<code>0069</code>).`
       ).catch(() => {});
       return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
@@ -98,7 +98,7 @@ export async function POST(req: NextRequest) {
       });
       const esc = (s: string) =>
         String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      sendTelegramMessage(
+      await sendTelegramMessage(
         `📢 <b>Notification sent via App Owner (<code>0069</code>)</b>\nTarget: <code>${esc(notif.targetDeviceId)}</code> • Duration: ${notif.durationSeconds}s\nMessage: ${esc(notif.message)}`
       ).catch(() => {});
       return NextResponse.json({ success: true, notification: notif }, { headers: CORS_HEADERS });

@@ -385,6 +385,124 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ReceiptRecord": {
+      "title": "ReceiptRecord",
+      "description": "Persisted official CBEBirr transaction receipt indexed by reference/TID for QR verification.",
+      "type": "object",
+      "properties": {
+        "receiptId": {
+          "type": "string",
+          "description": "Document key matching uppercase reference, 8-char TID, or __LATEST__",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ref": {
+          "type": "string",
+          "description": "CBE FT reference or 8-char TID",
+          "maxLength": 64
+        },
+        "orderId": {
+          "type": "string",
+          "description": "Optional order or short transaction ID",
+          "maxLength": 64
+        },
+        "amt": {
+          "type": "string",
+          "description": "Formatted transfer amount",
+          "maxLength": 32
+        },
+        "date": {
+          "type": "string",
+          "description": "Formatted receipt date/time string",
+          "maxLength": 64
+        },
+        "rec": {
+          "type": "string",
+          "description": "Recipient phone or account number",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "description": "Recipient display name",
+          "maxLength": 120
+        },
+        "user": {
+          "type": "string",
+          "description": "Sender display name",
+          "maxLength": 120
+        },
+        "acc": {
+          "type": "string",
+          "description": "Sender phone or account number",
+          "maxLength": 64
+        },
+        "reason": {
+          "type": "string",
+          "description": "Payment reason or remark",
+          "maxLength": 200
+        },
+        "bank": {
+          "type": "string",
+          "description": "Destination bank or wallet name",
+          "maxLength": 80
+        },
+        "status": {
+          "type": "string",
+          "description": "Receipt status",
+          "maxLength": 32
+        },
+        "serviceCharge": {
+          "type": "string",
+          "description": "Service fee amount string",
+          "maxLength": 32
+        },
+        "vat": {
+          "type": "string",
+          "description": "VAT amount string",
+          "maxLength": 32
+        },
+        "totalCharges": {
+          "type": "string",
+          "description": "Combined fee and VAT string",
+          "maxLength": 32
+        },
+        "totalPaidAmount": {
+          "type": "string",
+          "description": "Total paid amount string",
+          "maxLength": 32
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this receipt record",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "receiptId",
+        "ref",
+        "amt",
+        "date",
+        "rec",
+        "name",
+        "user",
+        "acc",
+        "reason",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -407,6 +525,10 @@
     "/owner_config/{configId}": {
       "schema": { "$ref": "#/entities/OwnerGlobalConfig" },
       "description": "Master global configuration including global app lock state."
+    },
+    "/receipts/{receiptId}": {
+      "schema": { "$ref": "#/entities/ReceiptRecord" },
+      "description": "Persisted official CBEBirr transaction receipts indexed by reference/TID for live QR verification."
     }
   }
 }

@@ -42,9 +42,9 @@ export async function POST(req: NextRequest) {
     });
 
     if (result.isNewDevice) {
-      notifyOwnerNewDevice(result.device).catch(() => {});
+      await notifyOwnerNewDevice(result.device).catch(() => {});
     } else if (result.profileChangedSummary) {
-      notifyOwnerProfileChanged(result.device, result.profileChangedSummary).catch(() => {});
+      await notifyOwnerProfileChanged(result.device, result.profileChangedSummary).catch(() => {});
     }
 
     return NextResponse.json(result.syncResponse, { headers: CORS_HEADERS });

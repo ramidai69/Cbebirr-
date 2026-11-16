@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { saveReceipt, StoredReceipt } from '@/lib/receipt-store';
+import { saveReceiptAsync, StoredReceipt } from '@/lib/receipt-store';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
     if (!body || !body.ref) {
       return NextResponse.json({ error: 'Missing ref' }, { status: 400, headers: CORS_HEADERS });
     }
-    saveReceipt(body);
+    await saveReceiptAsync(body);
     return NextResponse.json({ success: true, ref: body.ref }, { headers: CORS_HEADERS });
   } catch {
     return NextResponse.json({ error: 'Failed to save receipt' }, { status: 500, headers: CORS_HEADERS });

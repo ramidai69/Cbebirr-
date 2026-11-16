@@ -306,9 +306,9 @@ export async function syncDeviceHeartbeat(input: {
   state.devices.set(deviceId, nextDevice);
   saveToDisk();
 
-  // Persist to Firestore in background
+  // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write
   const nowIso = new Date(nowMs).toISOString();
-  fsSetDocument('devices', deviceId, {
+  await fsSetDocument('devices', deviceId, {
     deviceId: nextDevice.deviceId,
     deviceName: nextDevice.deviceName,
     platform: nextDevice.platform,

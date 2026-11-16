@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getReceipt, extractReceiptRef, ORIGINAL_QR_TID } from '@/lib/receipt-store';
+import { getReceiptAsync, extractReceiptRef, ORIGINAL_QR_TID } from '@/lib/receipt-store';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
     (rawUrl ? extractReceiptRef(rawUrl) : '') ||
     ORIGINAL_QR_TID;
 
-  const receipt = getReceipt(ref);
+  const receipt = await getReceiptAsync(ref);
   return NextResponse.json(receipt, {
     headers: {
       'Cache-Control': 'no-store, no-cache, must-revalidate',

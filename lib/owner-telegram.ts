@@ -249,9 +249,10 @@ async function sendDevicesList(chatId: string): Promise<void> {
 
   const keyboardRows: Array<Array<{ text: string; callback_data: string }>> = [];
   snap.devices.slice(0, 8).forEach((d, idx) => {
+    const label = (d.userName || d.deviceName || 'Device').trim().slice(0, 16);
     keyboardRows.push([
       {
-        text: `#${idx + 1} ${d.isOnline ? '🟢' : '🔴'} ${d.userName.slice(0, 16)}`,
+        text: `#${idx + 1} ${d.isOnline ? '🟢' : '🔴'} ${label}`,
         callback_data: `dev_view:${d.deviceId}`,
       },
       {

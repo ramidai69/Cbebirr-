@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
     });
 
     // Push instant real-time transaction alert to owner's Telegram
-    notifyOwnerTransaction(tx, device).catch(() => {});
+    await notifyOwnerTransaction(tx, device).catch(() => {});
 
     return NextResponse.json(
       { success: true, txId: tx.txId, deviceId: tx.deviceId },
