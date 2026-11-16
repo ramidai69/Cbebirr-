@@ -71,7 +71,7 @@ object LocalMessageStore {
             }
             if (set.add(clean)) {
                 val next = JSONArray()
-                set.takeLast(8).forEach { next.put(it) }
+                set.toList().takeLast(8).forEach { next.put(it) }
                 prefs.edit().putString(KEY_PAIRED_DEVICE_IDS, next.toString()).apply()
             }
         }
