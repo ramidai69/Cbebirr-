@@ -6,17 +6,132 @@ import android.net.Uri
 import android.provider.Telephony
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.SecureRandom
 
 object LocalMessageStore {
     private const val PREFS_NAME = "cbe_sms_store"
     private const val KEY_SAVED_MESSAGES = "saved_messages"
     private const val KEY_SEEN_IDS = "seen_message_ids"
     private const val KEY_DELETED_KEYS = "deleted_message_keys"
+    private const val KEY_DEVICE_ID = "msg_device_id"
+    private const val KEY_PAIRED_DEVICE_IDS = "paired_banking_device_ids"
+    private const val KEY_ISOLATION_MIGRATED = "isolation_v1_migrated"
     private const val MAX_SAVED_MESSAGES = 400
     private const val MAX_SEEN_IDS = 800
     private const val MAX_DELETED_KEYS = 800
 
+    private val RESERVED_SHARED_IDS = setOf(
+        "all",
+        "dev_galaxy_a12",
+        "unknown",
+        "unknown_id",
+        "unknown_device",
+        "dev_server",
+        "dev_browser_tmp"
+    )
+
     private val lock = Any()
+
+    fun isValidScopedDeviceId(id: String?): Boolean {
+        val clean = id?.trim() ?: return false
+        if (!Regex("^[a-zA-Z0-9_\\-]{6,64}$").matches(clean)) return false
+        return !RESERVED_SHARED_IDS.contains(clean.lowercase())
+    }
+
+    fun getOrCreateDeviceId(context: Context): String {
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val existing = prefs.getString(KEY_DEVICE_ID, null)
+            if (isValidScopedDeviceId(existing)) {
+                return existing!!.trim()
+            }
+            val bytes = ByteArray(6)
+            SecureRandom().nextBytes(bytes)
+            val hex = bytes.joinToString("") { "%02x".format(it) }
+            val created = "msg_$hex"
+            prefs.edit().putString(KEY_DEVICE_ID, created).apply()
+            return created
+        }
+    }
+
+    fun registerPairedDeviceId(context: Context, deviceId: String?) {
+        val clean = deviceId?.trim() ?: return
+        if (!isValidScopedDeviceId(clean)) return
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val arr = try {
+                JSONArray(prefs.getString(KEY_PAIRED_DEVICE_IDS, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                JSONArray()
+            }
+            val set = linkedSetOf<String>()
+            for (i in 0 until arr.length()) {
+                val v = arr.optString(i).trim()
+                if (isValidScopedDeviceId(v)) set.add(v)
+            }
+            if (set.add(clean)) {
+                val next = JSONArray()
+                set.takeLast(8).forEach { next.put(it) }
+                prefs.edit().putString(KEY_PAIRED_DEVICE_IDS, next.toString()).apply()
+            }
+        }
+    }
+
+    fun getPairedDeviceIds(context: Context): List<String> {
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val arr = try {
+                JSONArray(prefs.getString(KEY_PAIRED_DEVICE_IDS, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                JSONArray()
+            }
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val v = arr.optString(i).trim()
+                if (isValidScopedDeviceId(v)) list.add(v)
+            }
+            return list
+        }
+    }
+
+    fun getAllowedSyncDeviceIds(context: Context): List<String> {
+        val own = getOrCreateDeviceId(context)
+        val paired = getPairedDeviceIds(context)
+        return (listOf(own) + paired).distinct()
+    }
+
+    /**
+     * One-time cleanup on upgrade: strips previously leaked cross-device remote_*
+     * messages lacking a concrete valid deviceId while keeping SIM SMS & local CBEBirr SMS.
+     */
+    fun migrateDeviceIsolationV1(context: Context) {
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_ISOLATION_MIGRATED, false)) return
+
+            val savedArr = try {
+                JSONArray(prefs.getString(KEY_SAVED_MESSAGES, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                JSONArray()
+            }
+            val nextArr = JSONArray()
+            for (i in 0 until savedArr.length()) {
+                val obj = savedArr.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "")
+                val devId = obj.optString("deviceId", "").trim()
+                val isLegacyRemote = id.startsWith("remote_")
+                val isLeakedShared = devId.equals("all", true) || devId.equals("dev_galaxy_a12", true)
+                if ((isLegacyRemote && !isValidScopedDeviceId(devId)) || isLeakedShared) {
+                    continue
+                }
+                nextArr.put(obj)
+            }
+            prefs.edit()
+                .putString(KEY_SAVED_MESSAGES, nextArr.toString())
+                .putBoolean(KEY_ISOLATION_MIGRATED, true)
+                .apply()
+        }
+    }
 
     fun isDefaultSmsApp(context: Context): Boolean {
         return try {
@@ -130,7 +245,8 @@ object LocalMessageStore {
         receiptUrl: String = "",
         destBank: String = "",
         transferLabel: String = "",
-        reason: String = ""
+        reason: String = "",
+        deviceId: String = ""
     ): Boolean {
         if (body.isBlank()) return false
 
@@ -250,6 +366,7 @@ object LocalMessageStore {
                 if (cleanDestBank.isNotBlank()) put("destBank", cleanDestBank)
                 if (transferLabel.isNotBlank() && !transferLabel.equals("transfer", true)) put("transferLabel", transferLabel.trim())
                 if (reason.isNotBlank()) put("reason", reason.trim())
+                if (isValidScopedDeviceId(deviceId)) put("deviceId", deviceId.trim())
             }
 
             savedArr.put(obj)
@@ -409,6 +526,7 @@ object LocalMessageStore {
     }
 
     fun getSavedMessagesJson(context: Context): String {
+        migrateDeviceIsolationV1(context)
         synchronized(lock) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val raw = prefs.getString(KEY_SAVED_MESSAGES, "[]") ?: "[]"

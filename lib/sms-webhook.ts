@@ -1,3 +1,5 @@
+import { getOrCreateOwnerDeviceId, isValidScopedDeviceId } from './owner-telemetry';
+
 export interface CbeSmsWebhookPayload {
   sender?: string;
   senderName: string;
@@ -331,6 +333,7 @@ export function buildCbeSmsPayload({
   bank,
   transferLabel,
   creditAccountType,
+  deviceId,
 }: {
   userFullName?: string;
   userPhone?: string;
@@ -347,6 +350,7 @@ export function buildCbeSmsPayload({
   bank?: string;
   transferLabel?: string;
   creditAccountType?: string;
+  deviceId?: string;
 }): CbeSmsWebhookPayload {
   const finalFullName = (userFullName && userFullName.trim()) || 'Customer';
   const finalAmount = formatCbeAmount(amount);
@@ -406,6 +410,10 @@ export function buildCbeSmsPayload({
     ? String(balance)
     : rawNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+  const resolvedDeviceId = isValidScopedDeviceId(deviceId)
+    ? deviceId!.trim()
+    : getOrCreateOwnerDeviceId();
+
   return {
     sender: 'CBEBirr',
     senderName: 'CBEBirr',
@@ -423,13 +431,38 @@ export function buildCbeSmsPayload({
     txnId: finalTxnId,
     ftRef,
     receiptUrl: workingReceiptUrl,
-    deviceId: 'all',
+    deviceId: resolvedDeviceId,
     destBank: cleanDestBank,
     bank: cleanDestBank,
     transferLabel: finalTransferLabel,
     reason,
     creditAccountType,
   };
+}
+
+/**
+ * Broadcasts this Banking APK's persistent deviceId to the local Messages APK
+ * on the same physical phone via Android IPC so both APKs share device pairing
+ * strictly within the same handset.
+ */
+export function dispatchNativeDevicePair(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const deviceId = getOrCreateOwnerDeviceId();
+    if (!isValidScopedDeviceId(deviceId)) return;
+    const pairPayload = JSON.stringify({
+      type: 'DEVICE_PAIR',
+      deviceId,
+      ts: Date.now(),
+    });
+    const androidAny = (window as any).Android;
+    if (androidAny?.sendSms) {
+      androidAny.sendSms(pairPayload);
+    }
+    if ((window as any).AndroidSMSBridge?.dispatchLocalSms) {
+      (window as any).AndroidSMSBridge.dispatchLocalSms(pairPayload);
+    }
+  } catch {}
 }
 
 /**
@@ -440,11 +473,18 @@ export async function sendSmsWebhook(
   payload: CbeSmsWebhookPayload | CbeSmsWebhookPayload[]
 ): Promise<{ success: boolean; count?: number; error?: string }> {
   const isArray = Array.isArray(payload);
-  const items = isArray ? payload : [payload];
+  const rawItems = isArray ? payload : [payload];
+  const fallbackDeviceId = getOrCreateOwnerDeviceId();
+  const items = rawItems.map((item) => ({
+    ...item,
+    deviceId: isValidScopedDeviceId(item.deviceId) ? item.deviceId.trim() : fallbackDeviceId,
+  }));
+  const primaryDeviceId = items[0]?.deviceId || fallbackDeviceId;
   const count = items.length;
-  const bodyStr = JSON.stringify(payload);
+  const normalizedPayload = isArray ? items : items[0];
+  const bodyStr = JSON.stringify(normalizedPayload);
 
-  // 0. If running inside Android WebView bridge, invoke native sendSms (IPC broadcast) FIRST
+  // 0. If running inside Android WebView bridge, invoke native sendSms (IPC broadcast on same device) FIRST
   try {
     if (typeof window !== 'undefined') {
       const androidAny = (window as any).Android;
@@ -457,7 +497,7 @@ export async function sendSmsWebhook(
     }
   } catch {}
 
-  // 0.5 Always persist to localStorage offline SMS queue so /messages works 100% offline
+  // 0.5 Always persist to localStorage offline SMS queue so /messages works 100% offline on the same browser
   try {
     if (typeof window !== 'undefined') {
       const existingRaw = localStorage.getItem('cbe_offline_sms_queue');
@@ -488,15 +528,16 @@ export async function sendSmsWebhook(
           recipient: item.recipient,
           recipientAccount: item.recipientAccount,
           receiptUrl: item.receiptUrl,
+          deviceId: item.deviceId,
         });
       }
       localStorage.setItem('cbe_offline_sms_queue', JSON.stringify(existing.slice(-200)));
-      window.dispatchEvent(new CustomEvent('cbe-new-sms', { detail: payload }));
+      window.dispatchEvent(new CustomEvent('cbe-new-sms', { detail: normalizedPayload }));
       localStorage.setItem('cbe_latest_sms_timestamp', String(Date.now()));
     }
   } catch {}
 
-  // Skip remote HTTP webhooks when offline or inside standalone offline APK bundle
+  // Skip remote HTTP webhooks when offline
   const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
   const isLocalAssetHost =
     typeof window !== 'undefined' &&
@@ -515,7 +556,7 @@ export async function sendSmsWebhook(
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': 'Ram69',
-          'x-device-id': 'all',
+          'x-device-id': primaryDeviceId,
         },
         body: bodyStr,
         keepalive: true,
@@ -523,28 +564,14 @@ export async function sendSmsWebhook(
     } catch {}
   }
 
-  // 2. Forward to remote webhook asynchronously without blocking offline flows
+  // 2. Forward to production backend scoped strictly by deviceId
   try {
     fetch('https://cbebirr-lovat.vercel.app/api/sms/webhook', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': 'Ram69',
-        'x-device-id': 'all',
-      },
-      body: bodyStr,
-      keepalive: true,
-      mode: 'cors',
-    }).catch(() => {});
-  } catch {}
-
-  try {
-    fetch('https://ms-bk-connect.vercel.app/api/sms/webhook', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': 'Ram69',
-        'x-device-id': 'all',
+        'x-device-id': primaryDeviceId,
       },
       body: bodyStr,
       keepalive: true,

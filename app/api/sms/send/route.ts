@@ -1,11 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { smsStore } from '@/lib/sms-store';
+import { isValidServerDeviceId, smsStore } from '@/lib/sms-store';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    const targetDeviceId = String(body.deviceId || req.headers.get('x-device-id') || '').trim();
+    if (!isValidServerDeviceId(targetDeviceId)) {
+      return NextResponse.json(
+        { success: false, error: 'Valid scoped deviceId is required' },
+        { status: 400 }
+      );
+    }
+
     const sender = body.sender || body.senderName || 'CBEBirr';
     const text = body.text || body.message || body.body || '';
 
@@ -13,7 +21,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Text or amount is required' }, { status: 400 });
     }
 
-    const newMsg = smsStore.addMessage({
+    const newMsg = await smsStore.addMessageAsync({
       sender,
       senderName: sender,
       conversationId: body.conversationId || sender,
@@ -25,7 +33,7 @@ export async function POST(req: NextRequest) {
       fullName: body.fullName || 'Customer',
       txnId: body.txnId,
       receiptUrl: body.receiptUrl,
-      deviceId: body.deviceId || 'all',
+      deviceId: targetDeviceId,
       isOutgoing: !!body.isOutgoing,
       isBank: body.isBank ?? true,
       bankName: body.bankName || sender,

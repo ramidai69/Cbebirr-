@@ -31,6 +31,16 @@ class CbeSmsReceiver : BroadcastReceiver() {
         val dispatchArray = JSONArray()
 
         for (obj in items) {
+            val incomingDeviceId = obj.optString("deviceId", "").trim()
+            if (LocalMessageStore.isValidScopedDeviceId(incomingDeviceId)) {
+                LocalMessageStore.registerPairedDeviceId(context, incomingDeviceId)
+            }
+
+            val eventType = obj.optString("type", "").trim()
+            if (eventType.equals("DEVICE_PAIR", ignoreCase = true)) {
+                continue
+            }
+
             val body = obj.optString("body", obj.optString("text", obj.optString("message", ""))).trim()
             if (body.isEmpty()) continue
 
@@ -66,7 +76,8 @@ class CbeSmsReceiver : BroadcastReceiver() {
                 receiptUrl = receiptUrl,
                 destBank = destBank,
                 transferLabel = transferLabel,
-                reason = reason
+                reason = reason,
+                deviceId = incomingDeviceId
             )
 
             if (isNew) {

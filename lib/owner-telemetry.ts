@@ -19,16 +19,43 @@ export interface CachedLockState {
   updatedAtMs: number;
 }
 
+const RESERVED_SHARED_DEVICE_IDS = new Set([
+  'all',
+  'dev_galaxy_a12',
+  'unknown',
+  'unknown_id',
+  'unknown_device',
+  'dev_server',
+  'dev_browser_tmp',
+]);
+
+export function isValidScopedDeviceId(id?: string | null): boolean {
+  if (!id || typeof id !== 'string') return false;
+  const clean = id.trim();
+  if (!/^[a-zA-Z0-9_\-]{6,64}$/.test(clean)) return false;
+  return !RESERVED_SHARED_DEVICE_IDS.has(clean.toLowerCase());
+}
+
 export function getOrCreateOwnerDeviceId(): string {
   if (typeof window === 'undefined') return 'dev_server';
   try {
     const existing = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
-    if (existing && /^[a-zA-Z0-9_\-]{6,64}$/.test(existing)) {
-      return existing;
+    if (isValidScopedDeviceId(existing)) {
+      return existing!.trim();
     }
-    const rand = Math.random().toString(36).slice(2, 8);
+    let rand = '';
+    try {
+      if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+        const bytes = new Uint8Array(6);
+        crypto.getRandomValues(bytes);
+        rand = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch {}
+    if (!rand) {
+      rand = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+    }
     const ts = Date.now().toString(36).slice(-5);
-    const created = `dev_${ts}${rand}`;
+    const created = `dev_${ts}${rand}`.slice(0, 48);
     localStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
     return created;
   } catch {
@@ -42,7 +69,7 @@ export function detectDeviceInfo(): {
   appVersion: string;
 } {
   if (typeof window === 'undefined') {
-    return { deviceName: 'Server', platform: 'web', appVersion: '1.0.85' };
+    return { deviceName: 'Server', platform: 'web', appVersion: '1.0.94' };
   }
   const ua = navigator.userAgent || '';
   const isApk =
@@ -82,7 +109,7 @@ export function detectDeviceInfo(): {
   return {
     deviceName,
     platform,
-    appVersion: '1.0.88',
+    appVersion: '1.0.94',
   };
 }
 

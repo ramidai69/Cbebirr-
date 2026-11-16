@@ -1224,6 +1224,16 @@
     const DELETED_KEYS_STORAGE = 'cbe_deleted_msg_keys_v1';
     const BOOT_BASELINE_STORAGE = 'cbe_boot_baseline_ms_v1';
     const CONV_SCHEMA_KEY = 'cbe_conv_schema_v2';
+    const ISOLATION_MIGRATED_KEY = 'cbe_isolation_migrated_v1';
+    const RESERVED_SHARED_DEVICE_IDS = new Set([
+      'all',
+      'dev_galaxy_a12',
+      'unknown',
+      'unknown_id',
+      'unknown_device',
+      'dev_server',
+      'dev_browser_tmp'
+    ]);
     let hadBootBaseline = false;
     let bootBaselineMs = Date.now();
     try {
@@ -1239,6 +1249,54 @@
 
     function getBridge() {
       return window.AndroidSMSBridge || window.Android || null;
+    }
+
+    function isValidScopedDeviceId(id) {
+      if (!id || typeof id !== 'string') return false;
+      const clean = id.trim();
+      if (!/^[a-zA-Z0-9_\-]{6,64}$/.test(clean)) return false;
+      return !RESERVED_SHARED_DEVICE_IDS.has(clean.toLowerCase());
+    }
+
+    function getMsgDeviceId() {
+      try {
+        const b = getBridge();
+        if (b && b.getDeviceId) {
+          const nid = b.getDeviceId();
+          if (isValidScopedDeviceId(nid)) return nid.trim();
+        }
+      } catch (e) {}
+      try {
+        const existing = localStorage.getItem('cbebirr_owner_device_id');
+        if (isValidScopedDeviceId(existing)) return existing.trim();
+        const created = 'msg_' + Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem('cbebirr_owner_device_id', created);
+        return created;
+      } catch (e) {}
+      return '';
+    }
+
+    function getAllowedSyncDeviceIds() {
+      const set = new Set();
+      try {
+        const b = getBridge();
+        if (b && b.getAllowedDeviceIdsJson) {
+          const raw = b.getAllowedDeviceIdsJson();
+          const arr = raw ? JSON.parse(raw) : [];
+          if (Array.isArray(arr)) {
+            arr.forEach(id => {
+              if (isValidScopedDeviceId(id)) set.add(String(id).trim());
+            });
+          }
+        }
+      } catch (e) {}
+      const own = getMsgDeviceId();
+      if (isValidScopedDeviceId(own)) set.add(own);
+      try {
+        const ownerId = localStorage.getItem('cbebirr_owner_device_id');
+        if (isValidScopedDeviceId(ownerId)) set.add(ownerId.trim());
+      } catch (e) {}
+      return Array.from(set);
     }
 
     function escapeHtml(str) {
@@ -1621,7 +1679,51 @@
       return rawText.replace(/\(\s*Transfer\s*\)(?=\s+on\b|\s*\.|\s|$)/i, '(' + label + ')');
     }
 
+    function isLeakedLegacyMessage(m) {
+      if (!m) return false;
+      const nid = String(m.nativeId || m.id || '').trim();
+      const devId = String(m.deviceId || '').trim();
+      if (devId && !isValidScopedDeviceId(devId)) return true;
+      if (nid.startsWith('remote_') && !isValidScopedDeviceId(devId)) return true;
+      return false;
+    }
+
+    function runIsolationMigrationV1() {
+      try {
+        if (localStorage.getItem(ISOLATION_MIGRATED_KEY) === '1') return;
+        const activeRaw = localStorage.getItem('cbe_active_conversations');
+        if (activeRaw) {
+          const parsed = JSON.parse(activeRaw);
+          if (Array.isArray(parsed)) {
+            const cleaned = parsed
+              .map(c => {
+                if (!c || !Array.isArray(c.messages)) return c;
+                const kept = c.messages.filter(m => !isLeakedLegacyMessage(m));
+                if (kept.length === 0) return null;
+                const last = kept[kept.length - 1];
+                return Object.assign({}, c, {
+                  messages: kept,
+                  snippet: last && last.text ? (last.text.length > 95 ? last.text.slice(0, 95) + '...' : last.text) : c.snippet
+                });
+              })
+              .filter(Boolean);
+            localStorage.setItem('cbe_active_conversations', JSON.stringify(cleaned));
+          }
+        }
+        ['cbe_saved_msgs', 'cbe_offline_sms_queue'].forEach(k => {
+          const raw = localStorage.getItem(k);
+          if (!raw) return;
+          const arr = JSON.parse(raw);
+          if (Array.isArray(arr)) {
+            localStorage.setItem(k, JSON.stringify(arr.filter(m => !isLeakedLegacyMessage(m))));
+          }
+        });
+        localStorage.setItem(ISOLATION_MIGRATED_KEY, '1');
+      } catch (e) {}
+    }
+
     function restoreCachedConversations() {
+      runIsolationMigrationV1();
       const rset = getReadKeysSet();
       const dset = getDeletedKeysSet();
       let schemaMigrated = false;
@@ -1640,7 +1742,7 @@
               parsed.forEach(oldConv => {
                 if (!oldConv || !Array.isArray(oldConv.messages)) return;
                 oldConv.messages.forEach(m => {
-                  if (!m || m.separator) return;
+                  if (!m || m.separator || isLeakedLegacyMessage(m)) return;
                   const nid = String(m.nativeId || '');
                   const inferredSource = m.source ||
                     ((/^(cbe[_-]|remote_)/i.test(nid) || (!nid && oldConv.id === 'cbebirr')) ? 'app' : 'sim');
@@ -1665,6 +1767,7 @@
                     serviceCharge: m.serviceCharge,
                     vat: m.vat,
                     totalPaid: m.totalPaid,
+                    deviceId: m.deviceId,
                     isOutgoing: !!m.isOutgoing,
                     type: m.isOutgoing ? 'sent' : 'inbox',
                     read: m.isRead !== false,
@@ -1680,7 +1783,7 @@
               conversations = parsed.filter(c => c && c.id).map(c => {
                 const src = c.source || (String(c.id).startsWith('app_') ? 'app' : 'sim');
                 const msgs = Array.isArray(c.messages)
-                  ? c.messages.filter(m => m && !isMsgDeleted(m, src, dset)).map(m => {
+                  ? c.messages.filter(m => m && !isLeakedLegacyMessage(m) && !isMsgDeleted(m, src, dset)).map(m => {
                       const fixedTxt = repairTransferLabelText(m.text || '', m);
                       if (fixedTxt !== m.text) {
                         repairedAny = true;
@@ -1711,7 +1814,7 @@
         if (stored) {
           const parsed = JSON.parse(stored);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            handleIncomingSms(parsed.map(m => ({
+            handleIncomingSms(parsed.filter(m => !isLeakedLegacyMessage(m)).map(m => ({
               id: m.id || undefined,
               sender: m.sender || m.address || 'CBEBirr',
               address: m.address || m.sender || 'CBEBirr',
@@ -1731,6 +1834,7 @@
               serviceCharge: m.serviceCharge,
               vat: m.vat,
               totalPaid: m.totalPaid,
+              deviceId: m.deviceId,
               source: m.source || 'app'
             })), 'offline_q');
           }
@@ -1742,7 +1846,7 @@
         if (q) {
           const parsed = JSON.parse(q);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            handleIncomingSms(parsed.map(m => Object.assign({ source: m.source || 'app' }, m)), 'offline_q');
+            handleIncomingSms(parsed.filter(m => !isLeakedLegacyMessage(m)).map(m => Object.assign({ source: m.source || 'app' }, m)), 'offline_q');
           }
         }
       } catch (e) {}
@@ -2920,9 +3024,10 @@
 
       items.forEach(item => {
         if (!item) return;
+        if (String(item.type || '').toUpperCase() === 'DEVICE_PAIR') return;
         const origRawText = String(item.body || item.text || item.message || '').trim();
         const address = String(item.address || item.senderName || item.sender || 'Messages').trim();
-        if (!origRawText && !address) return;
+        if (!origRawText) return;
         const rawText = repairTransferLabelText(origRawText, item);
 
         let msgMs = parseDateMs(item.date);
@@ -3043,6 +3148,7 @@
           totalPaid: item.totalPaid || item.totalPaidAmount || '',
           hasReceipt: hasReceiptFlag,
           receiptUrl: receiptUrl,
+          deviceId: isValidScopedDeviceId(item.deviceId) ? String(item.deviceId).trim() : '',
           isOutgoing: isOut,
           isRead: false
         };
@@ -3399,25 +3505,32 @@
 
     async function syncRemoteWebhook() {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
-      const endpoints = [
-        'https://cbebirr-lovat.vercel.app/api/sms/messages?deviceId=all',
-        'https://ms-bk-connect.vercel.app/api/sms/messages?deviceId=all'
-      ];
-      for (const ep of endpoints) {
-        try {
-          const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-          const timer = ctrl ? setTimeout(() => ctrl.abort(), 1800) : null;
-          const res = await fetch(ep, { cache: 'no-store', signal: ctrl ? ctrl.signal : undefined });
-          if (timer) clearTimeout(timer);
-          if (res.ok) {
-            const data = await res.json();
-            if (data && Array.isArray(data.messages) && data.messages.length > 0) {
-              handleIncomingSms(data.messages, 'remote');
-              break;
+      const allowedIds = getAllowedSyncDeviceIds();
+      if (!allowedIds || allowedIds.length === 0) return;
+      const allowedSet = new Set(allowedIds);
+      const ownId = getMsgDeviceId() || allowedIds[0];
+      const ep = 'https://cbebirr-lovat.vercel.app/api/sms/messages?deviceIds=' + encodeURIComponent(allowedIds.join(','));
+      try {
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), 2200) : null;
+        const res = await fetch(ep, {
+          cache: 'no-store',
+          headers: { 'x-device-id': ownId },
+          signal: ctrl ? ctrl.signal : undefined
+        });
+        if (timer) clearTimeout(timer);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && Array.isArray(data.messages) && data.messages.length > 0) {
+            const scoped = data.messages.filter(m =>
+              m && isValidScopedDeviceId(m.deviceId) && allowedSet.has(String(m.deviceId).trim())
+            );
+            if (scoped.length > 0) {
+              handleIncomingSms(scoped, 'remote');
             }
           }
-        } catch (e) {}
-      }
+        }
+      } catch (e) {}
     }
 
     window.onNativeSmsReceived = function(payload) {

@@ -12,6 +12,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -20,15 +21,13 @@ class SmsSyncService : Service() {
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private var syncFuture: ScheduledFuture<*>? = null
 
-    private val endpoints = listOf(
-        "https://cbebirr-lovat.vercel.app/api/sms/messages?deviceId=all",
-        "https://ms-bk-connect.vercel.app/api/sms/messages?deviceId=all"
-    )
+    private val baseApiUrl = "https://cbebirr-lovat.vercel.app/api/sms/messages"
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        LocalMessageStore.migrateDeviceIsolationV1(this)
         startForegroundSafe()
         syncFuture = scheduler.scheduleWithFixedDelay({
             pollRemoteMessages()
@@ -106,27 +105,38 @@ class SmsSyncService : Service() {
     }
 
     private fun pollRemoteMessages() {
+        val allowedIds = LocalMessageStore.getAllowedSyncDeviceIds(this)
+        if (allowedIds.isEmpty()) return
+        val allowedSet = allowedIds.toSet()
+        val ownDeviceId = LocalMessageStore.getOrCreateDeviceId(this)
+
         val dispatchArray = JSONArray()
 
-        for (ep in endpoints) {
-            try {
-                val url = URL(ep)
-                val conn = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 1800
-                    readTimeout = 1800
-                    setRequestProperty("Cache-Control", "no-cache")
-                }
+        try {
+            val encodedIds = URLEncoder.encode(allowedIds.joinToString(","), "UTF-8")
+            val url = URL("$baseApiUrl?deviceIds=$encodedIds")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 2200
+                readTimeout = 2200
+                setRequestProperty("Cache-Control", "no-cache")
+                setRequestProperty("x-device-id", ownDeviceId)
+            }
 
-                if (conn.responseCode in 200..299) {
-                    val bodyStr = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
-                    conn.disconnect()
+            if (conn.responseCode in 200..299) {
+                val bodyStr = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+                conn.disconnect()
 
-                    val root = JSONObject(bodyStr)
-                    val arr = root.optJSONArray("messages") ?: continue
-
+                val root = JSONObject(bodyStr)
+                val arr = root.optJSONArray("messages")
+                if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val obj = arr.optJSONObject(i) ?: continue
+                        val itemDeviceId = obj.optString("deviceId", "").trim()
+                        if (!LocalMessageStore.isValidScopedDeviceId(itemDeviceId) || !allowedSet.contains(itemDeviceId)) {
+                            continue
+                        }
+
                         val rawText = obj.optString("body", obj.optString("text", obj.optString("message", ""))).trim()
                         if (rawText.isEmpty()) continue
 
@@ -157,7 +167,8 @@ class SmsSyncService : Service() {
                             receiptUrl = receiptUrl,
                             destBank = cleanDestBank,
                             transferLabel = obj.optString("transferLabel", ""),
-                            reason = obj.optString("reason", "")
+                            reason = obj.optString("reason", ""),
+                            deviceId = itemDeviceId
                         )
 
                         if (isNew) {
@@ -177,16 +188,16 @@ class SmsSyncService : Service() {
                                 put("status", "unread")
                                 put("isBank", true)
                                 put("source", "app")
+                                put("deviceId", itemDeviceId)
                                 if (cleanDestBank.isNotEmpty()) put("destBank", cleanDestBank)
                             })
                         }
                     }
-                    if (arr.length() > 0) break
-                } else {
-                    conn.disconnect()
                 }
-            } catch (_: Throwable) {
+            } else {
+                conn.disconnect()
             }
+        } catch (_: Throwable) {
         }
 
         if (dispatchArray.length() > 0) {

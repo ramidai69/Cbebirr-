@@ -503,6 +503,178 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "SmsMessageRecord": {
+      "title": "SmsMessageRecord",
+      "description": "Device-isolated SMS/notification message persisted per physical deviceId.",
+      "type": "object",
+      "properties": {
+        "smsId": {
+          "type": "string",
+          "description": "Unique SMS message document ID",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Originating device identifier (strictly isolated per device, never 'all')",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "conversationId": {
+          "type": "string",
+          "description": "Conversation thread key",
+          "maxLength": 80
+        },
+        "sender": {
+          "type": "string",
+          "description": "Sender address or label",
+          "maxLength": 80
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Sender display name",
+          "maxLength": 80
+        },
+        "text": {
+          "type": "string",
+          "description": "SMS body text",
+          "maxLength": 2000
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Formatted display timestamp",
+          "maxLength": 40
+        },
+        "date": {
+          "type": "string",
+          "description": "ISO or formatted timestamp",
+          "maxLength": 64
+        },
+        "isOutgoing": {
+          "type": "boolean",
+          "description": "Whether message was outgoing"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["delivered", "read", "pending"],
+          "description": "Message delivery/read status"
+        },
+        "isBank": {
+          "type": "boolean",
+          "description": "Whether message is a banking notification"
+        },
+        "bankName": {
+          "type": "string",
+          "description": "Bank name",
+          "maxLength": 80
+        },
+        "destBank": {
+          "type": "string",
+          "description": "Destination bank or wallet",
+          "maxLength": 80
+        },
+        "transferLabel": {
+          "type": "string",
+          "description": "Transfer label inside SMS text",
+          "maxLength": 80
+        },
+        "reason": {
+          "type": "string",
+          "description": "Transaction reason",
+          "maxLength": 200
+        },
+        "creditAccountType": {
+          "type": "string",
+          "description": "Credit account type",
+          "maxLength": 80
+        },
+        "amount": {
+          "type": "string",
+          "description": "Formatted transaction amount",
+          "maxLength": 32
+        },
+        "balance": {
+          "type": "string",
+          "description": "Formatted post-transaction balance",
+          "maxLength": 32
+        },
+        "recipient": {
+          "type": "string",
+          "description": "Recipient name",
+          "maxLength": 120
+        },
+        "recipientAccount": {
+          "type": "string",
+          "description": "Recipient phone or account",
+          "maxLength": 64
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Sender full name",
+          "maxLength": 120
+        },
+        "reference": {
+          "type": "string",
+          "description": "Transaction reference",
+          "maxLength": 64
+        },
+        "txnId": {
+          "type": "string",
+          "description": "8-char transaction ID",
+          "maxLength": 64
+        },
+        "receiptUrl": {
+          "type": "string",
+          "description": "Receipt URL",
+          "maxLength": 1000
+        },
+        "synced": {
+          "type": "boolean",
+          "description": "Whether synced to device"
+        },
+        "isDeposit": {
+          "type": "boolean",
+          "description": "Whether deposit transaction"
+        },
+        "createdAtMs": {
+          "type": "number",
+          "description": "Creation epoch ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this SMS record",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "smsId",
+        "deviceId",
+        "conversationId",
+        "sender",
+        "senderName",
+        "text",
+        "timestamp",
+        "date",
+        "isOutgoing",
+        "status",
+        "isBank",
+        "createdAtMs",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -529,6 +701,10 @@
     "/receipts/{receiptId}": {
       "schema": { "$ref": "#/entities/ReceiptRecord" },
       "description": "Persisted official CBEBirr transaction receipts indexed by reference/TID for live QR verification."
+    },
+    "/sms_messages/{smsId}": {
+      "schema": { "$ref": "#/entities/SmsMessageRecord" },
+      "description": "Per-device isolated SMS webhook notifications stored by physical deviceId."
     }
   }
 }

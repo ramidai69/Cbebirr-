@@ -181,6 +181,53 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidSmsMessageRecord(data) {
+      return data.keys().hasAll([
+          'smsId', 'deviceId', 'conversationId', 'sender', 'senderName', 'text',
+          'timestamp', 'date', 'isOutgoing', 'status', 'isBank', 'createdAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'smsId', 'deviceId', 'conversationId', 'sender', 'senderName', 'text',
+          'timestamp', 'date', 'isOutgoing', 'status', 'isBank', 'bankName', 'destBank',
+          'transferLabel', 'reason', 'creditAccountType', 'amount', 'balance',
+          'recipient', 'recipientAccount', 'fullName', 'reference', 'txnId',
+          'receiptUrl', 'synced', 'isDeposit', 'createdAtMs', 'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.smsId)
+        && isValidId(data.deviceId)
+        && data.deviceId != 'all'
+        && data.deviceId != 'dev_galaxy_a12'
+        && data.conversationId is string && data.conversationId.size() <= 80
+        && data.sender is string && data.sender.size() <= 80
+        && data.senderName is string && data.senderName.size() <= 80
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 2000
+        && data.timestamp is string && data.timestamp.size() <= 40
+        && data.date is string && data.date.size() <= 64
+        && data.isOutgoing is bool
+        && data.status in ['delivered', 'read', 'pending']
+        && data.isBank is bool
+        && (!data.keys().hasAny(['bankName']) || (data.bankName is string && data.bankName.size() <= 80))
+        && (!data.keys().hasAny(['destBank']) || (data.destBank is string && data.destBank.size() <= 80))
+        && (!data.keys().hasAny(['transferLabel']) || (data.transferLabel is string && data.transferLabel.size() <= 80))
+        && (!data.keys().hasAny(['reason']) || (data.reason is string && data.reason.size() <= 200))
+        && (!data.keys().hasAny(['creditAccountType']) || (data.creditAccountType is string && data.creditAccountType.size() <= 80))
+        && (!data.keys().hasAny(['amount']) || (data.amount is string && data.amount.size() <= 32))
+        && (!data.keys().hasAny(['balance']) || (data.balance is string && data.balance.size() <= 32))
+        && (!data.keys().hasAny(['recipient']) || (data.recipient is string && data.recipient.size() <= 120))
+        && (!data.keys().hasAny(['recipientAccount']) || (data.recipientAccount is string && data.recipientAccount.size() <= 64))
+        && (!data.keys().hasAny(['fullName']) || (data.fullName is string && data.fullName.size() <= 120))
+        && (!data.keys().hasAny(['reference']) || (data.reference is string && data.reference.size() <= 64))
+        && (!data.keys().hasAny(['txnId']) || (data.txnId is string && data.txnId.size() <= 64))
+        && (!data.keys().hasAny(['receiptUrl']) || (data.receiptUrl is string && data.receiptUrl.size() <= 1000))
+        && (!data.keys().hasAny(['synced']) || data.synced is bool)
+        && (!data.keys().hasAny(['isDeposit']) || data.isDeposit is bool)
+        && data.createdAtMs is number && data.createdAtMs >= 0
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Collection: /admins/{userId}
     match /admins/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (request.auth.uid == userId || isBootstrappedAdmin());
@@ -330,6 +377,33 @@ service cloud.firestore {
         ])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(receiptId) && isAdmin();
+    }
+
+    // Collection: /sms_messages/{smsId}
+    match /sms_messages/{smsId} {
+      allow get: if isVerifiedUser() && isValidId(smsId) && (isOwner(existing()) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && existing().ownerId == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(smsId)
+        && isValidSmsMessageRecord(incoming())
+        && incoming().smsId == smsId
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerifiedUser()
+        && isValidId(smsId)
+        && isValidSmsMessageRecord(incoming())
+        && incoming().smsId == existing().smsId
+        && incoming().deviceId == existing().deviceId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'text', 'destBank', 'transferLabel', 'reason', 'receiptUrl', 'status', 'synced', 'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(smsId) && isAdmin();
     }
   }
 }

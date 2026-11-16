@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         NotificationHelper.ensureChannels(this)
+        LocalMessageStore.migrateDeviceIsolationV1(this)
 
         webView = WebView(this).apply {
             setBackgroundColor(Color.WHITE)
@@ -661,6 +662,18 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun getSavedMessages(): String {
             return LocalMessageStore.getSavedMessagesJson(this@MainActivity)
+        }
+
+        @JavascriptInterface
+        fun getDeviceId(): String {
+            return LocalMessageStore.getOrCreateDeviceId(this@MainActivity)
+        }
+
+        @JavascriptInterface
+        fun getAllowedDeviceIdsJson(): String {
+            val arr = JSONArray()
+            LocalMessageStore.getAllowedSyncDeviceIds(this@MainActivity).forEach { arr.put(it) }
+            return arr.toString()
         }
 
         @JavascriptInterface

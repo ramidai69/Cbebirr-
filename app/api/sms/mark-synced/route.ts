@@ -1,14 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { smsStore } from '@/lib/sms-store';
+import { normalizeDeviceIdFilter, smsStore } from '@/lib/sms-store';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const ids = body.ids;
+    const ids = Array.isArray(body.ids) ? body.ids.map(String) : undefined;
+    const rawFilter = [
+      body.deviceIds,
+      body.deviceId,
+      req.headers.get('x-device-id'),
+    ]
+      .filter(Boolean)
+      .join(',');
+    const allowedIds = Array.from(normalizeDeviceIdFilter(rawFilter));
 
-    smsStore.markMessagesSynced(ids);
+    if (allowedIds.length === 0) {
+      return NextResponse.json(
+        { success: false, error: 'Valid scoped deviceId is required' },
+        { status: 400 }
+      );
+    }
+
+    smsStore.markMessagesSynced(ids, allowedIds);
 
     return NextResponse.json({
       success: true,

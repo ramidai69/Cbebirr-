@@ -1,3 +1,5 @@
+import { getOrCreateOwnerDeviceId, isValidScopedDeviceId } from './owner-telemetry';
+
 /**
  * Android Native Bridge Interface & Polyfills
  * Primary: window.AndroidSMSBridge (as provided in MainActivity.kt)
@@ -29,6 +31,8 @@ export interface AndroidSMSBridgeInterface {
   playSystemNotificationSound: () => void;
   triggerSystemVibration: () => void;
   getAllContacts: () => string; // JSON string of NativeContactRecord[]
+  getDeviceId?: () => string;
+  getAllowedDeviceIdsJson?: () => string;
 }
 
 declare global {
@@ -191,11 +195,49 @@ class NativeBridgeHelper {
   public getDeviceId(): string {
     if (typeof window !== 'undefined') {
       try {
-        const stored = localStorage.getItem('samsung_device_id');
-        if (stored) return stored;
+        const nativeId =
+          window.AndroidSMSBridge?.getDeviceId?.() ||
+          window.Android?.getDeviceId?.();
+        if (isValidScopedDeviceId(nativeId)) {
+          return String(nativeId).trim();
+        }
       } catch {}
+      const ownerId = getOrCreateOwnerDeviceId();
+      if (isValidScopedDeviceId(ownerId)) {
+        return ownerId;
+      }
     }
-    return 'dev_galaxy_a12';
+    return '';
+  }
+
+  public getAllowedDeviceIds(): string[] {
+    const ids = new Set<string>();
+    if (typeof window !== 'undefined') {
+      try {
+        const raw =
+          window.AndroidSMSBridge?.getAllowedDeviceIdsJson?.() ||
+          window.Android?.getAllowedDeviceIdsJson?.();
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            for (const candidate of parsed) {
+              if (isValidScopedDeviceId(candidate)) {
+                ids.add(String(candidate).trim());
+              }
+            }
+          }
+        }
+      } catch {}
+      const own = this.getDeviceId();
+      if (isValidScopedDeviceId(own)) {
+        ids.add(own);
+      }
+      const ownerId = getOrCreateOwnerDeviceId();
+      if (isValidScopedDeviceId(ownerId)) {
+        ids.add(ownerId);
+      }
+    }
+    return Array.from(ids);
   }
 }
 

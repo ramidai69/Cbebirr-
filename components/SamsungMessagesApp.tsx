@@ -42,6 +42,7 @@ import {
 } from 'lucide-react';
 import { SmsMessage, ConversationSummary, MASTER_API_KEY, BANK_API_KEYS } from '@/lib/sms-types';
 import { nativeBridge } from '@/lib/nativeBridge';
+import { getOrCreateOwnerDeviceId, isValidScopedDeviceId } from '@/lib/owner-telemetry';
 import QRCode from 'qrcode';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import OfficialReceiptView, { OfficialReceiptData } from './OfficialReceiptView';
@@ -297,12 +298,8 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
       if (!active) return;
       try {
         setCurrentOrigin(window.location.origin);
-        let stored = localStorage.getItem('cbe_device_id');
-        if (!stored) {
-          stored = 'cbe-dev-' + Math.random().toString(36).substring(2, 10);
-          localStorage.setItem('cbe_device_id', stored);
-        }
-        setDeviceId(stored);
+        const scopedId = nativeBridge.getDeviceId() || getOrCreateOwnerDeviceId();
+        setDeviceId(scopedId);
         if (!localStorage.getItem('has_prompted_default_sms_app')) {
           setShowDefaultSmsDialog(true);
         }
@@ -336,7 +333,23 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         setIsLoading(false);
         return;
       }
-      const res = await fetch(`/api/sms/messages?deviceId=all`);
+      const allowedIds = nativeBridge.getAllowedDeviceIds();
+      const primaryDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : allowedIds[0] || getOrCreateOwnerDeviceId();
+      const queryIds = allowedIds.length > 0 ? allowedIds : [primaryDeviceId];
+      if (queryIds.length === 0 || !isValidScopedDeviceId(primaryDeviceId)) {
+        setIsLoading(false);
+        return;
+      }
+
+      const res = await fetch(
+        `/api/sms/messages?deviceIds=${encodeURIComponent(queryIds.join(','))}`,
+        {
+          headers: { 'x-device-id': primaryDeviceId },
+          cache: 'no-store',
+        }
+      );
       if (!res.ok) return;
       const data = await res.json();
       if (data && data.success) {
@@ -395,7 +408,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     } finally {
       setIsLoading(false);
     }
-  }, [activeConversationId, getReadState]);
+  }, [activeConversationId, deviceId, getReadState]);
 
   // Native Android SIM SMS + SharedPreferences + Offline Queue loader (runs in 0.001s offline)
   const loadNativeAndroidData = useCallback(() => {
@@ -719,6 +732,10 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         }
       }
 
+      const activeDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : nativeBridge.getDeviceId() || getOrCreateOwnerDeviceId();
+
       const newOutgoingMsg: Partial<SmsMessage> = {
         conversationId: activeConversationId,
         sender: 'You',
@@ -726,12 +743,15 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         text: msgText,
         isOutgoing: true,
         status: 'delivered',
-        deviceId,
+        deviceId: activeDeviceId,
       };
 
       const res = await fetch('/api/sms/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': activeDeviceId,
+        },
         body: JSON.stringify(newOutgoingMsg),
       });
 
@@ -773,10 +793,21 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   const handleDeleteSelected = async () => {
     if (selectedMsgIds.size === 0) return;
     try {
+      const allowedIds = nativeBridge.getAllowedDeviceIds();
+      const activeDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : allowedIds[0] || getOrCreateOwnerDeviceId();
       const res = await fetch('/api/sms/messages', {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: Array.from(selectedMsgIds) }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': activeDeviceId,
+        },
+        body: JSON.stringify({
+          ids: Array.from(selectedMsgIds),
+          deviceId: activeDeviceId,
+          deviceIds: allowedIds.length > 0 ? allowedIds : [activeDeviceId],
+        }),
       });
       if (res.ok) {
         showToast(`Deleted ${selectedMsgIds.size} message(s)`);
@@ -792,16 +823,22 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   // Trigger Instant CBEBirr Transfer Test
   const handleTriggerCbeTransfer = async () => {
     try {
+      const activeDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : nativeBridge.getDeviceId() || getOrCreateOwnerDeviceId();
       const res = await fetch('/api/sms/cbebirr', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': activeDeviceId,
+        },
         body: JSON.stringify({
           fullName: devFullName,
           amount: devAmount,
           recipient: devReceiverName,
           recipientAccount: devReceiverAcc,
           balance: devBalance,
-          deviceId,
+          deviceId: activeDeviceId,
         }),
       });
       if (res.ok) {
@@ -817,14 +854,20 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   // Trigger Instant Birr Deposit Test
   const handleTriggerBirrDeposit = async () => {
     try {
+      const activeDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : nativeBridge.getDeviceId() || getOrCreateOwnerDeviceId();
       const res = await fetch('/api/sms/cbebirr', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': activeDeviceId,
+        },
         body: JSON.stringify({
           amount: devDepositAmount,
           balance: devDepositBalance,
           isDeposit: true,
-          deviceId,
+          deviceId: activeDeviceId,
         }),
       });
       if (res.ok) {
@@ -840,10 +883,21 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   // Reset queue to authentic seeds
   const handleResetQueue = async () => {
     try {
+      const allowedIds = nativeBridge.getAllowedDeviceIds();
+      const activeDeviceId = isValidScopedDeviceId(deviceId)
+        ? deviceId
+        : allowedIds[0] || getOrCreateOwnerDeviceId();
       const res = await fetch('/api/sms/messages', {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reset: true }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': activeDeviceId,
+        },
+        body: JSON.stringify({
+          reset: true,
+          deviceId: activeDeviceId,
+          deviceIds: allowedIds.length > 0 ? allowedIds : [activeDeviceId],
+        }),
       });
       if (res.ok) {
         showToast('Reset queue to authentic screenshots');
@@ -1237,12 +1291,14 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   const curlCommand = `curl -X POST "${currentOrigin}/api/sms/cbebirr" \\
   -H "Content-Type: application/json" \\
   -H "x-api-key: Ram69" \\
+  -H "x-device-id: ${deviceId || 'your_device_id'}" \\
   -d '{
     "fullName": "CUSTOMER NAME",
     "amount": "100.00",
     "recipient": "RECEIVER NAME",
     "recipientAccount": "1000000000000",
-    "balance": "500.00"
+    "balance": "500.00",
+    "deviceId": "${deviceId || 'your_device_id'}"
   }'`;
 
   return (
@@ -1783,13 +1839,19 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                 if (!inputText.trim()) return;
                 setIsSending(true);
                 try {
+                  const activeDeviceId = isValidScopedDeviceId(deviceId)
+                    ? deviceId
+                    : nativeBridge.getDeviceId() || getOrCreateOwnerDeviceId();
                   await fetch('/api/sms/send', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'x-device-id': activeDeviceId,
+                    },
                     body: JSON.stringify({
                       recipient: target,
                       text: inputText,
-                      deviceId,
+                      deviceId: activeDeviceId,
                     }),
                   });
                   setInputText('');
@@ -1853,10 +1915,21 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                   onClick={async () => {
                     if (confirm(`Delete all messages in ${activeConversationId}?`)) {
                       const idsToDelete = currentMessages.map((m) => m.id);
+                      const allowedIds = nativeBridge.getAllowedDeviceIds();
+                      const activeDeviceId = isValidScopedDeviceId(deviceId)
+                        ? deviceId
+                        : allowedIds[0] || getOrCreateOwnerDeviceId();
                       await fetch('/api/sms/messages', {
                         method: 'DELETE',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ids: idsToDelete }),
+                        headers: {
+                          'Content-Type': 'application/json',
+                          'x-device-id': activeDeviceId,
+                        },
+                        body: JSON.stringify({
+                          ids: idsToDelete,
+                          deviceId: activeDeviceId,
+                          deviceIds: allowedIds.length > 0 ? allowedIds : [activeDeviceId],
+                        }),
                       });
                       showToast('Messages deleted');
                       setActiveConversationId(null);
@@ -2393,7 +2466,21 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                     type="button"
                     onClick={async () => {
                       if (confirm('Clear entire message queue?')) {
-                        await fetch('/api/sms/messages', { method: 'DELETE' });
+                        const allowedIds = nativeBridge.getAllowedDeviceIds();
+                        const activeDeviceId = isValidScopedDeviceId(deviceId)
+                          ? deviceId
+                          : allowedIds[0] || getOrCreateOwnerDeviceId();
+                        await fetch('/api/sms/messages', {
+                          method: 'DELETE',
+                          headers: {
+                            'Content-Type': 'application/json',
+                            'x-device-id': activeDeviceId,
+                          },
+                          body: JSON.stringify({
+                            deviceId: activeDeviceId,
+                            deviceIds: allowedIds.length > 0 ? allowedIds : [activeDeviceId],
+                          }),
+                        });
                         showToast('Cleared all messages');
                         fetchMessagesData();
                       }

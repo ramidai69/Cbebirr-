@@ -14,6 +14,7 @@ import {
   buildOfficialReceiptUrl,
   getAppBaseUrl,
   getShortQrBaseUrl,
+  dispatchNativeDevicePair,
 } from '@/lib/sms-webhook';
 import {
   generateStyledQrDataUrl,
@@ -541,18 +542,30 @@ export default function CBEBirrFullscreenApp() {
     runSync();
     const intervalId = setInterval(runSync, 4000);
 
+    let lastPairBroadcastMs = 0;
+    const triggerPairBroadcast = () => {
+      const now = Date.now();
+      if (now - lastPairBroadcastMs < 10_000) return;
+      lastPairBroadcastMs = now;
+      dispatchNativeDevicePair();
+    };
+    triggerPairBroadcast();
+
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
         runSync();
+        triggerPairBroadcast();
       } else if (document.visibilityState === 'hidden') {
         sendOfflineBeacon(profileSyncRef.current);
       }
     };
     const onOnline = () => runSync();
+    const onFocus = () => triggerPairBroadcast();
     const onPageHide = () => sendOfflineBeacon(profileSyncRef.current);
 
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onFocus);
     window.addEventListener('pagehide', onPageHide);
 
     return () => {
@@ -560,6 +573,7 @@ export default function CBEBirrFullscreenApp() {
       clearInterval(intervalId);
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('online', onOnline);
+      window.removeEventListener('focus', onFocus);
       window.removeEventListener('pagehide', onPageHide);
     };
   }, [isStorageHydrated, showNextQueuedNotification]);

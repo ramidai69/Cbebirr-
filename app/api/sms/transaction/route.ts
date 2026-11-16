@@ -1,18 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { smsStore } from '@/lib/sms-store';
-
-export const dynamic = 'force-dynamic';
+import { isValidServerDeviceId, smsStore } from '@/lib/sms-store';
 import {
-  buildCbeSmsText,
   formatCbeDateTime,
   formatCbeAmount,
   generate8CharTxnId,
   buildOfficialReceiptUrl,
 } from '@/lib/sms-webhook';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    const targetDeviceId = String(body.deviceId || req.headers.get('x-device-id') || '').trim();
+    if (!isValidServerDeviceId(targetDeviceId)) {
+      return NextResponse.json(
+        { success: false, error: 'Valid scoped deviceId is required' },
+        { status: 400 }
+      );
+    }
+
     let bank = body.bank || body.bankName || 'CBEBirr';
     if (bank === 'All Banks' || bank.toLowerCase().includes('cbe')) {
       bank = 'CBEBirr';
@@ -27,10 +34,21 @@ export async function POST(req: NextRequest) {
     const dateTimeStr = formatCbeDateTime(body.date);
     const isDeposit = !!body.isDeposit;
 
-    const destBank = body.destBank || (!/^(all banks|cbebirr|cbe birr|cbe)$/i.test(String(bank).trim()) ? String(bank).trim() : undefined);
+    const destBank =
+      body.destBank ||
+      (!/^(all banks|cbebirr|cbe birr|cbe)$/i.test(String(bank).trim()) ? String(bank).trim() : undefined);
     const isPhoneRec = String(recipientAccount).startsWith('09') || String(recipientAccount).startsWith('07');
-    const transferLabel = (body.transferLabel && String(body.transferLabel).trim()) || destBank || (isPhoneRec ? 'CBEBirr' : 'CBE');
-    const reasonText = body.reason || (isDeposit ? 'Deposit to CBE Birr' : (destBank ? `Transfer to ${destBank}` : (isPhoneRec ? 'Wallet Transfer' : 'Customer transfer to CBE account')));
+    const transferLabel =
+      (body.transferLabel && String(body.transferLabel).trim()) || destBank || (isPhoneRec ? 'CBEBirr' : 'CBE');
+    const reasonText =
+      body.reason ||
+      (isDeposit
+        ? 'Deposit to CBE Birr'
+        : destBank
+        ? `Transfer to ${destBank}`
+        : isPhoneRec
+        ? 'Wallet Transfer'
+        : 'Customer transfer to CBE account');
 
     let receiptUrl = body.receiptUrl;
     if (!receiptUrl) {
@@ -56,7 +74,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const created = smsStore.addMessage({
+    const created = await smsStore.addMessageAsync({
       sender: bank,
       senderName: bank,
       conversationId: bank,
@@ -69,7 +87,7 @@ export async function POST(req: NextRequest) {
       txnId,
       reference: body.reference || txnId,
       receiptUrl,
-      deviceId: body.deviceId || 'all',
+      deviceId: targetDeviceId,
       isBank: true,
       bankName: bank,
       destBank,
