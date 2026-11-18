@@ -100,8 +100,14 @@ function buildMainMenuKeyboard(globalLocked: boolean) {
 function formatDeviceShortLine(d: DeviceClient, idx: number, nowMs: number): string {
   const statusIcon = d.isOnline ? '🟢 ONLINE' : `🔴 OFFLINE (${formatRelativeTime(d.lastSeenAtMs, nowMs)})`;
   const lockIcon = d.isLocked ? '🔒 LOCKED' : '🔓 ACTIVE';
+  const aprTag =
+    d.approvalStatus === 'pending'
+      ? ' • ⏳ PENDING APPROVAL'
+      : d.approvalStatus === 'rejected'
+        ? ' • ❌ REJECTED'
+        : '';
   return (
-    `<b>#${idx + 1}</b> ${statusIcon} | ${lockIcon}\n` +
+    `<b>#${idx + 1}</b> ${statusIcon} | ${lockIcon}${aprTag}\n` +
     `📱 <b>${escapeHtml(d.deviceName)}</b> (<code>${escapeHtml(d.deviceId)}</code>)\n` +
     `👤 ${escapeHtml(d.userName)} | 📞 ${escapeHtml(d.phoneNumber || '-')}\n` +
     `💰 Balance: <b>${d.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })} ETB</b>`
@@ -321,12 +327,19 @@ async function sendDeviceInspect(chatId: string, deviceId: string): Promise<void
   const statusText = d.isOnline
     ? '🟢 ONLINE NOW'
     : `🔴 OFFLINE (last seen ${formatRelativeTime(d.lastSeenAtMs, snap.serverTimeMs)})`;
+  const aprText =
+    d.approvalStatus === 'approved'
+      ? '✅ APPROVED'
+      : d.approvalStatus === 'rejected'
+        ? '❌ REJECTED'
+        : '⏳ PENDING APPROVAL';
 
   const text =
     `🔍 <b>Device Details</b>\n\n` +
     `📱 <b>Device:</b> ${escapeHtml(d.deviceName)} (${escapeHtml(d.platform)} v${escapeHtml(d.appVersion)})\n` +
     `🆔 <code>${escapeHtml(d.deviceId)}</code>\n` +
     `📡 <b>Status:</b> ${statusText}\n` +
+    `🛂 <b>Approval:</b> ${aprText}\n` +
     `🔐 <b>Lock:</b> ${d.isLocked ? '🔒 LOCKED' : '🔓 ACTIVE'}${snap.globalConfig.globalLocked ? ' (⚠️ Global Lock ON)' : ''}\n` +
     `👤 <b>Name:</b> ${escapeHtml(d.userName)}\n` +
     `📞 <b>Phone:</b> ${escapeHtml(d.phoneNumber || '-')}\n` +
@@ -334,25 +347,28 @@ async function sendDeviceInspect(chatId: string, deviceId: string): Promise<void
     `💰 <b>Balance:</b> ${d.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })} ETB\n\n` +
     `💸 <b>Latest Device Transactions:</b>\n${txText}`;
 
-  await sendTelegramMessage(
-    text,
-    {
-      inline_keyboard: [
-        [
-          {
-            text: d.isLocked ? '🔓 Unlock Device' : '🔒 Lock Device',
-            callback_data: `${d.isLocked ? 'dev_unlock' : 'dev_lock'}:${d.deviceId}`,
-          },
-          { text: '📩 Send Notification', callback_data: `dev_notify:${d.deviceId}` },
-        ],
-        [
-          { text: '📜 All Txns (Device)', callback_data: `dev_tx:${d.deviceId}` },
-          { text: '⬅️ All Devices', callback_data: 'dev_list' },
-        ],
-      ],
-    },
-    chatId
+  const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+  if (d.approvalStatus !== 'approved') {
+    keyboard.push([
+      { text: '✅ Approve (ፍቀድ)', callback_data: `dev_approve:${d.deviceId}` },
+      { text: '❌ Reject (ከልክል)', callback_data: `dev_reject:${d.deviceId}` },
+    ]);
+  }
+  keyboard.push(
+    [
+      {
+        text: d.isLocked ? '🔓 Unlock Device' : '🔒 Lock Device',
+        callback_data: `${d.isLocked ? 'dev_unlock' : 'dev_lock'}:${d.deviceId}`,
+      },
+      { text: '📩 Send Notification', callback_data: `dev_notify:${d.deviceId}` },
+    ],
+    [
+      { text: '📜 All Txns (Device)', callback_data: `dev_tx:${d.deviceId}` },
+      { text: '⬅️ All Devices', callback_data: 'dev_list' },
+    ]
   );
+
+  await sendTelegramMessage(text, { inline_keyboard: keyboard }, chatId);
 }
 
 async function sendTransactionsList(chatId: string, filterDeviceId?: string): Promise<void> {
@@ -412,6 +428,37 @@ export async function handleTelegramWebhookUpdate(update: any): Promise<{ ok: bo
       return { ok: true };
     }
 
+    if (data.startsWith('dev_approve:') || data.startsWith('dev_reject:')) {
+      const isApprove = data.startsWith('dev_approve:');
+      const id = data.slice(isApprove ? 'dev_approve:'.length : 'dev_reject:'.length);
+      const dev = await setDeviceApproval(id, isApprove ? 'approved' : 'rejected');
+      await callTelegramApi('answerCallbackQuery', {
+        callback_query_id: cq.id,
+        text: dev
+          ? isApprove
+            ? '✅ Approved!'
+            : '❌ Rejected!'
+          : 'Device not found',
+      });
+      await sendTelegramMessage(
+        dev
+          ? `${isApprove ? '✅ <b>APPROVED</b>' : '❌ <b>REJECTED</b>'}: <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>)\n👤 ${escapeHtml(dev.userName)} • 📞 ${escapeHtml(dev.phoneNumber || '-')}`
+          : `❌ Device not found (<code>${escapeHtml(id)}</code>).`,
+        dev
+          ? {
+              inline_keyboard: [
+                [
+                  { text: '🔍 Inspect Device', callback_data: `dev_view:${dev.deviceId}` },
+                  { text: '📱 All Devices', callback_data: 'dev_list' },
+                ],
+              ],
+            }
+          : undefined,
+        chatId
+      );
+      return { ok: true };
+    }
+
     await callTelegramApi('answerCallbackQuery', { callback_query_id: cq.id });
 
     if (data === 'refresh_menu') {
@@ -448,10 +495,18 @@ export async function handleTelegramWebhookUpdate(update: any): Promise<{ ok: bo
         dev
           ? `🔒 Device <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>) is now <b>LOCKED</b>.`
           : `❌ Device not found.`,
-        undefined,
+        dev
+          ? {
+              inline_keyboard: [
+                [
+                  { text: '🔍 Inspect Device', callback_data: `dev_view:${dev.deviceId}` },
+                  { text: '📱 All Devices', callback_data: 'dev_list' },
+                ],
+              ],
+            }
+          : undefined,
         chatId
       );
-      if (dev) await sendDeviceInspect(chatId, id);
     } else if (data.startsWith('dev_unlock:')) {
       const id = data.slice('dev_unlock:'.length);
       const dev = await setDeviceLock(id, false);
@@ -459,22 +514,18 @@ export async function handleTelegramWebhookUpdate(update: any): Promise<{ ok: bo
         dev
           ? `🔓 Device <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>) is now <b>UNLOCKED</b>.`
           : `❌ Device not found.`,
-        undefined,
-        chatId
-      );
-      if (dev) await sendDeviceInspect(chatId, id);
-    } else if (data.startsWith('dev_approve:') || data.startsWith('dev_reject:')) {
-      const isApprove = data.startsWith('dev_approve:');
-      const id = data.slice(isApprove ? 'dev_approve:'.length : 'dev_reject:'.length);
-      const dev = await setDeviceApproval(id, isApprove ? 'approved' : 'rejected');
-      await sendTelegramMessage(
         dev
-          ? `${isApprove ? '✅ <b>APPROVED</b>' : '❌ <b>REJECTED</b>'}: <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>)\n👤 ${escapeHtml(dev.userName)} • 📞 ${escapeHtml(dev.phoneNumber)}`
-          : `❌ Device not found.`,
-        undefined,
+          ? {
+              inline_keyboard: [
+                [
+                  { text: '🔍 Inspect Device', callback_data: `dev_view:${dev.deviceId}` },
+                  { text: '📱 All Devices', callback_data: 'dev_list' },
+                ],
+              ],
+            }
+          : undefined,
         chatId
       );
-      if (dev) await sendDeviceInspect(chatId, id);
     } else if (data.startsWith('dev_notify:')) {
       const id = data.slice('dev_notify:'.length);
       await sendTelegramMessage(

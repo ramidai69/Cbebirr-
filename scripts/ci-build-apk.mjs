@@ -900,6 +900,28 @@ if (fs.existsSync(ramControlDir)) {
     const ramAssetsWebDir = path.join(ramControlDir, 'app', 'src', 'main', 'assets', 'web');
     fs.rmSync(ramAssetsWebDir, { recursive: true, force: true });
     fs.cpSync(outWebDir, ramAssetsWebDir, { recursive: true });
+
+    // Android Gradle / aapt2 ignores asset directories starting with "_" (e.g. "_next") by default!
+    // Rename assets/web/_next -> assets/web/next_bundle so MainActivity serves all Next.js JS & CSS chunks reliably.
+    const rawNextDir = path.join(ramAssetsWebDir, '_next');
+    const safeNextDir = path.join(ramAssetsWebDir, 'next_bundle');
+    if (fs.existsSync(rawNextDir)) {
+      fs.rmSync(safeNextDir, { recursive: true, force: true });
+      fs.renameSync(rawNextDir, safeNextDir);
+    }
+
+    // Prune heavy CBEBirr screenshot/bank assets not needed by Ram control standalone APK
+    for (const unusedRel of [
+      'screens',
+      path.join('assets', 'aistudio'),
+      path.join('assets', 'banks'),
+      path.join('assets', 'wallets'),
+      path.join('assets', 'banners'),
+      'SamsungMessages.apk.idsig',
+    ]) {
+      fs.rmSync(path.join(ramAssetsWebDir, unusedRel), { recursive: true, force: true });
+    }
+
     fs.writeFileSync(path.join(ramAssetsWebDir, 'build-stamp.txt'), expectedRamControlStamp, 'utf8');
 
     execSync(`${gradleBin} assembleRelease --no-daemon`, {
@@ -914,6 +936,15 @@ if (fs.existsSync(ramControlDir)) {
     const ramInputApk = fs.existsSync(ramUnsignedApk) ? ramUnsignedApk : ramGradleApk;
     if (!fs.existsSync(ramInputApk)) {
       throw new Error(`Ram control release APK output not found in ${ramReleaseDir}`);
+    }
+
+    const ramApkListing = execSync(`unzip -l "${ramInputApk}"`, { encoding: 'utf8' });
+    if (
+      !ramApkListing.includes('assets/web/ram-control.html') ||
+      !ramApkListing.includes('assets/web/next_bundle/static/chunks/app/ram-control/') ||
+      !ramApkListing.includes('assets/web/next_bundle/static/css/')
+    ) {
+      throw new Error('RamControl APK is missing required assets/web/next_bundle JS/CSS bundles!');
     }
 
     const ramAlignedApk = '/tmp/ramcontrol-aligned.apk';

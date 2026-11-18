@@ -17,6 +17,7 @@ import {
   fsDeleteDocument,
   fsGetDocument,
   fsListCollection,
+  fsPatchFields,
   fsSetDocument,
   isFirestoreServerConfigured,
 } from './firestore-admin';
@@ -55,6 +56,7 @@ interface StoreState {
   notifications: Map<string, OwnerNotification>;
   supportSessions: Map<string, SupportSession>;
   supportFetchAtMs: Map<string, number>;
+  knownDevicesInFirestore: Set<string>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
   lastNotifFirestoreSyncMs: number;
@@ -77,6 +79,7 @@ if (!g.__ownerStore) {
     notifications: new Map(),
     supportSessions: new Map(),
     supportFetchAtMs: new Map(),
+    knownDevicesInFirestore: new Set(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
     lastNotifFirestoreSyncMs: 0,
@@ -86,6 +89,7 @@ if (!g.__ownerStore) {
 const state = g.__ownerStore;
 if (!state.supportSessions) state.supportSessions = new Map();
 if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
+if (!state.knownDevicesInFirestore) state.knownDevicesInFirestore = new Set();
 
 function loadFromDisk(): void {
   try {
@@ -179,12 +183,17 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
     for (const d of fsDevices) {
       const id = sanitizeId(String(d.deviceId || ''));
       if (!id) continue;
+      state.knownDevicesInFirestore.add(id);
       const existing = state.devices.get(id);
       const remoteSeen = safeNum(d.lastSeenAtMs, 0);
       const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
       const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
       const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
-      if (!existing || remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs)) {
+      if (
+        !existing ||
+        remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs) ||
+        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending')
+      ) {
         state.devices.set(id, {
           deviceId: id,
           deviceName: clampStr(d.deviceName, 120, 'Android Device'),
@@ -293,13 +302,24 @@ export async function syncDeviceHeartbeat(input: {
 
   // When a device is waiting on approval or re-checking status, read the single device doc directly from Firestore
   // so cross-instance owner decisions propagate immediately without delay.
-  if (input.forceApprovalCheck || input.registerRequest || prev?.approvalStatus === 'pending' || prev?.approvalStatus === 'rejected') {
+  let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
+  if (
+    input.forceApprovalCheck ||
+    input.registerRequest ||
+    !prev ||
+    prev.approvalStatus !== 'approved'
+  ) {
     const freshDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
     if (freshDoc && freshDoc.deviceId) {
+      remoteDocExists = true;
+      state.knownDevicesInFirestore.add(deviceId);
       const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
       const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
       const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
       const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+      const remoteLocked = Boolean(freshDoc.isLocked);
+      const remoteLockReason = clampStr(freshDoc.lockReason, 240, '');
+
       if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
         prev = {
           deviceId,
@@ -312,15 +332,23 @@ export async function syncDeviceHeartbeat(input: {
           phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
           userAccount: clampStr(freshDoc.userAccount, 64, ''),
           balance: safeNum(freshDoc.balance, 500),
-          isLocked: Boolean(freshDoc.isLocked),
-          lockReason: clampStr(freshDoc.lockReason, 240, ''),
+          isLocked: remoteLocked,
+          lockReason: remoteLockReason,
           approvalStatus: remoteStatus,
           lastSeenAtMs: remoteSeen,
           createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
           updatedAtMs: remoteUpdated,
         };
-        state.devices.set(deviceId, prev);
+      } else {
+        // Always treat remote approvalStatus and lock state as authoritative across serverless instances
+        prev = {
+          ...prev,
+          approvalStatus: remoteStatus,
+          isLocked: remoteLocked,
+          lockReason: remoteLockReason,
+        };
       }
+      state.devices.set(deviceId, prev);
     }
   }
 
@@ -332,16 +360,26 @@ export async function syncDeviceHeartbeat(input: {
       input.clientGateState === 'rejected'
   );
 
+  const reqUserName = clampStr(input.userName, 120, '');
+  const reqPhone = clampStr(input.phoneNumber, 32, '');
+  const reqAccount = clampStr(input.userAccount, 64, '');
+  const sameRegisteredIdentity = Boolean(
+    prev &&
+      (!reqUserName || prev.userName === reqUserName) &&
+      (!reqPhone || prev.phoneNumber === reqPhone) &&
+      (!reqAccount || prev.userAccount === reqAccount)
+  );
+
   let nextApprovalStatus: DeviceApprovalStatus;
   let isNewRegistrationRequest = false;
   if (input.registerRequest) {
     if (prev?.approvalStatus === 'rejected') {
       nextApprovalStatus = 'rejected';
+    } else if (prev?.approvalStatus === 'approved' && (!input.freshRegistration || sameRegisteredIdentity)) {
+      nextApprovalStatus = 'approved';
     } else if (input.freshRegistration) {
       nextApprovalStatus = 'pending';
       isNewRegistrationRequest = true;
-    } else if (prev?.approvalStatus === 'approved') {
-      nextApprovalStatus = 'approved';
     } else {
       nextApprovalStatus = 'pending';
       if (!prev || prev.approvalStatus !== 'pending' || (input.userName && input.userName !== prev.userName)) {
@@ -404,24 +442,50 @@ export async function syncDeviceHeartbeat(input: {
   state.devices.set(deviceId, nextDevice);
   saveToDisk();
 
-  // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write
-  await fsSetDocument('devices', deviceId, {
-    deviceId: nextDevice.deviceId,
-    deviceName: nextDevice.deviceName,
-    platform: nextDevice.platform,
-    appVersion: nextDevice.appVersion,
-    userName: nextDevice.userName,
-    phoneNumber: nextDevice.phoneNumber,
-    userAccount: nextDevice.userAccount,
-    balance: nextDevice.balance,
-    isLocked: nextDevice.isLocked,
-    lockReason: nextDevice.lockReason || '',
-    approvalStatus: nextApprovalStatus,
-    lastSeenAtMs: nextDevice.lastSeenAtMs,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAt: new Date(nextDevice.createdAtMs || nowMs),
-    updatedAt: new Date(nowMs),
-  }).catch(() => {});
+  // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write.
+  // CRITICAL: For existing devices that aren't resetting registration, use fsPatchFields (updateMask)
+  // WITHOUT approvalStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
+  const shouldWriteFullDoc =
+    !remoteDocExists ||
+    isNewDevice ||
+    isNewRegistrationRequest ||
+    prev?.approvalStatus !== nextApprovalStatus;
+
+  if (shouldWriteFullDoc) {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: nextDevice.deviceId,
+      deviceName: nextDevice.deviceName,
+      platform: nextDevice.platform,
+      appVersion: nextDevice.appVersion,
+      userName: nextDevice.userName,
+      phoneNumber: nextDevice.phoneNumber,
+      userAccount: nextDevice.userAccount,
+      balance: nextDevice.balance,
+      isLocked: nextDevice.isLocked,
+      lockReason: nextDevice.lockReason || '',
+      approvalStatus: nextApprovalStatus,
+      lastSeenAtMs: nextDevice.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: nextDevice.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(nextDevice.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  } else {
+    await fsPatchFields('devices', deviceId, {
+      deviceName: nextDevice.deviceName,
+      platform: nextDevice.platform,
+      appVersion: nextDevice.appVersion,
+      userName: nextDevice.userName,
+      phoneNumber: nextDevice.phoneNumber,
+      userAccount: nextDevice.userAccount,
+      balance: nextDevice.balance,
+      lastSeenAtMs: nextDevice.lastSeenAtMs,
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  }
 
   const activeNotifs = Array.from(state.notifications.values())
     .filter((n) => {
@@ -551,14 +615,33 @@ export async function logDeviceTransaction(input: {
   state.transactions.set(txId, tx);
   saveToDisk();
 
-  // Persist both to Firestore
+  // Persist both to Firestore (use updateMask patch for existing device so lock/approval isn't clobbered)
+  const devInFs = state.knownDevicesInFirestore.has(deviceId);
   await Promise.all([
-    fsSetDocument('devices', deviceId, {
-      ...updatedDevice,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAt: new Date(updatedDevice.createdAtMs || nowMs),
-      updatedAt: new Date(nowMs),
-    }),
+    devInFs
+      ? fsPatchFields('devices', deviceId, {
+          deviceName: updatedDevice.deviceName,
+          platform: updatedDevice.platform,
+          appVersion: updatedDevice.appVersion,
+          userName: updatedDevice.userName,
+          phoneNumber: updatedDevice.phoneNumber,
+          userAccount: updatedDevice.userAccount,
+          balance: updatedDevice.balance,
+          lastSeenAtMs: updatedDevice.lastSeenAtMs,
+          updatedAtMs: nowMs,
+          updatedAt: new Date(nowMs),
+        })
+      : fsSetDocument('devices', deviceId, {
+          ...updatedDevice,
+          ownerId: SYSTEM_OWNER_ID,
+          createdAtMs: updatedDevice.createdAtMs || nowMs,
+          updatedAtMs: nowMs,
+          createdAt: new Date(updatedDevice.createdAtMs || nowMs),
+          updatedAt: new Date(nowMs),
+        }).then((ok) => {
+          if (ok) state.knownDevicesInFirestore.add(deviceId);
+          return ok;
+        }),
     fsSetDocument('device_transactions', txId, {
       txId: tx.txId,
       deviceId: tx.deviceId,
@@ -621,15 +704,47 @@ export async function setGlobalLock(
   return next;
 }
 
+async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClient | null; inFirestore: boolean }> {
+  const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
+  if (fsDoc && fsDoc.deviceId) {
+    state.knownDevicesInFirestore.add(deviceId);
+    const remoteSeen = safeNum(fsDoc.lastSeenAtMs, Date.now());
+    const remoteUpdated = parseRemoteUpdatedMs(fsDoc, remoteSeen);
+    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(fsDoc.approvalStatus));
+    const remoteStatus = (hasValidStatus ? fsDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+    const loaded: DeviceClient = {
+      deviceId,
+      deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
+      platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
+        ? fsDoc.platform
+        : 'web') as DevicePlatform,
+      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
+      userName: clampStr(fsDoc.userName, 120, ''),
+      phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
+      userAccount: clampStr(fsDoc.userAccount, 64, ''),
+      balance: safeNum(fsDoc.balance, 500),
+      isLocked: Boolean(fsDoc.isLocked),
+      lockReason: clampStr(fsDoc.lockReason, 240, ''),
+      approvalStatus: remoteStatus,
+      lastSeenAtMs: remoteSeen,
+      createdAtMs: safeNum(fsDoc.createdAtMs, remoteSeen),
+      updatedAtMs: remoteUpdated,
+    };
+    state.devices.set(deviceId, loaded);
+    return { dev: loaded, inFirestore: true };
+  }
+  const cached = state.devices.get(deviceId) || null;
+  return { dev: cached, inFirestore: Boolean(cached && state.knownDevicesInFirestore.has(deviceId)) };
+}
+
 export async function setDeviceLock(
   deviceIdInput: string,
   locked: boolean,
   reason?: string
 ): Promise<DeviceClient | null> {
   loadFromDisk();
-  await syncFromFirestoreIfAvailable(true);
   const deviceId = sanitizeId(deviceIdInput);
-  const dev = state.devices.get(deviceId);
+  const { dev, inFirestore } = await loadSingleDeviceFast(deviceId);
   if (!dev) return null;
 
   const nowMs = Date.now();
@@ -644,23 +759,35 @@ export async function setDeviceLock(
   state.devices.set(deviceId, next);
   saveToDisk();
 
-  await fsSetDocument('devices', deviceId, {
-    deviceId: next.deviceId,
-    deviceName: next.deviceName,
-    platform: next.platform,
-    appVersion: next.appVersion,
-    userName: next.userName,
-    phoneNumber: next.phoneNumber,
-    userAccount: next.userAccount,
-    balance: next.balance,
-    isLocked: next.isLocked,
-    lockReason: next.lockReason || '',
-    approvalStatus: next.approvalStatus || 'pending',
-    lastSeenAtMs: next.lastSeenAtMs,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAt: new Date(next.createdAtMs || nowMs),
-    updatedAt: new Date(nowMs),
-  }).catch(() => {});
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, {
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: next.deviceId,
+      deviceName: next.deviceName,
+      platform: next.platform,
+      appVersion: next.appVersion,
+      userName: next.userName,
+      phoneNumber: next.phoneNumber,
+      userAccount: next.userAccount,
+      balance: next.balance,
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      approvalStatus: next.approvalStatus || 'pending',
+      lastSeenAtMs: next.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
@@ -670,32 +797,8 @@ export async function setDeviceApproval(
   approvalStatus: 'approved' | 'rejected'
 ): Promise<DeviceClient | null> {
   loadFromDisk();
-  await syncFromFirestoreIfAvailable(true);
   const deviceId = sanitizeId(deviceIdInput);
-  let dev = state.devices.get(deviceId);
-  if (!dev) {
-    const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
-    if (fsDoc && fsDoc.deviceId) {
-      dev = {
-        deviceId,
-        deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
-        platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
-          ? fsDoc.platform
-          : 'web') as DevicePlatform,
-        appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
-        userName: clampStr(fsDoc.userName, 120, ''),
-        phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
-        userAccount: clampStr(fsDoc.userAccount, 64, ''),
-        balance: safeNum(fsDoc.balance, 500),
-        isLocked: Boolean(fsDoc.isLocked),
-        lockReason: clampStr(fsDoc.lockReason, 240, ''),
-        approvalStatus: 'pending',
-        lastSeenAtMs: safeNum(fsDoc.lastSeenAtMs, Date.now()),
-        createdAtMs: safeNum(fsDoc.createdAtMs, Date.now()),
-        updatedAtMs: safeNum(fsDoc.updatedAtMs, Date.now()),
-      };
-    }
-  }
+  const { dev, inFirestore } = await loadSingleDeviceFast(deviceId);
   if (!dev) return null;
 
   const nowMs = Date.now();
@@ -707,23 +810,34 @@ export async function setDeviceApproval(
   state.devices.set(deviceId, next);
   saveToDisk();
 
-  await fsSetDocument('devices', deviceId, {
-    deviceId: next.deviceId,
-    deviceName: next.deviceName,
-    platform: next.platform,
-    appVersion: next.appVersion,
-    userName: next.userName,
-    phoneNumber: next.phoneNumber,
-    userAccount: next.userAccount,
-    balance: next.balance,
-    isLocked: next.isLocked,
-    lockReason: next.lockReason || '',
-    approvalStatus: next.approvalStatus,
-    lastSeenAtMs: next.lastSeenAtMs,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAt: new Date(next.createdAtMs || nowMs),
-    updatedAt: new Date(nowMs),
-  }).catch(() => {});
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, {
+      approvalStatus: next.approvalStatus,
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: next.deviceId,
+      deviceName: next.deviceName,
+      platform: next.platform,
+      appVersion: next.appVersion,
+      userName: next.userName,
+      phoneNumber: next.phoneNumber,
+      userAccount: next.userAccount,
+      balance: next.balance,
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      approvalStatus: next.approvalStatus,
+      lastSeenAtMs: next.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }

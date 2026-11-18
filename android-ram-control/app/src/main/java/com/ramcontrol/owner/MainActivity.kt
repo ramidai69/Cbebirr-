@@ -92,7 +92,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        webView.loadUrl("https://appassets.androidplatform.net/ram-control.html")
+        webView.loadUrl("https://appassets.androidplatform.net/ram-control")
     }
 
     private fun openLocalAssetResponse(rawPath: String): WebResourceResponse? {
@@ -106,11 +106,15 @@ class MainActivity : AppCompatActivity() {
             cleanPath = "ram-control.html"
         }
 
-        val candidates = mutableListOf(
-            "web/$cleanPath",
-            "web/${cleanPath}.html",
-            "web/${cleanPath.trimEnd('/')}/index.html"
-        )
+        val candidates = mutableListOf<String>()
+        if (cleanPath.startsWith("_next/")) {
+            val subPath = cleanPath.removePrefix("_next/")
+            candidates.add("web/next_bundle/$subPath")
+        }
+        candidates.add("web/$cleanPath")
+        candidates.add("web/${cleanPath}.html")
+        candidates.add("web/${cleanPath.trimEnd('/')}/index.html")
+
         val fileName = cleanPath.substringAfterLast('/')
         if (!fileName.contains('.') || cleanPath == "ram-control.html") {
             candidates.add("web/ram-control.html")

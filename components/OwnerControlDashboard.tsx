@@ -84,13 +84,17 @@ export default function OwnerControlDashboard({
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
   const [fbDevices, setFbDevices] = useState<DeviceClient[]>([]);
 
-  const myDeviceId = useMemo(() => getOrCreateOwnerDeviceId(), []);
-  const isApkEnv = useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    return (
-      window.location?.origin?.includes('appassets.androidplatform.net') ||
-      window.location?.protocol === 'file:'
-    );
+  const [myDeviceId, setMyDeviceId] = useState<string>('dev_server');
+  const [isApkEnv, setIsApkEnv] = useState<boolean>(false);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      setMyDeviceId(getOrCreateOwnerDeviceId());
+      setIsApkEnv(
+        window.location?.origin?.includes('appassets.androidplatform.net') ||
+          window.location?.protocol === 'file:'
+      );
+    });
   }, []);
 
   const flashBanner = useCallback((type: 'ok' | 'err', text: string) => {
@@ -132,6 +136,7 @@ export default function OwnerControlDashboard({
 
   // Listen to Firebase Auth state and real-time Firestore devices collection when signed in on Web
   useEffect(() => {
+    if (isApkEnv) return;
     try {
       const { auth } = getFirebaseClient();
       const unsubAuth = onAuthStateChanged(auth, (user) => {
@@ -144,10 +149,10 @@ export default function OwnerControlDashboard({
     } catch {
       return undefined;
     }
-  }, []);
+  }, [isApkEnv]);
 
   useEffect(() => {
-    if (!fbUser || !fbUser.emailVerified) {
+    if (isApkEnv || !fbUser || !fbUser.emailVerified) {
       return;
     }
     try {
@@ -175,7 +180,7 @@ export default function OwnerControlDashboard({
     } catch {
       return undefined;
     }
-  }, [fbUser]);
+  }, [isApkEnv, fbUser]);
 
   const devicesList = useMemo(() => {
     const apiDevices = snapshot?.devices || [];

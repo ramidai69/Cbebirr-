@@ -13,7 +13,6 @@ interface CachedToken {
 }
 
 let cachedToken: CachedToken | null = null;
-let adcUnavailable = false;
 
 function base64UrlEncode(input: string | Buffer): string {
   return Buffer.from(input)
@@ -49,7 +48,7 @@ async function getAdminAccessToken(): Promise<string | null> {
     return cachedToken.accessToken;
   }
 
-  // 1. Service account JSON (works on Vercel, Cloud Run, anywhere)
+  // Service account JSON (configured on Vercel / server env)
   const sa = parseServiceAccountFromEnv();
   if (sa) {
     try {
@@ -94,38 +93,11 @@ async function getAdminAccessToken(): Promise<string | null> {
     }
   }
 
-  // 2. GCP Metadata ADC token (works automatically inside Cloud Run / AI Studio)
-  if (!adcUnavailable && !process.env.VERCEL) {
-    try {
-      const res = await fetch(
-        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
-        {
-          headers: { 'Metadata-Flavor': 'Google' },
-          signal: AbortSignal.timeout(800),
-        }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.access_token) {
-          cachedToken = {
-            accessToken: data.access_token,
-            expiresAtMs: Date.now() + ((data.expires_in || 3000) * 1000),
-          };
-          return cachedToken.accessToken;
-        }
-      } else {
-        adcUnavailable = true;
-      }
-    } catch {
-      adcUnavailable = true;
-    }
-  }
-
   return null;
 }
 
 export function isFirestoreServerConfigured(): boolean {
-  return Boolean(parseServiceAccountFromEnv()) || (!adcUnavailable && !process.env.VERCEL);
+  return Boolean(parseServiceAccountFromEnv());
 }
 
 function getBaseDocumentsUrl(): string {
@@ -242,8 +214,54 @@ export async function fsSetDocument(
       body: JSON.stringify({ fields }),
       signal: AbortSignal.timeout(4000),
     });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error(`[firestore-admin] fsSetDocument ${collectionName}/${docId} failed (${res.status}):`, errText.slice(0, 300));
+    }
     return res.ok;
-  } catch {
+  } catch (err) {
+    console.error(`[firestore-admin] fsSetDocument ${collectionName}/${docId} error:`, err);
+    return false;
+  }
+}
+
+export async function fsPatchFields(
+  collectionName: string,
+  docId: string,
+  data: Record<string, unknown>
+): Promise<boolean> {
+  const token = await getAdminAccessToken();
+  if (!token) return false;
+  try {
+    const fields: Record<string, FsValue> = {};
+    const fieldPaths: string[] = [];
+    for (const [k, v] of Object.entries(data)) {
+      if (v !== undefined) {
+        fields[k] = toFsValue(v);
+        fieldPaths.push(k);
+      }
+    }
+    if (fieldPaths.length === 0) return true;
+    const maskParams = fieldPaths
+      .map((p) => `updateMask.fieldPaths=${encodeURIComponent(p)}`)
+      .join('&');
+    const url = `${getBaseDocumentsUrl()}/${collectionName}/${encodeURIComponent(docId)}?${maskParams}`;
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fields }),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error(`[firestore-admin] fsPatchFields ${collectionName}/${docId} failed (${res.status}):`, errText.slice(0, 300));
+    }
+    return res.ok;
+  } catch (err) {
+    console.error(`[firestore-admin] fsPatchFields ${collectionName}/${docId} error:`, err);
     return false;
   }
 }
