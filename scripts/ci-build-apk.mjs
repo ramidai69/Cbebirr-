@@ -73,7 +73,7 @@ if (!usePermanentMsgKey && !fs.existsSync(keystorePath)) {
 }
 
 // 1. Build Messages APK from android/
-console.log('Building release APK with Gradle 8.5...');
+console.log('[CI] Step 1/4: Building release CBEMessages & SamsungMessages APK with Gradle 8.5...');
 execSync(`${gradleBin} assembleRelease --no-daemon`, {
   cwd: androidDir,
   env,
@@ -210,6 +210,7 @@ const ensureStaticWebExport = () => {
 };
 
 // 2. Cleanly update CBEBirr Plus Banking APK (Web bundle + UssdAccessibilityService opaque overlay & no 12s timeout + icon + wallet PNG)
+console.log('[CI] Step 2/4: Checking & updating cbebirr-plus.apk...');
 const cbeApkPath = path.join(rootDir, 'public', 'cbebirr-plus.apk');
 const logoPng512 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo.png');
 const logoPng192 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo_192.png');
@@ -863,11 +864,15 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { env, stdio: 'inherit' }
     );
     execSync(`"${apksignerBin}" verify --print-certs "${cbeApkPath}"`, { env, stdio: 'inherit' });
+    fs.rmSync(decDir, { recursive: true, force: true });
+    fs.rmSync(rebuiltCbe, { force: true });
+    fs.rmSync(alignedCbe, { force: true });
     console.log(`Successfully updated & signed public/cbebirr-plus.apk (${usePermanentCbeKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
 }
 
 // 3. Build & sign standalone Ram control APK from android-ram-control/
+console.log('[CI] Step 3/4: Checking & building RamControl.apk...');
 const ramControlOutApk = path.join(rootDir, 'public', 'RamControl.apk');
 if (fs.existsSync(ramControlDir)) {
   let ramControlUpToDate = false;
@@ -931,6 +936,7 @@ if (fs.existsSync(ramControlDir)) {
     );
     execSync(`"${apksignerBin}" verify --print-certs "${ramControlOutApk}"`, { env, stdio: 'inherit' });
     fs.rmSync(ramAssetsWebDir, { recursive: true, force: true });
+    fs.rmSync(ramAlignedApk, { force: true });
     console.log(`Successfully compiled and signed public/RamControl.apk (${usePermanentRamKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
 }

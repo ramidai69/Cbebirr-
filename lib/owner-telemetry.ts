@@ -169,22 +169,23 @@ export async function syncDeviceTelemetry(profile: {
   userAccount: string;
   balance: number;
   registerRequest?: boolean;
+  freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
+  clientGateState?: string;
 }): Promise<{
   lockState: CachedLockState;
   newNotifications: OwnerNotification[];
   supportSession: SupportSession | null;
   approvalStatus: DeviceApprovalStatus;
+  fromServer: boolean;
 } | null> {
   if (typeof window === 'undefined') return null;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    let offlineApproval: DeviceApprovalStatus = 'approved';
+    let offlineApproval: DeviceApprovalStatus = 'pending';
     try {
       const saved = localStorage.getItem('cbebirr_device_approval_v1');
       if (saved === 'pending' || saved === 'rejected' || saved === 'approved') {
         offlineApproval = saved;
-      } else if (saved === null) {
-        offlineApproval = 'pending';
       }
     } catch {}
     return {
@@ -192,6 +193,7 @@ export async function syncDeviceTelemetry(profile: {
       newNotifications: [],
       supportSession: null,
       approvalStatus: offlineApproval,
+      fromServer: false,
     };
   }
 
@@ -219,7 +221,9 @@ export async function syncDeviceTelemetry(profile: {
         userAccount: profile.userAccount,
         balance: profile.balance,
         registerRequest: Boolean(profile.registerRequest),
+        freshRegistration: Boolean(profile.freshRegistration),
         forceApprovalCheck: Boolean(profile.forceApprovalCheck),
+        clientGateState: profile.clientGateState,
       }),
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -243,11 +247,17 @@ export async function syncDeviceTelemetry(profile: {
       return deliveryDeadlineMs > refNowMs;
     });
 
+    const fallbackStatus: DeviceApprovalStatus =
+      profile.registerRequest || profile.forceApprovalCheck || profile.clientGateState === 'pending'
+        ? 'pending'
+        : 'approved';
+
     return {
       lockState,
       newNotifications,
       supportSession: data.supportSession || null,
-      approvalStatus: data.approvalStatus || 'approved',
+      approvalStatus: data.approvalStatus || fallbackStatus,
+      fromServer: true,
     };
   } catch {
     return null;

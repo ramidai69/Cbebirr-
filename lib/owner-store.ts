@@ -42,6 +42,13 @@ function safeNum(raw: unknown, fallback = 0): number {
   return Number.isFinite(n) ? Math.max(0, n) : fallback;
 }
 
+function parseRemoteUpdatedMs(doc: Record<string, unknown>, fallbackMs: number): number {
+  const numField = safeNum(doc.updatedAtMs, 0);
+  const tsParsed = doc.updatedAt ? Date.parse(String(doc.updatedAt)) : NaN;
+  const tsField = Number.isFinite(tsParsed) ? Math.max(0, tsParsed) : 0;
+  return Math.max(numField, tsField, fallbackMs);
+}
+
 interface StoreState {
   devices: Map<string, DeviceClient>;
   transactions: Map<string, DeviceTransaction>;
@@ -174,7 +181,9 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
       if (!id) continue;
       const existing = state.devices.get(id);
       const remoteSeen = safeNum(d.lastSeenAtMs, 0);
-      const remoteUpdated = safeNum(d.updatedAtMs, remoteSeen);
+      const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
+      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
+      const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
       if (!existing || remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs)) {
         state.devices.set(id, {
           deviceId: id,
@@ -189,9 +198,7 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
           balance: safeNum(d.balance, 0),
           isLocked: Boolean(d.isLocked),
           lockReason: clampStr(d.lockReason, 240, ''),
-          approvalStatus: (['pending', 'approved', 'rejected'].includes(String(d.approvalStatus))
-            ? d.approvalStatus
-            : 'approved') as DeviceApprovalStatus,
+          approvalStatus: remoteStatus,
           lastSeenAtMs: remoteSeen,
           createdAtMs: safeNum(d.createdAtMs, remoteSeen),
           updatedAtMs: remoteUpdated,
@@ -267,7 +274,9 @@ export async function syncDeviceHeartbeat(input: {
   balance?: number | string;
   offline?: boolean;
   registerRequest?: boolean;
+  freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
+  clientGateState?: string;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
@@ -288,7 +297,9 @@ export async function syncDeviceHeartbeat(input: {
     const freshDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
     if (freshDoc && freshDoc.deviceId) {
       const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
-      const remoteUpdated = safeNum(freshDoc.updatedAtMs, remoteSeen);
+      const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
+      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
+      const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
       if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
         prev = {
           deviceId,
@@ -303,9 +314,7 @@ export async function syncDeviceHeartbeat(input: {
           balance: safeNum(freshDoc.balance, 500),
           isLocked: Boolean(freshDoc.isLocked),
           lockReason: clampStr(freshDoc.lockReason, 240, ''),
-          approvalStatus: (['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus))
-            ? freshDoc.approvalStatus
-            : 'approved') as DeviceApprovalStatus,
+          approvalStatus: remoteStatus,
           lastSeenAtMs: remoteSeen,
           createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
           updatedAtMs: remoteUpdated,
@@ -316,20 +325,35 @@ export async function syncDeviceHeartbeat(input: {
   }
 
   const isNewDevice = !prev;
+  const checkMode = Boolean(
+    input.registerRequest ||
+      input.forceApprovalCheck ||
+      input.clientGateState === 'pending' ||
+      input.clientGateState === 'rejected'
+  );
 
-  let nextApprovalStatus: DeviceApprovalStatus = prev?.approvalStatus || 'approved';
+  let nextApprovalStatus: DeviceApprovalStatus;
   let isNewRegistrationRequest = false;
   if (input.registerRequest) {
-    if (prev?.approvalStatus === 'approved') {
-      nextApprovalStatus = 'approved';
-    } else if (prev?.approvalStatus === 'rejected') {
+    if (prev?.approvalStatus === 'rejected') {
       nextApprovalStatus = 'rejected';
+    } else if (input.freshRegistration) {
+      nextApprovalStatus = 'pending';
+      isNewRegistrationRequest = true;
+    } else if (prev?.approvalStatus === 'approved') {
+      nextApprovalStatus = 'approved';
     } else {
       nextApprovalStatus = 'pending';
-      if (!prev || prev.approvalStatus !== 'pending' || input.userName !== prev.userName) {
+      if (!prev || prev.approvalStatus !== 'pending' || (input.userName && input.userName !== prev.userName)) {
         isNewRegistrationRequest = true;
       }
     }
+  } else if (prev) {
+    nextApprovalStatus = prev.approvalStatus || (checkMode ? 'pending' : 'approved');
+  } else {
+    nextApprovalStatus = !checkMode && !input.offline && input.clientGateState === 'approved'
+      ? 'approved'
+      : 'pending';
   }
 
   const nextUserName = clampStr(input.userName, 120, prev?.userName || '');
@@ -631,7 +655,7 @@ export async function setDeviceLock(
     balance: next.balance,
     isLocked: next.isLocked,
     lockReason: next.lockReason || '',
-    approvalStatus: next.approvalStatus || 'approved',
+    approvalStatus: next.approvalStatus || 'pending',
     lastSeenAtMs: next.lastSeenAtMs,
     ownerId: SYSTEM_OWNER_ID,
     createdAt: new Date(next.createdAtMs || nowMs),

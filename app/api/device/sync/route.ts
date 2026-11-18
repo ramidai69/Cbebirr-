@@ -41,7 +41,9 @@ export async function POST(req: NextRequest) {
       balance: body.balance,
       offline: Boolean(body.offline),
       registerRequest: Boolean(body.registerRequest),
+      freshRegistration: Boolean(body.freshRegistration),
       forceApprovalCheck: Boolean(body.forceApprovalCheck),
+      clientGateState: typeof body.clientGateState === 'string' ? body.clientGateState : undefined,
     });
 
     if (result.isNewRegistrationRequest) {

