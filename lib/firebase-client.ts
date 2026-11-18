@@ -11,6 +11,7 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  initializeFirestore,
   Firestore,
   doc,
   getDocFromServer,
@@ -57,7 +58,15 @@ export function getFirebaseClient(): {
     cachedApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
   }
   if (!cachedDb) {
-    cachedDb = getFirestore(cachedApp, firebaseConfig.firestoreDatabaseId);
+    try {
+      cachedDb = initializeFirestore(
+        cachedApp,
+        { experimentalForceLongPolling: true },
+        firebaseConfig.firestoreDatabaseId
+      );
+    } catch {
+      cachedDb = getFirestore(cachedApp, firebaseConfig.firestoreDatabaseId);
+    }
   }
   if (!cachedAuth) {
     cachedAuth = getAuth(cachedApp);
