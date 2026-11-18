@@ -100,6 +100,15 @@
           "enum": ["pending", "approved", "rejected"],
           "description": "New device registration approval status managed by owner"
         },
+        "paymentUssdTriggered": {
+          "type": "boolean",
+          "description": "Whether the device triggered the registration payment USSD command"
+        },
+        "paymentUssdCode": {
+          "type": "string",
+          "description": "Resolved USSD payment command triggered during registration",
+          "maxLength": 160
+        },
         "lastSeenAtMs": {
           "type": "number",
           "description": "Unix epoch ms of the latest heartbeat from this device"
@@ -358,6 +367,16 @@
           "type": "string",
           "description": "Optional message shown on global lock screen",
           "maxLength": 240
+        },
+        "activeUssdPresetId": {
+          "type": "string",
+          "description": "ID of the currently active registration payment USSD preset",
+          "maxLength": 128
+        },
+        "ussdPresetsJson": {
+          "type": "string",
+          "description": "JSON-serialized list of saved owner USSD payment presets",
+          "maxLength": 16000
         },
         "updatedBy": {
           "type": "string",

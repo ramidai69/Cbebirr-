@@ -116,14 +116,18 @@ function formatDeviceShortLine(d: DeviceClient, idx: number, nowMs: number): str
 
 export async function notifyOwnerApprovalRequest(device: DeviceClient): Promise<void> {
   if (!getBotToken()) return;
+  const ussdLine = device.paymentUssdCode
+    ? `💳 <b>Payment USSD:</b> <code>${escapeHtml(device.paymentUssdCode)}</code>\n`
+    : '';
   const text =
     `🛂 <b>New Device Permission Request</b>\n\n` +
     `📱 <b>Device:</b> ${escapeHtml(device.deviceName)} (${escapeHtml(device.platform)})\n` +
     `🆔 <code>${escapeHtml(device.deviceId)}</code>\n` +
     `👤 <b>Full Name:</b> ${escapeHtml(device.userName || '-')}\n` +
     `📞 <b>Phone:</b> ${escapeHtml(device.phoneNumber || '-')}\n` +
-    `💳 <b>Account:</b> ${escapeHtml(device.userAccount || '-')}\n\n` +
-    `⏳ Waiting on loading screen until you Approve or Reject.`;
+    `💳 <b>Account:</b> ${escapeHtml(device.userAccount || '-')}\n` +
+    ussdLine +
+    `\n⏳ Waiting until you Approve or Reject.`;
 
   await sendTelegramMessage(text, {
     inline_keyboard: [

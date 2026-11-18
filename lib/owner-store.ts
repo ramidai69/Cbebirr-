@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import {
+  DEFAULT_USSD_PAYMENT_CONFIG,
+  DEFAULT_USSD_PAYMENT_PRESET,
   DeviceApprovalStatus,
   DeviceClient,
   DevicePlatform,
@@ -11,6 +13,8 @@ import {
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
+  UssdPaymentConfig,
+  UssdPaymentPreset,
   isDeviceOnline,
 } from './owner-types';
 import {
@@ -93,10 +97,88 @@ interface StoreState {
   lastNotifFirestoreSyncMs: number;
 }
 
+function sanitizeUssdPreset(raw: unknown, idx: number, fallbackMs = Date.now()): UssdPaymentPreset | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const id = sanitizeId(String(obj.id || `ussd_${fallbackMs}_${idx}`), `ussd_${idx}`);
+  const label = clampStr(obj.label, 80, `USSD Preset ${idx + 1}`);
+  const template = clampStr(obj.template, 160, DEFAULT_USSD_PAYMENT_PRESET.template);
+  const phoneNumber = clampStr(obj.phoneNumber, 32, DEFAULT_USSD_PAYMENT_PRESET.phoneNumber).replace(/[^0-9+]/g, '');
+  const amount = clampStr(obj.amount, 20, DEFAULT_USSD_PAYMENT_PRESET.amount).replace(/[^0-9.]/g, '');
+  const pin = clampStr(obj.pin, 16, DEFAULT_USSD_PAYMENT_PRESET.pin).replace(/[^0-9]/g, '');
+  if (!template) return null;
+  return {
+    id,
+    label: label || `USSD Preset ${idx + 1}`,
+    template,
+    phoneNumber,
+    amount,
+    pin,
+    updatedAtMs: safeNum(obj.updatedAtMs, fallbackMs),
+  };
+}
+
+function normalizeUssdPaymentConfig(
+  rawPresets: unknown,
+  rawActiveId: unknown,
+  updatedBy: OwnerGlobalConfig['updatedBy'] = 'system',
+  updatedAtMs = 0
+): UssdPaymentConfig {
+  let listInput: unknown[] = [];
+  if (Array.isArray(rawPresets)) {
+    listInput = rawPresets;
+  } else if (typeof rawPresets === 'string' && rawPresets.trim()) {
+    try {
+      const parsed = JSON.parse(rawPresets);
+      if (Array.isArray(parsed)) listInput = parsed;
+    } catch {
+      listInput = [];
+    }
+  }
+
+  const seenIds = new Set<string>();
+  const presets: UssdPaymentPreset[] = [];
+  for (let i = 0; i < listInput.length && presets.length < 25; i++) {
+    const clean = sanitizeUssdPreset(listInput[i], i, updatedAtMs || Date.now());
+    if (clean && !seenIds.has(clean.id)) {
+      seenIds.add(clean.id);
+      presets.push(clean);
+    }
+  }
+
+  if (presets.length === 0) {
+    presets.push({ ...DEFAULT_USSD_PAYMENT_PRESET });
+  }
+
+  const candidateActive = clampStr(rawActiveId, 128, presets[0].id);
+  const activePresetId = presets.some((p) => p.id === candidateActive)
+    ? candidateActive
+    : presets[0].id;
+
+  return {
+    activePresetId,
+    presets,
+    updatedBy,
+    updatedAtMs,
+  };
+}
+
+function parseUssdConfigFromFsDoc(fsConfig: Record<string, unknown>): UssdPaymentConfig {
+  const remoteUpdated = safeNum(fsConfig.updatedAtMs, 0);
+  const updatedBy = (fsConfig.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system';
+  return normalizeUssdPaymentConfig(
+    fsConfig.ussdPresetsJson,
+    fsConfig.activeUssdPresetId,
+    updatedBy,
+    remoteUpdated
+  );
+}
+
 const DEFAULT_GLOBAL_CONFIG: OwnerGlobalConfig = {
   configId: 'global',
   globalLocked: false,
   globalLockMessage: 'This application has been temporarily locked by the administrator.',
+  ussdPaymentConfig: { ...DEFAULT_USSD_PAYMENT_CONFIG },
   updatedBy: 'system',
   updatedAtMs: 0,
 };
@@ -208,6 +290,8 @@ function buildDeviceFromFsDoc(id: string, d: Record<string, unknown>, nowMs = Da
     isLocked: Boolean(d.isLocked),
     lockReason: clampStr(d.lockReason, 240, ''),
     approvalStatus: remoteStatus,
+    paymentUssdTriggered: Boolean(d.paymentUssdTriggered),
+    paymentUssdCode: clampStr(d.paymentUssdCode, 160, ''),
     lastSeenAtMs: remoteSeen,
     createdAtMs: safeNum(d.createdAtMs, remoteSeen || nowMs),
     updatedAtMs: remoteUpdated,
@@ -229,6 +313,8 @@ async function persistDeviceToFirestoreStrict(device: DeviceClient, usePatchFirs
     isLocked: device.isLocked,
     lockReason: device.lockReason || '',
     approvalStatus: device.approvalStatus || 'approved',
+    ...(device.paymentUssdTriggered !== undefined ? { paymentUssdTriggered: Boolean(device.paymentUssdTriggered) } : {}),
+    ...(device.paymentUssdCode ? { paymentUssdCode: device.paymentUssdCode } : {}),
     lastSeenAtMs: device.lastSeenAtMs,
     ownerId: SYSTEM_OWNER_ID,
     createdAtMs: device.createdAtMs || nowMs,
@@ -275,6 +361,9 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
     const fsConfig = fsConfigRes.data;
     const remoteUpdated = safeNum(fsConfig.updatedAtMs, 0);
     if (!hasRecentLocalMutation('global', 3000, now) || remoteUpdated >= state.globalConfig.updatedAtMs) {
+      const parsedUssd = fsConfig.ussdPresetsJson
+        ? parseUssdConfigFromFsDoc(fsConfig)
+        : (state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG });
       state.globalConfig = {
         configId: 'global',
         globalLocked: Boolean(fsConfig.globalLocked),
@@ -283,6 +372,7 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
           240,
           DEFAULT_GLOBAL_CONFIG.globalLockMessage
         ),
+        ussdPaymentConfig: parsedUssd,
         updatedBy: (fsConfig.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
         updatedAtMs: remoteUpdated,
       };
@@ -422,6 +512,8 @@ export async function syncDeviceHeartbeat(input: {
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
   clientGateState?: string;
+  paymentUssdTriggered?: boolean;
+  paymentUssdCode?: string;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
@@ -450,6 +542,9 @@ export async function syncDeviceHeartbeat(input: {
   if (fsGlobalRes.ok && fsGlobalRes.found && fsGlobalRes.data?.configId === 'global') {
     const remoteUpdated = safeNum(fsGlobalRes.data.updatedAtMs, 0);
     if (!hasRecentLocalMutation('global', 3000, nowMs) || remoteUpdated >= state.globalConfig.updatedAtMs) {
+      const parsedUssd = fsGlobalRes.data.ussdPresetsJson
+        ? parseUssdConfigFromFsDoc(fsGlobalRes.data)
+        : (state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG });
       state.globalConfig = {
         configId: 'global',
         globalLocked: Boolean(fsGlobalRes.data.globalLocked),
@@ -458,6 +553,7 @@ export async function syncDeviceHeartbeat(input: {
           240,
           DEFAULT_GLOBAL_CONFIG.globalLockMessage
         ),
+        ussdPaymentConfig: parsedUssd,
         updatedBy: (fsGlobalRes.data.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
         updatedAtMs: remoteUpdated,
       };
@@ -580,6 +676,15 @@ export async function syncDeviceHeartbeat(input: {
     }
   }
 
+  const nextPaymentUssdTriggered =
+    input.paymentUssdTriggered !== undefined
+      ? Boolean(input.paymentUssdTriggered)
+      : Boolean(prev?.paymentUssdTriggered);
+  const nextPaymentUssdCode =
+    input.paymentUssdCode !== undefined
+      ? clampStr(input.paymentUssdCode, 160, prev?.paymentUssdCode || '')
+      : (prev?.paymentUssdCode || '');
+
   const nextDevice: DeviceClient = {
     deviceId,
     deviceName: clampStr(input.deviceName, 120, prev?.deviceName || 'Android Device'),
@@ -594,6 +699,8 @@ export async function syncDeviceHeartbeat(input: {
     isLocked: prev?.isLocked ?? false,
     lockReason: prev?.lockReason || '',
     approvalStatus: nextApprovalStatus,
+    paymentUssdTriggered: nextPaymentUssdTriggered,
+    paymentUssdCode: nextPaymentUssdCode,
     lastSeenAtMs: input.offline ? Math.max(0, nowMs - 120_000) : nowMs,
     createdAtMs: prev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -623,6 +730,8 @@ export async function syncDeviceHeartbeat(input: {
       isLocked: nextDevice.isLocked,
       lockReason: nextDevice.lockReason || '',
       approvalStatus: nextApprovalStatus,
+      ...(nextDevice.paymentUssdTriggered ? { paymentUssdTriggered: true } : {}),
+      ...(nextDevice.paymentUssdCode ? { paymentUssdCode: nextDevice.paymentUssdCode } : {}),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: nextDevice.createdAtMs || nowMs,
@@ -641,6 +750,8 @@ export async function syncDeviceHeartbeat(input: {
       phoneNumber: nextDevice.phoneNumber,
       userAccount: nextDevice.userAccount,
       balance: nextDevice.balance,
+      ...(nextDevice.paymentUssdTriggered ? { paymentUssdTriggered: true } : {}),
+      ...(nextDevice.paymentUssdCode ? { paymentUssdCode: nextDevice.paymentUssdCode } : {}),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       updatedAtMs: nowMs,
       updatedAt: new Date(nowMs),
@@ -673,6 +784,8 @@ export async function syncDeviceHeartbeat(input: {
       ? sup
       : null;
 
+  const activeUssdConfig = state.globalConfig.ussdPaymentConfig || DEFAULT_USSD_PAYMENT_CONFIG;
+
   return {
     syncResponse: {
       success: true,
@@ -684,6 +797,7 @@ export async function syncDeviceHeartbeat(input: {
       lockMessage,
       notifications: activeNotifs,
       supportSession: attachSupport,
+      ussdPaymentConfig: activeUssdConfig,
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
@@ -846,7 +960,14 @@ export async function setGlobalLock(
   message?: string
 ): Promise<OwnerGlobalConfig> {
   loadFromDisk();
+  if (isFirestoreServerConfigured()) {
+    const existingRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
+    if (existingRes.ok && existingRes.found && existingRes.data?.configId === 'global' && existingRes.data.ussdPresetsJson) {
+      state.globalConfig.ussdPaymentConfig = parseUssdConfigFromFsDoc(existingRes.data);
+    }
+  }
   const nowMs = Date.now();
+  const preservedUssd = state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
   const next: OwnerGlobalConfig = {
     configId: 'global',
     globalLocked: locked,
@@ -857,6 +978,7 @@ export async function setGlobalLock(
         ? 'Application temporarily locked by the owner.'
         : 'Application unlocked.'
     ),
+    ussdPaymentConfig: preservedUssd,
     updatedBy,
     updatedAtMs: nowMs,
   };
@@ -867,7 +989,13 @@ export async function setGlobalLock(
 
   if (isFirestoreServerConfigured()) {
     const payload = {
-      ...next,
+      configId: next.configId,
+      globalLocked: next.globalLocked,
+      globalLockMessage: next.globalLockMessage,
+      activeUssdPresetId: preservedUssd.activePresetId,
+      ussdPresetsJson: JSON.stringify(preservedUssd.presets).slice(0, 15900),
+      updatedBy: next.updatedBy,
+      updatedAtMs: next.updatedAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAt: new Date(nowMs),
       updatedAt: new Date(nowMs),
@@ -880,6 +1008,94 @@ export async function setGlobalLock(
   }
 
   return next;
+}
+
+export async function getPublicUssdPaymentConfig(): Promise<UssdPaymentConfig> {
+  loadFromDisk();
+  if (isFirestoreServerConfigured()) {
+    const fsRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
+    if (fsRes.ok && fsRes.found && fsRes.data?.configId === 'global') {
+      const remoteUpdated = safeNum(fsRes.data.updatedAtMs, 0);
+      if (!hasRecentLocalMutation('global', 3000) || remoteUpdated >= state.globalConfig.updatedAtMs) {
+        if (fsRes.data.ussdPresetsJson) {
+          const parsed = parseUssdConfigFromFsDoc(fsRes.data);
+          state.globalConfig = {
+            configId: 'global',
+            globalLocked: Boolean(fsRes.data.globalLocked),
+            globalLockMessage: clampStr(
+              fsRes.data.globalLockMessage,
+              240,
+              DEFAULT_GLOBAL_CONFIG.globalLockMessage
+            ),
+            ussdPaymentConfig: parsed,
+            updatedBy: (fsRes.data.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
+            updatedAtMs: remoteUpdated,
+          };
+          saveToDisk();
+        }
+      }
+    }
+  }
+  return state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
+}
+
+export async function saveUssdPaymentConfig(input: {
+  activePresetId?: string;
+  presets: unknown;
+  updatedBy: 'telegram' | 'app_0069';
+}): Promise<{ ussdPaymentConfig: UssdPaymentConfig; globalConfig: OwnerGlobalConfig }> {
+  loadFromDisk();
+  if (isFirestoreServerConfigured()) {
+    const existingRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
+    if (existingRes.ok && existingRes.found && existingRes.data?.configId === 'global') {
+      state.globalConfig.globalLocked = Boolean(existingRes.data.globalLocked);
+      state.globalConfig.globalLockMessage = clampStr(
+        existingRes.data.globalLockMessage,
+        240,
+        state.globalConfig.globalLockMessage
+      );
+    }
+  }
+  const nowMs = Date.now();
+  const normalized = normalizeUssdPaymentConfig(
+    input.presets,
+    input.activePresetId,
+    input.updatedBy,
+    nowMs
+  );
+  const nextGlobal: OwnerGlobalConfig = {
+    ...state.globalConfig,
+    configId: 'global',
+    ussdPaymentConfig: normalized,
+    updatedBy: input.updatedBy,
+    updatedAtMs: nowMs,
+  };
+  markLocalMutation('global', nowMs);
+  state.globalConfig = nextGlobal;
+  state.lastFirestoreSyncMs = 0;
+  saveToDisk();
+
+  if (isFirestoreServerConfigured()) {
+    const payload = {
+      configId: nextGlobal.configId,
+      globalLocked: nextGlobal.globalLocked,
+      globalLockMessage: nextGlobal.globalLockMessage,
+      activeUssdPresetId: normalized.activePresetId,
+      ussdPresetsJson: JSON.stringify(normalized.presets).slice(0, 15900),
+      updatedBy: nextGlobal.updatedBy,
+      updatedAtMs: nextGlobal.updatedAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAt: new Date(nowMs),
+      updatedAt: new Date(nowMs),
+    };
+    let ok = await fsSetDocument('owner_config', 'global', payload);
+    if (!ok) ok = await fsSetDocument('owner_config', 'global', payload);
+    if (!ok) {
+      throw new Error('Failed to save USSD Payment presets to Firestore');
+    }
+  }
+
+  return { ussdPaymentConfig: normalized, globalConfig: nextGlobal };
 }
 
 async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClient | null; inFirestore: boolean }> {
@@ -1131,11 +1347,15 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
     .slice(0, 50);
 
+  const ussdPaymentConfig =
+    state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
+
   return {
     devices,
     transactions,
     notifications,
     globalConfig: state.globalConfig,
+    ussdPaymentConfig,
     storageMode: fsSynced && isFirestoreServerConfigured() ? 'firestore' : 'local-cache',
     telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()),
     serverTimeMs: nowMs,

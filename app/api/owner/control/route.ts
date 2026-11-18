@@ -5,6 +5,7 @@ import {
   createOwnerNotification,
   getOwnerDashboardSnapshot,
   removeDeviceRecord,
+  saveUssdPaymentConfig,
   setDeviceApproval,
   setDeviceLock,
   setGlobalLock,
@@ -130,6 +131,22 @@ export async function POST(req: NextRequest) {
     if (action === 'clear_notifications') {
       await clearNotificationsHistory();
       return NextResponse.json({ success: true }, { headers: CORS_HEADERS });
+    }
+
+    if (action === 'save_ussd_config') {
+      const saved = await saveUssdPaymentConfig({
+        activePresetId: typeof body.activePresetId === 'string' ? body.activePresetId : undefined,
+        presets: body.presets,
+        updatedBy: 'app_0069',
+      });
+      return NextResponse.json(
+        {
+          success: true,
+          ussdPaymentConfig: saved.ussdPaymentConfig,
+          globalConfig: saved.globalConfig,
+        },
+        { headers: CORS_HEADERS }
+      );
     }
 
     return NextResponse.json(

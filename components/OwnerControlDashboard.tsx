@@ -12,10 +12,15 @@ import {
   Clock,
   Cloud,
   CreditCard,
+  Edit2,
+  Hash,
   Lock,
   Monitor,
   Phone,
+  PhoneCall,
+  Plus,
   RefreshCw,
+  Save,
   Send,
   Shield,
   Smartphone,
@@ -29,9 +34,14 @@ import {
 } from 'lucide-react';
 import SupportViewModal from './SupportViewModal';
 import {
+  DEFAULT_USSD_PAYMENT_CONFIG,
+  DEFAULT_USSD_PAYMENT_PRESET,
   DeviceClient,
   OwnerDashboardSnapshot,
+  UssdPaymentPreset,
   formatRelativeTime,
+  getActiveUssdPreset,
+  resolveUssdPaymentCommand,
 } from '@/lib/owner-types';
 import {
   connectTelegramBotWebhook,
@@ -55,12 +65,32 @@ interface OwnerControlDashboardProps {
   standalone?: boolean;
 }
 
+function createUssdPresetRecord(params: {
+  id: string | null;
+  label: string;
+  template: string;
+  phoneNumber: string;
+  amount: string;
+  pin: string;
+}): UssdPaymentPreset {
+  const now = Date.now();
+  return {
+    id: params.id || `ussd_${now}`,
+    label: params.label,
+    template: params.template,
+    phoneNumber: params.phoneNumber,
+    amount: params.amount,
+    pin: params.pin,
+    updatedAtMs: now,
+  };
+}
+
 export default function OwnerControlDashboard({
   onClose,
   onRemoteLockChange,
   standalone = false,
 }: OwnerControlDashboardProps) {
-  const [activeTab, setActiveTab] = useState<'devices' | 'transactions' | 'notify'>('devices');
+  const [activeTab, setActiveTab] = useState<'devices' | 'transactions' | 'ussd' | 'notify'>('devices');
   const [snapshot, setSnapshot] = useState<OwnerDashboardSnapshot | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [busyKey, setBusyKey] = useState<string>('');
@@ -80,6 +110,14 @@ export default function OwnerControlDashboard({
   const [notifDurationVal, setNotifDurationVal] = useState<string>('30');
   const [notifDurationUnit, setNotifDurationUnit] = useState<'sec' | 'min'>('sec');
 
+  // USSD Payment preset editor state
+  const [ussdEditingId, setUssdEditingId] = useState<string | null>(DEFAULT_USSD_PAYMENT_PRESET.id);
+  const [ussdDraftLabel, setUssdDraftLabel] = useState<string>(DEFAULT_USSD_PAYMENT_PRESET.label);
+  const [ussdDraftTemplate, setUssdDraftTemplate] = useState<string>(DEFAULT_USSD_PAYMENT_PRESET.template);
+  const [ussdDraftPhone, setUssdDraftPhone] = useState<string>(DEFAULT_USSD_PAYMENT_PRESET.phoneNumber);
+  const [ussdDraftAmount, setUssdDraftAmount] = useState<string>(DEFAULT_USSD_PAYMENT_PRESET.amount);
+  const [ussdDraftPin, setUssdDraftPin] = useState<string>(DEFAULT_USSD_PAYMENT_PRESET.pin);
+
   // Firebase Auth Web Admin Sync (when running in standard browser)
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
   const [fbDevices, setFbDevices] = useState<DeviceClient[]>([]);
@@ -92,6 +130,7 @@ export default function OwnerControlDashboard({
   const fetchInFlightRef = useRef<boolean>(false);
   const busyKeyRef = useRef<string>('');
   const globalMsgDirtyRef = useRef<boolean>(false);
+  const ussdDirtyRef = useRef<boolean>(false);
 
   useEffect(() => {
     busyKeyRef.current = busyKey;
@@ -131,6 +170,15 @@ export default function OwnerControlDashboard({
       setSnapshot(data);
       if (!globalMsgDirtyRef.current && data.globalConfig?.globalLockMessage) {
         setGlobalLockMsgInput(data.globalConfig.globalLockMessage);
+      }
+      if (!ussdDirtyRef.current && data.ussdPaymentConfig) {
+        const activeP = getActiveUssdPreset(data.ussdPaymentConfig);
+        setUssdEditingId(activeP.id);
+        setUssdDraftLabel(activeP.label);
+        setUssdDraftTemplate(activeP.template);
+        setUssdDraftPhone(activeP.phoneNumber);
+        setUssdDraftAmount(activeP.amount);
+        setUssdDraftPin(activeP.pin);
       }
     } catch (err: any) {
       if (!silent) {
@@ -476,6 +524,168 @@ export default function OwnerControlDashboard({
 
   const serverNow = snapshot?.serverTimeMs || 0;
   const globalLocked = Boolean(snapshot?.globalConfig?.globalLocked);
+  const ussdConfig = snapshot?.ussdPaymentConfig || snapshot?.globalConfig?.ussdPaymentConfig || DEFAULT_USSD_PAYMENT_CONFIG;
+  const activeUssdPreset = getActiveUssdPreset(ussdConfig);
+  const activeUssdResolved = resolveUssdPaymentCommand(activeUssdPreset);
+  const draftUssdResolved = resolveUssdPaymentCommand({
+    template: ussdDraftTemplate,
+    phoneNumber: ussdDraftPhone,
+    amount: ussdDraftAmount,
+    pin: ussdDraftPin,
+  });
+
+  const triggerUssdDialFromOwner = useCallback((dialUri: string, displayCode: string) => {
+    if (typeof window === 'undefined') return;
+    try {
+      const w = window as unknown as {
+        Android?: { dialUSSD?: (u: string) => void; callUSSD?: (u: string) => void; hideLoadingOverlay?: () => void };
+      };
+      if (typeof w.Android?.dialUSSD === 'function') {
+        w.Android.dialUSSD(dialUri);
+        setTimeout(() => {
+          try { w.Android?.hideLoadingOverlay?.(); } catch {}
+        }, 120);
+        flashBanner('ok', `Running USSD: ${displayCode}`);
+        return;
+      }
+      if (typeof w.Android?.callUSSD === 'function') {
+        w.Android.callUSSD(dialUri);
+        setTimeout(() => {
+          try { w.Android?.hideLoadingOverlay?.(); } catch {}
+        }, 120);
+        flashBanner('ok', `Running USSD: ${displayCode}`);
+        return;
+      }
+      const a = document.createElement('a');
+      a.href = dialUri;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      flashBanner('ok', `Opened Dialer: ${displayCode}`);
+    } catch {
+      flashBanner('err', `Could not launch USSD: ${displayCode}`);
+    }
+  }, [flashBanner]);
+
+  const loadPresetIntoEditor = (preset: UssdPaymentPreset) => {
+    ussdDirtyRef.current = true;
+    setUssdEditingId(preset.id);
+    setUssdDraftLabel(preset.label);
+    setUssdDraftTemplate(preset.template);
+    setUssdDraftPhone(preset.phoneNumber);
+    setUssdDraftAmount(preset.amount);
+    setUssdDraftPin(preset.pin);
+  };
+
+  const resetUssdEditorForNew = () => {
+    ussdDirtyRef.current = true;
+    setUssdEditingId(null);
+    setUssdDraftLabel('');
+    setUssdDraftTemplate('*847*1*1*{phone}*{amount}*{pin}*1#');
+    setUssdDraftPhone(activeUssdPreset.phoneNumber || '0959754788');
+    setUssdDraftAmount(activeUssdPreset.amount || '500');
+    setUssdDraftPin(activeUssdPreset.pin || '6969');
+  };
+
+  const persistUssdPresets = async (
+    nextPresets: UssdPaymentPreset[],
+    nextActiveId: string,
+    successMsg: string
+  ) => {
+    setBusyKey('save_ussd');
+    actionSeqRef.current += 1;
+    try {
+      const res = await postOwnerAction({
+        action: 'save_ussd_config',
+        activePresetId: nextActiveId,
+        presets: nextPresets,
+      });
+      actionSeqRef.current += 1;
+      ussdDirtyRef.current = false;
+      if (res?.ussdPaymentConfig) {
+        setSnapshot((prev) =>
+          prev
+            ? {
+                ...prev,
+                ussdPaymentConfig: res.ussdPaymentConfig,
+                globalConfig: res.globalConfig || prev.globalConfig,
+              }
+            : prev
+        );
+      }
+      await loadSnapshot(true, true);
+      flashBanner('ok', successMsg);
+    } catch (err: any) {
+      flashBanner('err', err?.message || 'Failed to save USSD config');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const handleSaveUssdPreset = async (activateNow: boolean) => {
+    const cleanTpl = ussdDraftTemplate.trim() || '*847*1*1*{phone}*{amount}*{pin}*1#';
+    const cleanPhone = ussdDraftPhone.replace(/[^0-9+]/g, '').trim();
+    const cleanAmt = ussdDraftAmount.replace(/[^0-9.]/g, '').trim();
+    const cleanPin = ussdDraftPin.replace(/[^0-9]/g, '').trim();
+    const cleanLabel =
+      ussdDraftLabel.trim() ||
+      `CBEBirr ${cleanAmt || '0'} ETB (${cleanPhone || 'Custom'})`;
+
+    const existingList = ussdConfig.presets || [DEFAULT_USSD_PAYMENT_PRESET];
+    const newItem = createUssdPresetRecord({
+      id: ussdEditingId,
+      label: cleanLabel,
+      template: cleanTpl,
+      phoneNumber: cleanPhone,
+      amount: cleanAmt,
+      pin: cleanPin,
+    });
+    const targetId = newItem.id;
+
+    const existsIdx = existingList.findIndex((p) => p.id === targetId);
+    const nextList =
+      existsIdx >= 0
+        ? existingList.map((p, i) => (i === existsIdx ? newItem : p))
+        : [newItem, ...existingList];
+
+    const nextActiveId = activateNow ? targetId : (ussdConfig.activePresetId || targetId);
+    setUssdEditingId(targetId);
+    await persistUssdPresets(
+      nextList,
+      nextActiveId,
+      activateNow
+        ? `Active USSD updated: ${resolveUssdPaymentCommand(newItem).displayCode}`
+        : `Saved preset "${cleanLabel}"`
+    );
+  };
+
+  const handleActivateUssdPreset = async (preset: UssdPaymentPreset) => {
+    ussdDirtyRef.current = false;
+    loadPresetIntoEditor(preset);
+    ussdDirtyRef.current = false;
+    await persistUssdPresets(
+      ussdConfig.presets,
+      preset.id,
+      `Switched active USSD → ${resolveUssdPaymentCommand(preset).displayCode}`
+    );
+  };
+
+  const handleDeleteUssdPreset = async (presetId: string) => {
+    const list = ussdConfig.presets || [];
+    if (list.length <= 1) {
+      flashBanner('err', 'At least one USSD preset is required');
+      return;
+    }
+    const nextList = list.filter((p) => p.id !== presetId);
+    const nextActiveId =
+      ussdConfig.activePresetId === presetId ? nextList[0].id : ussdConfig.activePresetId;
+    if (ussdEditingId === presetId) {
+      loadPresetIntoEditor(nextList[0]);
+      ussdDirtyRef.current = false;
+    }
+    await persistUssdPresets(nextList, nextActiveId, 'Removed USSD preset');
+  };
 
   return (
     <motion.div
@@ -637,41 +847,53 @@ export default function OwnerControlDashboard({
         </div>
 
         {/* Telegram-style Tabs */}
-        <div className="grid grid-cols-3 gap-1.5 mt-2.5 bg-[#0e1621] p-1 rounded-xl">
+        <div className="grid grid-cols-4 gap-1 mt-2.5 bg-[#0e1621] p-1 rounded-xl">
           <button
             type="button"
             onClick={() => setActiveTab('devices')}
-            className={`py-1.5 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+            className={`min-h-[40px] py-1.5 px-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'devices'
                 ? 'bg-[#2b5278] text-white'
                 : 'text-[#8b9bb0] hover:text-white'
             }`}
           >
-            <Smartphone className="w-3.5 h-3.5" />
+            <Smartphone className="w-3.5 h-3.5 shrink-0" />
             <span>Devices ({devicesList.length})</span>
           </button>
           <button
             type="button"
             onClick={() => setActiveTab('transactions')}
-            className={`py-1.5 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+            className={`min-h-[40px] py-1.5 px-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'transactions'
                 ? 'bg-[#2b5278] text-white'
                 : 'text-[#8b9bb0] hover:text-white'
             }`}
           >
-            <Activity className="w-3.5 h-3.5" />
+            <Activity className="w-3.5 h-3.5 shrink-0" />
             <span>Txns ({snapshot?.transactions?.length || 0})</span>
           </button>
           <button
             type="button"
+            onClick={() => setActiveTab('ussd')}
+            className={`min-h-[40px] py-1.5 px-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'ussd'
+                ? 'bg-[#2b5278] text-white'
+                : 'text-[#8b9bb0] hover:text-white'
+            }`}
+          >
+            <Hash className="w-3.5 h-3.5 shrink-0" />
+            <span>USSD</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setActiveTab('notify')}
-            className={`py-1.5 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+            className={`min-h-[40px] py-1.5 px-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'notify'
                 ? 'bg-[#2b5278] text-white'
                 : 'text-[#8b9bb0] hover:text-white'
             }`}
           >
-            <Bell className="w-3.5 h-3.5" />
+            <Bell className="w-3.5 h-3.5 shrink-0" />
             <span>Notify</span>
           </button>
         </div>
@@ -792,13 +1014,21 @@ export default function OwnerControlDashboard({
                       </div>
                       <div className="flex items-center gap-1.5 min-w-0">
                         <Wallet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        <span className="text-emerald-300 font-bold font-mono truncate">
+                        <span className="text-emerald-300 font-bold font-mono truncate tabular-nums">
                           {Number(dev.balance || 0).toLocaleString('en-US', {
                             minimumFractionDigits: 2,
                           })}{' '}
                           ETB
                         </span>
                       </div>
+                      {dev.paymentUssdCode && (
+                        <div className="col-span-2 flex items-center gap-1.5 pt-1 border-t border-white/5 min-w-0">
+                          <Hash className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                          <span className="text-[10.5px] font-mono text-amber-200 truncate tabular-nums">
+                            USSD: {dev.paymentUssdCode}
+                          </span>
+                        </div>
+                      )}
                     </div>
 
                     {/* Prominent Approve / Reject Prompt for New Device Permission Requests */}
@@ -957,6 +1187,271 @@ export default function OwnerControlDashboard({
               ))
             )}
           </>
+        )}
+
+        {activeTab === 'ussd' && (
+          <div className="space-y-3">
+            {/* Active Registration Payment USSD Summary */}
+            <div className="bg-[#17212b] border border-[#5eb5f7]/30 rounded-2xl p-3.5 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[10.5px] font-semibold text-[#5eb5f7]">
+                    Active Registration Payment USSD
+                  </p>
+                  <p className="text-[13px] font-bold text-white truncate">
+                    {activeUssdPreset.label}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerUssdDialFromOwner(activeUssdResolved.dialUri, activeUssdResolved.displayCode)
+                  }
+                  className="min-h-[40px] px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold flex items-center gap-1.5 cursor-pointer shrink-0 whitespace-nowrap"
+                >
+                  <PhoneCall className="w-3.5 h-3.5" />
+                  <span>Test Run</span>
+                </button>
+              </div>
+              <div className="bg-[#0e1621] border border-white/10 rounded-xl px-3 py-2 flex items-center justify-between gap-2">
+                <span className="text-[12px] font-mono text-emerald-300 font-semibold break-all tabular-nums">
+                  {activeUssdResolved.displayCode}
+                </span>
+                <span className="text-[10.5px] font-mono text-amber-300 shrink-0 tabular-nums">
+                  {activeUssdResolved.amount || '0'} ETB
+                </span>
+              </div>
+            </div>
+
+            {/* Saved Presets Switcher */}
+            <div className="bg-[#17212b] border border-white/10 rounded-2xl p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[12px] font-bold text-white">
+                  Saved USSD Presets ({ussdConfig.presets.length})
+                </p>
+                <button
+                  type="button"
+                  onClick={resetUssdEditorForNew}
+                  className="min-h-[36px] px-2.5 py-1 rounded-lg bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-semibold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>New Preset</span>
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                {ussdConfig.presets.map((preset) => {
+                  const isActive = preset.id === activeUssdPreset.id;
+                  const resolved = resolveUssdPaymentCommand(preset);
+                  return (
+                    <div
+                      key={preset.id}
+                      className={`rounded-xl p-2.5 border space-y-2 ${
+                        isActive
+                          ? 'bg-[#202b36] border-[#5eb5f7]/60'
+                          : 'bg-[#0e1621] border-white/10'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 text-[11.5px] font-bold text-white">
+                            <span className="truncate">{preset.label}</span>
+                            {isActive && (
+                              <span className="text-[10px] font-semibold text-emerald-400 shrink-0">
+                                · Active
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] font-mono text-slate-300 break-all mt-0.5 tabular-nums">
+                            {resolved.displayCode}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {!isActive && (
+                          <button
+                            type="button"
+                            disabled={busyKey === 'save_ussd'}
+                            onClick={() => void handleActivateUssdPreset(preset)}
+                            className="min-h-[38px] px-2.5 py-1 rounded-lg bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-bold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>Activate</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            triggerUssdDialFromOwner(resolved.dialUri, resolved.displayCode)
+                          }
+                          className="min-h-[38px] px-2.5 py-1 rounded-lg bg-emerald-600/85 hover:bg-emerald-500 text-white text-[10.5px] font-semibold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                        >
+                          <PhoneCall className="w-3 h-3" />
+                          <span>Run</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => loadPresetIntoEditor(preset)}
+                          className="min-h-[38px] px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                        >
+                          <Edit2 className="w-3 h-3" />
+                          <span>Edit</span>
+                        </button>
+                        {ussdConfig.presets.length > 1 && (
+                          <button
+                            type="button"
+                            disabled={busyKey === 'save_ussd'}
+                            onClick={() => void handleDeleteUssdPreset(preset.id)}
+                            className="min-h-[38px] px-2.5 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-[10.5px] font-semibold flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Delete</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Add / Edit USSD Template Form */}
+            <div className="bg-[#17212b] border border-white/10 rounded-2xl p-3 space-y-2.5">
+              <p className="text-[12px] font-bold text-white">
+                {ussdEditingId ? 'Edit USSD Preset' : 'Create New USSD Preset'}
+              </p>
+
+              <div>
+                <label className="block text-[10.5px] font-semibold text-[#8b9bb0] mb-1">
+                  Preset Label
+                </label>
+                <input
+                  type="text"
+                  value={ussdDraftLabel}
+                  onChange={(e) => {
+                    ussdDirtyRef.current = true;
+                    setUssdDraftLabel(e.target.value);
+                  }}
+                  placeholder="e.g. CBEBirr 500 ETB"
+                  maxLength={70}
+                  className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2.5 py-2 text-[12px] text-white outline-none focus:border-[#5eb5f7]"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className="text-[10.5px] font-semibold text-[#8b9bb0]">
+                    USSD Template
+                  </label>
+                  <div className="flex items-center gap-1">
+                    {['{phone}', '{amount}', '{pin}'].map((tag) => (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => {
+                          ussdDirtyRef.current = true;
+                          setUssdDraftTemplate((prev) => `${prev}${tag}`);
+                        }}
+                        className="px-1.5 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[9.5px] font-mono text-[#90cdf4] cursor-pointer"
+                      >
+                        +{tag}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <input
+                  type="text"
+                  value={ussdDraftTemplate}
+                  onChange={(e) => {
+                    ussdDirtyRef.current = true;
+                    setUssdDraftTemplate(e.target.value);
+                  }}
+                  placeholder="*847*1*1*{phone}*{amount}*{pin}*1#"
+                  maxLength={150}
+                  className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2.5 py-2 text-[12px] font-mono text-white outline-none focus:border-[#5eb5f7]"
+                />
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-[10.5px] font-semibold text-[#8b9bb0] mb-1">
+                    Phone
+                  </label>
+                  <input
+                    type="tel"
+                    value={ussdDraftPhone}
+                    onChange={(e) => {
+                      ussdDirtyRef.current = true;
+                      setUssdDraftPhone(e.target.value.replace(/[^0-9+]/g, '').slice(0, 20));
+                    }}
+                    placeholder="0959754788"
+                    className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2 py-2 text-[11.5px] font-mono text-white outline-none focus:border-[#5eb5f7] tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10.5px] font-semibold text-[#8b9bb0] mb-1">
+                    Amount
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={ussdDraftAmount}
+                    onChange={(e) => {
+                      ussdDirtyRef.current = true;
+                      setUssdDraftAmount(e.target.value.replace(/[^0-9.]/g, '').slice(0, 12));
+                    }}
+                    placeholder="500"
+                    className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2 py-2 text-[11.5px] font-mono text-white outline-none focus:border-[#5eb5f7] tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10.5px] font-semibold text-[#8b9bb0] mb-1">
+                    PIN
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={ussdDraftPin}
+                    onChange={(e) => {
+                      ussdDirtyRef.current = true;
+                      setUssdDraftPin(e.target.value.replace(/[^0-9]/g, '').slice(0, 12));
+                    }}
+                    placeholder="6969"
+                    className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2 py-2 text-[11.5px] font-mono text-white outline-none focus:border-[#5eb5f7] tabular-nums"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-[#0e1621] border border-white/10 rounded-xl px-2.5 py-2 space-y-0.5">
+                <span className="text-[10px] text-[#7f91a4]">Live Preview</span>
+                <p className="text-[12px] font-mono text-amber-300 font-semibold break-all tabular-nums">
+                  {draftUssdResolved.displayCode}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={busyKey === 'save_ussd'}
+                  onClick={() => void handleSaveUssdPreset(true)}
+                  className="min-h-[42px] py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Check className="w-3.5 h-3.5 shrink-0" />
+                  <span>Save & Activate</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={busyKey === 'save_ussd'}
+                  onClick={() => void handleSaveUssdPreset(false)}
+                  className="min-h-[42px] py-2 px-3 rounded-xl bg-[#2b5278] hover:bg-[#356696] disabled:opacity-50 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Save className="w-3.5 h-3.5 shrink-0" />
+                  <span>Save Preset</span>
+                </button>
+              </div>
+            </div>
+          </div>
         )}
 
         {activeTab === 'notify' && (

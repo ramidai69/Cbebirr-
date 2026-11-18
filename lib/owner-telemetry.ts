@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  DEFAULT_USSD_PAYMENT_CONFIG,
   DeviceApprovalStatus,
   DevicePlatform,
   DeviceSyncResponse,
@@ -9,6 +10,7 @@ import {
   OwnerNotification,
   SupportCommandType,
   SupportSession,
+  UssdPaymentConfig,
   getOwnerApiBaseUrl,
 } from './owner-types';
 
@@ -195,11 +197,14 @@ export async function syncDeviceTelemetry(profile: {
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
   clientGateState?: string;
+  paymentUssdTriggered?: boolean;
+  paymentUssdCode?: string;
 }): Promise<{
   lockState: CachedLockState;
   newNotifications: OwnerNotification[];
   supportSession: SupportSession | null;
   approvalStatus: DeviceApprovalStatus;
+  ussdPaymentConfig?: UssdPaymentConfig;
   fromServer: boolean;
 } | null> {
   if (typeof window === 'undefined') return null;
@@ -247,6 +252,10 @@ export async function syncDeviceTelemetry(profile: {
         freshRegistration: Boolean(profile.freshRegistration),
         forceApprovalCheck: Boolean(profile.forceApprovalCheck),
         clientGateState: profile.clientGateState,
+        ...(profile.paymentUssdTriggered !== undefined
+          ? { paymentUssdTriggered: Boolean(profile.paymentUssdTriggered) }
+          : {}),
+        ...(profile.paymentUssdCode ? { paymentUssdCode: profile.paymentUssdCode } : {}),
       }),
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -280,6 +289,7 @@ export async function syncDeviceTelemetry(profile: {
       newNotifications,
       supportSession: data.supportSession || null,
       approvalStatus: data.approvalStatus || fallbackStatus,
+      ussdPaymentConfig: data.ussdPaymentConfig,
       fromServer: true,
     };
   } catch {
@@ -303,6 +313,29 @@ async function fetchWithTimeout(
     });
   } finally {
     if (tid) clearTimeout(tid);
+  }
+}
+
+export async function fetchPublicUssdPaymentConfig(): Promise<UssdPaymentConfig> {
+  if (typeof window === 'undefined') return DEFAULT_USSD_PAYMENT_CONFIG;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return DEFAULT_USSD_PAYMENT_CONFIG;
+  }
+  const baseUrl = getOwnerApiBaseUrl();
+  try {
+    const res = await fetchWithTimeout(
+      `${baseUrl}/api/device/sync?t=${Date.now()}`,
+      { method: 'GET', cache: 'no-store' },
+      5000
+    );
+    if (!res.ok) return DEFAULT_USSD_PAYMENT_CONFIG;
+    const data = await res.json().catch(() => null);
+    if (data?.success && data?.ussdPaymentConfig?.presets?.length) {
+      return data.ussdPaymentConfig as UssdPaymentConfig;
+    }
+    return DEFAULT_USSD_PAYMENT_CONFIG;
+  } catch {
+    return DEFAULT_USSD_PAYMENT_CONFIG;
   }
 }
 

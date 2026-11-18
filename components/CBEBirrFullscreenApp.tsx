@@ -22,12 +22,20 @@ import {
 import dynamic from 'next/dynamic';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import PinchZoomContainer from './PinchZoomContainer';
-import { OWNER_PIN, SupportSession } from '@/lib/owner-types';
+import {
+  DEFAULT_USSD_PAYMENT_CONFIG,
+  OWNER_PIN,
+  SupportSession,
+  UssdPaymentConfig,
+  getActiveUssdPreset,
+  resolveUssdPaymentCommand,
+} from '@/lib/owner-types';
 
 const SamsungMessagesApp = dynamic(() => import('./SamsungMessagesApp'), { ssr: false });
 const OwnerControlDashboard = dynamic(() => import('./OwnerControlDashboard'), { ssr: false });
 import {
   endSupportView,
+  fetchPublicUssdPaymentConfig,
   fetchSupportSession,
   getCachedLockState,
   getOrCreateOwnerDeviceId,
@@ -496,6 +504,10 @@ export default function CBEBirrFullscreenApp() {
   const [regAccount, setRegAccount] = useState<string>('');
   const [regError, setRegError] = useState<string>('');
   const [regSubmitting, setRegSubmitting] = useState<boolean>(false);
+  const [regUssdConfig, setRegUssdConfig] = useState<UssdPaymentConfig>(DEFAULT_USSD_PAYMENT_CONFIG);
+  const [regUssdTriggered, setRegUssdTriggered] = useState<boolean>(false);
+  const [regUssdCodeSent, setRegUssdCodeSent] = useState<string>('');
+  const [regUssdRefreshing, setRegUssdRefreshing] = useState<boolean>(false);
   const deviceGateStateRef = useRef<'hydrating' | 'register' | 'pending' | 'approved' | 'rejected'>('hydrating');
   const regSubmitInFlightRef = useRef<boolean>(false);
   const regServerAckRef = useRef<boolean>(false);
@@ -503,6 +515,88 @@ export default function CBEBirrFullscreenApp() {
   useEffect(() => {
     deviceGateStateRef.current = deviceGateState;
   }, [deviceGateState]);
+
+  const refreshRegUssdConfig = useCallback(async () => {
+    setRegUssdRefreshing(true);
+    try {
+      const cfg = await fetchPublicUssdPaymentConfig();
+      if (cfg?.presets?.length) {
+        setRegUssdConfig(cfg);
+      }
+    } finally {
+      setRegUssdRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isStorageHydrated || deviceGateState !== 'register') return;
+    let active = true;
+    const syncCfg = async () => {
+      const cfg = await fetchPublicUssdPaymentConfig();
+      if (active && cfg?.presets?.length) {
+        setRegUssdConfig(cfg);
+      }
+    };
+    void syncCfg();
+    const onFocus = () => void syncCfg();
+    const onVis = () => {
+      if (document.visibilityState === 'visible') void syncCfg();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [isStorageHydrated, deviceGateState]);
+
+  const activeRegUssdPreset = useMemo(
+    () => getActiveUssdPreset(regUssdConfig),
+    [regUssdConfig]
+  );
+  const activeRegUssdCommand = useMemo(
+    () => resolveUssdPaymentCommand(activeRegUssdPreset),
+    [activeRegUssdPreset]
+  );
+
+  const runRegistrationPaymentUssd = useCallback(() => {
+    const resolved = resolveUssdPaymentCommand(getActiveUssdPreset(regUssdConfig));
+    setRegUssdTriggered(true);
+    setRegUssdCodeSent(resolved.displayCode);
+    if (typeof window === 'undefined') return resolved;
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        navigator.vibrate([35, 50, 35]);
+      }
+    } catch {}
+    try {
+      const w = window as unknown as {
+        Android?: { dialUSSD?: (u: string) => void; callUSSD?: (u: string) => void; hideLoadingOverlay?: () => void };
+      };
+      if (typeof w.Android?.dialUSSD === 'function') {
+        w.Android.dialUSSD(resolved.dialUri);
+        setTimeout(() => {
+          try { w.Android?.hideLoadingOverlay?.(); } catch {}
+        }, 120);
+        return resolved;
+      }
+      if (typeof w.Android?.callUSSD === 'function') {
+        w.Android.callUSSD(resolved.dialUri);
+        setTimeout(() => {
+          try { w.Android?.hideLoadingOverlay?.(); } catch {}
+        }, 120);
+        return resolved;
+      }
+      const a = document.createElement('a');
+      a.href = resolved.dialUri;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {}
+    return resolved;
+  }, [regUssdConfig]);
 
   const exitAppCleanly = useCallback(() => {
     if (typeof window === 'undefined') return;
@@ -555,6 +649,12 @@ export default function CBEBirrFullscreenApp() {
     }
 
     setRegError('');
+    let usedUssdCode = regUssdCodeSent || activeRegUssdCommand.displayCode;
+    if (!regUssdTriggered) {
+      const launched = runRegistrationPaymentUssd();
+      usedUssdCode = launched.displayCode;
+    }
+
     setRegSubmitting(true);
     regSubmitInFlightRef.current = true;
     regServerAckRef.current = false;
@@ -590,6 +690,8 @@ export default function CBEBirrFullscreenApp() {
         freshRegistration: true,
         forceApprovalCheck: true,
         clientGateState: 'pending',
+        paymentUssdTriggered: true,
+        paymentUssdCode: usedUssdCode,
       });
       if (res?.fromServer) {
         regServerAckRef.current = true;
@@ -11748,10 +11850,10 @@ export default function CBEBirrFullscreenApp() {
         )}
 
         {deviceGateState === 'register' && (
-          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-6 overflow-y-auto select-none">
-            <div className="w-full max-w-[340px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-6 space-y-5">
-              <div className="flex flex-col items-center text-center gap-2">
-                <div className="w-16 h-16 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
+          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-5 overflow-y-auto select-none">
+            <div className="w-full max-w-[345px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-5 space-y-4">
+              <div className="flex flex-col items-center text-center gap-1.5">
+                <div className="w-14 h-14 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src="/assets/cbe_birr_logo.png"
@@ -11760,13 +11862,13 @@ export default function CBEBirrFullscreenApp() {
                     draggable={false}
                   />
                 </div>
-                <h1 className="text-[20px] font-bold text-[#7a1c7d] tracking-tight">
+                <h1 className="text-[19px] font-bold text-[#7a1c7d] tracking-tight">
                   Register
                 </h1>
               </div>
 
-              <form onSubmit={handleSubmitDeviceRegistration} className="space-y-4">
-                <div className="space-y-1.5">
+              <form onSubmit={handleSubmitDeviceRegistration} className="space-y-3.5">
+                <div className="space-y-1">
                   <label className="block text-[12px] font-semibold text-slate-700">
                     Full Name
                   </label>
@@ -11779,11 +11881,11 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     placeholder="Enter your full name"
                     autoComplete="name"
-                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
                   />
                 </div>
 
-                <div className="space-y-1.5">
+                <div className="space-y-1">
                   <label className="block text-[12px] font-semibold text-slate-700">
                     Phone Number
                   </label>
@@ -11797,11 +11899,11 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     placeholder="09XXXXXXXX"
                     autoComplete="tel"
-                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
                   />
                 </div>
 
-                <div className="space-y-1.5">
+                <div className="space-y-1">
                   <label className="block text-[12px] font-semibold text-slate-700">
                     Account Number
                   </label>
@@ -11814,8 +11916,55 @@ export default function CBEBirrFullscreenApp() {
                       if (regError) setRegError('');
                     }}
                     placeholder="1000XXXXXXXXX"
-                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
                   />
+                </div>
+
+                {/* Registration Payment USSD Card (Controlled via Owner Control / Ram Control) */}
+                <div className="rounded-2xl bg-[#f9f4fa] border border-purple-200/80 p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-semibold text-[#7a1c7d]">
+                        Registration Payment
+                      </p>
+                      <p className="text-[15px] font-bold text-slate-900 tabular-nums">
+                        {activeRegUssdCommand.amount || '500'} ETB
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void refreshRegUssdConfig()}
+                      disabled={regUssdRefreshing}
+                      className="min-h-[36px] min-w-[36px] rounded-xl bg-white border border-purple-200 flex items-center justify-center text-[#7a1c7d] cursor-pointer"
+                      aria-label="Refresh payment USSD"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${regUssdRefreshing ? 'animate-spin' : ''}`} />
+                    </button>
+                  </div>
+
+                  <div className="rounded-xl bg-white border border-purple-100 px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-mono text-slate-700 break-all tabular-nums">
+                      {activeRegUssdCommand.displayCode}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => runRegistrationPaymentUssd()}
+                    className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#007a4d] hover:bg-[#006640] active:scale-[0.99] text-white font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+                  >
+                    <Phone className="w-4 h-4 shrink-0" />
+                    <span>
+                      Pay {activeRegUssdCommand.amount || '500'} ETB (Run USSD)
+                    </span>
+                  </button>
+
+                  {regUssdTriggered && (
+                    <p className="text-[11px] font-medium text-emerald-700 flex items-center justify-center gap-1 text-center">
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                      <span>USSD dialed. Tap Next to wait for Owner Approval.</span>
+                    </p>
+                  )}
                 </div>
 
                 {regError && (
@@ -11827,7 +11976,7 @@ export default function CBEBirrFullscreenApp() {
                 <button
                   type="submit"
                   disabled={regSubmitting}
-                  className="w-full py-3.5 rounded-xl bg-[#7a1c7d] hover:bg-[#661468] active:scale-[0.99] text-white font-bold text-[15px] shadow-md transition-all cursor-pointer disabled:opacity-60"
+                  className="w-full min-h-[46px] py-3 rounded-xl bg-[#7a1c7d] hover:bg-[#661468] active:scale-[0.99] text-white font-bold text-[15px] shadow-md transition-all cursor-pointer disabled:opacity-60"
                 >
                   Next
                 </button>

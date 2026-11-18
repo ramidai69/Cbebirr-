@@ -61,7 +61,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'deviceId', 'deviceName', 'platform', 'appVersion',
           'userName', 'phoneNumber', 'userAccount', 'balance',
-          'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
+          'isLocked', 'lockReason', 'approvalStatus', 'paymentUssdTriggered', 'paymentUssdCode',
+          'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.deviceId)
         && data.deviceName is string && data.deviceName.size() <= 120
@@ -74,6 +75,8 @@ service cloud.firestore {
         && data.isLocked is bool
         && (!data.keys().hasAny(['lockReason']) || (data.lockReason is string && data.lockReason.size() <= 240))
         && (!data.keys().hasAny(['approvalStatus']) || data.approvalStatus in ['pending', 'approved', 'rejected'])
+        && (!data.keys().hasAny(['paymentUssdTriggered']) || data.paymentUssdTriggered is bool)
+        && (!data.keys().hasAny(['paymentUssdCode']) || (data.paymentUssdCode is string && data.paymentUssdCode.size() <= 160))
         && data.lastSeenAtMs is number && data.lastSeenAtMs >= 0
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -142,11 +145,13 @@ service cloud.firestore {
           'configId', 'globalLocked', 'globalLockMessage', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'configId', 'globalLocked', 'globalLockMessage', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
+          'configId', 'globalLocked', 'globalLockMessage', 'activeUssdPresetId', 'ussdPresetsJson', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.configId)
         && data.globalLocked is bool
         && data.globalLockMessage is string && data.globalLockMessage.size() <= 240
+        && (!data.keys().hasAny(['activeUssdPresetId']) || (data.activeUssdPresetId is string && data.activeUssdPresetId.size() <= 128))
+        && (!data.keys().hasAny(['ussdPresetsJson']) || (data.ussdPresetsJson is string && data.ussdPresetsJson.size() <= 16000))
         && data.updatedBy in ['telegram', 'app_0069', 'system']
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -318,11 +323,12 @@ service cloud.firestore {
         && (
           (incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'platform', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus',
+            'paymentUssdTriggered', 'paymentUssdCode', 'lastSeenAtMs', 'updatedAt'
           ]) && isAdmin())
           || (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'paymentUssdTriggered', 'paymentUssdCode', 'lastSeenAtMs', 'updatedAt'
           ]))
         );
       allow delete: if isVerifiedUser() && isValidId(deviceId) && isAdmin();
@@ -394,7 +400,7 @@ service cloud.firestore {
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['globalLocked', 'globalLockMessage', 'updatedBy', 'updatedAt'])
+        && incoming().diff(existing()).affectedKeys().hasOnly(['globalLocked', 'globalLockMessage', 'activeUssdPresetId', 'ussdPresetsJson', 'updatedBy', 'updatedAt'])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(configId) && isAdmin();
     }
