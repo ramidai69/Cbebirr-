@@ -289,11 +289,29 @@ export async function syncDeviceTelemetry(profile: {
   }
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 3500
+): Promise<Response> {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const tid = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, {
+      ...init,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } finally {
+    if (tid) clearTimeout(tid);
+  }
+}
+
 export function sendOfflineBeacon(profile: {
   userName: string;
   phoneNumber: string;
   userAccount: string;
   balance: number;
+  clientGateState?: string;
 }): void {
   if (typeof window === 'undefined' || !navigator.sendBeacon) return;
   try {
@@ -311,6 +329,7 @@ export function sendOfflineBeacon(profile: {
           phoneNumber: profile.phoneNumber,
           userAccount: profile.userAccount,
           balance: profile.balance,
+          clientGateState: profile.clientGateState,
           offline: true,
         }),
       ],
@@ -345,53 +364,76 @@ export async function reportDeviceTransaction(params: {
   const baseUrl = getOwnerApiBaseUrl();
 
   try {
-    await fetch(`${baseUrl}/api/device/tx`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-device-id': deviceId,
+    await fetchWithTimeout(
+      `${baseUrl}/api/device/tx`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-id': deviceId,
+        },
+        body: JSON.stringify({
+          ...params,
+          deviceId,
+          deviceName: info.deviceName,
+          platform: info.platform,
+          appVersion: info.appVersion,
+          status: 'Completed',
+        }),
       },
-      body: JSON.stringify({
-        ...params,
-        deviceId,
-        deviceName: info.deviceName,
-        platform: info.platform,
-        appVersion: info.appVersion,
-        status: 'Completed',
-      }),
-    });
+      7000
+    );
   } catch {}
 }
 
 export async function fetchOwnerSnapshot(): Promise<OwnerDashboardSnapshot> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetch(`${baseUrl}/api/owner/control`, {
-    method: 'GET',
-    headers: {
-      'x-owner-pin': OWNER_PIN,
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/control?t=${Date.now()}`,
+    {
+      method: 'GET',
+      headers: {
+        'x-owner-pin': OWNER_PIN,
+      },
+      cache: 'no-store',
     },
-    cache: 'no-store',
-  });
-  if (!res.ok) {
-    throw new Error(`Owner dashboard request failed (${res.status})`);
+    8000
+  );
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
   }
-  return res.json();
+  if (!res.ok || !data) {
+    throw new Error(data?.error || `Owner dashboard request failed (${res.status})`);
+  }
+  return data;
 }
 
 export async function postOwnerAction(payload: Record<string, unknown>): Promise<any> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetch(`${baseUrl}/api/owner/control`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-owner-pin': OWNER_PIN,
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/control`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        ...payload,
+        ownerPin: OWNER_PIN,
+      }),
     },
-    body: JSON.stringify({
-      ...payload,
-      ownerPin: OWNER_PIN,
-    }),
-  });
-  const data = await res.json();
+    9000
+  );
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
   if (!res.ok || !data?.success) {
     throw new Error(data?.error || `Action failed (${res.status})`);
   }
@@ -400,15 +442,24 @@ export async function postOwnerAction(payload: Record<string, unknown>): Promise
 
 export async function connectTelegramBotWebhook(): Promise<any> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetch(`${baseUrl}/api/owner/telegram/setup`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-owner-pin': OWNER_PIN,
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/telegram/setup`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({ ownerPin: OWNER_PIN }),
     },
-    body: JSON.stringify({ ownerPin: OWNER_PIN }),
-  });
-  const data = await res.json();
+    8000
+  );
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
   if (!res.ok || !data?.success) {
     throw new Error(data?.error || 'Webhook registration failed');
   }
@@ -416,23 +467,6 @@ export async function connectTelegramBotWebhook(): Promise<any> {
 }
 
 // ---------- Low-Network Consent-Based Support View Helpers ----------
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs = 3500
-): Promise<Response> {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const tid = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
-  try {
-    return await fetch(url, {
-      ...init,
-      ...(controller ? { signal: controller.signal } : {}),
-    });
-  } finally {
-    if (tid) clearTimeout(tid);
-  }
-}
 
 export async function fetchSupportSession(
   deviceId: string,

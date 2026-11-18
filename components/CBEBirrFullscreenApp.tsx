@@ -789,14 +789,20 @@ export default function CBEBirrFullscreenApp() {
         runSync();
         triggerPairBroadcast();
       } else if (document.visibilityState === 'hidden' && deviceGateStateRef.current === 'approved') {
-        sendOfflineBeacon(profileSyncRef.current);
+        sendOfflineBeacon({
+          ...profileSyncRef.current,
+          clientGateState: deviceGateStateRef.current,
+        });
       }
     };
     const onOnline = () => runSync();
     const onFocus = () => triggerPairBroadcast();
     const onPageHide = () => {
       if (deviceGateStateRef.current === 'approved') {
-        sendOfflineBeacon(profileSyncRef.current);
+        sendOfflineBeacon({
+          ...profileSyncRef.current,
+          clientGateState: deviceGateStateRef.current,
+        });
       }
     };
 

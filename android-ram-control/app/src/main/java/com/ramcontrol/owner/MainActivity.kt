@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -14,6 +15,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.net.URLDecoder
 
@@ -47,6 +49,13 @@ class MainActivity : AppCompatActivity() {
             settings.loadWithOverviewMode = true
         }
 
+        try {
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(webView, true)
+        } catch (_: Throwable) {
+        }
+
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -58,6 +67,16 @@ class MainActivity : AppCompatActivity() {
                 if (host == "appassets.androidplatform.net" || host == "localhost" || host == "127.0.0.1") {
                     val assetResponse = openLocalAssetResponse(url.path ?: "/")
                     if (assetResponse != null) return assetResponse
+                    if (host == "appassets.androidplatform.net") {
+                        return WebResourceResponse(
+                            "text/plain",
+                            "UTF-8",
+                            404,
+                            "Not Found",
+                            mapOf("Access-Control-Allow-Origin" to "*"),
+                            ByteArrayInputStream(ByteArray(0))
+                        )
+                    }
                 }
                 return super.shouldInterceptRequest(view, request)
             }
@@ -93,6 +112,32 @@ class MainActivity : AppCompatActivity() {
         })
 
         webView.loadUrl("https://appassets.androidplatform.net/ram-control")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized) {
+            webView.onResume()
+            webView.resumeTimers()
+            webView.evaluateJavascript(
+                "try{if(window.onNativeResume)window.onNativeResume();}catch(e){}",
+                null
+            )
+        }
+    }
+
+    override fun onPause() {
+        if (::webView.isInitialized) {
+            webView.onPause()
+        }
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        if (::webView.isInitialized) {
+            webView.destroy()
+        }
+        super.onDestroy()
     }
 
     private fun openLocalAssetResponse(rawPath: String): WebResourceResponse? {

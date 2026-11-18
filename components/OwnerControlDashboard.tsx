@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Activity,
@@ -87,6 +87,16 @@ export default function OwnerControlDashboard({
   const [myDeviceId, setMyDeviceId] = useState<string>('dev_server');
   const [isApkEnv, setIsApkEnv] = useState<boolean>(false);
 
+  const snapshotSeqRef = useRef<number>(0);
+  const actionSeqRef = useRef<number>(0);
+  const fetchInFlightRef = useRef<boolean>(false);
+  const busyKeyRef = useRef<string>('');
+  const globalMsgDirtyRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    busyKeyRef.current = busyKey;
+  }, [busyKey]);
+
   useEffect(() => {
     queueMicrotask(() => {
       setMyDeviceId(getOrCreateOwnerDeviceId());
@@ -104,12 +114,22 @@ export default function OwnerControlDashboard({
     }, 3500);
   }, []);
 
-  const loadSnapshot = useCallback(async (silent = false) => {
+  const loadSnapshot = useCallback(async (silent = false, force = false) => {
+    if (silent && !force && (fetchInFlightRef.current || busyKeyRef.current)) {
+      return;
+    }
     if (!silent) setLoading(true);
+    const myActionSeq = actionSeqRef.current;
+    const myFetchSeq = ++snapshotSeqRef.current;
+    fetchInFlightRef.current = true;
     try {
       const data = await fetchOwnerSnapshot();
+      // Never let an older in-flight poll overwrite a newer fetch or post-mutation UI update
+      if (actionSeqRef.current !== myActionSeq || myFetchSeq < snapshotSeqRef.current) {
+        return;
+      }
       setSnapshot(data);
-      if (data.globalConfig?.globalLockMessage) {
+      if (!globalMsgDirtyRef.current && data.globalConfig?.globalLockMessage) {
         setGlobalLockMsgInput(data.globalConfig.globalLockMessage);
       }
     } catch (err: any) {
@@ -117,20 +137,43 @@ export default function OwnerControlDashboard({
         flashBanner('err', err?.message || 'Failed to load owner data');
       }
     } finally {
+      fetchInFlightRef.current = false;
       if (!silent) setLoading(false);
     }
   }, [flashBanner]);
 
   useEffect(() => {
     const t = setTimeout(() => {
-      void loadSnapshot(false);
+      void loadSnapshot(false, true);
     }, 0);
     const id = setInterval(() => {
-      void loadSnapshot(true);
+      void loadSnapshot(true, false);
     }, 2500);
+
+    const triggerResumeSync = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void loadSnapshot(true, true);
+      }
+    };
+    const onOnline = () => void loadSnapshot(true, true);
+    const onFocus = () => void loadSnapshot(true, true);
+
+    (window as any).onNativeResume = () => {
+      void loadSnapshot(true, true);
+    };
+    document.addEventListener('visibilitychange', triggerResumeSync);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onFocus);
+
     return () => {
       clearTimeout(t);
       clearInterval(id);
+      document.removeEventListener('visibilitychange', triggerResumeSync);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('focus', onFocus);
+      if ((window as any).onNativeResume) {
+        delete (window as any).onNativeResume;
+      }
     };
   }, [loadSnapshot]);
 
@@ -187,10 +230,15 @@ export default function OwnerControlDashboard({
     if (fbDevices.length === 0) return apiDevices;
     const map = new Map<string, DeviceClient>();
     for (const d of fbDevices) {
-      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
+      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'approved' });
     }
     for (const d of apiDevices) {
-      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
+      const prev = map.get(d.deviceId);
+      const apiUpdated = Number(d.updatedAtMs || d.lastSeenAtMs || 0);
+      const fbUpdated = Number(prev?.updatedAtMs || prev?.lastSeenAtMs || 0);
+      if (!prev || apiUpdated >= fbUpdated) {
+        map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'approved' });
+      }
     }
     return Array.from(map.values()).sort((a, b) => {
       const aPending = a.approvalStatus === 'pending' ? 1 : 0;
@@ -217,13 +265,19 @@ export default function OwnerControlDashboard({
   const handleGlobalLockToggle = async () => {
     const currentlyLocked = Boolean(snapshot?.globalConfig?.globalLocked);
     setBusyKey('global_lock');
+    actionSeqRef.current += 1;
     try {
       const action = currentlyLocked ? 'unlock_all' : 'lock_all';
-      await postOwnerAction({
+      const res = await postOwnerAction({
         action,
         message: globalLockMsgInput.trim() || undefined,
       });
-      await loadSnapshot(true);
+      actionSeqRef.current += 1;
+      globalMsgDirtyRef.current = false;
+      if (res?.globalConfig) {
+        setSnapshot((prev) => (prev ? { ...prev, globalConfig: res.globalConfig } : prev));
+      }
+      await loadSnapshot(true, true);
       onRemoteLockChange?.(!currentlyLocked, globalLockMsgInput.trim());
       flashBanner(
         'ok',
@@ -240,13 +294,31 @@ export default function OwnerControlDashboard({
 
   const handleDeviceLockToggle = async (dev: DeviceClient) => {
     setBusyKey(`lock_${dev.deviceId}`);
+    actionSeqRef.current += 1;
     try {
       const action = dev.isLocked ? 'unlock_device' : 'lock_device';
-      await postOwnerAction({
+      const res = await postOwnerAction({
         action,
         deviceId: dev.deviceId,
       });
-      await loadSnapshot(true);
+      actionSeqRef.current += 1;
+      if (res?.device) {
+        const updatedDev = res.device as DeviceClient;
+        setSnapshot((prev) =>
+          prev
+            ? {
+                ...prev,
+                devices: prev.devices.map((d) =>
+                  d.deviceId === updatedDev.deviceId ? updatedDev : d
+                ),
+              }
+            : prev
+        );
+        setFbDevices((prev) =>
+          prev.map((d) => (d.deviceId === updatedDev.deviceId ? updatedDev : d))
+        );
+      }
+      await loadSnapshot(true, true);
       if (dev.deviceId === myDeviceId) {
         onRemoteLockChange?.(!dev.isLocked, dev.lockReason || '');
       }
@@ -265,10 +337,30 @@ export default function OwnerControlDashboard({
 
   const handleDeviceApproval = async (dev: DeviceClient, approve: boolean) => {
     setBusyKey(`apr_${dev.deviceId}`);
+    actionSeqRef.current += 1;
     try {
       const action = approve ? 'approve_device' : 'reject_device';
-      await postOwnerAction({ action, deviceId: dev.deviceId });
-      await loadSnapshot(true);
+      const res = await postOwnerAction({ action, deviceId: dev.deviceId });
+      actionSeqRef.current += 1;
+      const updatedDev: DeviceClient = res?.device || {
+        ...dev,
+        approvalStatus: approve ? 'approved' : 'rejected',
+        updatedAtMs: Date.now(),
+      };
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              devices: prev.devices.map((d) =>
+                d.deviceId === updatedDev.deviceId ? updatedDev : d
+              ),
+            }
+          : prev
+      );
+      setFbDevices((prev) =>
+        prev.map((d) => (d.deviceId === updatedDev.deviceId ? updatedDev : d))
+      );
+      await loadSnapshot(true, true);
       flashBanner(
         'ok',
         approve
@@ -284,9 +376,20 @@ export default function OwnerControlDashboard({
 
   const handleDeleteDevice = async (dev: DeviceClient) => {
     setBusyKey(`del_${dev.deviceId}`);
+    actionSeqRef.current += 1;
     try {
       await postOwnerAction({ action: 'delete_device', deviceId: dev.deviceId });
-      await loadSnapshot(true);
+      actionSeqRef.current += 1;
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              devices: prev.devices.filter((d) => d.deviceId !== dev.deviceId),
+            }
+          : prev
+      );
+      setFbDevices((prev) => prev.filter((d) => d.deviceId !== dev.deviceId));
+      await loadSnapshot(true, true);
       flashBanner('ok', `Removed ${dev.deviceName}`);
     } catch (err: any) {
       flashBanner('err', err?.message || 'Remove failed');
@@ -309,16 +412,28 @@ export default function OwnerControlDashboard({
     );
 
     setBusyKey('send_notif');
+    actionSeqRef.current += 1;
     try {
-      await postOwnerAction({
+      const res = await postOwnerAction({
         action: 'send_notification',
         targetDeviceId: notifTarget,
         title: notifTitle.trim() || 'CBEBirr',
         message: msg,
         durationSeconds,
       });
+      actionSeqRef.current += 1;
       setNotifMessage('');
-      await loadSnapshot(true);
+      if (res?.notification) {
+        setSnapshot((prev) =>
+          prev
+            ? {
+                ...prev,
+                notifications: [res.notification, ...(prev.notifications || [])],
+              }
+            : prev
+        );
+      }
+      await loadSnapshot(true, true);
       flashBanner(
         'ok',
         `Notification dispatched (${durationSeconds}s) → ${notifTarget === 'all' ? 'All Devices' : notifTarget}`
@@ -432,7 +547,7 @@ export default function OwnerControlDashboard({
 
             <button
               type="button"
-              onClick={() => loadSnapshot(false)}
+              onClick={() => void loadSnapshot(false, true)}
               className="w-8 h-8 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-200 cursor-pointer"
               aria-label="Refresh"
             >
@@ -511,7 +626,10 @@ export default function OwnerControlDashboard({
           <input
             type="text"
             value={globalLockMsgInput}
-            onChange={(e) => setGlobalLockMsgInput(e.target.value)}
+            onChange={(e) => {
+              globalMsgDirtyRef.current = true;
+              setGlobalLockMsgInput(e.target.value);
+            }}
             placeholder="Custom lock screen message..."
             maxLength={200}
             className="mt-2 w-full bg-[#17212b] border border-white/10 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-500 outline-none focus:border-[#5eb5f7]"
@@ -574,8 +692,9 @@ export default function OwnerControlDashboard({
             ) : (
               devicesList.map((dev, index) => {
                 const isMe = dev.deviceId === myDeviceId;
-                const isPending = dev.approvalStatus === 'pending';
-                const isRejected = dev.approvalStatus === 'rejected';
+                const effectiveStatus = dev.approvalStatus || 'approved';
+                const isPending = effectiveStatus === 'pending';
+                const isRejected = effectiveStatus === 'rejected';
                 return (
                   <div
                     key={dev.deviceId}
@@ -968,10 +1087,21 @@ export default function OwnerControlDashboard({
                   <button
                     type="button"
                     onClick={async () => {
-                      await postOwnerAction({ action: 'clear_notifications' });
-                      await loadSnapshot(true);
+                      setBusyKey('clear_notifs');
+                      actionSeqRef.current += 1;
+                      try {
+                        await postOwnerAction({ action: 'clear_notifications' });
+                        actionSeqRef.current += 1;
+                        setSnapshot((prev) => (prev ? { ...prev, notifications: [] } : prev));
+                        await loadSnapshot(true, true);
+                      } catch (err: any) {
+                        flashBanner('err', err?.message || 'Failed to clear notifications');
+                      } finally {
+                        setBusyKey('');
+                      }
                     }}
-                    className="text-[10px] text-rose-300 hover:underline cursor-pointer"
+                    disabled={busyKey === 'clear_notifs'}
+                    className="text-[10px] text-rose-300 hover:underline cursor-pointer disabled:opacity-50"
                   >
                     Clear All
                   </button>

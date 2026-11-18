@@ -16,6 +16,7 @@ import {
 import {
   fsDeleteDocument,
   fsGetDocument,
+  fsGetDocumentResult,
   fsListCollection,
   fsPatchFields,
   fsSetDocument,
@@ -50,6 +51,35 @@ function parseRemoteUpdatedMs(doc: Record<string, unknown>, fallbackMs: number):
   return Math.max(numField, tsField, fallbackMs);
 }
 
+function normalizePhoneComparable(raw: string): string {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (digits.startsWith('251') && digits.length > 9) {
+    digits = digits.slice(3);
+  }
+  if (digits.startsWith('0') && digits.length > 9) {
+    digits = digits.slice(1);
+  }
+  return digits.slice(-9);
+}
+
+function normalizeTextComparable(raw: string): string {
+  return String(raw || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function parseApprovalStatus(
+  raw: unknown,
+  fallback: DeviceApprovalStatus = 'approved'
+): DeviceApprovalStatus {
+  const v = String(raw || '');
+  if (v === 'pending' || v === 'approved' || v === 'rejected') {
+    return v;
+  }
+  return fallback;
+}
+
 interface StoreState {
   devices: Map<string, DeviceClient>;
   transactions: Map<string, DeviceTransaction>;
@@ -57,6 +87,7 @@ interface StoreState {
   supportSessions: Map<string, SupportSession>;
   supportFetchAtMs: Map<string, number>;
   knownDevicesInFirestore: Set<string>;
+  recentLocalMutations: Map<string, number>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
   lastNotifFirestoreSyncMs: number;
@@ -80,6 +111,7 @@ if (!g.__ownerStore) {
     supportSessions: new Map(),
     supportFetchAtMs: new Map(),
     knownDevicesInFirestore: new Set(),
+    recentLocalMutations: new Map(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
     lastNotifFirestoreSyncMs: 0,
@@ -90,6 +122,21 @@ const state = g.__ownerStore;
 if (!state.supportSessions) state.supportSessions = new Map();
 if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
 if (!state.knownDevicesInFirestore) state.knownDevicesInFirestore = new Set();
+if (!state.recentLocalMutations) state.recentLocalMutations = new Map();
+
+function markLocalMutation(key: string, nowMs = Date.now()): void {
+  state.recentLocalMutations.set(key, nowMs);
+  if (state.recentLocalMutations.size > 500) {
+    for (const [k, ts] of state.recentLocalMutations.entries()) {
+      if (nowMs - ts > 15_000) state.recentLocalMutations.delete(k);
+    }
+  }
+}
+
+function hasRecentLocalMutation(key: string, withinMs = 3000, nowMs = Date.now()): boolean {
+  const ts = state.recentLocalMutations.get(key);
+  return Boolean(ts && nowMs - ts < withinMs);
+}
 
 function loadFromDisk(): void {
   try {
@@ -117,9 +164,7 @@ function loadFromDisk(): void {
       }
     }
     if (parsed.globalConfig?.configId === 'global') {
-      if (
-        parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs
-      ) {
+      if (parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs) {
         state.globalConfig = parsed.globalConfig;
       }
     }
@@ -145,25 +190,91 @@ function saveToDisk(): void {
 
 loadFromDisk();
 
+function buildDeviceFromFsDoc(id: string, d: Record<string, unknown>, nowMs = Date.now()): DeviceClient {
+  const remoteSeen = safeNum(d.lastSeenAtMs, 0);
+  const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
+  const remoteStatus = parseApprovalStatus(d.approvalStatus, 'approved');
+  return {
+    deviceId: id,
+    deviceName: clampStr(d.deviceName, 120, 'Android Device'),
+    platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
+      ? d.platform
+      : 'web') as DevicePlatform,
+    appVersion: clampStr(d.appVersion, 40, '1.0.105'),
+    userName: clampStr(d.userName, 120, ''),
+    phoneNumber: clampStr(d.phoneNumber, 32, ''),
+    userAccount: clampStr(d.userAccount, 64, ''),
+    balance: safeNum(d.balance, 0),
+    isLocked: Boolean(d.isLocked),
+    lockReason: clampStr(d.lockReason, 240, ''),
+    approvalStatus: remoteStatus,
+    lastSeenAtMs: remoteSeen,
+    createdAtMs: safeNum(d.createdAtMs, remoteSeen || nowMs),
+    updatedAtMs: remoteUpdated,
+  };
+}
+
+async function persistDeviceToFirestoreStrict(device: DeviceClient, usePatchFirst: boolean, fields?: Record<string, unknown>): Promise<void> {
+  if (!isFirestoreServerConfigured()) return;
+  const nowMs = Date.now();
+  const fullPayload = {
+    deviceId: device.deviceId,
+    deviceName: device.deviceName,
+    platform: device.platform,
+    appVersion: device.appVersion,
+    userName: device.userName,
+    phoneNumber: device.phoneNumber,
+    userAccount: device.userAccount,
+    balance: device.balance,
+    isLocked: device.isLocked,
+    lockReason: device.lockReason || '',
+    approvalStatus: device.approvalStatus || 'approved',
+    lastSeenAtMs: device.lastSeenAtMs,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAtMs: device.createdAtMs || nowMs,
+    updatedAtMs: device.updatedAtMs || nowMs,
+    createdAt: new Date(device.createdAtMs || nowMs),
+    updatedAt: new Date(device.updatedAtMs || nowMs),
+  };
+
+  if (usePatchFirst && fields) {
+    const okPatch = await fsPatchFields('devices', device.deviceId, fields);
+    if (okPatch) {
+      state.knownDevicesInFirestore.add(device.deviceId);
+      return;
+    }
+  }
+
+  let okSet = await fsSetDocument('devices', device.deviceId, fullPayload);
+  if (!okSet) {
+    okSet = await fsSetDocument('devices', device.deviceId, fullPayload);
+  }
+  if (!okSet) {
+    throw new Error('Failed to persist device change to Firestore');
+  }
+  state.knownDevicesInFirestore.add(device.deviceId);
+}
+
 async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
   const now = Date.now();
-  if (!force && now - state.lastFirestoreSyncMs < 4000) {
+  if (!force && now - state.lastFirestoreSyncMs < 1500) {
     return isFirestoreServerConfigured();
   }
 
-  const [fsConfig, fsDevices, fsTxs, fsNotifs] = await Promise.all([
-    fsGetDocument<Record<string, unknown>>('owner_config', 'global'),
-    fsListCollection<Record<string, unknown>>('devices', 200),
+  const [fsConfigRes, fsDevices, fsTxs, fsNotifs] = await Promise.all([
+    fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global'),
+    fsListCollection<Record<string, unknown>>('devices', 250),
     fsListCollection<Record<string, unknown>>('device_transactions', 300),
     fsListCollection<Record<string, unknown>>('owner_notifications', 150),
   ]);
 
   let syncedAny = false;
 
-  if (fsConfig && fsConfig.configId === 'global') {
+  if (fsConfigRes.ok && fsConfigRes.found && fsConfigRes.data?.configId === 'global') {
     syncedAny = true;
+    const fsConfig = fsConfigRes.data;
     const remoteUpdated = safeNum(fsConfig.updatedAtMs, 0);
-    if (remoteUpdated >= state.globalConfig.updatedAtMs) {
+    if (!hasRecentLocalMutation('global', 3000, now) || remoteUpdated >= state.globalConfig.updatedAtMs) {
       state.globalConfig = {
         configId: 'global',
         globalLocked: Boolean(fsConfig.globalLocked),
@@ -180,38 +291,54 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
 
   if (fsDevices) {
     syncedAny = true;
+    const remoteIds = new Set<string>();
     for (const d of fsDevices) {
       const id = sanitizeId(String(d.deviceId || ''));
       if (!id) continue;
+      if (hasRecentLocalMutation(`del:${id}`, 4000, now)) continue;
+      remoteIds.add(id);
       state.knownDevicesInFirestore.add(id);
+
       const existing = state.devices.get(id);
-      const remoteSeen = safeNum(d.lastSeenAtMs, 0);
-      const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
-      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
-      const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
-      if (
-        !existing ||
-        remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs) ||
-        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending')
-      ) {
-        state.devices.set(id, {
-          deviceId: id,
-          deviceName: clampStr(d.deviceName, 120, 'Android Device'),
-          platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
-            ? d.platform
-            : 'web') as DevicePlatform,
-          appVersion: clampStr(d.appVersion, 40, '1.0.0'),
-          userName: clampStr(d.userName, 120, 'Unknown User'),
-          phoneNumber: clampStr(d.phoneNumber, 32, ''),
-          userAccount: clampStr(d.userAccount, 64, ''),
-          balance: safeNum(d.balance, 0),
-          isLocked: Boolean(d.isLocked),
-          lockReason: clampStr(d.lockReason, 240, ''),
-          approvalStatus: remoteStatus,
-          lastSeenAtMs: remoteSeen,
-          createdAtMs: safeNum(d.createdAtMs, remoteSeen),
-          updatedAtMs: remoteUpdated,
-        });
+      const remoteDev = buildDeviceFromFsDoc(id, d, now);
+
+      if (!existing) {
+        state.devices.set(id, remoteDev);
+        continue;
+      }
+
+      // If this lambda did not mutate this device in the last 3s, Firestore approval & lock state is strictly authoritative.
+      const keepLocalDecision =
+        hasRecentLocalMutation(`dev:${id}`, 3000, now) &&
+        (existing.updatedAtMs || 0) > (remoteDev.updatedAtMs || 0);
+
+      const remoteUpdated = remoteDev.updatedAtMs || 0;
+      const existingUpdated = existing.updatedAtMs || existing.lastSeenAtMs || 0;
+      const takeRemoteProfile = remoteUpdated >= existingUpdated;
+
+      state.devices.set(id, {
+        deviceId: id,
+        deviceName: takeRemoteProfile ? (remoteDev.deviceName || existing.deviceName) : existing.deviceName,
+        platform: takeRemoteProfile ? remoteDev.platform : existing.platform,
+        appVersion: takeRemoteProfile ? (remoteDev.appVersion || existing.appVersion) : existing.appVersion,
+        userName: takeRemoteProfile ? (remoteDev.userName || existing.userName) : (existing.userName || remoteDev.userName),
+        phoneNumber: takeRemoteProfile ? (remoteDev.phoneNumber || existing.phoneNumber) : (existing.phoneNumber || remoteDev.phoneNumber),
+        userAccount: takeRemoteProfile ? (remoteDev.userAccount || existing.userAccount) : (existing.userAccount || remoteDev.userAccount),
+        balance: takeRemoteProfile ? remoteDev.balance : existing.balance,
+        lastSeenAtMs: Math.max(remoteDev.lastSeenAtMs || 0, existing.lastSeenAtMs || 0),
+        createdAtMs: Math.min(remoteDev.createdAtMs || now, existing.createdAtMs || now),
+        updatedAtMs: Math.max(remoteUpdated, existingUpdated),
+        approvalStatus: keepLocalDecision ? existing.approvalStatus : remoteDev.approvalStatus,
+        isLocked: keepLocalDecision ? existing.isLocked : remoteDev.isLocked,
+        lockReason: keepLocalDecision ? existing.lockReason : remoteDev.lockReason,
+      });
+    }
+
+    // Prune devices that were deleted in Firestore from local cache (unless freshly created on this lambda in last 4s)
+    for (const cachedId of Array.from(state.devices.keys())) {
+      if (!remoteIds.has(cachedId) && !hasRecentLocalMutation(`dev:${cachedId}`, 4000, now)) {
+        state.devices.delete(cachedId);
+        state.knownDevicesInFirestore.delete(cachedId);
       }
     }
   }
@@ -249,9 +376,11 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
 
   if (fsNotifs) {
     syncedAny = true;
+    const remoteNotifIds = new Set<string>();
     for (const n of fsNotifs) {
       const notifId = sanitizeId(String(n.notifId || ''));
       if (!notifId) continue;
+      remoteNotifIds.add(notifId);
       state.notifications.set(notifId, {
         notifId,
         targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
@@ -263,13 +392,20 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
         expiresAtMs: safeNum(n.expiresAtMs, Date.now() + 30_000),
       });
     }
+    if (!hasRecentLocalMutation('notifs_clear', 4000, now)) {
+      for (const localNotifId of Array.from(state.notifications.keys())) {
+        if (!remoteNotifIds.has(localNotifId) && !hasRecentLocalMutation(`notif:${localNotifId}`, 4000, now)) {
+          state.notifications.delete(localNotifId);
+        }
+      }
+    }
   }
 
   if (syncedAny) {
     state.lastFirestoreSyncMs = now;
     saveToDisk();
   }
-  return syncedAny;
+  return syncedAny || isFirestoreServerConfigured();
 }
 
 export async function syncDeviceHeartbeat(input: {
@@ -294,62 +430,72 @@ export async function syncDeviceHeartbeat(input: {
   profileChangedSummary?: string;
 }> {
   loadFromDisk();
-  await syncFromFirestoreIfAvailable(false);
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
-  let prev = state.devices.get(deviceId);
+  const fsConfigured = isFirestoreServerConfigured();
 
-  // When a device is waiting on approval or re-checking status, read the single device doc directly from Firestore
-  // so cross-instance owner decisions propagate immediately without delay.
-  let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
-  if (
-    input.forceApprovalCheck ||
-    input.registerRequest ||
-    !prev ||
-    prev.approvalStatus !== 'approved'
-  ) {
-    const freshDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
-    if (freshDoc && freshDoc.deviceId) {
-      remoteDocExists = true;
-      state.knownDevicesInFirestore.add(deviceId);
-      const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
-      const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
-      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
-      const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
-      const remoteLocked = Boolean(freshDoc.isLocked);
-      const remoteLockReason = clampStr(freshDoc.lockReason, 240, '');
+  // Read device doc + global config directly in parallel on every heartbeat when Firestore is configured,
+  // so lock/unlock/approve/reject/notifications propagate within 1 poll across all serverless lambdas.
+  const [fsDevRes, fsGlobalRes, activeNotifsFromFs] = await Promise.all([
+    fsConfigured
+      ? fsGetDocumentResult<Record<string, unknown>>('devices', deviceId)
+      : Promise.resolve({ ok: false, found: false, data: null }),
+    fsConfigured
+      ? fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global')
+      : Promise.resolve({ ok: false, found: false, data: null }),
+    getActiveNotificationsForDevices([deviceId], false).catch(() => null),
+  ]);
 
-      if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
-        prev = {
-          deviceId,
-          deviceName: clampStr(freshDoc.deviceName, 120, 'Android Device'),
-          platform: (['android-apk', 'web-pwa', 'web'].includes(String(freshDoc.platform))
-            ? freshDoc.platform
-            : 'web') as DevicePlatform,
-          appVersion: clampStr(freshDoc.appVersion, 40, '1.0.105'),
-          userName: clampStr(freshDoc.userName, 120, ''),
-          phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
-          userAccount: clampStr(freshDoc.userAccount, 64, ''),
-          balance: safeNum(freshDoc.balance, 500),
-          isLocked: remoteLocked,
-          lockReason: remoteLockReason,
-          approvalStatus: remoteStatus,
-          lastSeenAtMs: remoteSeen,
-          createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
-          updatedAtMs: remoteUpdated,
-        };
-      } else {
-        // Always treat remote approvalStatus and lock state as authoritative across serverless instances
-        prev = {
-          ...prev,
-          approvalStatus: remoteStatus,
-          isLocked: remoteLocked,
-          lockReason: remoteLockReason,
-        };
-      }
-      state.devices.set(deviceId, prev);
+  if (fsGlobalRes.ok && fsGlobalRes.found && fsGlobalRes.data?.configId === 'global') {
+    const remoteUpdated = safeNum(fsGlobalRes.data.updatedAtMs, 0);
+    if (!hasRecentLocalMutation('global', 3000, nowMs) || remoteUpdated >= state.globalConfig.updatedAtMs) {
+      state.globalConfig = {
+        configId: 'global',
+        globalLocked: Boolean(fsGlobalRes.data.globalLocked),
+        globalLockMessage: clampStr(
+          fsGlobalRes.data.globalLockMessage,
+          240,
+          DEFAULT_GLOBAL_CONFIG.globalLockMessage
+        ),
+        updatedBy: (fsGlobalRes.data.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
+        updatedAtMs: remoteUpdated,
+      };
     }
+  }
+
+  let prev = state.devices.get(deviceId);
+  let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
+
+  if (fsDevRes.ok && fsDevRes.found && fsDevRes.data?.deviceId) {
+    remoteDocExists = true;
+    state.knownDevicesInFirestore.add(deviceId);
+    const remoteDev = buildDeviceFromFsDoc(deviceId, fsDevRes.data, nowMs);
+    const keepLocalDecision =
+      hasRecentLocalMutation(`dev:${deviceId}`, 3000, nowMs) &&
+      (prev?.updatedAtMs || 0) > (remoteDev.updatedAtMs || 0);
+
+    if (!prev || (remoteDev.updatedAtMs || 0) >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
+      prev = {
+        ...remoteDev,
+        approvalStatus: keepLocalDecision ? prev?.approvalStatus : remoteDev.approvalStatus,
+        isLocked: keepLocalDecision ? (prev?.isLocked ?? remoteDev.isLocked) : remoteDev.isLocked,
+        lockReason: keepLocalDecision ? (prev?.lockReason ?? remoteDev.lockReason) : remoteDev.lockReason,
+      };
+    } else {
+      // Authoritative remote owner status & lock state even when heartbeats bump updatedAtMs locally
+      prev = {
+        ...prev,
+        approvalStatus: keepLocalDecision ? prev.approvalStatus : remoteDev.approvalStatus,
+        isLocked: keepLocalDecision ? prev.isLocked : remoteDev.isLocked,
+        lockReason: keepLocalDecision ? prev.lockReason : remoteDev.lockReason,
+      };
+    }
+    state.devices.set(deviceId, prev);
+  } else if (fsDevRes.ok && !fsDevRes.found) {
+    // Document was explicitly not found (404) in Firestore — e.g. deleted by owner
+    remoteDocExists = false;
+    state.knownDevicesInFirestore.delete(deviceId);
   }
 
   const isNewDevice = !prev;
@@ -365,33 +511,47 @@ export async function syncDeviceHeartbeat(input: {
   const reqAccount = clampStr(input.userAccount, 64, '');
   const sameRegisteredIdentity = Boolean(
     prev &&
-      (!reqUserName || prev.userName === reqUserName) &&
-      (!reqPhone || prev.phoneNumber === reqPhone) &&
-      (!reqAccount || prev.userAccount === reqAccount)
+      (!reqUserName || normalizeTextComparable(prev.userName) === normalizeTextComparable(reqUserName)) &&
+      (!reqPhone || normalizePhoneComparable(prev.phoneNumber) === normalizePhoneComparable(reqPhone)) &&
+      (!reqAccount || normalizeTextComparable(prev.userAccount) === normalizeTextComparable(reqAccount))
   );
 
   let nextApprovalStatus: DeviceApprovalStatus;
   let isNewRegistrationRequest = false;
-  if (input.registerRequest) {
-    if (prev?.approvalStatus === 'rejected') {
-      nextApprovalStatus = 'rejected';
-    } else if (prev?.approvalStatus === 'approved' && (!input.freshRegistration || sameRegisteredIdentity)) {
-      nextApprovalStatus = 'approved';
-    } else if (input.freshRegistration) {
+
+  if (prev?.approvalStatus === 'rejected') {
+    nextApprovalStatus = 'rejected';
+  } else if (prev?.approvalStatus === 'approved') {
+    // CRITICAL: Once a device is approved, NEVER revert it to pending from polling retries,
+    // offline beacons, or normal reconnects — only a brand-new identity submission resets approval.
+    if (input.registerRequest && input.freshRegistration && !sameRegisteredIdentity) {
       nextApprovalStatus = 'pending';
       isNewRegistrationRequest = true;
     } else {
+      nextApprovalStatus = 'approved';
+    }
+  } else if (input.registerRequest) {
+    if (fsConfigured && !fsDevRes.ok && input.clientGateState === 'approved') {
+      // Transient Firestore read timeout on a locally-approved device: do NOT downgrade!
+      nextApprovalStatus = 'approved';
+    } else {
       nextApprovalStatus = 'pending';
-      if (!prev || prev.approvalStatus !== 'pending' || (input.userName && input.userName !== prev.userName)) {
+      if (
+        input.freshRegistration ||
+        !prev ||
+        prev.approvalStatus !== 'pending' ||
+        (reqUserName && normalizeTextComparable(reqUserName) !== normalizeTextComparable(prev.userName))
+      ) {
         isNewRegistrationRequest = true;
       }
     }
   } else if (prev) {
     nextApprovalStatus = prev.approvalStatus || (checkMode ? 'pending' : 'approved');
   } else {
-    nextApprovalStatus = !checkMode && !input.offline && input.clientGateState === 'approved'
-      ? 'approved'
-      : 'pending';
+    nextApprovalStatus =
+      !checkMode && input.clientGateState === 'approved'
+        ? 'approved'
+        : 'pending';
   }
 
   const nextUserName = clampStr(input.userName, 120, prev?.userName || '');
@@ -442,14 +602,13 @@ export async function syncDeviceHeartbeat(input: {
   state.devices.set(deviceId, nextDevice);
   saveToDisk();
 
-  // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write.
-  // CRITICAL: For existing devices that aren't resetting registration, use fsPatchFields (updateMask)
-  // WITHOUT approvalStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
+  // CRITICAL: Only write full document (including approvalStatus/isLocked) when creating a doc
+  // that was confirmed missing (404) or explicitly starting a new registration request.
+  // Never clobber Firestore security fields on transient read errors (fsDevRes.ok === false)!
   const shouldWriteFullDoc =
-    !remoteDocExists ||
-    isNewDevice ||
+    (fsConfigured ? fsDevRes.ok && !fsDevRes.found : !remoteDocExists) ||
     isNewRegistrationRequest ||
-    prev?.approvalStatus !== nextApprovalStatus;
+    (Boolean(prev) && prev?.approvalStatus !== nextApprovalStatus && (!fsConfigured || fsDevRes.ok));
 
   if (shouldWriteFullDoc) {
     const ok = await fsSetDocument('devices', deviceId, {
@@ -473,6 +632,7 @@ export async function syncDeviceHeartbeat(input: {
     }).catch(() => false);
     if (ok) state.knownDevicesInFirestore.add(deviceId);
   } else {
+    // Only patch non-security telemetry fields via updateMask
     await fsPatchFields('devices', deviceId, {
       deviceName: nextDevice.deviceName,
       platform: nextDevice.platform,
@@ -487,15 +647,17 @@ export async function syncDeviceHeartbeat(input: {
     }).catch(() => {});
   }
 
-  const activeNotifs = Array.from(state.notifications.values())
-    .filter((n) => {
-      const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
-      return (
-        deliveryDeadlineMs > nowMs &&
-        (n.targetDeviceId === 'all' || n.targetDeviceId === deviceId)
-      );
-    })
-    .sort((a, b) => a.createdAtMs - b.createdAtMs);
+  const activeNotifs =
+    activeNotifsFromFs ||
+    Array.from(state.notifications.values())
+      .filter((n) => {
+        const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
+        return (
+          deliveryDeadlineMs > nowMs &&
+          (n.targetDeviceId === 'all' || n.targetDeviceId === deviceId)
+        );
+      })
+      .sort((a, b) => a.createdAtMs - b.createdAtMs);
 
   const effectiveLocked = Boolean(state.globalConfig.globalLocked || nextDevice.isLocked);
   const lockMessage = nextDevice.isLocked
@@ -554,10 +716,18 @@ export async function logDeviceTransaction(input: {
   status?: 'Completed' | 'Pending' | 'Failed';
 }): Promise<{ tx: DeviceTransaction; device: DeviceClient }> {
   loadFromDisk();
-  await syncFromFirestoreIfAvailable(false);
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
+
+  if (isFirestoreServerConfigured() && !state.knownDevicesInFirestore.has(deviceId)) {
+    const fsDevRes = await fsGetDocumentResult<Record<string, unknown>>('devices', deviceId);
+    if (fsDevRes.ok && fsDevRes.found && fsDevRes.data?.deviceId) {
+      state.knownDevicesInFirestore.add(deviceId);
+      state.devices.set(deviceId, buildDeviceFromFsDoc(deviceId, fsDevRes.data, nowMs));
+    }
+  }
+
   const prevDev = state.devices.get(deviceId);
 
   const balanceAfter =
@@ -676,7 +846,6 @@ export async function setGlobalLock(
   message?: string
 ): Promise<OwnerGlobalConfig> {
   loadFromDisk();
-  await syncFromFirestoreIfAvailable(false);
   const nowMs = Date.now();
   const next: OwnerGlobalConfig = {
     configId: 'global',
@@ -691,50 +860,44 @@ export async function setGlobalLock(
     updatedBy,
     updatedAtMs: nowMs,
   };
+  markLocalMutation('global', nowMs);
   state.globalConfig = next;
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  await fsSetDocument('owner_config', 'global', {
-    ...next,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAt: new Date(nowMs),
-    updatedAt: new Date(nowMs),
-  }).catch(() => {});
+  if (isFirestoreServerConfigured()) {
+    const payload = {
+      ...next,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAt: new Date(nowMs),
+      updatedAt: new Date(nowMs),
+    };
+    let ok = await fsSetDocument('owner_config', 'global', payload);
+    if (!ok) ok = await fsSetDocument('owner_config', 'global', payload);
+    if (!ok) {
+      throw new Error('Failed to save Global Lock state to Firestore');
+    }
+  }
 
   return next;
 }
 
 async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClient | null; inFirestore: boolean }> {
-  const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
-  if (fsDoc && fsDoc.deviceId) {
+  const fsRes = await fsGetDocumentResult<Record<string, unknown>>('devices', deviceId);
+  if (fsRes.ok && fsRes.found && fsRes.data?.deviceId) {
     state.knownDevicesInFirestore.add(deviceId);
-    const remoteSeen = safeNum(fsDoc.lastSeenAtMs, Date.now());
-    const remoteUpdated = parseRemoteUpdatedMs(fsDoc, remoteSeen);
-    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(fsDoc.approvalStatus));
-    const remoteStatus = (hasValidStatus ? fsDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
-    const loaded: DeviceClient = {
-      deviceId,
-      deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
-      platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
-        ? fsDoc.platform
-        : 'web') as DevicePlatform,
-      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.105'),
-      userName: clampStr(fsDoc.userName, 120, ''),
-      phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
-      userAccount: clampStr(fsDoc.userAccount, 64, ''),
-      balance: safeNum(fsDoc.balance, 500),
-      isLocked: Boolean(fsDoc.isLocked),
-      lockReason: clampStr(fsDoc.lockReason, 240, ''),
-      approvalStatus: remoteStatus,
-      lastSeenAtMs: remoteSeen,
-      createdAtMs: safeNum(fsDoc.createdAtMs, remoteSeen),
-      updatedAtMs: remoteUpdated,
-    };
+    const loaded = buildDeviceFromFsDoc(deviceId, fsRes.data);
     state.devices.set(deviceId, loaded);
     return { dev: loaded, inFirestore: true };
   }
   const cached = state.devices.get(deviceId) || null;
-  return { dev: cached, inFirestore: Boolean(cached && state.knownDevicesInFirestore.has(deviceId)) };
+  if (cached) {
+    return { dev: cached, inFirestore: state.knownDevicesInFirestore.has(deviceId) };
+  }
+  // Fallback full collection sync before declaring 404
+  await syncFromFirestoreIfAvailable(true);
+  const synced = state.devices.get(deviceId) || null;
+  return { dev: synced, inFirestore: Boolean(synced && state.knownDevicesInFirestore.has(deviceId)) };
 }
 
 export async function setDeviceLock(
@@ -756,38 +919,17 @@ export async function setDeviceLock(
       : '',
     updatedAtMs: nowMs,
   };
+  markLocalMutation(`dev:${deviceId}`, nowMs);
   state.devices.set(deviceId, next);
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  if (inFirestore) {
-    await fsPatchFields('devices', deviceId, {
-      isLocked: next.isLocked,
-      lockReason: next.lockReason || '',
-      updatedAtMs: nowMs,
-      updatedAt: new Date(nowMs),
-    }).catch(() => {});
-  } else {
-    const ok = await fsSetDocument('devices', deviceId, {
-      deviceId: next.deviceId,
-      deviceName: next.deviceName,
-      platform: next.platform,
-      appVersion: next.appVersion,
-      userName: next.userName,
-      phoneNumber: next.phoneNumber,
-      userAccount: next.userAccount,
-      balance: next.balance,
-      isLocked: next.isLocked,
-      lockReason: next.lockReason || '',
-      approvalStatus: next.approvalStatus || 'pending',
-      lastSeenAtMs: next.lastSeenAtMs,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAtMs: next.createdAtMs || nowMs,
-      updatedAtMs: nowMs,
-      createdAt: new Date(next.createdAtMs || nowMs),
-      updatedAt: new Date(nowMs),
-    }).catch(() => false);
-    if (ok) state.knownDevicesInFirestore.add(deviceId);
-  }
+  await persistDeviceToFirestoreStrict(next, inFirestore, {
+    isLocked: next.isLocked,
+    lockReason: next.lockReason || '',
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  });
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
@@ -807,37 +949,16 @@ export async function setDeviceApproval(
     approvalStatus,
     updatedAtMs: nowMs,
   };
+  markLocalMutation(`dev:${deviceId}`, nowMs);
   state.devices.set(deviceId, next);
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  if (inFirestore) {
-    await fsPatchFields('devices', deviceId, {
-      approvalStatus: next.approvalStatus,
-      updatedAtMs: nowMs,
-      updatedAt: new Date(nowMs),
-    }).catch(() => {});
-  } else {
-    const ok = await fsSetDocument('devices', deviceId, {
-      deviceId: next.deviceId,
-      deviceName: next.deviceName,
-      platform: next.platform,
-      appVersion: next.appVersion,
-      userName: next.userName,
-      phoneNumber: next.phoneNumber,
-      userAccount: next.userAccount,
-      balance: next.balance,
-      isLocked: next.isLocked,
-      lockReason: next.lockReason || '',
-      approvalStatus: next.approvalStatus,
-      lastSeenAtMs: next.lastSeenAtMs,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAtMs: next.createdAtMs || nowMs,
-      updatedAtMs: nowMs,
-      createdAt: new Date(next.createdAtMs || nowMs),
-      updatedAt: new Date(nowMs),
-    }).catch(() => false);
-    if (ok) state.knownDevicesInFirestore.add(deviceId);
-  }
+  await persistDeviceToFirestoreStrict(next, inFirestore, {
+    approvalStatus: next.approvalStatus,
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  });
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
@@ -866,14 +987,24 @@ export async function createOwnerNotification(input: {
     expiresAtMs: nowMs + dur * 1000,
   };
 
+  markLocalMutation(`notif:${notifId}`, nowMs);
   state.notifications.set(notifId, notif);
+  state.lastNotifFirestoreSyncMs = 0;
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  await fsSetDocument('owner_notifications', notifId, {
-    ...notif,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAt: new Date(nowMs),
-  }).catch(() => {});
+  if (isFirestoreServerConfigured()) {
+    const payload = {
+      ...notif,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAt: new Date(nowMs),
+    };
+    let ok = await fsSetDocument('owner_notifications', notifId, payload);
+    if (!ok) ok = await fsSetDocument('owner_notifications', notifId, payload);
+    if (!ok) {
+      throw new Error('Failed to save notification to Firestore');
+    }
+  }
 
   return notif;
 }
@@ -881,33 +1012,64 @@ export async function createOwnerNotification(input: {
 export async function removeDeviceRecord(deviceIdInput: string): Promise<boolean> {
   loadFromDisk();
   const deviceId = sanitizeId(deviceIdInput);
+  const nowMs = Date.now();
+  markLocalMutation(`del:${deviceId}`, nowMs);
   const existed = state.devices.delete(deviceId);
+  state.knownDevicesInFirestore.delete(deviceId);
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
-  await fsDeleteDocument('devices', deviceId).catch(() => {});
+
+  if (isFirestoreServerConfigured()) {
+    let ok = await fsDeleteDocument('devices', deviceId);
+    if (!ok) ok = await fsDeleteDocument('devices', deviceId);
+    if (!ok) {
+      throw new Error('Failed to remove device from Firestore');
+    }
+    return true;
+  }
+
   return existed;
 }
 
 export async function clearNotificationsHistory(): Promise<void> {
   loadFromDisk();
-  const ids = Array.from(state.notifications.keys());
+  const nowMs = Date.now();
+  markLocalMutation('notifs_clear', nowMs);
+  const ids = new Set<string>(state.notifications.keys());
+  if (isFirestoreServerConfigured()) {
+    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 150).catch(() => null);
+    if (fsNotifs) {
+      for (const n of fsNotifs) {
+        const id = sanitizeId(String(n.notifId || ''));
+        if (id) ids.add(id);
+      }
+    }
+  }
   state.notifications.clear();
+  state.lastNotifFirestoreSyncMs = 0;
+  state.lastFirestoreSyncMs = 0;
   saveToDisk();
-  await Promise.all(ids.map((id) => fsDeleteDocument('owner_notifications', id))).catch(() => {});
+  if (ids.size > 0) {
+    await Promise.all(Array.from(ids).map((id) => fsDeleteDocument('owner_notifications', id))).catch(() => {});
+  }
 }
 
 export async function getActiveNotificationsForDevices(
-  deviceIds: string[]
+  deviceIds: string[],
+  useCache = true
 ): Promise<OwnerNotification[]> {
   loadFromDisk();
   const nowMs = Date.now();
-  const lastSync = Math.max(state.lastNotifFirestoreSyncMs || 0, state.lastFirestoreSyncMs || 0);
-  if (nowMs - lastSync >= 4000) {
-    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 40).catch(() => null);
+  const lastSync = state.lastNotifFirestoreSyncMs || 0;
+  if (isFirestoreServerConfigured() && (!useCache || nowMs - lastSync >= 2000)) {
+    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 80).catch(() => null);
     state.lastNotifFirestoreSyncMs = nowMs;
     if (fsNotifs) {
+      const remoteIds = new Set<string>();
       for (const n of fsNotifs) {
         const notifId = sanitizeId(String(n.notifId || ''));
         if (!notifId) continue;
+        remoteIds.add(notifId);
         state.notifications.set(notifId, {
           notifId,
           targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
@@ -918,6 +1080,13 @@ export async function getActiveNotificationsForDevices(
           createdAtMs: safeNum(n.createdAtMs, nowMs),
           expiresAtMs: safeNum(n.expiresAtMs, nowMs + 30_000),
         });
+      }
+      if (!hasRecentLocalMutation('notifs_clear', 4000, nowMs)) {
+        for (const id of Array.from(state.notifications.keys())) {
+          if (!remoteIds.has(id) && !hasRecentLocalMutation(`notif:${id}`, 4000, nowMs)) {
+            state.notifications.delete(id);
+          }
+        }
       }
       saveToDisk();
     }
@@ -943,7 +1112,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const devices = Array.from(state.devices.values())
     .map((d) => ({
       ...d,
-      approvalStatus: d.approvalStatus || 'approved',
+      approvalStatus: parseApprovalStatus(d.approvalStatus, 'approved'),
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {
@@ -967,7 +1136,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
     transactions,
     notifications,
     globalConfig: state.globalConfig,
-    storageMode: fsSynced ? 'firestore' : 'local-cache',
+    storageMode: fsSynced && isFirestoreServerConfigured() ? 'firestore' : 'local-cache',
     telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()),
     serverTimeMs: nowMs,
   };

@@ -147,6 +147,12 @@ function fromFsDocument(doc: { name?: string; fields?: Record<string, Record<str
   return out;
 }
 
+export interface FsGetResult<T> {
+  ok: boolean;
+  found: boolean;
+  data: T | null;
+}
+
 export async function fsListCollection<T extends Record<string, unknown>>(
   collectionName: string,
   pageSize = 200
@@ -154,18 +160,55 @@ export async function fsListCollection<T extends Record<string, unknown>>(
   const token = await getAdminAccessToken();
   if (!token) return null;
   try {
-    const url = `${getBaseDocumentsUrl()}/${collectionName}?pageSize=${pageSize}`;
+    const out: T[] = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < 6; page++) {
+      const qs = new URLSearchParams({ pageSize: String(pageSize) });
+      if (pageToken) qs.set('pageToken', pageToken);
+      const url = `${getBaseDocumentsUrl()}/${collectionName}?${qs.toString()}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return page === 0 ? null : out;
+      const data = await res.json();
+      const docs = Array.isArray(data.documents) ? data.documents : [];
+      for (const d of docs) {
+        out.push(fromFsDocument(d) as T);
+      }
+      if (!data.nextPageToken) break;
+      pageToken = String(data.nextPageToken);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export async function fsGetDocumentResult<T extends Record<string, unknown>>(
+  collectionName: string,
+  docId: string
+): Promise<FsGetResult<T>> {
+  const token = await getAdminAccessToken();
+  if (!token) return { ok: false, found: false, data: null };
+  try {
+    const url = `${getBaseDocumentsUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
       cache: 'no-store',
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(4500),
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const docs = Array.isArray(data.documents) ? data.documents : [];
-    return docs.map((d: any) => fromFsDocument(d) as T);
+    if (res.status === 404) {
+      return { ok: true, found: false, data: null };
+    }
+    if (!res.ok) {
+      return { ok: false, found: false, data: null };
+    }
+    const doc = await res.json();
+    return { ok: true, found: true, data: fromFsDocument(doc) as T };
   } catch {
-    return null;
+    return { ok: false, found: false, data: null };
   }
 }
 
@@ -173,21 +216,8 @@ export async function fsGetDocument<T extends Record<string, unknown>>(
   collectionName: string,
   docId: string
 ): Promise<T | null> {
-  const token = await getAdminAccessToken();
-  if (!token) return null;
-  try {
-    const url = `${getBaseDocumentsUrl()}/${collectionName}/${encodeURIComponent(docId)}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(4000),
-    });
-    if (!res.ok) return null;
-    const doc = await res.json();
-    return fromFsDocument(doc) as T;
-  } catch {
-    return null;
-  }
+  const res = await fsGetDocumentResult<T>(collectionName, docId);
+  return res.found ? res.data : null;
 }
 
 export async function fsSetDocument(
@@ -212,7 +242,7 @@ export async function fsSetDocument(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ fields }),
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
@@ -253,7 +283,7 @@ export async function fsPatchFields(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ fields }),
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
@@ -277,9 +307,9 @@ export async function fsDeleteDocument(
     const res = await fetch(url, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(5000),
     });
-    return res.ok;
+    return res.ok || res.status === 404;
   } catch {
     return false;
   }
