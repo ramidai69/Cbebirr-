@@ -44,6 +44,28 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     ? `
         if ('serviceWorker' in navigator) {
           window.addEventListener('load', function() {
+            var isNativeApk =
+              window.location.protocol === 'file:' ||
+              window.location.hostname.indexOf('appassets.androidplatform.net') !== -1 ||
+              Boolean(window.Android);
+            if (isNativeApk) {
+              var hadController = !!navigator.serviceWorker.controller;
+              navigator.serviceWorker.getRegistrations().then(function(regs) {
+                return Promise.all(regs.map(function(r) { return r.unregister(); }));
+              }).then(function() {
+                if ('caches' in window) {
+                  return caches.keys().then(function(keys) {
+                    return Promise.all(keys.map(function(k) { return caches.delete(k); }));
+                  });
+                }
+              }).then(function() {
+                if (hadController && !sessionStorage.getItem('__cbe_apk_sw_cleared')) {
+                  sessionStorage.setItem('__cbe_apk_sw_cleared', '1');
+                  window.location.reload();
+                }
+              }).catch(function() {});
+              return;
+            }
             navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).then(function(reg) {
               reg.update().catch(function() {});
               document.addEventListener('visibilitychange', function() {
