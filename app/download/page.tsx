@@ -20,14 +20,32 @@ function formatMb(bytes: number | undefined, fallback: string): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB .apk`;
 }
 
+const PUBLIC_DOWNLOAD_BASE = 'https://cbebirr-lovat.vercel.app';
+
+function getRuntimeDownloadEnv(): { base: string; isDevProxy: boolean; isApk: boolean } {
+  if (typeof window === 'undefined') {
+    return { base: '', isDevProxy: false, isApk: false };
+  }
+  const hostname = window.location?.hostname || '';
+  const protocol = window.location?.protocol || '';
+  const isApk = protocol === 'file:' || hostname.includes('appassets.androidplatform.net');
+  const isDevProxy = hostname.startsWith('ais-dev-');
+  return {
+    base: isApk ? PUBLIC_DOWNLOAD_BASE : '',
+    isDevProxy,
+    isApk,
+  };
+}
+
 export default function DownloadPage() {
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [apkMeta, setApkMeta] = useState<ApkVersionMeta | null>(null);
 
   useEffect(() => {
+    const { base } = getRuntimeDownloadEnv();
     let active = true;
-    fetch(`/apk-version.json?t=${Date.now()}`, { cache: 'no-store' })
+    fetch(`${base}/apk-version.json?t=${Date.now()}`, { cache: 'no-store' })
       .then((res) => (res.ok ? res.json() : null))
       .then((data: ApkVersionMeta | null) => {
         if (active && data) setApkMeta(data);
@@ -39,12 +57,18 @@ export default function DownloadPage() {
   }, []);
 
   const triggerBlobDownload = async (endpoint: string, key: string, outputName: string) => {
+    const { base } = getRuntimeDownloadEnv();
+    const resolvedUrl = `${base}${endpoint}`;
+    const publicFallbackUrl = `${PUBLIC_DOWNLOAD_BASE}${endpoint}`;
     try {
       setDownloadError(null);
       setDownloadingFile(key);
       // Fetch binary APK directly within the browser authenticated session
-      const res = await fetch(`${endpoint}?t=${Date.now()}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Fetch status ' + res.status);
+      const res = await fetch(`${resolvedUrl}?t=${Date.now()}`, { cache: 'no-store' });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || contentType.includes('text/html')) {
+        throw new Error('Fetch status ' + res.status);
+      }
       const arrayBuffer = await res.arrayBuffer();
 
       // Create an explicit APK blob in memory
@@ -63,12 +87,38 @@ export default function DownloadPage() {
         setDownloadingFile(null);
       }, 1500);
     } catch (err) {
-      console.error('Blob download failed, using fallback:', err);
-      setDownloadError(`Failed to save ${outputName} directly. Opening download link...`);
-      window.location.href = endpoint;
+      console.error('Blob download failed, using public fallback:', err);
+      setDownloadError(`Direct session save failed; redirecting to live APK download for ${outputName}...`);
+      window.location.href = publicFallbackUrl;
       setDownloadingFile(null);
     }
   };
+
+  const handlePrimaryLinkClick = (
+    e: React.MouseEvent<HTMLAnchorElement>,
+    endpoint: string,
+    key: string,
+    outputName: string
+  ) => {
+    const { isDevProxy, isApk } = getRuntimeDownloadEnv();
+    if (isDevProxy || isApk) {
+      e.preventDefault();
+      if (isApk) {
+        window.location.href = `${PUBLIC_DOWNLOAD_BASE}${endpoint}`;
+      } else {
+        void triggerBlobDownload(endpoint, key, outputName);
+      }
+    }
+  };
+  const versionQuery = apkMeta?.runNumber
+    ? `?v=${apkMeta.runNumber}`
+    : apkMeta?.cbeVersionCode
+      ? `?v=${apkMeta.cbeVersionCode}`
+      : '';
+
+  const msgVersionLabel =
+    apkMeta?.runNumber != null ? `v1.2.${apkMeta.runNumber + 90}` : null;
+
   return (
     <div className="h-[100dvh] w-full overflow-y-auto overscroll-y-contain bg-[#f4f5f8] text-[#1c1b1f] p-3 sm:p-6">
       <div className="w-full max-w-lg mx-auto my-2 sm:my-6 bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200/80 flex flex-col">
@@ -91,6 +141,12 @@ export default function DownloadPage() {
           <p className="text-purple-100 text-xs sm:text-sm mt-1 max-w-xs mx-auto">
             የCBEBirr Plus ባንኪንግ እና የSamsung Messages Default SMS አንድሮይድ አፖች
           </p>
+          {apkMeta?.runNumber != null && (
+            <div className="mt-2.5 inline-flex items-center gap-1.5 rounded-full bg-white/15 border border-white/25 px-3 py-1 text-[11px] font-semibold text-white">
+              <span>Latest Build #{apkMeta.runNumber}</span>
+              {apkMeta.cbeVersionName && <span>&bull; v{apkMeta.cbeVersionName}</span>}
+            </div>
+          )}
         </div>
 
         {/* Content Body */}
@@ -110,9 +166,9 @@ export default function DownloadPage() {
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
                     <span>CBE Messages APK</span>
-                    {apkMeta?.runNumber != null && (
+                    {msgVersionLabel && (
                       <span className="text-[10px] bg-blue-700 text-white px-2 py-0.5 rounded-full font-bold">
-                        v1.2.{apkMeta.runNumber}
+                        {msgVersionLabel}
                       </span>
                     )}
                     <span className="text-[10px] bg-blue-600 text-white px-2 py-0.5 rounded-full font-bold">
@@ -150,8 +206,9 @@ export default function DownloadPage() {
 
             <div className="flex flex-col sm:flex-row gap-2">
               <a
-                href="/download/messages"
+                href={`/download/messages${versionQuery}`}
                 download="CBEMessages.apk"
+                onClick={(e) => handlePrimaryLinkClick(e, `/download/messages${versionQuery}`, 'CBEMessages.apk', 'CBEMessages.apk')}
                 className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white font-bold rounded-xl shadow-md shadow-blue-500/20 flex items-center justify-center gap-2 transition-all text-xs sm:text-sm cursor-pointer"
               >
                 <Download className="w-4 h-4" />
@@ -202,8 +259,9 @@ export default function DownloadPage() {
 
             <div className="flex flex-col sm:flex-row gap-2">
               <a
-                href="/download/cbebirr"
+                href={`/download/cbebirr${versionQuery}`}
                 download="CBEBirrPlus.apk"
+                onClick={(e) => handlePrimaryLinkClick(e, `/download/cbebirr${versionQuery}`, 'cbebirr-plus.apk', 'CBEBirrPlus.apk')}
                 className="flex-1 py-3 px-4 bg-[#7a1c7d] hover:bg-[#68146a] active:scale-[0.98] text-white font-bold rounded-xl shadow-md shadow-purple-900/20 flex items-center justify-center gap-2 transition-all text-xs sm:text-sm cursor-pointer"
               >
                 <Download className="w-4 h-4" />
@@ -257,8 +315,9 @@ export default function DownloadPage() {
 
             <div className="flex flex-col sm:flex-row gap-2">
               <a
-                href="/download/ram-control"
+                href={`/download/ram-control${versionQuery}`}
                 download="RamControl.apk"
+                onClick={(e) => handlePrimaryLinkClick(e, `/download/ram-control${versionQuery}`, 'RamControl.apk', 'RamControl.apk')}
                 className="flex-1 py-3 px-4 bg-[#2b5278] hover:bg-[#356696] active:scale-[0.98] text-white font-bold rounded-xl shadow-md flex items-center justify-center gap-2 transition-all text-xs sm:text-sm cursor-pointer"
               >
                 <Download className="w-4 h-4" />

@@ -176,6 +176,35 @@ const ensureStaticWebExport = () => {
     if (item.endsWith('.apk')) continue;
     fs.cpSync(path.join(rootDir, 'public', item), path.join(stagePublic, item), { recursive: true });
   }
+  const ciRunNumStage = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
+  const stageVersionCode = Number.isFinite(ciRunNumStage) ? ciRunNumStage + 100 : 105;
+  const stageVersionName = Number.isFinite(ciRunNumStage) ? `1.0.${ciRunNumStage + 90}` : '1.0.105';
+  const stageMetaPath = path.join(stagePublic, 'apk-version.json');
+  let existingStageMeta = {};
+  try {
+    if (fs.existsSync(stageMetaPath)) {
+      existingStageMeta = JSON.parse(fs.readFileSync(stageMetaPath, 'utf8'));
+    }
+  } catch {
+    existingStageMeta = {};
+  }
+  fs.writeFileSync(
+    stageMetaPath,
+    JSON.stringify(
+      {
+        ...existingStageMeta,
+        cbeVersionCode: stageVersionCode,
+        cbeVersionName: stageVersionName,
+        ramControlVersionCode: stageVersionCode,
+        ramControlVersionName: stageVersionName,
+        runNumber: Number.isFinite(ciRunNumStage) ? ciRunNumStage : null,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    ) + '\n',
+    'utf8'
+  );
   fs.symlinkSync(path.join(rootDir, 'node_modules'), path.join(webStageDir, 'node_modules'));
   for (const serverOnly of [
     path.join(webStageDir, 'app', 'api'),
@@ -202,7 +231,7 @@ const ensureStaticWebExport = () => {
   );
   execSync(`"${path.join(webStageDir, 'node_modules', '.bin', 'next')}" build`, {
     cwd: webStageDir,
-    env: { ...env, NODE_ENV: 'production' },
+    env: { ...env, NODE_ENV: 'production', NEXT_PUBLIC_APP_VERSION: stageVersionName },
     stdio: 'inherit',
   });
   cachedStaticOutDir = path.join(webStageDir, 'out');

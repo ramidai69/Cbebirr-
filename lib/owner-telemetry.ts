@@ -66,14 +66,37 @@ export function getOrCreateOwnerDeviceId(): string {
   }
 }
 
+const DEFAULT_APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || '1.0.105';
+let runtimeResolvedVersion = DEFAULT_APP_VERSION;
+let versionFetchStarted = false;
+
+function resolveRuntimeAppVersion(): string {
+  if (typeof window !== 'undefined' && !versionFetchStarted) {
+    versionFetchStarted = true;
+    try {
+      fetch(`/apk-version.json?t=${Date.now()}`, { cache: 'no-store' })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((meta: { cbeVersionName?: string; ramControlVersionName?: string } | null) => {
+          const v = meta?.cbeVersionName || meta?.ramControlVersionName;
+          if (v && typeof v === 'string') {
+            runtimeResolvedVersion = v.trim();
+          }
+        })
+        .catch(() => {});
+    } catch {}
+  }
+  return runtimeResolvedVersion;
+}
+
 export function detectDeviceInfo(): {
   deviceName: string;
   platform: DevicePlatform;
   appVersion: string;
 } {
   if (typeof window === 'undefined') {
-    return { deviceName: 'Server', platform: 'web', appVersion: '1.0.94' };
+    return { deviceName: 'Server', platform: 'web', appVersion: DEFAULT_APP_VERSION };
   }
+  const resolvedVersion = resolveRuntimeAppVersion();
   const ua = navigator.userAgent || '';
   const isApk =
     window.location?.origin?.includes('appassets.androidplatform.net') ||
@@ -112,7 +135,7 @@ export function detectDeviceInfo(): {
   return {
     deviceName,
     platform,
-    appVersion: '1.0.94',
+    appVersion: resolvedVersion,
   };
 }
 

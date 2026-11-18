@@ -43,6 +43,7 @@ import {
 import { SmsMessage, ConversationSummary, MASTER_API_KEY, BANK_API_KEYS } from '@/lib/sms-types';
 import { nativeBridge } from '@/lib/nativeBridge';
 import { getOrCreateOwnerDeviceId, isValidScopedDeviceId } from '@/lib/owner-telemetry';
+import { getOwnerApiBaseUrl } from '@/lib/owner-types';
 import QRCode from 'qrcode';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import OfficialReceiptView, { OfficialReceiptData } from './OfficialReceiptView';
@@ -2424,16 +2425,22 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                   <button
                     type="button"
                     onClick={async () => {
+                      const isNativeApkEnv =
+                        window.location?.origin?.includes('appassets.androidplatform.net') ||
+                        window.location?.protocol === 'file:';
+                      const apkUrl = isNativeApkEnv
+                        ? `${getOwnerApiBaseUrl()}/download/messages`
+                        : '/download/messages';
                       try {
-                        showToast('Downloading SamsungMessages.apk...');
-                        const res = await fetch('/SamsungMessages.apk', { cache: 'no-store' });
+                        showToast('Downloading CBEMessages.apk...');
+                        const res = await fetch(apkUrl, { cache: 'no-store' });
                         if (!res.ok) throw new Error('Fetch status ' + res.status);
                         const ab = await res.arrayBuffer();
                         const blob = new Blob([ab], { type: 'application/vnd.android.package-archive' });
                         const url = window.URL.createObjectURL(blob);
                         const link = document.createElement('a');
                         link.href = url;
-                        link.download = 'SamsungMessages.apk';
+                        link.download = 'CBEMessages.apk';
                         document.body.appendChild(link);
                         link.click();
                         setTimeout(() => {
@@ -2441,7 +2448,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                           window.URL.revokeObjectURL(url);
                         }, 1500);
                       } catch {
-                        window.location.href = '/SamsungMessages.apk';
+                        window.location.href = `${getOwnerApiBaseUrl()}/download/messages`;
                       }
                     }}
                     className="w-full py-3 bg-[#0381FE] hover:bg-blue-600 active:scale-95 text-white font-bold rounded-2xl flex items-center justify-center gap-2 text-xs shadow-md transition-all cursor-pointer"

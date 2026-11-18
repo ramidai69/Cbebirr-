@@ -327,7 +327,7 @@ export async function syncDeviceHeartbeat(input: {
           platform: (['android-apk', 'web-pwa', 'web'].includes(String(freshDoc.platform))
             ? freshDoc.platform
             : 'web') as DevicePlatform,
-          appVersion: clampStr(freshDoc.appVersion, 40, '1.0.94'),
+          appVersion: clampStr(freshDoc.appVersion, 40, '1.0.105'),
           userName: clampStr(freshDoc.userName, 120, ''),
           phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
           userAccount: clampStr(freshDoc.userAccount, 64, ''),
@@ -426,7 +426,7 @@ export async function syncDeviceHeartbeat(input: {
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.94'),
+    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.105'),
     userName: nextUserName,
     phoneNumber: nextPhone,
     userAccount: nextAccount,
@@ -571,7 +571,7 @@ export async function logDeviceTransaction(input: {
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prevDev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.85'),
+    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.105'),
     userName: clampStr(input.senderName, 120, prevDev?.userName || ''),
     phoneNumber: clampStr(input.senderPhone, 32, prevDev?.phoneNumber || ''),
     userAccount: clampStr(input.senderAccount, 64, prevDev?.userAccount || ''),
@@ -718,7 +718,7 @@ async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClie
       platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
         ? fsDoc.platform
         : 'web') as DevicePlatform,
-      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
+      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.105'),
       userName: clampStr(fsDoc.userName, 120, ''),
       phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
       userAccount: clampStr(fsDoc.userAccount, 64, ''),

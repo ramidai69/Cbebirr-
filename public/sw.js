@@ -1,5 +1,5 @@
 // CBEBirr Service Worker for Instant Offline PWA Support & Automatic Live OTA Updates
-const CACHE_NAME = 'cbebirr-cache-v13';
+const CACHE_NAME = 'cbebirr-cache-v14';
 const IS_NATIVE_APK = self.location.hostname.includes('appassets.androidplatform.net');
 const IS_DEV_HOST =
   self.location.hostname.startsWith('ais-dev-') ||
@@ -92,8 +92,10 @@ self.addEventListener('fetch', (event) => {
     url.origin !== self.location.origin ||
     req.method !== 'GET' ||
     url.pathname === '/sw.js' ||
+    url.pathname === '/apk-version.json' ||
     url.pathname.startsWith('/r/') ||
     url.pathname.startsWith('/api/') ||
+    url.pathname === '/download' ||
     url.pathname.startsWith('/download/') ||
     url.pathname.endsWith('.apk')
   ) {
