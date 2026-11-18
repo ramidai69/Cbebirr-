@@ -458,7 +458,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
               `    move-exception v0\n\n` +
               `    :cond_sys_exit\n` +
               `    const/4 v0, 0x0\n\n` +
-              `    invoke-static {v0}, Ljava/lang/System;->exit(I)\n\n` +
+              `    invoke-static {v0}, Ljava/lang/System;->exit(I)V\n\n` +
               `    return-void\n` +
               `.end method\n`;
             changed = true;
