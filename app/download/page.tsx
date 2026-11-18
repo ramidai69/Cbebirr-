@@ -22,6 +22,7 @@ function formatMb(bytes: number | undefined, fallback: string): string {
 
 export default function DownloadPage() {
   const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [apkMeta, setApkMeta] = useState<ApkVersionMeta | null>(null);
 
   useEffect(() => {
@@ -39,6 +40,7 @@ export default function DownloadPage() {
 
   const triggerBlobDownload = async (endpoint: string, key: string, outputName: string) => {
     try {
+      setDownloadError(null);
       setDownloadingFile(key);
       // Fetch binary APK directly within the browser authenticated session
       const res = await fetch(`${endpoint}?t=${Date.now()}`, { cache: 'no-store' });
@@ -62,13 +64,14 @@ export default function DownloadPage() {
       }, 1500);
     } catch (err) {
       console.error('Blob download failed, using fallback:', err);
+      setDownloadError(`Failed to save ${outputName} directly. Opening download link...`);
       window.location.href = endpoint;
       setDownloadingFile(null);
     }
   };
   return (
-    <div className="min-h-screen w-full bg-[#f4f5f8] text-[#1c1b1f] flex flex-col items-center justify-center p-3 sm:p-6">
-      <div className="w-full max-w-lg bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200/80 flex flex-col">
+    <div className="h-[100dvh] w-full overflow-y-auto overscroll-y-contain bg-[#f4f5f8] text-[#1c1b1f] p-3 sm:p-6">
+      <div className="w-full max-w-lg mx-auto my-2 sm:my-6 bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200/80 flex flex-col">
         {/* Header with Dual App Branding */}
         <div className="bg-gradient-to-br from-[#7a1c7d] via-[#8b278e] to-[#1c65e3] px-6 py-7 text-white text-center flex flex-col items-center relative">
           <div className="flex items-center gap-3 mb-3">
@@ -92,6 +95,11 @@ export default function DownloadPage() {
 
         {/* Content Body */}
         <div className="p-5 sm:p-6 space-y-5">
+          {downloadError && (
+            <div className="rounded-xl bg-rose-50 border border-rose-200 px-3.5 py-2.5 text-xs text-rose-700 font-medium">
+              {downloadError}
+            </div>
+          )}
           {/* Messages APK Card (Top Priority) */}
           <div className="rounded-2xl border-2 border-blue-500/30 bg-blue-50/50 p-4 space-y-3">
             <div className="flex items-start justify-between gap-3">

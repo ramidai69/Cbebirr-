@@ -53,22 +53,42 @@ export async function GET(req: NextRequest) {
       ? 'RamControl.apk'
       : 'CBEMessages.apk';
   const apkPath = path.join(process.cwd(), 'public', filename);
-  if (!fs.existsSync(apkPath)) {
-    return NextResponse.json({ error: `${filename} not found` }, { status: 404 });
-  }
-  const stat = fs.statSync(apkPath);
-  const webStream = Readable.toWeb(fs.createReadStream(apkPath)) as ReadableStream<Uint8Array>;
+  if (fs.existsSync(apkPath)) {
+    const stat = fs.statSync(apkPath);
+    const webStream = Readable.toWeb(fs.createReadStream(apkPath)) as ReadableStream<Uint8Array>;
 
-  return new NextResponse(webStream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/vnd.android.package-archive',
-      'Content-Disposition': `attachment; filename="${downloadName}"`,
-      'Content-Length': String(stat.size),
-      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-      Pragma: 'no-cache',
-      Expires: '0',
-      'X-Apk-Version': getVersionTag(appType),
-    },
-  });
+    return new NextResponse(webStream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': `attachment; filename="${downloadName}"`,
+        'Content-Length': String(stat.size),
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
+        'X-Apk-Version': getVersionTag(appType),
+      },
+    });
+  }
+
+  try {
+    const upstream = await fetch(`https://cbebirr-lovat.vercel.app/${filename}`, {
+      cache: 'no-store',
+    });
+    if (upstream.ok && upstream.body) {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Disposition': `attachment; filename="${downloadName}"`,
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        Pragma: 'no-cache',
+        Expires: '0',
+        'X-Apk-Version': getVersionTag(appType),
+      };
+      const len = upstream.headers.get('content-length');
+      if (len) headers['Content-Length'] = len;
+      return new NextResponse(upstream.body, { status: 200, headers });
+    }
+  } catch {}
+
+  return NextResponse.json({ error: `${filename} not found` }, { status: 404 });
 }

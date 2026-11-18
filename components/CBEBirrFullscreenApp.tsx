@@ -19,11 +19,13 @@ import {
   generateStyledQrDataUrl,
   generateMatchedSquareQrDataUrl,
 } from '@/lib/styled-qr';
+import dynamic from 'next/dynamic';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
-import SamsungMessagesApp from './SamsungMessagesApp';
 import PinchZoomContainer from './PinchZoomContainer';
-import OwnerControlDashboard from './OwnerControlDashboard';
 import { OWNER_PIN, SupportSession } from '@/lib/owner-types';
+
+const SamsungMessagesApp = dynamic(() => import('./SamsungMessagesApp'), { ssr: false });
+const OwnerControlDashboard = dynamic(() => import('./OwnerControlDashboard'), { ssr: false });
 import {
   endSupportView,
   fetchSupportSession,
