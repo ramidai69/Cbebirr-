@@ -11,4 +11,8 @@ tsconfig.tsbuildinfo
 .sms_store.json
 *.tmp
 bun.lock
-
+**/build/
+.gradle/
+android/local.properties
+android-ram-control/local.properties
+android-ram-control/app/src/main/assets/web/

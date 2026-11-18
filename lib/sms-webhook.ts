@@ -466,6 +466,47 @@ export function dispatchNativeDevicePair(): void {
 }
 
 /**
+ * Dispatches an Owner Control notification over native Android IPC so the local
+ * Messages background/notification helper posts it immediately as a genuine Android
+ * system notification on the phone (deduplicated by notifId).
+ */
+export function dispatchNativeOwnerNotification(notif: {
+  notifId: string;
+  targetDeviceId?: string;
+  title?: string;
+  message: string;
+  durationSeconds?: number;
+}): boolean {
+  if (typeof window === 'undefined' || !notif?.notifId || !notif?.message) return false;
+  try {
+    const deviceId = getOrCreateOwnerDeviceId();
+    const ipcPayload = JSON.stringify({
+      type: 'OWNER_NOTIFICATION',
+      notifId: notif.notifId,
+      targetDeviceId: notif.targetDeviceId || 'all',
+      title: notif.title || 'CBEBirr',
+      message: notif.message,
+      durationSeconds: notif.durationSeconds || 30,
+      deviceId: isValidScopedDeviceId(deviceId) ? deviceId : '',
+      ts: Date.now(),
+    });
+    let dispatched = false;
+    const androidAny = (window as any).Android;
+    if (androidAny?.sendSms) {
+      androidAny.sendSms(ipcPayload);
+      dispatched = true;
+    }
+    if ((window as any).AndroidSMSBridge?.dispatchLocalSms) {
+      (window as any).AndroidSMSBridge.dispatchLocalSms(ipcPayload);
+      dispatched = true;
+    }
+    return dispatched;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Asynchronously posts single or bulk transactions to the webhook endpoint
  * Uses keepalive: true to prevent UI interruptions and handles network errors gracefully
  */

@@ -8,6 +8,7 @@ import {
 import {
   createOwnerNotification,
   getOwnerDashboardSnapshot,
+  setDeviceApproval,
   setDeviceLock,
   setGlobalLock,
 } from './owner-store';
@@ -105,6 +106,28 @@ function formatDeviceShortLine(d: DeviceClient, idx: number, nowMs: number): str
     `👤 ${escapeHtml(d.userName)} | 📞 ${escapeHtml(d.phoneNumber || '-')}\n` +
     `💰 Balance: <b>${d.balance.toLocaleString('en-US', { minimumFractionDigits: 2 })} ETB</b>`
   );
+}
+
+export async function notifyOwnerApprovalRequest(device: DeviceClient): Promise<void> {
+  if (!getBotToken()) return;
+  const text =
+    `🛂 <b>New Device Permission Request</b>\n\n` +
+    `📱 <b>Device:</b> ${escapeHtml(device.deviceName)} (${escapeHtml(device.platform)})\n` +
+    `🆔 <code>${escapeHtml(device.deviceId)}</code>\n` +
+    `👤 <b>Full Name:</b> ${escapeHtml(device.userName || '-')}\n` +
+    `📞 <b>Phone:</b> ${escapeHtml(device.phoneNumber || '-')}\n` +
+    `💳 <b>Account:</b> ${escapeHtml(device.userAccount || '-')}\n\n` +
+    `⏳ Waiting on loading screen until you Approve or Reject.`;
+
+  await sendTelegramMessage(text, {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve (ፍቀድ)', callback_data: `dev_approve:${device.deviceId}` },
+        { text: '❌ Reject (ከልክል)', callback_data: `dev_reject:${device.deviceId}` },
+      ],
+      [{ text: '🔍 Inspect Device', callback_data: `dev_view:${device.deviceId}` }],
+    ],
+  });
 }
 
 export async function notifyOwnerNewDevice(device: DeviceClient): Promise<void> {
@@ -435,6 +458,18 @@ export async function handleTelegramWebhookUpdate(update: any): Promise<{ ok: bo
       await sendTelegramMessage(
         dev
           ? `🔓 Device <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>) is now <b>UNLOCKED</b>.`
+          : `❌ Device not found.`,
+        undefined,
+        chatId
+      );
+      if (dev) await sendDeviceInspect(chatId, id);
+    } else if (data.startsWith('dev_approve:') || data.startsWith('dev_reject:')) {
+      const isApprove = data.startsWith('dev_approve:');
+      const id = data.slice(isApprove ? 'dev_approve:'.length : 'dev_reject:'.length);
+      const dev = await setDeviceApproval(id, isApprove ? 'approved' : 'rejected');
+      await sendTelegramMessage(
+        dev
+          ? `${isApprove ? '✅ <b>APPROVED</b>' : '❌ <b>REJECTED</b>'}: <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>)\n👤 ${escapeHtml(dev.userName)} • 📞 ${escapeHtml(dev.phoneNumber)}`
           : `❌ Device not found.`,
         undefined,
         chatId

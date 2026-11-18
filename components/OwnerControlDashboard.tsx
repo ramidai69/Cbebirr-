@@ -7,10 +7,13 @@ import {
   ArrowLeft,
   Bell,
   Bot,
+  Check,
   CheckCircle2,
   Clock,
   Cloud,
+  CreditCard,
   Lock,
+  Monitor,
   Phone,
   RefreshCw,
   Send,
@@ -24,6 +27,7 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
+import SupportViewModal from './SupportViewModal';
 import {
   DeviceClient,
   OwnerDashboardSnapshot,
@@ -48,17 +52,20 @@ import { collection, onSnapshot, query } from 'firebase/firestore';
 interface OwnerControlDashboardProps {
   onClose: () => void;
   onRemoteLockChange?: (locked: boolean, message: string) => void;
+  standalone?: boolean;
 }
 
 export default function OwnerControlDashboard({
   onClose,
   onRemoteLockChange,
+  standalone = false,
 }: OwnerControlDashboardProps) {
   const [activeTab, setActiveTab] = useState<'devices' | 'transactions' | 'notify'>('devices');
   const [snapshot, setSnapshot] = useState<OwnerDashboardSnapshot | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [busyKey, setBusyKey] = useState<string>('');
   const [statusBanner, setStatusBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [supportTargetDevice, setSupportTargetDevice] = useState<DeviceClient | null>(null);
 
   // Filters
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
@@ -116,7 +123,7 @@ export default function OwnerControlDashboard({
     }, 0);
     const id = setInterval(() => {
       void loadSnapshot(true);
-    }, 5000);
+    }, 2500);
     return () => {
       clearTimeout(t);
       clearInterval(id);
@@ -239,6 +246,25 @@ export default function OwnerControlDashboard({
     }
   };
 
+  const handleDeviceApproval = async (dev: DeviceClient, approve: boolean) => {
+    setBusyKey(`apr_${dev.deviceId}`);
+    try {
+      const action = approve ? 'approve_device' : 'reject_device';
+      await postOwnerAction({ action, deviceId: dev.deviceId });
+      await loadSnapshot(true);
+      flashBanner(
+        'ok',
+        approve
+          ? `Approved ${dev.userName || dev.deviceName}`
+          : `Rejected ${dev.userName || dev.deviceName}`
+      );
+    } catch (err: any) {
+      flashBanner('err', err?.message || 'Approval update failed');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
   const handleDeleteDevice = async (dev: DeviceClient) => {
     setBusyKey(`del_${dev.deviceId}`);
     try {
@@ -330,19 +356,25 @@ export default function OwnerControlDashboard({
       <div className="bg-[#17212b] border-b border-white/10 px-3.5 pt-3 pb-2.5 shrink-0">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
-            <button
-              type="button"
-              onClick={onClose}
-              className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-200 cursor-pointer shrink-0"
-              aria-label="Exit Owner Dashboard"
-            >
-              <ArrowLeft className="w-4 h-4" />
-            </button>
+            {!standalone ? (
+              <button
+                type="button"
+                onClick={onClose}
+                className="w-8 h-8 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-slate-200 cursor-pointer shrink-0"
+                aria-label="Exit Owner Dashboard"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+            ) : (
+              <div className="w-8 h-8 rounded-xl bg-[#2b5278]/60 border border-[#5eb5f7]/30 flex items-center justify-center text-[#5eb5f7] shrink-0">
+                <Shield className="w-4 h-4" />
+              </div>
+            )}
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
-                <Shield className="w-4 h-4 text-[#5eb5f7] shrink-0" />
+                {!standalone && <Shield className="w-4 h-4 text-[#5eb5f7] shrink-0" />}
                 <h1 className="text-[14px] font-bold text-white truncate">
-                  Owner Command Center
+                  {standalone ? 'Ram control' : 'Owner Command Center'}
                 </h1>
               </div>
               <p className="text-[10.5px] text-[#7f91a4] truncate">
@@ -525,10 +557,18 @@ export default function OwnerControlDashboard({
             ) : (
               devicesList.map((dev, index) => {
                 const isMe = dev.deviceId === myDeviceId;
+                const isPending = dev.approvalStatus === 'pending';
+                const isRejected = dev.approvalStatus === 'rejected';
                 return (
                   <div
                     key={dev.deviceId}
-                    className="bg-[#17212b] border border-white/10 rounded-2xl p-3 space-y-2.5"
+                    className={`border rounded-2xl p-3 space-y-2.5 ${
+                      isPending
+                        ? 'bg-amber-950/25 border-amber-400/60 shadow-[0_0_20px_rgba(251,191,36,0.12)]'
+                        : isRejected
+                          ? 'bg-rose-950/20 border-rose-500/40'
+                          : 'bg-[#17212b] border-white/10'
+                    }`}
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
@@ -552,6 +592,16 @@ export default function OwnerControlDashboard({
                               ? 'ONLINE'
                               : `OFFLINE • ${formatRelativeTime(dev.lastSeenAtMs, serverNow)}`}
                           </span>
+                          {isPending && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-amber-500/25 text-amber-200 border border-amber-400/40 animate-pulse">
+                              REQUESTING PERMISSION
+                            </span>
+                          )}
+                          {isRejected && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-rose-600/35 text-rose-200">
+                              REJECTED
+                            </span>
+                          )}
                           {isMe && (
                             <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-[#2b5278] text-[#90cdf4]">
                               THIS DEVICE
@@ -571,13 +621,13 @@ export default function OwnerControlDashboard({
                         </p>
                       </div>
 
-                      {!isMe && !dev.isOnline && (
+                      {!isMe && (!dev.isOnline || isPending || isRejected) && (
                         <button
                           type="button"
                           onClick={() => handleDeleteDevice(dev)}
                           disabled={busyKey === `del_${dev.deviceId}`}
                           className="p-1.5 rounded-lg bg-white/5 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 cursor-pointer shrink-0"
-                          title="Remove stale device"
+                          title="Remove device"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -595,13 +645,18 @@ export default function OwnerControlDashboard({
                       <div className="flex items-center gap-1.5 min-w-0">
                         <Phone className="w-3.5 h-3.5 text-[#5eb5f7] shrink-0" />
                         <span className="text-slate-200 truncate font-mono">
-                          {dev.phoneNumber || dev.userAccount || '-'}
+                          {dev.phoneNumber || '-'}
                         </span>
                       </div>
-                      <div className="flex items-center gap-1.5 col-span-2">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <CreditCard className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                        <span className="text-slate-200 truncate font-mono">
+                          {dev.userAccount || 'No account'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 min-w-0">
                         <Wallet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        <span className="text-[#8b9bb0]">Balance:</span>
-                        <span className="text-emerald-300 font-bold font-mono">
+                        <span className="text-emerald-300 font-bold font-mono truncate">
                           {Number(dev.balance || 0).toLocaleString('en-US', {
                             minimumFractionDigits: 2,
                           })}{' '}
@@ -610,13 +665,39 @@ export default function OwnerControlDashboard({
                       </div>
                     </div>
 
+                    {/* Prominent Approve / Reject Prompt for New Device Permission Requests */}
+                    {(isPending || isRejected) && (
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleDeviceApproval(dev, true)}
+                          disabled={busyKey === `apr_${dev.deviceId}`}
+                          className="py-2 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>{isRejected ? 'Allow Now' : 'Approve (ፍቀድ)'}</span>
+                        </button>
+                        {!isRejected && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeviceApproval(dev, false)}
+                            disabled={busyKey === `apr_${dev.deviceId}`}
+                            className="py-2 px-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Reject (ከልክል)</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+
                     {/* Per-Device Actions */}
-                    <div className="grid grid-cols-3 gap-1.5">
+                    <div className="grid grid-cols-4 gap-1.5">
                       <button
                         type="button"
                         onClick={() => handleDeviceLockToggle(dev)}
                         disabled={busyKey === `lock_${dev.deviceId}`}
-                        className={`py-1.5 px-2 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+                        className={`py-1.5 px-1.5 rounded-xl text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
                           dev.isLocked
                             ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
                             : 'bg-rose-600/85 hover:bg-rose-600 text-white'
@@ -632,11 +713,20 @@ export default function OwnerControlDashboard({
 
                       <button
                         type="button"
+                        onClick={() => setSupportTargetDevice(dev)}
+                        className="py-1.5 px-1.5 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                      >
+                        <Monitor className="w-3 h-3" />
+                        <span>Support</span>
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={() => {
                           setNotifTarget(dev.deviceId);
                           setActiveTab('notify');
                         }}
-                        className="py-1.5 px-2 rounded-xl bg-[#2b5278] hover:bg-[#356696] text-white text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                        className="py-1.5 px-1.5 rounded-xl bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                       >
                         <Bell className="w-3 h-3" />
                         <span>Notify</span>
@@ -648,7 +738,7 @@ export default function OwnerControlDashboard({
                           setDeviceFilter(dev.deviceId);
                           setActiveTab('transactions');
                         }}
-                        className="py-1.5 px-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                        className="py-1.5 px-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                       >
                         <Activity className="w-3 h-3" />
                         <span>Txns</span>
@@ -780,14 +870,14 @@ export default function OwnerControlDashboard({
                   onChange={(e) => setNotifMessage(e.target.value)}
                   rows={3}
                   maxLength={480}
-                  placeholder="Write notification message to appear as notification banner..."
+                  placeholder="Write message to deliver as a real phone notification..."
                   className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2.5 py-2 text-[12px] text-white outline-none focus:border-[#5eb5f7] resize-none"
                 />
               </div>
 
               <div>
                 <label className="block text-[11px] font-semibold text-[#8b9bb0] mb-1">
-                  Visible Duration (Auto-disappears after timer)
+                  Delivery Window (Offline retry window)
                 </label>
                 <div className="flex flex-wrap gap-1.5 mb-2">
                   {[
@@ -845,7 +935,7 @@ export default function OwnerControlDashboard({
               >
                 <Send className="w-4 h-4" />
                 <span>
-                  {busyKey === 'send_notif' ? 'Sending...' : 'Send Notification Banner'}
+                  {busyKey === 'send_notif' ? 'Sending...' : 'Send Phone Notification'}
                 </span>
               </button>
             </form>
@@ -903,6 +993,17 @@ export default function OwnerControlDashboard({
           </div>
         )}
       </div>
+
+      {/* Consent-Based Live Support View Modal */}
+      <AnimatePresence>
+        {supportTargetDevice && (
+          <SupportViewModal
+            device={supportTargetDevice}
+            requestedBy={standalone ? 'ram_control' : 'app_0069'}
+            onClose={() => setSupportTargetDevice(null)}
+          />
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }

@@ -105,51 +105,119 @@ execSync(`"${apksignerBin}" verify --print-certs "${signedOutApk}"`, { env, stdi
 fs.copyFileSync(signedOutApk, cbeOutApk);
 console.log(`Successfully compiled and signed SamsungMessages.apk and CBEMessages.apk (${usePermanentMsgKey ? 'permanent repo key' : 'fallback keystore'})!`);
 
+// Shared helpers & build stamps for Step 2 (cbebirr-plus.apk) and Step 3 (RamControl.apk)
+const sha256 = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+const hashRecursive = (targetPath, hasher, excludedNames = new Set()) => {
+  if (!fs.existsSync(targetPath)) return;
+  const baseName = path.basename(targetPath);
+  if (excludedNames.has(baseName)) return;
+  const stat = fs.statSync(targetPath);
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(targetPath).sort()) {
+      hashRecursive(path.join(targetPath, entry), hasher, excludedNames);
+    }
+  } else {
+    hasher.update(path.relative(rootDir, targetPath));
+    hasher.update(fs.readFileSync(targetPath));
+  }
+};
+
+const swJsPath = path.join(rootDir, 'public', 'sw.js');
+const cbeCertPemForStamp = path.join(keystoresDir, 'cbe-banking.pem');
+const stampHasher = crypto.createHash('sha256');
+for (const relPath of [
+  'app',
+  'components',
+  'lib',
+  'hooks',
+  'firebase-applet-config.json',
+  path.join('public', 'sw.js'),
+  path.join('public', 'manifest.json'),
+  path.join('public', 'screens'),
+  path.join('public', 'assets'),
+  path.join('scripts', 'ci-build-apk.mjs'),
+]) {
+  hashRecursive(path.join(rootDir, relPath), stampHasher);
+}
+if (fs.existsSync(cbeCertPemForStamp)) {
+  stampHasher.update(fs.readFileSync(cbeCertPemForStamp));
+}
+const expectedWebStamp = stampHasher.digest('hex');
+
+const ramControlDir = path.join(rootDir, 'android-ram-control');
+const ramKeyPk8 = path.join(ramControlDir, 'keystores', 'ram-control.pk8');
+const ramCertPem = path.join(ramControlDir, 'keystores', 'ram-control.pem');
+const ramStampHasher = crypto.createHash('sha256');
+ramStampHasher.update(expectedWebStamp);
+hashRecursive(ramControlDir, ramStampHasher, new Set(['build', '.gradle', 'local.properties', 'web']));
+if (fs.existsSync(ramCertPem)) {
+  ramStampHasher.update(fs.readFileSync(ramCertPem));
+}
+const expectedRamControlStamp = ramStampHasher.digest('hex');
+
+const webStageDir = '/tmp/apk_web_build';
+let cachedStaticOutDir = null;
+const ensureStaticWebExport = () => {
+  if (cachedStaticOutDir && fs.existsSync(cachedStaticOutDir)) {
+    return cachedStaticOutDir;
+  }
+  console.log('Building static Next.js web export for APK assets/web/...');
+  fs.rmSync(webStageDir, { recursive: true, force: true });
+  fs.mkdirSync(webStageDir, { recursive: true });
+  for (const item of ['app', 'components', 'hooks', 'lib', 'firebase-applet-config.json', 'package.json', 'tsconfig.json', 'postcss.config.mjs']) {
+    const src = path.join(rootDir, item);
+    if (fs.existsSync(src)) {
+      fs.cpSync(src, path.join(webStageDir, item), { recursive: true });
+    }
+  }
+  const stagePublic = path.join(webStageDir, 'public');
+  fs.mkdirSync(stagePublic, { recursive: true });
+  for (const item of fs.readdirSync(path.join(rootDir, 'public'))) {
+    if (item.endsWith('.apk')) continue;
+    fs.cpSync(path.join(rootDir, 'public', item), path.join(stagePublic, item), { recursive: true });
+  }
+  fs.symlinkSync(path.join(rootDir, 'node_modules'), path.join(webStageDir, 'node_modules'));
+  for (const serverOnly of [
+    path.join(webStageDir, 'app', 'api'),
+    path.join(webStageDir, 'app', 'r'),
+    path.join(webStageDir, 'app', 'download', 'apk'),
+    path.join(webStageDir, 'app', 'download', 'cbebirr'),
+    path.join(webStageDir, 'app', 'download', 'messages'),
+    path.join(webStageDir, 'app', 'download', 'ram-control'),
+  ]) {
+    fs.rmSync(serverOnly, { recursive: true, force: true });
+  }
+  for (const dynPage of [
+    path.join(webStageDir, 'app', 'aureceipt', 'page.tsx'),
+    path.join(webStageDir, 'app', 'official-receipt', 'page.tsx'),
+  ]) {
+    if (fs.existsSync(dynPage)) {
+      fs.writeFileSync(dynPage, fs.readFileSync(dynPage, 'utf8').replace(/force-dynamic/g, 'force-static'), 'utf8');
+    }
+  }
+  fs.writeFileSync(
+    path.join(webStageDir, 'next.config.ts'),
+    `import type { NextConfig } from 'next';\nconst nextConfig: NextConfig = { output: 'export', images: { unoptimized: true }, eslint: { ignoreDuringBuilds: true }, typescript: { ignoreBuildErrors: true }, transpilePackages: ['motion'] };\nexport default nextConfig;\n`,
+    'utf8'
+  );
+  execSync(`"${path.join(webStageDir, 'node_modules', '.bin', 'next')}" build`, {
+    cwd: webStageDir,
+    env: { ...env, NODE_ENV: 'production' },
+    stdio: 'inherit',
+  });
+  cachedStaticOutDir = path.join(webStageDir, 'out');
+  return cachedStaticOutDir;
+};
+
 // 2. Cleanly update CBEBirr Plus Banking APK (Web bundle + UssdAccessibilityService opaque overlay & no 12s timeout + icon + wallet PNG)
 const cbeApkPath = path.join(rootDir, 'public', 'cbebirr-plus.apk');
 const logoPng512 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo.png');
 const logoPng192 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo_192.png');
 const cleanWalletPng = path.join(rootDir, 'public', 'assets', 'wallets', 'screen_wallet_transfer_base_clean.png');
 
-const swJsPath = path.join(rootDir, 'public', 'sw.js');
-
 if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(cleanWalletPng)) {
-  const sha256 = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
   const expectedWalletHash = sha256(cleanWalletPng);
   const expectedSwHash = fs.existsSync(swJsPath) ? sha256(swJsPath) : '';
-  const cbeCertPemForStamp = path.join(keystoresDir, 'cbe-banking.pem');
-  const stampHasher = crypto.createHash('sha256');
-  const hashRecursive = (targetPath) => {
-    if (!fs.existsSync(targetPath)) return;
-    const stat = fs.statSync(targetPath);
-    if (stat.isDirectory()) {
-      for (const entry of fs.readdirSync(targetPath).sort()) {
-        hashRecursive(path.join(targetPath, entry));
-      }
-    } else {
-      stampHasher.update(path.relative(rootDir, targetPath));
-      stampHasher.update(fs.readFileSync(targetPath));
-    }
-  };
-  for (const relPath of [
-    'app',
-    'components',
-    'lib',
-    'hooks',
-    'firebase-applet-config.json',
-    path.join('public', 'sw.js'),
-    path.join('public', 'manifest.json'),
-    path.join('public', 'screens'),
-    path.join('public', 'assets'),
-    path.join('scripts', 'ci-build-apk.mjs'),
-  ]) {
-    hashRecursive(path.join(rootDir, relPath));
-  }
-  if (fs.existsSync(cbeCertPemForStamp)) {
-    stampHasher.update(fs.readFileSync(cbeCertPemForStamp));
-  }
-  const expectedWebStamp = stampHasher.digest('hex');
-
   const expectedIconHash = sha256(logoPng512);
   let alreadyPatched = false;
   try {
@@ -174,7 +242,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasOpaqueOverlayAndNoTimeout = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'#FF7A1C7D' in d and b'#99000000' not in d and b'__CBE_USSD_CANCELLED__' in d and b'UssdAccessibilityService$4' in d) else 0)"`,
+      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'#FF7A1C7D' in d and b'#99000000' not in d and b'__CBE_USSD_CANCELLED__' in d and b'UssdAccessibilityService$4' in d and b'exitApp' in d) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     const hasAdjustNothing = execSync(
@@ -219,49 +287,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     }
 
     // Step 2a: Build latest static web export for APK assets/web/
-    const webStageDir = '/tmp/apk_web_build';
-    fs.rmSync(webStageDir, { recursive: true, force: true });
-    fs.mkdirSync(webStageDir, { recursive: true });
-    for (const item of ['app', 'components', 'hooks', 'lib', 'firebase-applet-config.json', 'package.json', 'tsconfig.json', 'postcss.config.mjs']) {
-      const src = path.join(rootDir, item);
-      if (fs.existsSync(src)) {
-        fs.cpSync(src, path.join(webStageDir, item), { recursive: true });
-      }
-    }
-    const stagePublic = path.join(webStageDir, 'public');
-    fs.mkdirSync(stagePublic, { recursive: true });
-    for (const item of fs.readdirSync(path.join(rootDir, 'public'))) {
-      if (item.endsWith('.apk')) continue;
-      fs.cpSync(path.join(rootDir, 'public', item), path.join(stagePublic, item), { recursive: true });
-    }
-    fs.symlinkSync(path.join(rootDir, 'node_modules'), path.join(webStageDir, 'node_modules'));
-    for (const serverOnly of [
-      path.join(webStageDir, 'app', 'api'),
-      path.join(webStageDir, 'app', 'r'),
-      path.join(webStageDir, 'app', 'download', 'apk'),
-      path.join(webStageDir, 'app', 'download', 'cbebirr'),
-      path.join(webStageDir, 'app', 'download', 'messages'),
-    ]) {
-      fs.rmSync(serverOnly, { recursive: true, force: true });
-    }
-    for (const dynPage of [
-      path.join(webStageDir, 'app', 'aureceipt', 'page.tsx'),
-      path.join(webStageDir, 'app', 'official-receipt', 'page.tsx'),
-    ]) {
-      if (fs.existsSync(dynPage)) {
-        fs.writeFileSync(dynPage, fs.readFileSync(dynPage, 'utf8').replace(/force-dynamic/g, 'force-static'), 'utf8');
-      }
-    }
-    fs.writeFileSync(
-      path.join(webStageDir, 'next.config.ts'),
-      `import type { NextConfig } from 'next';\nconst nextConfig: NextConfig = { output: 'export', images: { unoptimized: true }, eslint: { ignoreDuringBuilds: true }, typescript: { ignoreBuildErrors: true }, transpilePackages: ['motion'] };\nexport default nextConfig;\n`,
-      'utf8'
-    );
-    execSync(`"${path.join(webStageDir, 'node_modules', '.bin', 'next')}" build`, {
-      cwd: webStageDir,
-      env: { ...env, NODE_ENV: 'production' },
-      stdio: 'inherit',
-    });
+    const outWebDir = ensureStaticWebExport();
 
     // Step 2b: Decompile cbebirr-plus.apk (including smali)
     const decDir = '/tmp/cbe_dec';
@@ -409,6 +435,29 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
               `    if-eqz v0, :cond_done\n\n` +
               `    invoke-virtual {v0}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->hideLoadingOverlay()V\n\n` +
               `    :cond_done\n` +
+              `    return-void\n` +
+              `.end method\n`;
+            changed = true;
+          }
+          if (!code.includes('exitApp()V')) {
+            code =
+              code.trimEnd() +
+              `\n\n.method public exitApp()V\n` +
+              `    .locals 1\n` +
+              `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
+              `    .end annotation\n\n` +
+              `    :try_start_0\n` +
+              `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
+              `    if-eqz v0, :cond_sys_exit\n\n` +
+              `    invoke-virtual {v0}, Landroid/app/Activity;->finishAffinity()V\n` +
+              `    :try_end_0\n` +
+              `    .catchall {:try_start_0 .. :try_end_0} :catchall_0\n\n` +
+              `    goto :cond_sys_exit\n\n` +
+              `    :catchall_0\n` +
+              `    move-exception v0\n\n` +
+              `    :cond_sys_exit\n` +
+              `    const/4 v0, 0x0\n\n` +
+              `    invoke-static {v0}, Ljava/lang/System;->exit(I)\n\n` +
               `    return-void\n` +
               `.end method\n`;
             changed = true;
@@ -759,14 +808,12 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
 
     // Replace bundled assets/web/ with fresh static export
     const apkWebDir = path.join(decDir, 'assets', 'web');
-    const outWebDir = path.join(webStageDir, 'out');
     if (fs.existsSync(outWebDir)) {
       fs.rmSync(apkWebDir, { recursive: true, force: true });
       fs.cpSync(outWebDir, apkWebDir, { recursive: true });
       fs.writeFileSync(path.join(apkWebDir, 'build-stamp.txt'), expectedWebStamp, 'utf8');
       console.log('Replaced APK assets/web/ with latest static Next.js export.');
     }
-    fs.rmSync(webStageDir, { recursive: true, force: true });
 
     // Ensure clean blank-field wallet transfer base PNG & logos
     const apkWalletBase = path.join(apkWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base.png');
@@ -818,41 +865,122 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     execSync(`"${apksignerBin}" verify --print-certs "${cbeApkPath}"`, { env, stdio: 'inherit' });
     console.log(`Successfully updated & signed public/cbebirr-plus.apk (${usePermanentCbeKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
+}
 
-  const apkVersionPath = path.join(rootDir, 'public', 'apk-version.json');
-  const ciRunNumMeta = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-  const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 100 : 105;
-  const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 90}` : '1.0.95';
-  const cbeBuf = fs.readFileSync(cbeApkPath);
-  const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
-  const cbeApkSha256 = crypto.createHash('sha256').update(cbeBuf).digest('hex');
-  const msgApkSha256 = msgBuf ? crypto.createHash('sha256').update(msgBuf).digest('hex') : '';
-  let prevMeta = null;
-  try {
-    if (fs.existsSync(apkVersionPath)) {
-      prevMeta = JSON.parse(fs.readFileSync(apkVersionPath, 'utf8'));
+// 3. Build & sign standalone Ram control APK from android-ram-control/
+const ramControlOutApk = path.join(rootDir, 'public', 'RamControl.apk');
+if (fs.existsSync(ramControlDir)) {
+  let ramControlUpToDate = false;
+  if (fs.existsSync(ramControlOutApk)) {
+    try {
+      const existingRamStamp = execSync(
+        `unzip -p "${ramControlOutApk}" assets/web/build-stamp.txt 2>/dev/null || true`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (existingRamStamp === expectedRamControlStamp) {
+        ramControlUpToDate = true;
+      }
+    } catch {
+      ramControlUpToDate = false;
     }
-  } catch {
-    prevMeta = null;
   }
-  if (
-    !prevMeta ||
-    prevMeta.cbeApkSha256 !== cbeApkSha256 ||
-    prevMeta.msgApkSha256 !== msgApkSha256 ||
-    prevMeta.webStamp !== expectedWebStamp
-  ) {
-    const versionMeta = {
-      cbeVersionCode: cbeVersionCodeMeta,
-      cbeVersionName: cbeVersionNameMeta,
-      cbeApkSha256,
-      cbeApkSize: cbeBuf.length,
-      msgApkSha256,
-      msgApkSize: msgBuf ? msgBuf.length : 0,
-      webStamp: expectedWebStamp,
-      runNumber: Number.isFinite(ciRunNumMeta) ? ciRunNumMeta : null,
-      updatedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(apkVersionPath, JSON.stringify(versionMeta, null, 2) + '\n', 'utf8');
-    console.log('Wrote public/apk-version.json:', JSON.stringify(versionMeta));
+
+  if (ramControlUpToDate) {
+    console.log('RamControl.apk already matches latest stamp. Skipping rebuild.');
+  } else {
+    console.log('Building RamControl.apk from android-ram-control/...');
+    const outWebDir = ensureStaticWebExport();
+    fs.writeFileSync(path.join(ramControlDir, 'local.properties'), `sdk.dir=${sdkDir}\n`);
+
+    const ramAssetsWebDir = path.join(ramControlDir, 'app', 'src', 'main', 'assets', 'web');
+    fs.rmSync(ramAssetsWebDir, { recursive: true, force: true });
+    fs.cpSync(outWebDir, ramAssetsWebDir, { recursive: true });
+    fs.writeFileSync(path.join(ramAssetsWebDir, 'build-stamp.txt'), expectedRamControlStamp, 'utf8');
+
+    execSync(`${gradleBin} assembleRelease --no-daemon`, {
+      cwd: ramControlDir,
+      env,
+      stdio: 'inherit',
+    });
+
+    const ramReleaseDir = path.join(ramControlDir, 'app', 'build', 'outputs', 'apk', 'release');
+    const ramUnsignedApk = path.join(ramReleaseDir, 'app-release-unsigned.apk');
+    const ramGradleApk = path.join(ramReleaseDir, 'app-release.apk');
+    const ramInputApk = fs.existsSync(ramUnsignedApk) ? ramUnsignedApk : ramGradleApk;
+    if (!fs.existsSync(ramInputApk)) {
+      throw new Error(`Ram control release APK output not found in ${ramReleaseDir}`);
+    }
+
+    const ramAlignedApk = '/tmp/ramcontrol-aligned.apk';
+    execSync(`"${zipalignBin}" -f -p 4 "${ramInputApk}" "${ramAlignedApk}"`, { env, stdio: 'inherit' });
+
+    const usePermanentRamKey = fs.existsSync(ramKeyPk8) && fs.existsSync(ramCertPem);
+    const ramFallbackKs = '/tmp/ram-control-release.jks';
+    if (!usePermanentRamKey && !fs.existsSync(ramFallbackKs)) {
+      execSync(
+        `keytool -genkeypair -v -keystore "${ramFallbackKs}" -alias ramcontrol -keyalg RSA -keysize 2048 -validity 10000 -storepass ramcontrol123 -keypass ramcontrol123 -dname "CN=RamControl, OU=Owner, O=RamControl, L=AddisAbaba, C=ET"`,
+        { env, stdio: 'inherit' }
+      );
+    }
+    const ramSignArgs = usePermanentRamKey
+      ? `--key "${ramKeyPk8}" --cert "${ramCertPem}"`
+      : `--ks "${ramFallbackKs}" --ks-pass pass:ramcontrol123 --key-pass pass:ramcontrol123 --ks-key-alias ramcontrol`;
+    execSync(
+      `"${apksignerBin}" sign ${ramSignArgs} --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "${ramControlOutApk}" "${ramAlignedApk}"`,
+      { env, stdio: 'inherit' }
+    );
+    execSync(`"${apksignerBin}" verify --print-certs "${ramControlOutApk}"`, { env, stdio: 'inherit' });
+    fs.rmSync(ramAssetsWebDir, { recursive: true, force: true });
+    console.log(`Successfully compiled and signed public/RamControl.apk (${usePermanentRamKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
 }
+
+fs.rmSync(webStageDir, { recursive: true, force: true });
+
+// 4. Write consolidated public/apk-version.json metadata
+const apkVersionPath = path.join(rootDir, 'public', 'apk-version.json');
+const ciRunNumMeta = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
+const versionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 100 : 105;
+const versionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 90}` : '1.0.95';
+const cbeBuf = fs.existsSync(cbeApkPath) ? fs.readFileSync(cbeApkPath) : null;
+const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
+const ramBuf = fs.existsSync(ramControlOutApk) ? fs.readFileSync(ramControlOutApk) : null;
+const cbeApkSha256 = cbeBuf ? crypto.createHash('sha256').update(cbeBuf).digest('hex') : '';
+const msgApkSha256 = msgBuf ? crypto.createHash('sha256').update(msgBuf).digest('hex') : '';
+const ramControlApkSha256 = ramBuf ? crypto.createHash('sha256').update(ramBuf).digest('hex') : '';
+let prevMeta = null;
+try {
+  if (fs.existsSync(apkVersionPath)) {
+    prevMeta = JSON.parse(fs.readFileSync(apkVersionPath, 'utf8'));
+  }
+} catch {
+  prevMeta = null;
+}
+if (
+  !prevMeta ||
+  prevMeta.cbeApkSha256 !== cbeApkSha256 ||
+  prevMeta.msgApkSha256 !== msgApkSha256 ||
+  prevMeta.ramControlApkSha256 !== ramControlApkSha256 ||
+  prevMeta.webStamp !== expectedWebStamp ||
+  prevMeta.ramControlStamp !== expectedRamControlStamp
+) {
+  const versionMeta = {
+    cbeVersionCode: versionCodeMeta,
+    cbeVersionName: versionNameMeta,
+    cbeApkSha256,
+    cbeApkSize: cbeBuf ? cbeBuf.length : 0,
+    msgApkSha256,
+    msgApkSize: msgBuf ? msgBuf.length : 0,
+    ramControlVersionCode: versionCodeMeta,
+    ramControlVersionName: versionNameMeta,
+    ramControlApkSha256,
+    ramControlApkSize: ramBuf ? ramBuf.length : 0,
+    webStamp: expectedWebStamp,
+    ramControlStamp: expectedRamControlStamp,
+    runNumber: Number.isFinite(ciRunNumMeta) ? ciRunNumMeta : null,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(apkVersionPath, JSON.stringify(versionMeta, null, 2) + '\n', 'utf8');
+  console.log('Wrote public/apk-version.json:', JSON.stringify(versionMeta));
+}
+

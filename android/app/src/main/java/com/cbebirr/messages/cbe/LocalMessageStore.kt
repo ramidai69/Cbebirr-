@@ -16,9 +16,11 @@ object LocalMessageStore {
     private const val KEY_DEVICE_ID = "msg_device_id"
     private const val KEY_PAIRED_DEVICE_IDS = "paired_banking_device_ids"
     private const val KEY_ISOLATION_MIGRATED = "isolation_v1_migrated"
+    private const val KEY_SEEN_OWNER_NOTIFS = "seen_owner_notif_ids"
     private const val MAX_SAVED_MESSAGES = 400
     private const val MAX_SEEN_IDS = 800
     private const val MAX_DELETED_KEYS = 800
+    private const val MAX_SEEN_OWNER_NOTIFS = 400
 
     private val RESERVED_SHARED_IDS = setOf(
         "all",
@@ -98,6 +100,37 @@ object LocalMessageStore {
         val own = getOrCreateDeviceId(context)
         val paired = getPairedDeviceIds(context)
         return (listOf(own) + paired).distinct()
+    }
+
+    fun markOwnerNotificationNew(context: Context, notifId: String): Boolean {
+        val cleanId = notifId.trim()
+        if (cleanId.isEmpty()) return false
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val arr = try {
+                JSONArray(prefs.getString(KEY_SEEN_OWNER_NOTIFS, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                JSONArray()
+            }
+            val list = ArrayList<String>(arr.length() + 1)
+            for (i in 0 until arr.length()) {
+                val existing = arr.optString(i).trim()
+                if (existing.isNotEmpty()) {
+                    if (existing == cleanId) return false
+                    list.add(existing)
+                }
+            }
+            list.add(cleanId)
+            val trimmed = if (list.size > MAX_SEEN_OWNER_NOTIFS) {
+                list.subList(list.size - MAX_SEEN_OWNER_NOTIFS, list.size)
+            } else {
+                list
+            }
+            val next = JSONArray()
+            trimmed.forEach { next.put(it) }
+            prefs.edit().putString(KEY_SEEN_OWNER_NOTIFS, next.toString()).apply()
+            return true
+        }
     }
 
     /**

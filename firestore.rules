@@ -61,7 +61,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'deviceId', 'deviceName', 'platform', 'appVersion',
           'userName', 'phoneNumber', 'userAccount', 'balance',
-          'isLocked', 'lockReason', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
+          'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.deviceId)
         && data.deviceName is string && data.deviceName.size() <= 120
@@ -73,6 +73,7 @@ service cloud.firestore {
         && data.balance is number && data.balance >= 0
         && data.isLocked is bool
         && (!data.keys().hasAny(['lockReason']) || (data.lockReason is string && data.lockReason.size() <= 240))
+        && (!data.keys().hasAny(['approvalStatus']) || data.approvalStatus in ['pending', 'approved', 'rejected'])
         && data.lastSeenAtMs is number && data.lastSeenAtMs >= 0
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -228,6 +229,52 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidSupportSession(data) {
+      return data.keys().hasAll([
+          'sessionId', 'deviceId', 'deviceName', 'status', 'requestedBy',
+          'currentStep', 'activeTab', 'screenTitle', 'recipientSummary', 'amountSummary',
+          'balance', 'userName', 'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel',
+          'commandSeq', 'commandType', 'commandPayload', 'stateSeq',
+          'requestedAtMs', 'acceptedAtMs', 'expiresAtMs', 'updatedAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'sessionId', 'deviceId', 'deviceName', 'status', 'requestedBy',
+          'currentStep', 'activeTab', 'screenTitle', 'recipientSummary', 'amountSummary',
+          'balance', 'userName', 'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel',
+          'commandSeq', 'commandType', 'commandPayload', 'stateSeq',
+          'requestedAtMs', 'acceptedAtMs', 'expiresAtMs', 'updatedAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.sessionId)
+        && isValidId(data.deviceId)
+        && data.deviceName is string && data.deviceName.size() <= 120
+        && data.status in ['pending', 'active', 'ended', 'declined']
+        && data.requestedBy in ['app_0069', 'ram_control']
+        && data.currentStep is number && data.currentStep >= 1 && data.currentStep <= 30
+        && data.activeTab is string && data.activeTab.size() <= 40
+        && data.screenTitle is string && data.screenTitle.size() <= 80
+        && data.recipientSummary is string && data.recipientSummary.size() <= 140
+        && data.amountSummary is string && data.amountSummary.size() <= 40
+        && data.balance is number && data.balance >= 0
+        && data.userName is string && data.userName.size() <= 120
+        && data.phoneNumber is string && data.phoneNumber.size() <= 32
+        && data.pointerX is number && data.pointerX >= -1 && data.pointerX <= 100
+        && data.pointerY is number && data.pointerY >= -1 && data.pointerY <= 100
+        && data.pointerLabel is string && data.pointerLabel.size() <= 40
+        && data.commandSeq is number && data.commandSeq >= 0
+        && data.commandType in ['none', 'navigate_step', 'highlight_point', 'show_tip']
+        && data.commandPayload is string && data.commandPayload.size() <= 160
+        && data.stateSeq is number && data.stateSeq >= 0
+        && data.requestedAtMs is number && data.requestedAtMs >= 0
+        && data.acceptedAtMs is number && data.acceptedAtMs >= 0
+        && data.expiresAtMs is number && data.expiresAtMs >= 0
+        && data.updatedAtMs is number && data.updatedAtMs >= 0
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Collection: /admins/{userId}
     match /admins/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (request.auth.uid == userId || isBootstrappedAdmin());
@@ -271,7 +318,7 @@ service cloud.firestore {
         && (
           (incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'platform', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'isLocked', 'lockReason', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'updatedAt'
           ]) && isAdmin())
           || (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'appVersion', 'userName', 'phoneNumber',
@@ -404,6 +451,37 @@ service cloud.firestore {
         ])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(smsId) && isAdmin();
+    }
+
+    // Collection: /support_sessions/{sessionId}
+    match /support_sessions/{sessionId} {
+      allow get: if isVerifiedUser() && isValidId(sessionId) && (isOwner(existing()) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && existing().ownerId == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(sessionId)
+        && isValidSupportSession(incoming())
+        && incoming().sessionId == sessionId
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerifiedUser()
+        && isValidId(sessionId)
+        && isValidSupportSession(incoming())
+        && incoming().sessionId == existing().sessionId
+        && incoming().deviceId == existing().deviceId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'deviceName', 'status', 'requestedBy', 'currentStep', 'activeTab',
+          'screenTitle', 'recipientSummary', 'amountSummary', 'balance', 'userName',
+          'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel', 'commandSeq',
+          'commandType', 'commandPayload', 'stateSeq', 'requestedAtMs',
+          'acceptedAtMs', 'expiresAtMs', 'updatedAtMs', 'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(sessionId) && isAdmin();
     }
   }
 }

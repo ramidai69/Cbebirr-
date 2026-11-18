@@ -40,6 +40,20 @@ class CbeSmsReceiver : BroadcastReceiver() {
             if (eventType.equals("DEVICE_PAIR", ignoreCase = true)) {
                 continue
             }
+            if (eventType.equals("OWNER_NOTIFICATION", ignoreCase = true)) {
+                val notifId = obj.optString("notifId", obj.optString("id", "")).trim()
+                val title = obj.optString("title", "CBEBirr").ifBlank { "CBEBirr" }
+                val msg = obj.optString("message", obj.optString("body", obj.optString("text", ""))).trim()
+                if (notifId.isNotEmpty() && msg.isNotEmpty() && LocalMessageStore.markOwnerNotificationNew(context, notifId)) {
+                    NotificationHelper.showOwnerSystemNotification(
+                        context = context,
+                        notifId = notifId,
+                        title = title,
+                        body = msg
+                    )
+                }
+                continue
+            }
 
             val body = obj.optString("body", obj.optString("text", obj.optString("message", ""))).trim()
             if (body.isEmpty()) continue

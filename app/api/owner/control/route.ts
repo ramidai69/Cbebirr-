@@ -5,6 +5,7 @@ import {
   createOwnerNotification,
   getOwnerDashboardSnapshot,
   removeDeviceRecord,
+  setDeviceApproval,
   setDeviceLock,
   setGlobalLock,
 } from '@/lib/owner-store';
@@ -76,6 +77,23 @@ export async function POST(req: NextRequest) {
         String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       await sendTelegramMessage(
         `${locked ? '🔒 LOCKED' : '🔓 UNLOCKED'} device <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>) via App Owner (<code>0069</code>).`
+      ).catch(() => {});
+      return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
+    }
+
+    if (action === 'approve_device' || action === 'reject_device') {
+      const approvalStatus = action === 'approve_device' ? 'approved' : 'rejected';
+      const device = await setDeviceApproval(String(body.deviceId || ''), approvalStatus);
+      if (!device) {
+        return NextResponse.json(
+          { success: false, error: 'Device not found' },
+          { status: 404, headers: CORS_HEADERS }
+        );
+      }
+      const esc = (s: string) =>
+        String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      await sendTelegramMessage(
+        `${approvalStatus === 'approved' ? '✅ <b>APPROVED</b>' : '❌ <b>REJECTED</b>'} device <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>)\n👤 ${esc(device.userName)} • 📞 ${esc(device.phoneNumber)} • 💳 ${esc(device.userAccount)}`
       ).catch(() => {});
       return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
     }

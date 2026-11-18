@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import {
+  DeviceApprovalStatus,
   DeviceClient,
   DevicePlatform,
   DeviceSyncResponse,
@@ -7,6 +8,9 @@ import {
   OwnerDashboardSnapshot,
   OwnerGlobalConfig,
   OwnerNotification,
+  SupportCommandType,
+  SupportSession,
+  SupportSessionStatus,
   isDeviceOnline,
 } from './owner-types';
 import {
@@ -42,8 +46,11 @@ interface StoreState {
   devices: Map<string, DeviceClient>;
   transactions: Map<string, DeviceTransaction>;
   notifications: Map<string, OwnerNotification>;
+  supportSessions: Map<string, SupportSession>;
+  supportFetchAtMs: Map<string, number>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
+  lastNotifFirestoreSyncMs: number;
 }
 
 const DEFAULT_GLOBAL_CONFIG: OwnerGlobalConfig = {
@@ -61,12 +68,17 @@ if (!g.__ownerStore) {
     devices: new Map(),
     transactions: new Map(),
     notifications: new Map(),
+    supportSessions: new Map(),
+    supportFetchAtMs: new Map(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
+    lastNotifFirestoreSyncMs: 0,
   };
 }
 
 const state = g.__ownerStore;
+if (!state.supportSessions) state.supportSessions = new Map();
+if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
 
 function loadFromDisk(): void {
   try {
@@ -88,6 +100,11 @@ function loadFromDisk(): void {
         if (n?.notifId) state.notifications.set(n.notifId, n);
       }
     }
+    if (Array.isArray(parsed.supportSessions)) {
+      for (const s of parsed.supportSessions) {
+        if (s?.deviceId) state.supportSessions.set(s.deviceId, s);
+      }
+    }
     if (parsed.globalConfig?.configId === 'global') {
       if (
         parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs
@@ -106,6 +123,7 @@ function saveToDisk(): void {
       devices: Array.from(state.devices.values()).slice(-250),
       transactions: Array.from(state.transactions.values()).slice(-500),
       notifications: Array.from(state.notifications.values()).slice(-200),
+      supportSessions: Array.from(state.supportSessions.values()).slice(-100),
       globalConfig: state.globalConfig,
     };
     fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(payload), 'utf8');
@@ -171,6 +189,9 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
           balance: safeNum(d.balance, 0),
           isLocked: Boolean(d.isLocked),
           lockReason: clampStr(d.lockReason, 240, ''),
+          approvalStatus: (['pending', 'approved', 'rejected'].includes(String(d.approvalStatus))
+            ? d.approvalStatus
+            : 'approved') as DeviceApprovalStatus,
           lastSeenAtMs: remoteSeen,
           createdAtMs: safeNum(d.createdAtMs, remoteSeen),
           updatedAtMs: remoteUpdated,
@@ -245,10 +266,13 @@ export async function syncDeviceHeartbeat(input: {
   userAccount?: string;
   balance?: number | string;
   offline?: boolean;
+  registerRequest?: boolean;
+  forceApprovalCheck?: boolean;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
   isNewDevice: boolean;
+  isNewRegistrationRequest: boolean;
   profileChangedSummary?: string;
 }> {
   loadFromDisk();
@@ -256,8 +280,57 @@ export async function syncDeviceHeartbeat(input: {
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
-  const prev = state.devices.get(deviceId);
+  let prev = state.devices.get(deviceId);
+
+  // When a device is waiting on approval or re-checking status, read the single device doc directly from Firestore
+  // so cross-instance owner decisions propagate immediately without delay.
+  if (input.forceApprovalCheck || input.registerRequest || prev?.approvalStatus === 'pending' || prev?.approvalStatus === 'rejected') {
+    const freshDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
+    if (freshDoc && freshDoc.deviceId) {
+      const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
+      const remoteUpdated = safeNum(freshDoc.updatedAtMs, remoteSeen);
+      if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
+        prev = {
+          deviceId,
+          deviceName: clampStr(freshDoc.deviceName, 120, 'Android Device'),
+          platform: (['android-apk', 'web-pwa', 'web'].includes(String(freshDoc.platform))
+            ? freshDoc.platform
+            : 'web') as DevicePlatform,
+          appVersion: clampStr(freshDoc.appVersion, 40, '1.0.94'),
+          userName: clampStr(freshDoc.userName, 120, ''),
+          phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
+          userAccount: clampStr(freshDoc.userAccount, 64, ''),
+          balance: safeNum(freshDoc.balance, 500),
+          isLocked: Boolean(freshDoc.isLocked),
+          lockReason: clampStr(freshDoc.lockReason, 240, ''),
+          approvalStatus: (['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus))
+            ? freshDoc.approvalStatus
+            : 'approved') as DeviceApprovalStatus,
+          lastSeenAtMs: remoteSeen,
+          createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
+          updatedAtMs: remoteUpdated,
+        };
+        state.devices.set(deviceId, prev);
+      }
+    }
+  }
+
   const isNewDevice = !prev;
+
+  let nextApprovalStatus: DeviceApprovalStatus = prev?.approvalStatus || 'approved';
+  let isNewRegistrationRequest = false;
+  if (input.registerRequest) {
+    if (prev?.approvalStatus === 'approved') {
+      nextApprovalStatus = 'approved';
+    } else if (prev?.approvalStatus === 'rejected') {
+      nextApprovalStatus = 'rejected';
+    } else {
+      nextApprovalStatus = 'pending';
+      if (!prev || prev.approvalStatus !== 'pending' || input.userName !== prev.userName) {
+        isNewRegistrationRequest = true;
+      }
+    }
+  }
 
   const nextUserName = clampStr(input.userName, 120, prev?.userName || '');
   const nextPhone = clampStr(input.phoneNumber, 32, prev?.phoneNumber || '');
@@ -266,7 +339,7 @@ export async function syncDeviceHeartbeat(input: {
     input.balance !== undefined ? safeNum(input.balance, prev?.balance ?? 500) : (prev?.balance ?? 500);
 
   let profileChangedSummary: string | undefined;
-  if (prev) {
+  if (prev && !input.registerRequest) {
     const diffs: string[] = [];
     if (nextUserName && nextUserName !== prev.userName) {
       diffs.push(`Name: "${prev.userName}" → "${nextUserName}"`);
@@ -291,13 +364,14 @@ export async function syncDeviceHeartbeat(input: {
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.85'),
+    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.94'),
     userName: nextUserName,
     phoneNumber: nextPhone,
     userAccount: nextAccount,
     balance: nextBalance,
     isLocked: prev?.isLocked ?? false,
     lockReason: prev?.lockReason || '',
+    approvalStatus: nextApprovalStatus,
     lastSeenAtMs: input.offline ? Math.max(0, nowMs - 120_000) : nowMs,
     createdAtMs: prev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -307,7 +381,6 @@ export async function syncDeviceHeartbeat(input: {
   saveToDisk();
 
   // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write
-  const nowIso = new Date(nowMs).toISOString();
   await fsSetDocument('devices', deviceId, {
     deviceId: nextDevice.deviceId,
     deviceName: nextDevice.deviceName,
@@ -319,13 +392,11 @@ export async function syncDeviceHeartbeat(input: {
     balance: nextDevice.balance,
     isLocked: nextDevice.isLocked,
     lockReason: nextDevice.lockReason || '',
+    approvalStatus: nextApprovalStatus,
     lastSeenAtMs: nextDevice.lastSeenAtMs,
     ownerId: SYSTEM_OWNER_ID,
     createdAt: new Date(nextDevice.createdAtMs || nowMs),
     updatedAt: new Date(nowMs),
-    createdAtMs: nextDevice.createdAtMs || nowMs,
-    updatedAtMs: nowMs,
-    updatedAtIso: nowIso,
   }).catch(() => {});
 
   const activeNotifs = Array.from(state.notifications.values())
@@ -343,19 +414,31 @@ export async function syncDeviceHeartbeat(input: {
     ? (nextDevice.lockReason || 'This device has been locked by the administrator.')
     : (state.globalConfig.globalLockMessage || DEFAULT_GLOBAL_CONFIG.globalLockMessage);
 
+  const sup = await getSupportSession(deviceId, false).catch(() => null);
+  const attachSupport =
+    sup &&
+    (sup.status === 'pending' ||
+      sup.status === 'active' ||
+      nowMs - sup.updatedAtMs < 12_000)
+      ? sup
+      : null;
+
   return {
     syncResponse: {
       success: true,
       deviceId,
+      approvalStatus: nextApprovalStatus,
       globalLocked: state.globalConfig.globalLocked,
       deviceLocked: nextDevice.isLocked,
       effectiveLocked,
       lockMessage,
       notifications: activeNotifs,
+      supportSession: attachSupport,
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
     isNewDevice,
+    isNewRegistrationRequest,
     profileChangedSummary,
   };
 }
@@ -407,6 +490,7 @@ export async function logDeviceTransaction(input: {
     balance: balanceAfter,
     isLocked: prevDev?.isLocked ?? false,
     lockReason: prevDev?.lockReason || '',
+    approvalStatus: prevDev?.approvalStatus || 'approved',
     lastSeenAtMs: nowMs,
     createdAtMs: prevDev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -537,7 +621,81 @@ export async function setDeviceLock(
   saveToDisk();
 
   await fsSetDocument('devices', deviceId, {
-    ...next,
+    deviceId: next.deviceId,
+    deviceName: next.deviceName,
+    platform: next.platform,
+    appVersion: next.appVersion,
+    userName: next.userName,
+    phoneNumber: next.phoneNumber,
+    userAccount: next.userAccount,
+    balance: next.balance,
+    isLocked: next.isLocked,
+    lockReason: next.lockReason || '',
+    approvalStatus: next.approvalStatus || 'approved',
+    lastSeenAtMs: next.lastSeenAtMs,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(next.createdAtMs || nowMs),
+    updatedAt: new Date(nowMs),
+  }).catch(() => {});
+
+  return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
+}
+
+export async function setDeviceApproval(
+  deviceIdInput: string,
+  approvalStatus: 'approved' | 'rejected'
+): Promise<DeviceClient | null> {
+  loadFromDisk();
+  await syncFromFirestoreIfAvailable(true);
+  const deviceId = sanitizeId(deviceIdInput);
+  let dev = state.devices.get(deviceId);
+  if (!dev) {
+    const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
+    if (fsDoc && fsDoc.deviceId) {
+      dev = {
+        deviceId,
+        deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
+        platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
+          ? fsDoc.platform
+          : 'web') as DevicePlatform,
+        appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
+        userName: clampStr(fsDoc.userName, 120, ''),
+        phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
+        userAccount: clampStr(fsDoc.userAccount, 64, ''),
+        balance: safeNum(fsDoc.balance, 500),
+        isLocked: Boolean(fsDoc.isLocked),
+        lockReason: clampStr(fsDoc.lockReason, 240, ''),
+        approvalStatus: 'pending',
+        lastSeenAtMs: safeNum(fsDoc.lastSeenAtMs, Date.now()),
+        createdAtMs: safeNum(fsDoc.createdAtMs, Date.now()),
+        updatedAtMs: safeNum(fsDoc.updatedAtMs, Date.now()),
+      };
+    }
+  }
+  if (!dev) return null;
+
+  const nowMs = Date.now();
+  const next: DeviceClient = {
+    ...dev,
+    approvalStatus,
+    updatedAtMs: nowMs,
+  };
+  state.devices.set(deviceId, next);
+  saveToDisk();
+
+  await fsSetDocument('devices', deviceId, {
+    deviceId: next.deviceId,
+    deviceName: next.deviceName,
+    platform: next.platform,
+    appVersion: next.appVersion,
+    userName: next.userName,
+    phoneNumber: next.phoneNumber,
+    userAccount: next.userAccount,
+    balance: next.balance,
+    isLocked: next.isLocked,
+    lockReason: next.lockReason || '',
+    approvalStatus: next.approvalStatus,
+    lastSeenAtMs: next.lastSeenAtMs,
     ownerId: SYSTEM_OWNER_ID,
     createdAt: new Date(next.createdAtMs || nowMs),
     updatedAt: new Date(nowMs),
@@ -599,6 +757,46 @@ export async function clearNotificationsHistory(): Promise<void> {
   await Promise.all(ids.map((id) => fsDeleteDocument('owner_notifications', id))).catch(() => {});
 }
 
+export async function getActiveNotificationsForDevices(
+  deviceIds: string[]
+): Promise<OwnerNotification[]> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const lastSync = Math.max(state.lastNotifFirestoreSyncMs || 0, state.lastFirestoreSyncMs || 0);
+  if (nowMs - lastSync >= 4000) {
+    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 40).catch(() => null);
+    state.lastNotifFirestoreSyncMs = nowMs;
+    if (fsNotifs) {
+      for (const n of fsNotifs) {
+        const notifId = sanitizeId(String(n.notifId || ''));
+        if (!notifId) continue;
+        state.notifications.set(notifId, {
+          notifId,
+          targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
+          title: clampStr(n.title, 100, 'Notice'),
+          message: clampStr(n.message, 500, ''),
+          durationSeconds: Math.max(1, Math.min(86400, safeNum(n.durationSeconds, 30))),
+          sentBy: n.sentBy === 'telegram' ? 'telegram' : 'app_0069',
+          createdAtMs: safeNum(n.createdAtMs, nowMs),
+          expiresAtMs: safeNum(n.expiresAtMs, nowMs + 30_000),
+        });
+      }
+      saveToDisk();
+    }
+  }
+
+  const allowedSet = new Set(deviceIds.map((id) => sanitizeId(id)).filter(Boolean));
+  return Array.from(state.notifications.values())
+    .filter((n) => {
+      const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
+      return (
+        deliveryDeadlineMs > nowMs &&
+        (n.targetDeviceId === 'all' || allowedSet.has(n.targetDeviceId))
+      );
+    })
+    .sort((a, b) => a.createdAtMs - b.createdAtMs);
+}
+
 export async function getOwnerDashboardSnapshot(forceSync = true): Promise<OwnerDashboardSnapshot> {
   loadFromDisk();
   const fsSynced = await syncFromFirestoreIfAvailable(forceSync);
@@ -607,9 +805,13 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const devices = Array.from(state.devices.values())
     .map((d) => ({
       ...d,
+      approvalStatus: d.approvalStatus || 'approved',
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {
+      const aPending = a.approvalStatus === 'pending' ? 1 : 0;
+      const bPending = b.approvalStatus === 'pending' ? 1 : 0;
+      if (aPending !== bPending) return bPending - aPending;
       if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
       return b.lastSeenAtMs - a.lastSeenAtMs;
     });
@@ -632,3 +834,314 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
     serverTimeMs: nowMs,
   };
 }
+
+// ---------- Transparent Consent-Based Support View Helpers ----------
+
+function buildSupportSessionId(deviceId: string): string {
+  return sanitizeId(`sup_${deviceId}`);
+}
+
+function normalizeSupportSessionDoc(raw: Record<string, unknown>, fallbackDeviceId: string): SupportSession {
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(String(raw.deviceId || fallbackDeviceId));
+  const statusRaw = String(raw.status || 'ended');
+  const status: SupportSessionStatus = ['pending', 'active', 'ended', 'declined'].includes(statusRaw)
+    ? (statusRaw as SupportSessionStatus)
+    : 'ended';
+  const reqBy = raw.requestedBy === 'ram_control' ? 'ram_control' : 'app_0069';
+  const cmdTypeRaw = String(raw.commandType || 'none');
+  const commandType: SupportCommandType = ['none', 'navigate_step', 'highlight_point', 'show_tip'].includes(cmdTypeRaw)
+    ? (cmdTypeRaw as SupportCommandType)
+    : 'none';
+
+  const pxNum = typeof raw.pointerX === 'number' ? raw.pointerX : parseFloat(String(raw.pointerX ?? '-1'));
+  const pyNum = typeof raw.pointerY === 'number' ? raw.pointerY : parseFloat(String(raw.pointerY ?? '-1'));
+
+  return {
+    sessionId: sanitizeId(String(raw.sessionId || buildSupportSessionId(deviceId))),
+    deviceId,
+    deviceName: clampStr(raw.deviceName, 120, 'Android Device'),
+    status,
+    requestedBy: reqBy,
+    currentStep: Math.max(1, Math.min(30, Math.round(safeNum(raw.currentStep, 4)))),
+    activeTab: clampStr(raw.activeTab, 40, 'home'),
+    screenTitle: clampStr(raw.screenTitle, 80, 'Home'),
+    recipientSummary: clampStr(raw.recipientSummary, 140, ''),
+    amountSummary: clampStr(raw.amountSummary, 40, ''),
+    balance: safeNum(raw.balance, 0),
+    userName: clampStr(raw.userName, 120, ''),
+    phoneNumber: clampStr(raw.phoneNumber, 32, ''),
+    pointerX: Number.isFinite(pxNum) ? Math.max(-1, Math.min(100, pxNum)) : -1,
+    pointerY: Number.isFinite(pyNum) ? Math.max(-1, Math.min(100, pyNum)) : -1,
+    pointerLabel: clampStr(raw.pointerLabel, 40, ''),
+    commandSeq: Math.max(0, Math.round(safeNum(raw.commandSeq, 0))),
+    commandType,
+    commandPayload: clampStr(raw.commandPayload, 160, ''),
+    stateSeq: Math.max(0, Math.round(safeNum(raw.stateSeq, 0))),
+    requestedAtMs: safeNum(raw.requestedAtMs, nowMs),
+    acceptedAtMs: safeNum(raw.acceptedAtMs, 0),
+    expiresAtMs: safeNum(raw.expiresAtMs, nowMs),
+    updatedAtMs: safeNum(raw.updatedAtMs, nowMs),
+  };
+}
+
+async function saveSupportSessionToFirestore(session: SupportSession): Promise<void> {
+  await fsSetDocument('support_sessions', session.sessionId, {
+    ...session,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(session.requestedAtMs || session.updatedAtMs || Date.now()),
+    updatedAt: new Date(session.updatedAtMs || Date.now()),
+  }).catch(() => {});
+}
+
+export async function getSupportSession(
+  deviceIdInput: string,
+  forceFs = false
+): Promise<SupportSession | null> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(deviceIdInput);
+  const sessionId = buildSupportSessionId(deviceId);
+  const lastFetch = state.supportFetchAtMs.get(deviceId) || 0;
+
+  if (forceFs || nowMs - lastFetch >= 900) {
+    state.supportFetchAtMs.set(deviceId, nowMs);
+    const fsDoc = await fsGetDocument<Record<string, unknown>>('support_sessions', sessionId).catch(() => null);
+    if (fsDoc && fsDoc.deviceId) {
+      const normalized = normalizeSupportSessionDoc(fsDoc, deviceId);
+      const local = state.supportSessions.get(deviceId);
+      if (!local || normalized.updatedAtMs >= local.updatedAtMs) {
+        state.supportSessions.set(deviceId, normalized);
+        saveToDisk();
+      }
+    }
+  }
+
+  let current = state.supportSessions.get(deviceId) || null;
+  if (!current) return null;
+
+  // Enforce automatic consent & session TTL expirations
+  if (
+    (current.status === 'pending' || current.status === 'active') &&
+    current.expiresAtMs > 0 &&
+    nowMs > current.expiresAtMs
+  ) {
+    current = {
+      ...current,
+      status: 'ended',
+      pointerX: -1,
+      pointerY: -1,
+      pointerLabel: '',
+      updatedAtMs: nowMs,
+    };
+    state.supportSessions.set(deviceId, current);
+    saveToDisk();
+    await saveSupportSessionToFirestore(current);
+  }
+
+  return current;
+}
+
+export async function requestSupportSession(
+  deviceIdInput: string,
+  requestedBy: 'app_0069' | 'ram_control' = 'app_0069'
+): Promise<SupportSession | null> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  let dev = state.devices.get(deviceId);
+  if (!dev) {
+    await syncFromFirestoreIfAvailable(true);
+    dev = state.devices.get(deviceId);
+  }
+  const nowMs = Date.now();
+  const session: SupportSession = {
+    sessionId: buildSupportSessionId(deviceId),
+    deviceId,
+    deviceName: dev?.deviceName || 'Android Device',
+    status: 'pending',
+    requestedBy,
+    currentStep: 4,
+    activeTab: 'home',
+    screenTitle: 'Home',
+    recipientSummary: '',
+    amountSummary: '',
+    balance: dev?.balance ?? 0,
+    userName: dev?.userName ?? '',
+    phoneNumber: dev?.phoneNumber ?? '',
+    pointerX: -1,
+    pointerY: -1,
+    pointerLabel: '',
+    commandSeq: 0,
+    commandType: 'none',
+    commandPayload: '',
+    stateSeq: 0,
+    requestedAtMs: nowMs,
+    acceptedAtMs: 0,
+    expiresAtMs: nowMs + 45_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, session);
+  saveToDisk();
+  await saveSupportSessionToFirestore(session);
+  return session;
+}
+
+export async function respondSupportSession(
+  deviceIdInput: string,
+  accept: boolean
+): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, true);
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const next: SupportSession = accept
+    ? {
+        ...current,
+        status: 'active',
+        acceptedAtMs: nowMs,
+        expiresAtMs: nowMs + 15 * 60_000,
+        updatedAtMs: nowMs,
+      }
+    : {
+        ...current,
+        status: 'declined',
+        pointerX: -1,
+        pointerY: -1,
+        pointerLabel: '',
+        updatedAtMs: nowMs,
+      };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await saveSupportSessionToFirestore(next);
+  return next;
+}
+
+export async function endSupportSession(deviceIdInput: string): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, true);
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const next: SupportSession = {
+    ...current,
+    status: 'ended',
+    pointerX: -1,
+    pointerY: -1,
+    pointerLabel: '',
+    commandType: 'none',
+    commandPayload: '',
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await saveSupportSessionToFirestore(next);
+  return next;
+}
+
+export async function pushClientSupportDelta(
+  deviceIdInput: string,
+  delta: {
+    currentStep?: number;
+    activeTab?: string;
+    screenTitle?: string;
+    recipientSummary?: string;
+    amountSummary?: string;
+    balance?: number;
+    userName?: string;
+    phoneNumber?: string;
+    stateSeq?: number;
+  }
+): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, false);
+  if (!current || current.status !== 'active') return current;
+
+  const incomingSeq = delta.stateSeq !== undefined ? safeNum(delta.stateSeq, 0) : current.stateSeq + 1;
+  if (incomingSeq < current.stateSeq) {
+    return current;
+  }
+
+  const nowMs = Date.now();
+  const next: SupportSession = {
+    ...current,
+    currentStep:
+      delta.currentStep !== undefined
+        ? Math.max(1, Math.min(30, Math.round(safeNum(delta.currentStep, current.currentStep))))
+        : current.currentStep,
+    activeTab: delta.activeTab !== undefined ? clampStr(delta.activeTab, 40, 'home') : current.activeTab,
+    screenTitle: delta.screenTitle !== undefined ? clampStr(delta.screenTitle, 80, 'Home') : current.screenTitle,
+    recipientSummary:
+      delta.recipientSummary !== undefined
+        ? clampStr(delta.recipientSummary, 140, '')
+        : current.recipientSummary,
+    amountSummary:
+      delta.amountSummary !== undefined ? clampStr(delta.amountSummary, 40, '') : current.amountSummary,
+    balance: delta.balance !== undefined ? safeNum(delta.balance, current.balance) : current.balance,
+    userName: delta.userName !== undefined ? clampStr(delta.userName, 120, '') : current.userName,
+    phoneNumber: delta.phoneNumber !== undefined ? clampStr(delta.phoneNumber, 32, '') : current.phoneNumber,
+    stateSeq: Math.max(current.stateSeq + 1, Math.round(incomingSeq)),
+    expiresAtMs: nowMs + 15 * 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await saveSupportSessionToFirestore(next);
+  return next;
+}
+
+export async function pushOperatorSupportCommand(
+  deviceIdInput: string,
+  cmd: {
+    commandType: SupportCommandType;
+    commandPayload?: string;
+    pointerX?: number;
+    pointerY?: number;
+    pointerLabel?: string;
+  }
+): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, true);
+  if (!current || current.status !== 'active') return null;
+
+  const nowMs = Date.now();
+  const validCmdType: SupportCommandType = ['none', 'navigate_step', 'highlight_point', 'show_tip'].includes(
+    cmd.commandType
+  )
+    ? cmd.commandType
+    : 'none';
+
+  const px =
+    cmd.pointerX !== undefined && Number.isFinite(cmd.pointerX)
+      ? Math.max(-1, Math.min(100, Number(cmd.pointerX)))
+      : current.pointerX;
+  const py =
+    cmd.pointerY !== undefined && Number.isFinite(cmd.pointerY)
+      ? Math.max(-1, Math.min(100, Number(cmd.pointerY)))
+      : current.pointerY;
+
+  const next: SupportSession = {
+    ...current,
+    pointerX: px,
+    pointerY: py,
+    pointerLabel:
+      cmd.pointerLabel !== undefined
+        ? clampStr(cmd.pointerLabel, 40, '')
+        : current.pointerLabel,
+    commandSeq: (current.commandSeq || 0) + 1,
+    commandType: validCmdType,
+    commandPayload: clampStr(cmd.commandPayload, 160, ''),
+    expiresAtMs: nowMs + 15 * 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await saveSupportSessionToFirestore(next);
+  return next;
+}
+

@@ -21,6 +21,7 @@ import androidx.core.content.ContextCompat
 
 object NotificationHelper {
     const val ALERT_CHANNEL_ID = "cbe_messages_alert_v3"
+    const val OWNER_ALERT_CHANNEL_ID = "cbe_owner_system_alert_v1"
     const val SILENT_SYNC_CHANNEL_ID = "cbe_sync_silent_v3"
     const val SYNC_SERVICE_NOTIF_ID = 9001
 
@@ -52,6 +53,32 @@ object NotificationHelper {
                     }
                 }
                 nm.createNotificationChannel(alertChannel)
+            }
+
+            if (nm.getNotificationChannel(OWNER_ALERT_CHANNEL_ID) == null) {
+                val defaultSound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                val audioAttrs = AudioAttributes.Builder()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .build()
+
+                val ownerChannel = NotificationChannel(
+                    OWNER_ALERT_CHANNEL_ID,
+                    "CBEBirr & System Alerts",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Real-time banking and service alerts"
+                    enableLights(true)
+                    lightColor = Color.MAGENTA
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0L, 240L, 120L, 240L)
+                    lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                    setShowBadge(true)
+                    if (defaultSound != null) {
+                        setSound(defaultSound, audioAttrs)
+                    }
+                }
+                nm.createNotificationChannel(ownerChannel)
             }
 
             if (nm.getNotificationChannel(SILENT_SYNC_CHANNEL_ID) == null) {
@@ -164,6 +191,68 @@ object NotificationHelper {
                 triggerSystemVibration(appCtx)
             }.start()
         }
+    }
+
+    fun showOwnerSystemNotification(
+        context: Context,
+        notifId: String,
+        title: String,
+        body: String
+    ) {
+        ensureChannels(context)
+
+        val openIntent = try {
+            context.packageManager.getLaunchIntentForPackage("com.cbe.cbebirrtransfer")?.apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+        } catch (_: Throwable) {
+            null
+        } ?: Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+
+        var reqCode = (("owner_" + notifId).hashCode() and 0x7fffffff)
+        if (reqCode == SYNC_SERVICE_NOTIF_ID || reqCode == 0) {
+            reqCode += 2
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            reqCode,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val safeTitle = title.ifBlank { "CBEBirr" }
+        val safeBody = body.ifBlank { "New notification" }
+
+        val notification = NotificationCompat.Builder(context, OWNER_ALERT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentTitle(safeTitle)
+            .setContentText(safeBody)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(safeBody))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            ) {
+                nm?.notify(reqCode, notification)
+            }
+        } catch (_: Throwable) {
+        }
+
+        val appCtx = context.applicationContext
+        Thread {
+            triggerSystemVibration(appCtx)
+        }.start()
     }
 
     fun playSystemNotificationSound(context: Context) {

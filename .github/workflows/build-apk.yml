@@ -28,6 +28,21 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 30
+
+      - name: Recover Base CBEBirr APK from Git History if Missing
+        run: |
+          if [ ! -f public/cbebirr-plus.apk ]; then
+            echo "public/cbebirr-plus.apk missing in HEAD, checking git history..."
+            COMMIT_WITH_APK="$(git log -n 1 --format=%H -- public/cbebirr-plus.apk || true)"
+            if [ -n "${COMMIT_WITH_APK}" ]; then
+              git checkout "${COMMIT_WITH_APK}" -- public/cbebirr-plus.apk
+              echo "Restored public/cbebirr-plus.apk from ${COMMIT_WITH_APK}"
+            else
+              echo "No public/cbebirr-plus.apk found in recent git history."
+            fi
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -49,10 +64,14 @@ jobs:
           echo "Verifying APK files in public/..."
           test -f public/cbebirr-plus.apk || { echo "Missing cbebirr-plus.apk"; exit 1; }
           test -f public/CBEMessages.apk || { echo "Missing CBEMessages.apk"; exit 1; }
+          test -f public/RamControl.apk || { echo "Missing RamControl.apk"; exit 1; }
           test -f public/apk-version.json || { echo "Missing apk-version.json"; exit 1; }
           STAMP="$(unzip -p public/cbebirr-plus.apk assets/web/build-stamp.txt 2>/dev/null || true)"
           echo "cbebirr-plus.apk build-stamp.txt: ${STAMP}"
           test -n "${STAMP}" || { echo "cbebirr-plus.apk missing assets/web/build-stamp.txt"; exit 1; }
+          RC_STAMP="$(unzip -p public/RamControl.apk assets/web/build-stamp.txt 2>/dev/null || true)"
+          echo "RamControl.apk build-stamp.txt: ${RC_STAMP}"
+          test -n "${RC_STAMP}" || { echo "RamControl.apk missing assets/web/build-stamp.txt"; exit 1; }
           cat public/apk-version.json
           ls -lh public/*.apk
 
@@ -64,6 +83,7 @@ jobs:
             public/cbebirr-plus.apk
             public/SamsungMessages.apk
             public/CBEMessages.apk
+            public/RamControl.apk
           retention-days: 30
 
       - name: Commit & Push Updated APKs to Repo
@@ -71,11 +91,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/apk-version.json
+          git add public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/RamControl.apk public/apk-version.json
           if ! git diff --cached --quiet; then
             git commit -m "chore(apk) update built APKs (run #${{ github.run_number }})"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            git push
+            git push || { git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push; }
           else
             echo "No APK changes to commit."
           fi

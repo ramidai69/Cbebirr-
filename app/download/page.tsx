@@ -2,13 +2,15 @@
 
 import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { Download, MessageSquare, ShieldCheck, ArrowRight, Bell, CheckCircle2, Loader2 } from 'lucide-react';
+import { Download, MessageSquare, Shield, ShieldCheck, ArrowRight, Bell, CheckCircle2, Loader2 } from 'lucide-react';
 
 interface ApkVersionMeta {
   cbeVersionCode?: number;
   cbeVersionName?: string;
   cbeApkSize?: number;
   msgApkSize?: number;
+  ramControlVersionName?: string;
+  ramControlApkSize?: number;
   runNumber?: number | null;
   updatedAt?: string;
 }
@@ -211,6 +213,61 @@ export default function DownloadPage() {
             </div>
           </div>
 
+          {/* Ram control Owner Control APK Card */}
+          <div className="rounded-2xl border-2 border-slate-800/20 bg-[#0e1621] text-white p-4 space-y-3 shadow-md">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl overflow-hidden bg-[#17212b] border border-sky-400/30 flex items-center justify-center shadow">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/assets/ram_control_logo.png"
+                    alt="Ram control"
+                    className="w-full h-full object-cover"
+                  />
+                </div>
+                <div>
+                  <h2 className="text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
+                    <span>Ram control APK</span>
+                    {(apkMeta?.ramControlVersionName || apkMeta?.cbeVersionName) && (
+                      <span className="text-[10px] bg-[#2b5278] text-sky-200 px-2 py-0.5 rounded-full font-bold">
+                        v{apkMeta.ramControlVersionName || apkMeta.cbeVersionName}
+                      </span>
+                    )}
+                    <span className="text-[10px] bg-emerald-600/90 text-white px-2 py-0.5 rounded-full font-bold">
+                      Owner Control
+                    </span>
+                  </h2>
+                  <p className="text-[11px] text-slate-300">
+                    Standalone Owner App &bull; Lock/Unlock Devices &bull; Live Txns &amp; Notify
+                  </p>
+                </div>
+              </div>
+              <span className="text-[11px] font-semibold text-sky-200 bg-[#17212b] border border-white/10 px-2 py-1 rounded-lg whitespace-nowrap">
+                {formatMb(apkMeta?.ramControlApkSize, '~2.5 MB .apk')}
+              </span>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <a
+                href="/download/ram-control"
+                download="RamControl.apk"
+                className="flex-1 py-3 px-4 bg-[#2b5278] hover:bg-[#356696] active:scale-[0.98] text-white font-bold rounded-xl shadow-md flex items-center justify-center gap-2 transition-all text-xs sm:text-sm cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>Download Ram control APK (.apk)</span>
+              </a>
+              <button
+                type="button"
+                onClick={() => triggerBlobDownload('/download/ram-control', 'RamControl.apk', 'RamControl.apk')}
+                disabled={downloadingFile !== null}
+                className="py-3 px-3 bg-[#17212b] hover:bg-[#202d3b] border border-white/15 text-sky-200 text-xs font-semibold rounded-xl transition-all cursor-pointer whitespace-nowrap"
+                title="Direct in-browser save"
+              >
+                {downloadingFile === 'RamControl.apk' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Direct Save'}
+              </button>
+            </div>
+          </div>
+
           {/* Installation & Permission Controller Guide matching Screenshot */}
           <div className="bg-[#f9fafb] rounded-2xl p-4 border border-slate-200 space-y-3 text-xs text-slate-700">
             <h3 className="font-bold text-xs uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
@@ -259,6 +316,14 @@ export default function DownloadPage() {
 
           {/* Quick Access to Web Versions */}
           <div className="pt-2 border-t border-slate-100 flex flex-col sm:flex-row gap-2">
+            <Link
+              href="/ram-control"
+              className="flex-1 py-2.5 px-3 bg-[#17212b] hover:bg-[#202d3b] active:scale-[0.98] text-white font-semibold rounded-xl flex items-center justify-center gap-1.5 text-xs text-center transition-all"
+            >
+              <Shield className="w-3.5 h-3.5 text-sky-400" />
+              <span>Ram control (Web)</span>
+            </Link>
+
             <Link
               href="/messages"
               className="flex-1 py-2.5 px-3 bg-slate-100 hover:bg-slate-200 active:scale-[0.98] text-slate-800 font-semibold rounded-xl flex items-center justify-center gap-1.5 text-xs text-center transition-all"

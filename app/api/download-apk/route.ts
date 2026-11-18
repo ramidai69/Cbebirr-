@@ -5,16 +5,23 @@ import path from 'path';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function getVersionTag(isMessages: boolean): string {
+function getVersionTag(appType: 'messages' | 'ramcontrol' | 'cbe'): string {
   try {
     const metaPath = path.join(process.cwd(), 'public', 'apk-version.json');
     if (fs.existsSync(metaPath)) {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as {
         cbeApkSha256?: string;
         msgApkSha256?: string;
+        ramControlApkSha256?: string;
         cbeVersionCode?: number;
       };
-      const sha = (isMessages ? meta.msgApkSha256 : meta.cbeApkSha256)?.slice(0, 12);
+      const sha = (
+        appType === 'messages'
+          ? meta.msgApkSha256
+          : appType === 'ramcontrol'
+          ? meta.ramControlApkSha256
+          : meta.cbeApkSha256
+      )?.slice(0, 12);
       if (sha) {
         return `${meta.cbeVersionCode || 'v'}-${sha}`;
       }
@@ -25,10 +32,20 @@ function getVersionTag(isMessages: boolean): string {
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const app = searchParams.get('app');
-  const isMessages = app === 'messages' || app === 'samsung';
-  const filename = isMessages ? 'SamsungMessages.apk' : 'cbebirr-plus.apk';
-  const target = new URL(`/${filename}?v=${encodeURIComponent(getVersionTag(isMessages))}`, req.url);
+  const app = (searchParams.get('app') || '').toLowerCase();
+  const appType: 'messages' | 'ramcontrol' | 'cbe' =
+    app === 'messages' || app === 'samsung'
+      ? 'messages'
+      : app === 'ramcontrol' || app === 'ram-control' || app === 'owner'
+      ? 'ramcontrol'
+      : 'cbe';
+  const filename =
+    appType === 'messages'
+      ? 'SamsungMessages.apk'
+      : appType === 'ramcontrol'
+      ? 'RamControl.apk'
+      : 'cbebirr-plus.apk';
+  const target = new URL(`/${filename}?v=${encodeURIComponent(getVersionTag(appType))}`, req.url);
   return NextResponse.redirect(target, {
     status: 307,
     headers: {

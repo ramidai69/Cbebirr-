@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { syncDeviceHeartbeat } from '@/lib/owner-store';
 import {
+  notifyOwnerApprovalRequest,
   notifyOwnerNewDevice,
   notifyOwnerProfileChanged,
 } from '@/lib/owner-telegram';
@@ -39,9 +40,13 @@ export async function POST(req: NextRequest) {
       userAccount: body.userAccount,
       balance: body.balance,
       offline: Boolean(body.offline),
+      registerRequest: Boolean(body.registerRequest),
+      forceApprovalCheck: Boolean(body.forceApprovalCheck),
     });
 
-    if (result.isNewDevice) {
+    if (result.isNewRegistrationRequest) {
+      await notifyOwnerApprovalRequest(result.device).catch(() => {});
+    } else if (result.isNewDevice) {
       await notifyOwnerNewDevice(result.device).catch(() => {});
     } else if (result.profileChangedSummary) {
       await notifyOwnerProfileChanged(result.device, result.profileChangedSummary).catch(() => {});

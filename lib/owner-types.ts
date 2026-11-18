@@ -3,6 +3,7 @@ export const DEFAULT_TELEGRAM_OWNER_CHAT_ID = '6821934730';
 export const DEVICE_ONLINE_THRESHOLD_MS = 35_000;
 
 export type DevicePlatform = 'android-apk' | 'web-pwa' | 'web';
+export type DeviceApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 export interface DeviceClient {
   deviceId: string;
@@ -15,6 +16,7 @@ export interface DeviceClient {
   balance: number;
   isLocked: boolean;
   lockReason?: string;
+  approvalStatus?: DeviceApprovalStatus;
   lastSeenAtMs: number;
   isOnline?: boolean;
   ownerId?: string;
@@ -73,14 +75,51 @@ export interface OwnerDashboardSnapshot {
   serverTimeMs: number;
 }
 
+export type SupportSessionStatus = 'pending' | 'active' | 'ended' | 'declined';
+
+export type SupportCommandType =
+  | 'none'
+  | 'navigate_step'
+  | 'highlight_point'
+  | 'show_tip';
+
+export interface SupportSession {
+  sessionId: string;
+  deviceId: string;
+  deviceName: string;
+  status: SupportSessionStatus;
+  requestedBy: 'app_0069' | 'ram_control';
+  currentStep: number;
+  activeTab: string;
+  screenTitle: string;
+  recipientSummary: string;
+  amountSummary: string;
+  balance: number;
+  userName: string;
+  phoneNumber: string;
+  pointerX: number;
+  pointerY: number;
+  pointerLabel: string;
+  commandSeq: number;
+  commandType: SupportCommandType;
+  commandPayload: string;
+  stateSeq: number;
+  requestedAtMs: number;
+  acceptedAtMs: number;
+  expiresAtMs: number;
+  updatedAtMs: number;
+}
+
 export interface DeviceSyncResponse {
   success: boolean;
   deviceId: string;
+  approvalStatus: DeviceApprovalStatus;
   globalLocked: boolean;
   deviceLocked: boolean;
   effectiveLocked: boolean;
   lockMessage: string;
   notifications: OwnerNotification[];
+  supportSession?: SupportSession | null;
   serverTimeMs: number;
 }
 

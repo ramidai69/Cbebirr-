@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { normalizeDeviceIdFilter, smsStore } from '@/lib/sms-store';
+import { getActiveNotificationsForDevices } from '@/lib/owner-store';
 
 export const dynamic = 'force-dynamic';
 
@@ -55,7 +56,10 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  let messages = await smsStore.getAllMessagesAsync(allowedIds, unsyncedOnly);
+  let [messages, ownerNotifications] = await Promise.all([
+    smsStore.getAllMessagesAsync(allowedIds, unsyncedOnly),
+    getActiveNotificationsForDevices(allowedIds).catch(() => []),
+  ]);
 
   if (conversationId) {
     messages = messages.filter(
@@ -73,6 +77,7 @@ export async function GET(req: NextRequest) {
       deviceIds: allowedIds,
       conversations,
       messages,
+      ownerNotifications,
     },
     { headers: CORS_HEADERS }
   );

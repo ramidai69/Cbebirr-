@@ -95,6 +95,11 @@
           "description": "Optional lock banner message shown on this device",
           "maxLength": 240
         },
+        "approvalStatus": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected"],
+          "description": "New device registration approval status managed by owner"
+        },
         "lastSeenAtMs": {
           "type": "number",
           "description": "Unix epoch ms of the latest heartbeat from this device"
@@ -675,6 +680,170 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "SupportSession": {
+      "title": "SupportSession",
+      "description": "Consent-based transparent live support session linking owner dashboard with an explicitly consenting device.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "description": "Unique support session document ID",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Target device identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Target device label",
+          "maxLength": 120
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "active", "ended", "declined"],
+          "description": "Explicit user consent session lifecycle state"
+        },
+        "requestedBy": {
+          "type": "string",
+          "enum": ["app_0069", "ram_control"],
+          "description": "Initiating support surface"
+        },
+        "currentStep": {
+          "type": "number",
+          "description": "Active app screen step index"
+        },
+        "activeTab": {
+          "type": "string",
+          "description": "Active tab identifier",
+          "maxLength": 40
+        },
+        "screenTitle": {
+          "type": "string",
+          "description": "Readable screen label",
+          "maxLength": 80
+        },
+        "recipientSummary": {
+          "type": "string",
+          "description": "Non-sensitive summary of current screen target",
+          "maxLength": 140
+        },
+        "amountSummary": {
+          "type": "string",
+          "description": "Visible transfer amount string",
+          "maxLength": 40
+        },
+        "balance": {
+          "type": "number",
+          "description": "Visible balance in ETB"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Profile name displayed in app",
+          "maxLength": 120
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "Profile phone string",
+          "maxLength": 32
+        },
+        "pointerX": {
+          "type": "number",
+          "description": "Visible support guide pointer X percent (-1 if hidden)"
+        },
+        "pointerY": {
+          "type": "number",
+          "description": "Visible support guide pointer Y percent (-1 if hidden)"
+        },
+        "pointerLabel": {
+          "type": "string",
+          "description": "Visible pointer badge label",
+          "maxLength": 40
+        },
+        "commandSeq": {
+          "type": "number",
+          "description": "Monotonic operator guidance sequence number"
+        },
+        "commandType": {
+          "type": "string",
+          "enum": ["none", "navigate_step", "highlight_point", "show_tip"],
+          "description": "Latest operator guidance type"
+        },
+        "commandPayload": {
+          "type": "string",
+          "description": "Latest operator guidance payload",
+          "maxLength": 160
+        },
+        "stateSeq": {
+          "type": "number",
+          "description": "Monotonic device UI state delta sequence number"
+        },
+        "requestedAtMs": {
+          "type": "number",
+          "description": "Request timestamp ms"
+        },
+        "acceptedAtMs": {
+          "type": "number",
+          "description": "Acceptance timestamp ms"
+        },
+        "expiresAtMs": {
+          "type": "number",
+          "description": "Expiration timestamp ms"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last update timestamp ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this session",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "sessionId",
+        "deviceId",
+        "deviceName",
+        "status",
+        "requestedBy",
+        "currentStep",
+        "activeTab",
+        "screenTitle",
+        "recipientSummary",
+        "amountSummary",
+        "balance",
+        "userName",
+        "phoneNumber",
+        "pointerX",
+        "pointerY",
+        "pointerLabel",
+        "commandSeq",
+        "commandType",
+        "commandPayload",
+        "stateSeq",
+        "requestedAtMs",
+        "acceptedAtMs",
+        "expiresAtMs",
+        "updatedAtMs",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -705,6 +874,10 @@
     "/sms_messages/{smsId}": {
       "schema": { "$ref": "#/entities/SmsMessageRecord" },
       "description": "Per-device isolated SMS webhook notifications stored by physical deviceId."
+    },
+    "/support_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/SupportSession" },
+      "description": "Transparent consent-based live support sessions between admin and device."
     }
   }
 }

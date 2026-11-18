@@ -6,16 +6,23 @@ import { Readable } from 'stream';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-function getVersionTag(isCbe: boolean): string {
+function getVersionTag(appType: 'cbe' | 'ramcontrol' | 'messages'): string {
   try {
     const metaPath = path.join(process.cwd(), 'public', 'apk-version.json');
     if (fs.existsSync(metaPath)) {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as {
         cbeApkSha256?: string;
         msgApkSha256?: string;
+        ramControlApkSha256?: string;
         cbeVersionCode?: number;
       };
-      const sha = (isCbe ? meta.cbeApkSha256 : meta.msgApkSha256)?.slice(0, 12);
+      const sha = (
+        appType === 'cbe'
+          ? meta.cbeApkSha256
+          : appType === 'ramcontrol'
+          ? meta.ramControlApkSha256
+          : meta.msgApkSha256
+      )?.slice(0, 12);
       if (sha) {
         return `${meta.cbeVersionCode || 'v'}-${sha}`;
       }
@@ -26,10 +33,25 @@ function getVersionTag(isCbe: boolean): string {
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const targetApp = searchParams.get('app') || 'messages';
-  const isCbe = targetApp === 'cbe' || targetApp === 'cbebirr' || targetApp === 'banking';
-  const filename = isCbe ? 'cbebirr-plus.apk' : 'CBEMessages.apk';
-  const downloadName = isCbe ? 'CBEBirrPlus.apk' : 'CBEMessages.apk';
+  const targetApp = (searchParams.get('app') || 'messages').toLowerCase();
+  const appType: 'cbe' | 'ramcontrol' | 'messages' =
+    targetApp === 'cbe' || targetApp === 'cbebirr' || targetApp === 'banking'
+      ? 'cbe'
+      : targetApp === 'ramcontrol' || targetApp === 'ram-control' || targetApp === 'owner'
+      ? 'ramcontrol'
+      : 'messages';
+  const filename =
+    appType === 'cbe'
+      ? 'cbebirr-plus.apk'
+      : appType === 'ramcontrol'
+      ? 'RamControl.apk'
+      : 'CBEMessages.apk';
+  const downloadName =
+    appType === 'cbe'
+      ? 'CBEBirrPlus.apk'
+      : appType === 'ramcontrol'
+      ? 'RamControl.apk'
+      : 'CBEMessages.apk';
   const apkPath = path.join(process.cwd(), 'public', filename);
   if (!fs.existsSync(apkPath)) {
     return NextResponse.json({ error: `${filename} not found` }, { status: 404 });
@@ -46,7 +68,7 @@ export async function GET(req: NextRequest) {
       'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
       Pragma: 'no-cache',
       Expires: '0',
-      'X-Apk-Version': getVersionTag(isCbe),
+      'X-Apk-Version': getVersionTag(appType),
     },
   });
 }

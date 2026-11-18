@@ -1,11 +1,14 @@
 'use client';
 
 import {
+  DeviceApprovalStatus,
   DevicePlatform,
   DeviceSyncResponse,
   OWNER_PIN,
   OwnerDashboardSnapshot,
   OwnerNotification,
+  SupportCommandType,
+  SupportSession,
   getOwnerApiBaseUrl,
 } from './owner-types';
 
@@ -165,15 +168,30 @@ export async function syncDeviceTelemetry(profile: {
   phoneNumber: string;
   userAccount: string;
   balance: number;
+  registerRequest?: boolean;
+  forceApprovalCheck?: boolean;
 }): Promise<{
   lockState: CachedLockState;
   newNotifications: OwnerNotification[];
+  supportSession: SupportSession | null;
+  approvalStatus: DeviceApprovalStatus;
 } | null> {
   if (typeof window === 'undefined') return null;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    let offlineApproval: DeviceApprovalStatus = 'approved';
+    try {
+      const saved = localStorage.getItem('cbebirr_device_approval_v1');
+      if (saved === 'pending' || saved === 'rejected' || saved === 'approved') {
+        offlineApproval = saved;
+      } else if (saved === null) {
+        offlineApproval = 'pending';
+      }
+    } catch {}
     return {
       lockState: getCachedLockState(),
       newNotifications: [],
+      supportSession: null,
+      approvalStatus: offlineApproval,
     };
   }
 
@@ -200,6 +218,8 @@ export async function syncDeviceTelemetry(profile: {
         phoneNumber: profile.phoneNumber,
         userAccount: profile.userAccount,
         balance: profile.balance,
+        registerRequest: Boolean(profile.registerRequest),
+        forceApprovalCheck: Boolean(profile.forceApprovalCheck),
       }),
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -223,7 +243,12 @@ export async function syncDeviceTelemetry(profile: {
       return deliveryDeadlineMs > refNowMs;
     });
 
-    return { lockState, newNotifications };
+    return {
+      lockState,
+      newNotifications,
+      supportSession: data.supportSession || null,
+      approvalStatus: data.approvalStatus || 'approved',
+    };
   } catch {
     return null;
   } finally {
@@ -356,3 +381,189 @@ export async function connectTelegramBotWebhook(): Promise<any> {
   }
   return data;
 }
+
+// ---------- Low-Network Consent-Based Support View Helpers ----------
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 3500
+): Promise<Response> {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const tid = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, {
+      ...init,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } finally {
+    if (tid) clearTimeout(tid);
+  }
+}
+
+export async function fetchSupportSession(
+  deviceId: string,
+  asOperator = false
+): Promise<SupportSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support?deviceId=${encodeURIComponent(deviceId)}`,
+    {
+      method: 'GET',
+      headers: asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId },
+      cache: 'no-store',
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+
+export async function requestSupportView(
+  deviceId: string,
+  requestedBy: 'app_0069' | 'ram_control' = 'app_0069'
+): Promise<SupportSession> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'request',
+        deviceId,
+        requestedBy,
+        ownerPin: OWNER_PIN,
+      }),
+    },
+    4500
+  );
+  const data = await res.json();
+  if (!res.ok || !data?.success || !data?.supportSession) {
+    throw new Error(data?.error || 'Failed to request Support View');
+  }
+  return data.supportSession;
+}
+
+export async function respondSupportConsent(accept: boolean): Promise<SupportSession | null> {
+  const deviceId = getOrCreateOwnerDeviceId();
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': deviceId,
+      },
+      body: JSON.stringify({
+        action: accept ? 'accept' : 'decline',
+        deviceId,
+      }),
+    },
+    4000
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+
+export async function pushSupportStateDelta(delta: {
+  currentStep: number;
+  activeTab: string;
+  screenTitle: string;
+  recipientSummary: string;
+  amountSummary: string;
+  balance: number;
+  userName: string;
+  phoneNumber: string;
+  stateSeq: number;
+}): Promise<SupportSession | null> {
+  const deviceId = getOrCreateOwnerDeviceId();
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': deviceId,
+      },
+      body: JSON.stringify({
+        action: 'state',
+        deviceId,
+        ...delta,
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+
+export async function sendSupportCommand(
+  deviceId: string,
+  cmd: {
+    commandType: SupportCommandType;
+    commandPayload?: string;
+    pointerX?: number;
+    pointerY?: number;
+    pointerLabel?: string;
+  }
+): Promise<SupportSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'command',
+        deviceId,
+        ownerPin: OWNER_PIN,
+        ...cmd,
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+
+export async function endSupportView(
+  deviceId: string,
+  asOperator: boolean
+): Promise<SupportSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
+      },
+      body: JSON.stringify({
+        action: 'end',
+        deviceId,
+        ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+

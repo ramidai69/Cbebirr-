@@ -94,6 +94,23 @@ const nextConfig: NextConfig = {
         ],
       },
       {
+        source: '/RamControl.apk',
+        headers: [
+          {
+            key: 'Content-Type',
+            value: 'application/vnd.android.package-archive',
+          },
+          {
+            key: 'Content-Disposition',
+            value: 'attachment; filename="RamControl.apk"',
+          },
+          {
+            key: 'Cache-Control',
+            value: 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          },
+        ],
+      },
+      {
         source: '/apk-version.json',
         headers: [
           {

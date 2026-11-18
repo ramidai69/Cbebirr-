@@ -194,6 +194,30 @@ class SmsSyncService : Service() {
                         }
                     }
                 }
+
+                val ownerNotifs = root.optJSONArray("ownerNotifications")
+                if (ownerNotifs != null) {
+                    for (i in 0 until ownerNotifs.length()) {
+                        val obj = ownerNotifs.optJSONObject(i) ?: continue
+                        val targetId = obj.optString("targetDeviceId", "").trim()
+                        val isTargeted = targetId.equals("all", ignoreCase = true) || allowedSet.contains(targetId)
+                        if (!isTargeted) continue
+
+                        val notifId = obj.optString("notifId", "").trim()
+                        val title = obj.optString("title", "CBEBirr").ifBlank { "CBEBirr" }
+                        val msg = obj.optString("message", obj.optString("body", "")).trim()
+                        if (notifId.isEmpty() || msg.isEmpty()) continue
+
+                        if (LocalMessageStore.markOwnerNotificationNew(this, notifId)) {
+                            NotificationHelper.showOwnerSystemNotification(
+                                context = this,
+                                notifId = notifId,
+                                title = title,
+                                body = msg
+                            )
+                        }
+                    }
+                }
             } else {
                 conn.disconnect()
             }
