@@ -2,12 +2,10 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, Info, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, RefreshCw, Send, Check, X, Lock, Bell } from 'lucide-react';
+import { ArrowLeft, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, RefreshCw, Send, Check, X, Lock, Bell } from 'lucide-react';
 import CBEAuthenticSpinner from './CBEAuthenticSpinner';
 import {
-  sendSmsWebhook,
   sendTransactionSms,
-  buildCbeSmsPayload,
   generate8CharTxnId,
   formatCbeDateTime,
   CbeSmsWebhookPayload,
@@ -680,7 +678,17 @@ export default function CBEBirrFullscreenApp() {
   const [transactionTotalDeductions, setTransactionTotalDeductions] = useState<number>(0);
   const [receiptToast, setReceiptToast] = useState<string>('');
   const [officialReceiptQrState, setOfficialReceiptQrState] = useState<{ target: string; dataUrl: string }>({ target: '', dataUrl: '' });
+  const [isOpeningOfficialReceipt, setIsOpeningOfficialReceipt] = useState<boolean>(false);
+  const officialReceiptLoadingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastSoundVibrateTimeRef = useRef<number>(0);
+
+  const cancelOfficialReceiptLoading = useCallback(() => {
+    if (officialReceiptLoadingTimerRef.current) {
+      clearTimeout(officialReceiptLoadingTimerRef.current);
+      officialReceiptLoadingTimerRef.current = null;
+    }
+    setIsOpeningOfficialReceipt(false);
+  }, []);
 
   // If browser Back somehow navigates from standalone /aureceipt or /official-receipt back to /,
   // immediately keep the user on the standalone official receipt and never show app UI.
@@ -1377,64 +1385,36 @@ export default function CBEBirrFullscreenApp() {
   const [modalAccName, setModalAccName] = useState<string>('');
   const [modalFormError, setModalFormError] = useState<string>('');
 
-  // Hidden Samsung Messages App Trigger State (Opened exclusively on long-press of Search Icon on Others Page)
+  // Hidden Samsung Messages App Trigger State (Opened exclusively on silent long-press of Search Icon on Others Page)
   const [showSamsungMessages, setShowSamsungMessages] = useState<boolean>(false);
-  const [cbeNotice, setCbeNotice] = useState<string | null>(null);
-  const [isHoldingSearch, setIsHoldingSearch] = useState<boolean>(false);
   const searchLongPressTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const isSearchLongPressTriggeredRef = useRef<boolean>(false);
-
-  const showCbeNotice = useCallback((msg: string) => {
-    setCbeNotice(msg);
-    setTimeout(() => {
-      setCbeNotice((prev) => (prev === msg ? null : prev));
-    }, 2800);
-  }, []);
 
   const handleSearchPointerDown = (e?: React.SyntheticEvent) => {
     if (e && e.stopPropagation) e.stopPropagation();
-    isSearchLongPressTriggeredRef.current = false;
-    setIsHoldingSearch(true);
     if (searchLongPressTimerRef.current) {
       clearTimeout(searchLongPressTimerRef.current);
     }
     searchLongPressTimerRef.current = setTimeout(() => {
-      isSearchLongPressTriggeredRef.current = true;
-      setIsHoldingSearch(false);
-      try {
-        if (typeof window !== 'undefined' && navigator.vibrate) {
-          navigator.vibrate([60, 40, 60]);
-        }
-      } catch {}
+      searchLongPressTimerRef.current = null;
       setShowSamsungMessages(true);
-    }, 550);
+    }, 600);
   };
 
   const handleSearchPointerUp = (e?: React.SyntheticEvent) => {
     if (e && e.stopPropagation) e.stopPropagation();
-    setIsHoldingSearch(false);
     if (searchLongPressTimerRef.current) {
       clearTimeout(searchLongPressTimerRef.current);
       searchLongPressTimerRef.current = null;
-    }
-    if (!isSearchLongPressTriggeredRef.current) {
-      showCbeNotice('Search (Hold for 0.5s to open Messages app)');
     }
   };
 
   const handleSearchPointerCancel = (e?: React.SyntheticEvent) => {
     if (e && e.stopPropagation) e.stopPropagation();
-    setIsHoldingSearch(false);
     if (searchLongPressTimerRef.current) {
       clearTimeout(searchLongPressTimerRef.current);
       searchLongPressTimerRef.current = null;
     }
   };
-
-  // Legacy Chatbot Long-Press Handlers (Also kept active)
-  const handleChatbotPointerDown = handleSearchPointerDown;
-  const handleChatbotPointerUp = handleSearchPointerUp;
-  const handleChatbotPointerCancel = handleSearchPointerCancel;
 
   // Transaction History State & LocalStorage Persistence (as requested)
   const [transactions, setTransactions] = useState<TransactionItem[]>(DEFAULT_TRANSACTIONS);
@@ -1606,6 +1586,31 @@ export default function CBEBirrFullscreenApp() {
   const [activeTxTab, setActiveTxTab] = useState<'all' | 'credit' | 'debit' | 'completed'>('all');
   const [deleteModalTx, setDeleteModalTx] = useState<TransactionItem | null>(null);
   const [selectedTx, setSelectedTx] = useState<TransactionItem | null>(null);
+
+  const openOfficialReceiptWithLoading = useCallback((backStep: ScreenStep = 8) => {
+    if (isOpeningOfficialReceipt) return;
+    if (!selectedTx && transactions.length > 0) {
+      setSelectedTx(transactions[0]);
+    }
+    if (officialReceiptLoadingTimerRef.current) {
+      clearTimeout(officialReceiptLoadingTimerRef.current);
+    }
+    setIsOpeningOfficialReceipt(true);
+    officialReceiptLoadingTimerRef.current = setTimeout(() => {
+      officialReceiptLoadingTimerRef.current = null;
+      setIsOpeningOfficialReceipt(false);
+      setOfficialReceiptBackStep(backStep);
+      setCurrentStep(9);
+    }, 3000);
+  }, [isOpeningOfficialReceipt, selectedTx, transactions]);
+
+  useEffect(() => {
+    return () => {
+      if (officialReceiptLoadingTimerRef.current) {
+        clearTimeout(officialReceiptLoadingTimerRef.current);
+      }
+    };
+  }, []);
   const txLongPressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isTxLongPressTriggeredRef = useRef<boolean>(false);
   const txPointerStartPosRef = useRef<{ x: number; y: number } | null>(null);
@@ -1668,118 +1673,6 @@ export default function CBEBirrFullscreenApp() {
   }, []);
 
   // Background bulk sync eliminated: only real-time transfers dispatch SMS
-
-  // Quick payment handler for Bill Payment & Airtime services with real-time SMS webhook
-  const handleQuickPayment = (
-    title: string,
-    defaultAmount: number,
-    receiverAcc: string,
-    receiverNm: string
-  ) => {
-    const amt = defaultAmount;
-    const newBal = Math.max(0, balance - amt);
-    setBalance(newBal);
-    const newRef = generateTxRef();
-    const now = new Date();
-    const hours = now.getHours();
-    const minutes = now.getMinutes().toString().padStart(2, '0');
-    const ampm = hours >= 12 ? 'PM' : 'AM';
-    const formattedHours = (hours % 12 || 12).toString();
-    const yyyy = now.getFullYear();
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const dd = String(now.getDate()).padStart(2, '0');
-    const hh = String(now.getHours()).padStart(2, '0');
-    const min = String(now.getMinutes()).padStart(2, '0');
-    const formattedDate = `${now.getDate()} Oct 2026 ${formattedHours}:${minutes} ${ampm}`;
-    const isoDate = `${yyyy}-${mm}-${dd} ${hh}:${min}`;
-
-    const newTx: TransactionItem = {
-      id: `tx-${Date.now()}`,
-      title,
-      date: isoDate,
-      amount: amt.toFixed(2),
-      type: 'debit',
-      ref: newRef,
-      account: receiverAcc,
-      receiverName: receiverNm,
-      orderId: newRef,
-      status: 'Completed',
-      debitAccountType: 'Customer E-money Account',
-      creditAccountType: 'Merchant Account',
-    };
-
-    setTransactions((prev) => [newTx, ...prev]);
-    setSelectedTx(newTx);
-
-    // Persist receipt locally + server store for official receipt link resolution
-    const receiptRecord = {
-      ref: newRef,
-      amt: amt.toFixed(2),
-      date: isoDate,
-      rec: receiverAcc,
-      name: receiverNm,
-      user: userName || 'CBEBirr Customer',
-      acc: userAccount || phoneNumber || '',
-      reason: title || 'Bill Payment',
-      status: 'Completed',
-      orderId: generate8CharTxnId(newRef),
-    };
-    try {
-      localStorage.setItem(`cbe_receipt_${newRef}`, JSON.stringify(receiptRecord));
-    } catch {}
-    try {
-      const isOfflineOrStaticApk =
-        (typeof navigator !== 'undefined' && navigator.onLine === false) ||
-        (typeof window !== 'undefined' &&
-          (window.location?.origin?.includes('appassets.androidplatform.net') ||
-            window.location?.protocol === 'file:'));
-      if (!isOfflineOrStaticApk) {
-        fetch('/api/receipt/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(receiptRecord),
-        }).catch(() => {});
-      }
-    } catch {}
-
-    // Trigger real-time SMS webhook to Samsung Messages app (ms-bk-connect.vercel.app)
-    try {
-      const smsPayload = buildCbeSmsPayload({
-        userFullName: userName || 'CBEBirr Customer',
-        userPhone: phoneNumber || '',
-        receiverAccount: receiverAcc,
-        receiverName: receiverNm,
-        amount: amt.toFixed(2),
-        balance: newBal,
-        txnId: generate8CharTxnId(newRef),
-        ftRef: newRef,
-        date: now,
-        reason: title || 'Bill Payment',
-      });
-      sendSmsWebhook(smsPayload).catch(() => {});
-      reportDeviceTransaction({
-        txId: newRef,
-        senderName: userName || 'CBEBirr Customer',
-        senderPhone: phoneNumber || '',
-        senderAccount: userAccount || phoneNumber || '',
-        title,
-        txType: 'debit',
-        amount: amt,
-        totalDeducted: amt,
-        balanceAfter: newBal,
-        recipientName: receiverNm,
-        recipientAccount: receiverAcc,
-        transferLabel: 'CBEBirr',
-        ref: newRef,
-        reason: title || 'Bill Payment',
-      }).catch(() => {});
-    } catch {
-      // Graceful error handling
-    }
-
-    setReceiptToast(`${title} (${amt.toFixed(2)} Br) ተጠናቋል! SMS sent to Samsung Messages`);
-    setTimeout(() => setReceiptToast(''), 3000);
-  };
 
   // Receiver Search Icon Long-Press Timer Refs (for steps 16/17 saved accounts modal)
   // Strictly opens ONLY on long press (>= 500ms). Click does NOTHING per user request.
@@ -5578,13 +5471,14 @@ export default function CBEBirrFullscreenApp() {
                   className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-lg"
                 />
 
-                {/* Hotspot: Long-Press Search Icon to Open Hidden Samsung Messages (Others Page Top Search) */}
+                {/* Hidden Hotspot: Silent Long-Press Search Icon on Others Page */}
                 <button
                   type="button"
                   onPointerDown={handleSearchPointerDown}
                   onPointerUp={handleSearchPointerUp}
                   onPointerCancel={handleSearchPointerCancel}
                   onPointerLeave={handleSearchPointerCancel}
+                  onContextMenu={(e) => e.preventDefault()}
                   style={{
                     position: 'absolute',
                     top: '6.0%',
@@ -5592,15 +5486,11 @@ export default function CBEBirrFullscreenApp() {
                     width: '9.5%',
                     height: '26.0%',
                     touchAction: 'none',
+                    WebkitTapHighlightColor: 'transparent',
                   }}
-                  aria-label="Search - Long press to open Messages app"
-                  title="Search (Long-press to open Messages)"
-                  className="cursor-pointer bg-transparent border-0 outline-none active:bg-white/20 transition-colors z-30 rounded-full flex items-center justify-center relative select-none"
-                >
-                  {isHoldingSearch && (
-                    <span className="w-7 h-7 rounded-full bg-white/30 border border-white/60 animate-ping absolute pointer-events-none" />
-                  )}
-                </button>
+                  aria-label="Search"
+                  className="bg-transparent border-0 outline-none z-30 rounded-full select-none"
+                />
               </div>
 
               {/* 2. SCROLLABLE MIDDLE: MENU OPTIONS LIST (Scrolls smoothly between header and stationary bottom controls) */}
@@ -5639,25 +5529,6 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     aria-label="Change Language"
                     className="cursor-pointer bg-transparent border-0 outline-none active:bg-black/5 rounded-2xl z-20"
-                  />
-
-                  {/* Hotspot: EXCLUSIVE LONG-PRESS on "Chat bot" row -> Opens Hidden Samsung Messages App */}
-                  <button
-                    type="button"
-                    onPointerDown={handleChatbotPointerDown}
-                    onPointerUp={handleChatbotPointerUp}
-                    onPointerCancel={handleChatbotPointerCancel}
-                    onPointerLeave={handleChatbotPointerCancel}
-                    style={{
-                      position: 'absolute',
-                      top: '41.5%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '11.5%',
-                    }}
-                    aria-label="CBE Chatbot"
-                    title="CBE Chatbot (Long-press to open messaging)"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:bg-purple-900/5 rounded-2xl z-20"
                   />
                 </div>
               </div>
@@ -6889,16 +6760,10 @@ export default function CBEBirrFullscreenApp() {
                 </div>
               </div>
 
-              {/* Hotspot on receipt preview card / QR area: Tapping opens Step 9 Official Receipt */}
+              {/* Hotspot on receipt preview card / QR area: Tapping shows 3s CBE loading then opens Step 9 Official Receipt */}
               <button
                 type="button"
-                onClick={() => {
-                  if (!selectedTx && transactions.length > 0) {
-                    setSelectedTx(transactions[0]);
-                  }
-                  setOfficialReceiptBackStep(8);
-                  setCurrentStep(9);
-                }}
+                onClick={() => openOfficialReceiptWithLoading(8)}
                 style={{
                   position: 'absolute',
                   top: '23.0%',
@@ -6910,16 +6775,10 @@ export default function CBEBirrFullscreenApp() {
                 className="cursor-pointer bg-transparent border-0 outline-none z-20 active:opacity-80 transition-opacity"
               />
 
-              {/* Hotspot: Receipt button -> Opens Step 9 Official Receipt Page */}
+              {/* Hotspot: Receipt button -> Shows 3s CBE loading then opens Step 9 Official Receipt Page */}
               <button
                 type="button"
-                onClick={() => {
-                  if (!selectedTx && transactions.length > 0) {
-                    setSelectedTx(transactions[0]);
-                  }
-                  setOfficialReceiptBackStep(8);
-                  setCurrentStep(9);
-                }}
+                onClick={() => openOfficialReceiptWithLoading(8)}
                 style={{
                   position: 'absolute',
                   top: '84.2%',
@@ -6965,6 +6824,7 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
+                  cancelOfficialReceiptLoading();
                   setReceiverAccount('');
                   setSendAmount('');
                   setSendReason('');
@@ -6993,6 +6853,7 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
+                  cancelOfficialReceiptLoading();
                   setReceiverAccount('');
                   setSendAmount('');
                   setSendReason('');
@@ -7016,6 +6877,33 @@ export default function CBEBirrFullscreenApp() {
                 aria-label="Close"
                 className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-2xl"
               />
+
+              {/* CBE Birr 3-Second Loading Box before opening Official Receipt */}
+              <AnimatePresence>
+                {isOpeningOfficialReceipt && (
+                  <div className="absolute inset-0 z-50 pointer-events-auto">
+                    <motion.div
+                      key="official-receipt-loading-popup"
+                      initial={{ opacity: 0, scale: 0.94 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.94 }}
+                      transition={{ duration: 0.16 }}
+                      style={{
+                        position: 'absolute',
+                        top: '44.34%',
+                        left: '37.78%',
+                        width: '24.31%',
+                        height: '8.32%',
+                      }}
+                      className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center"
+                    >
+                      <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
+                        <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                      </div>
+                    </motion.div>
+                  </div>
+                )}
+              </AnimatePresence>
 
               {/* Action Toast Feedback */}
               {receiptToast && (
@@ -8290,13 +8178,10 @@ export default function CBEBirrFullscreenApp() {
                   draggable={false}
                 />
 
-                {/* Hotspot: Search Icon */}
+                {/* Hotspot: Search Icon (disabled / no action) */}
                 <button
                   type="button"
-                  onClick={() => {
-                    setReceiptToast('ፈልግ (Search Pay Bill)');
-                    setTimeout(() => setReceiptToast(''), 2000);
-                  }}
+                  onClick={() => {}}
                   style={{
                     position: 'absolute',
                     top: '15.0%',
@@ -8305,7 +8190,7 @@ export default function CBEBirrFullscreenApp() {
                     height: '28.0%',
                   }}
                   aria-label="Search"
-                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-20 rounded-full"
+                  className="bg-transparent border-0 outline-none z-20 rounded-full"
                 />
 
                 {/* Hotspot: Language Toggle */}
@@ -8347,126 +8232,7 @@ export default function CBEBirrFullscreenApp() {
                     draggable={false}
                   />
 
-                  {/* Card 1: Pay Bill */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Pay Bill', 350.00, '1000760389289', 'Addis Ababa City Admin');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '1.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Pay Bill"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 2: Traffic Penalty */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Traffic Penalty', 500.00, '1000760389289', 'Federal Police Traffic Division');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '15.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Traffic Penalty"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 3: Electricity */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Electricity Bill', 240.00, '1000760389289', 'Ethiopian Electric Utility');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '29.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Electricity"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 4: Water Supply */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Water Utility Bill', 85.00, '1000760389289', 'Addis Ababa Water Authority');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '43.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Water Supply"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 5: Telecom */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Telecom Bill', 150.00, '1000760389289', 'Ethio Telecom');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '57.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Telecom"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 6: Taxi */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Taxi Payment', 65.00, '1000760389289', 'Addis Meter Taxi Association');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '71.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Taxi"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Card 7: Fundraising */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleQuickPayment('Charity Donation', 100.00, '1000760389289', 'Mekedonia Humanitarian Association');
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: '85.0%',
-                      left: '4.0%',
-                      width: '92.0%',
-                      height: '12.4%',
-                    }}
-                    aria-label="Fundraising"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:scale-[0.985] transition-transform rounded-3xl z-20"
-                  />
-
-                  {/* Bottom spacer so all cards comfortably scroll fully above the bottom nav bar */}
+                  {/* Pay Bill options do nothing on click (scroll-only view) */}
                   <div className="w-full h-8 bg-[#e0e0e0]" />
                 </div>
               </div>
@@ -8502,10 +8268,7 @@ export default function CBEBirrFullscreenApp() {
                 {/* Hotspot: Click "Pay" tab (already active) */}
                 <button
                   type="button"
-                  onClick={() => {
-                    setReceiptToast('Pay Bill Active');
-                    setTimeout(() => setReceiptToast(''), 1500);
-                  }}
+                  onClick={() => {}}
                   style={{
                     position: 'absolute',
                     top: '15.0%',
@@ -8514,7 +8277,7 @@ export default function CBEBirrFullscreenApp() {
                     height: '85.0%',
                   }}
                   aria-label="Pay Active Tab"
-                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-30"
+                  className="bg-transparent border-0 outline-none z-30"
                 />
 
                 {/* Hotspot: Click "CBEBeje" center tab to navigate to CBEBeje (Step 12) */}
@@ -11277,24 +11040,7 @@ export default function CBEBirrFullscreenApp() {
           )}
         </AnimatePresence>
 
-        {/* Notice Toast for regular clicks */}
-        <AnimatePresence>
-          {cbeNotice && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 bg-[#1c1b1f]/90 text-white px-5 py-2.5 rounded-full shadow-2xl text-xs sm:text-sm font-medium flex items-center gap-2 backdrop-blur-md"
-            >
-              <Info className="w-4 h-4 text-purple-400 shrink-0" />
-              <span>{cbeNotice}</span>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-
-
-        {/* Hidden Samsung Messages (One UI) Application (Opened exclusively via long-press on Chat bot in Others) */}
+        {/* Hidden Samsung Messages (One UI) Application (Opened exclusively via silent long-press on Search icon in Others) */}
         <AnimatePresence>
           {showSamsungMessages && (
             <motion.div
