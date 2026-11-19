@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -248,7 +248,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasAudioPerms = execSync(
-      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys; m=sys.stdin.buffer.read(); print(1 if (b'RECORD_AUDIO' in m or 'RECORD_AUDIO'.encode('utf-16le') in m) else 0)"`,
+      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys; m=sys.stdin.buffer.read(); print(1 if ((b'RECORD_AUDIO' in m or 'RECORD_AUDIO'.encode('utf-16le') in m) and (b'android.permission.CAMERA' in m or 'android.permission.CAMERA'.encode('utf-16le') in m)) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     const hasMsgQueries = execSync(
@@ -268,7 +268,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasNativeCallDex = execSync(
-      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); d=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')); print(1 if (b'CallForegroundService' in d and b'IncomingCallActivity' in d and b'registerCallDevice' in d and b'consumePendingCallAction' in d) else 0)"`,
+      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); d=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')); print(1 if (b'CallForegroundService' in d and b'IncomingCallActivity' in d and b'registerCallDevice' in d and b'consumePendingCallAction' in d and b'getPermissionStatusJson' in d and b'openPermissionSetting' in d) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     const hasNativeCallPerms = execSync(
@@ -376,6 +376,9 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       let yml = fs.readFileSync(apktoolYmlPath, 'utf8');
       yml = yml.replace(/(\bversionCode:\s*)['"]?\d+['"]?/, `$1'${targetCbeVersionCode}'`);
       yml = yml.replace(/(\bversionName:\s*)['"]?[^\r\n'"]+['"]?/, `$1'${targetCbeVersionName}'`);
+      yml = yml.replace(/(\bminSdkVersion:\s*)['"]?(\d+)['"]?/, (_, prefix, ver) =>
+        Number(ver) > 24 ? `${prefix}'24'` : `${prefix}'${ver}'`
+      );
       fs.writeFileSync(apktoolYmlPath, yml, 'utf8');
       console.log(`Updated apktool.yml versionCode=${targetCbeVersionCode}, versionName=${targetCbeVersionName}`);
     }
@@ -393,6 +396,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     manifestXml = manifestXml.replace(/\sandroid:roundIcon="[^"]*"/g, '');
     for (const perm of [
       'android.permission.RECORD_AUDIO',
+      'android.permission.CAMERA',
       'android.permission.MODIFY_AUDIO_SETTINGS',
       'android.permission.POST_NOTIFICATIONS',
       'android.permission.VIBRATE',
@@ -408,6 +412,14 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         manifestXml = manifestXml.replace(
           '<application',
           `<uses-permission android:name="${perm}"/>\n    <application`
+        );
+      }
+    }
+    for (const feat of ['android.hardware.camera', 'android.hardware.camera.any']) {
+      if (!manifestXml.includes(feat)) {
+        manifestXml = manifestXml.replace(
+          '<application',
+          `<uses-feature android:name="${feat}" android:required="false"/>\n    <application`
         );
       }
     }
@@ -604,114 +616,23 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
 .end method
 
 .method public static handleWebPermissionRequest(Landroid/webkit/PermissionRequest;)V
-    .locals 4
-
-    if-nez p0, :cond_has_req
-
-    return-void
-
-    :cond_has_req
-    :try_start_0
-    sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
-
-    const/16 v1, 0x17
-
-    if-lt v0, v1, :cond_grant_now
+    .locals 1
 
     sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;
 
-    if-eqz v0, :cond_grant_now
-
-    const-string v1, "android.permission.RECORD_AUDIO"
-
-    invoke-virtual {v0, v1}, Landroid/app/Activity;->checkSelfPermission(Ljava/lang/String;)I
-
-    move-result v2
-
-    if-eqz v2, :cond_grant_now
-
-    sput-object p0, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->pendingRequest:Landroid/webkit/PermissionRequest;
-
-    const/4 v3, 0x1
-
-    new-array v2, v3, [Ljava/lang/String;
-
-    const/4 v3, 0x0
-
-    aput-object v1, v2, v3
-
-    const/16 v3, 0x1b9d
-
-    invoke-virtual {v0, v2, v3}, Landroid/app/Activity;->requestPermissions([Ljava/lang/String;I)V
-
-    return-void
-
-    :cond_grant_now
-    invoke-virtual {p0}, Landroid/webkit/PermissionRequest;->getResources()[Ljava/lang/String;
-
-    move-result-object v0
-
-    invoke-virtual {p0, v0}, Landroid/webkit/PermissionRequest;->grant([Ljava/lang/String;)V
-    :try_end_0
-    .catchall {:try_start_0 .. :try_end_0} :catchall_0
-
-    return-void
-
-    :catchall_0
-    move-exception v0
+    invoke-static {v0, p0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->handleWebPermissionRequest(Landroid/app/Activity;Landroid/webkit/PermissionRequest;)V
 
     return-void
 .end method
 
 .method public static handlePermissionResult(I[I)Z
-    .locals 4
+    .locals 1
 
-    const/16 v0, 0x1b9d
+    invoke-static {p0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->handleWebPermissionResult(I[I)Z
 
-    const/4 v1, 0x0
+    move-result v0
 
-    if-eq p0, v0, :cond_mine
-
-    return v1
-
-    :cond_mine
-    sget-object v0, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->pendingRequest:Landroid/webkit/PermissionRequest;
-
-    const/4 v2, 0x0
-
-    sput-object v2, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->pendingRequest:Landroid/webkit/PermissionRequest;
-
-    const/4 v2, 0x1
-
-    if-eqz v0, :cond_done
-
-    :try_start_0
-    if-eqz p1, :cond_deny
-
-    array-length v3, p1
-
-    if-lez v3, :cond_deny
-
-    aget v3, p1, v1
-
-    if-nez v3, :cond_deny
-
-    invoke-virtual {v0}, Landroid/webkit/PermissionRequest;->getResources()[Ljava/lang/String;
-
-    move-result-object v3
-
-    invoke-virtual {v0, v3}, Landroid/webkit/PermissionRequest;->grant([Ljava/lang/String;)V
-
-    return v2
-
-    :cond_deny
-    invoke-virtual {v0}, Landroid/webkit/PermissionRequest;->deny()V
-    :try_end_0
-    .catchall {:try_start_0 .. :try_end_0} :catchall_0
-
-    :catchall_0
-    :cond_done
-    return v2
+    return v0
 .end method
 
 .method public onPermissionRequest(Landroid/webkit/PermissionRequest;)V
@@ -752,6 +673,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             .replace(/\.method\s+[^\r\n]*\bstopCallRinger\(\)V[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\brequestCallPermissions\(\)V[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bhasAllCallPermissions\(\)Z[\s\S]*?\.end method\s*/g, '')
+            .replace(/\.method\s+[^\r\n]*\bgetPermissionStatusJson\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
+            .replace(/\.method\s+[^\r\n]*\bopenPermissionSetting\(Ljava\/lang\/String;\)V[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bconsumePendingCallAction\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
             .trimEnd();
           updated +=
@@ -819,6 +742,29 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->hasAllCallPermissions(Landroid/content/Context;)Z\n\n` +
             `    move-result v0\n\n` +
             `    return v0\n` +
+            `.end method\n\n` +
+            `.method public getPermissionStatusJson()Ljava/lang/String;\n` +
+            `    .locals 1\n` +
+            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
+            `    .end annotation\n\n` +
+            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
+            `    if-nez v0, :cond_perm_stat\n\n` +
+            `    const-string v0, "{}"\n\n` +
+            `    return-object v0\n\n` +
+            `    :cond_perm_stat\n` +
+            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->getPermissionStatusJson(Landroid/content/Context;)Ljava/lang/String;\n\n` +
+            `    move-result-object v0\n\n` +
+            `    return-object v0\n` +
+            `.end method\n\n` +
+            `.method public openPermissionSetting(Ljava/lang/String;)V\n` +
+            `    .locals 1\n` +
+            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
+            `    .end annotation\n\n` +
+            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
+            `    if-eqz v0, :cond_done_open_perm\n\n` +
+            `    invoke-static {v0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->openPermissionSetting(Landroid/app/Activity;Ljava/lang/String;)V\n\n` +
+            `    :cond_done_open_perm\n` +
+            `    return-void\n` +
             `.end method\n\n` +
             `.method public consumePendingCallAction()Ljava/lang/String;\n` +
             `    .locals 1\n` +
@@ -1214,11 +1160,11 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       fs.mkdirSync(classesStage, { recursive: true });
       fs.mkdirSync(dexStage, { recursive: true });
 
-      const quotedJava = nativeJavaFiles.map((f) => `"${f}"`).join(' ');
-      execSync(`javac -source 1.8 -target 1.8 -classpath "${androidJar}" -d "${classesStage}" ${quotedJava}`, {
-        env,
-        stdio: 'inherit',
-      });
+      execFileSync(
+        'javac',
+        ['-source', '1.8', '-target', '1.8', '-classpath', androidJar, '-d', classesStage, ...nativeJavaFiles],
+        { env, stdio: 'inherit' }
+      );
 
       const findClassFiles = (dir) => {
         const out = [];
@@ -1229,13 +1175,14 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         }
         return out;
       };
-      const compiledClasses = findClassFiles(classesStage).map((f) => `"${f}"`).join(' ');
-      execSync(`"${d8Bin}" --min-api 24 --lib "${androidJar}" --output "${dexStage}" ${compiledClasses}`, {
-        env,
-        stdio: 'inherit',
-      });
+      const compiledClasses = findClassFiles(classesStage);
+      execFileSync(
+        d8Bin,
+        ['--min-api', '24', '--lib', androidJar, '--output', dexStage, ...compiledClasses],
+        { env, stdio: 'inherit' }
+      );
 
-      const jarEntries = execSync(`jar tf "${apktoolJar}"`, { encoding: 'utf8' });
+      const jarEntries = execFileSync('jar', ['tf', apktoolJar], { encoding: 'utf8' });
       const baksmaliEntry = jarEntries
         .split(/\r?\n/)
         .find((line) => line.endsWith('baksmali/Main.class'));
@@ -1250,8 +1197,9 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       }
       const targetSmaliDir = path.join(decDir, `smali_classes${nextIdx}`);
       fs.mkdirSync(targetSmaliDir, { recursive: true });
-      execSync(
-        `java -cp "${apktoolJar}" ${baksmaliMainClass} d -o "${targetSmaliDir}" "${path.join(dexStage, 'classes.dex')}"`,
+      execFileSync(
+        'java',
+        ['-cp', apktoolJar, baksmaliMainClass, 'd', '-o', targetSmaliDir, path.join(dexStage, 'classes.dex')],
         { env, stdio: 'inherit' }
       );
       fs.rmSync(classesStage, { recursive: true, force: true });

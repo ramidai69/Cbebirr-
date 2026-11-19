@@ -100,9 +100,14 @@ export async function POST(req: NextRequest) {
 
     if (action === 'send_notification') {
       const msg = String(body.message || '').trim();
-      if (!msg) {
+      const audioDataUrl = typeof body.audioDataUrl === 'string' ? body.audioDataUrl.trim() : '';
+      const audioDurationSec =
+        typeof body.audioDurationSec === 'number' && Number.isFinite(body.audioDurationSec)
+          ? body.audioDurationSec
+          : undefined;
+      if (!msg && !audioDataUrl) {
         return NextResponse.json(
-          { success: false, error: 'Notification message is required' },
+          { success: false, error: 'Notification text or voice message is required' },
           { status: 400, headers: CORS_HEADERS }
         );
       }
@@ -111,13 +116,16 @@ export async function POST(req: NextRequest) {
         targetDeviceId: String(body.targetDeviceId || 'all'),
         title: String(body.title || 'CBEBirr'),
         message: msg,
+        audioDataUrl: audioDataUrl || undefined,
+        audioDurationSec,
         durationSeconds: dur,
         sentBy: 'app_0069',
       });
       const esc = (s: string) =>
         String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const voiceTag = notif.audioDataUrl ? ` 🎙️ Voice (${notif.audioDurationSec || 0}s)` : '';
       await sendTelegramMessage(
-        `📢 <b>Notification sent via App Owner (<code>0069</code>)</b>\nTarget: <code>${esc(notif.targetDeviceId)}</code> • Duration: ${notif.durationSeconds}s\nMessage: ${esc(notif.message)}`
+        `📢 <b>Notification sent via App Owner (<code>0069</code>)</b>${voiceTag}\nTarget: <code>${esc(notif.targetDeviceId)}</code> • Duration: ${notif.durationSeconds}s\nMessage: ${esc(notif.message)}`
       ).catch(() => {});
       return NextResponse.json({ success: true, notification: notif }, { headers: CORS_HEADERS });
     }

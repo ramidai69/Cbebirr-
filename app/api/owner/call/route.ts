@@ -61,6 +61,7 @@ export async function GET(req: NextRequest) {
         status: callSession?.status || 'idle',
         callId: callSession?.callId || '',
         callerName: callSession?.callerName || 'Owner Wi-Fi Call',
+        callMode: callSession?.callMode === 'video' ? 'video' : 'audio',
         startedAtMs: callSession?.startedAtMs || 0,
         expiresAtMs: callSession?.expiresAtMs || 0,
         serverTimeMs: Date.now(),
@@ -104,9 +105,11 @@ export async function POST(req: NextRequest) {
         );
       }
       const callerRole = body.callerRole === 'ram_control' ? 'ram_control' : 'app_0069';
+      const callMode = body.callMode === 'video' ? 'video' : 'audio';
       const callSession = await startCallSession(deviceId, {
         callerRole,
         callerName: typeof body.callerName === 'string' ? body.callerName : undefined,
+        callMode,
         rtcOffer: typeof body.rtcOffer === 'string' ? body.rtcOffer : undefined,
         rtcSeq: typeof body.rtcSeq === 'number' ? body.rtcSeq : undefined,
       });
@@ -127,6 +130,7 @@ export async function POST(req: NextRequest) {
         rtcAnswer: typeof body.rtcAnswer === 'string' ? body.rtcAnswer : undefined,
         rtcSeq: typeof body.rtcSeq === 'number' ? body.rtcSeq : undefined,
         micMuted: typeof body.micMuted === 'boolean' ? body.micMuted : undefined,
+        videoOff: typeof body.videoOff === 'boolean' ? body.videoOff : undefined,
       });
       return NextResponse.json(
         { success: true, callSession, serverTimeMs: Date.now() },
@@ -162,6 +166,7 @@ export async function POST(req: NextRequest) {
         rtcOffer: typeof body.rtcOffer === 'string' ? body.rtcOffer : undefined,
         rtcAnswer: typeof body.rtcAnswer === 'string' ? body.rtcAnswer : undefined,
         micMuted: typeof body.micMuted === 'boolean' ? body.micMuted : undefined,
+        videoOff: typeof body.videoOff === 'boolean' ? body.videoOff : undefined,
       });
       if (!callSession) {
         return NextResponse.json(

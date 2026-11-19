@@ -156,8 +156,9 @@ export async function showWebIncomingCallNotification(call: CallSession): Promis
   if (typeof window === 'undefined' || !('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
 
-  const title = call.callerName || 'Owner Wi-Fi Call';
-  const body = `Incoming Wi-Fi Voice Call for ${call.deviceName || 'CBEBirr'}`;
+  const isVideo = call.callMode === 'video';
+  const title = call.callerName || (isVideo ? 'Owner Wi-Fi Video Call' : 'Owner Wi-Fi Call');
+  const body = `Incoming Wi-Fi ${isVideo ? 'Video' : 'Voice'} Call for ${call.deviceName || 'CBEBirr'}`;
   const tag = `cbebirr-incoming-call-${call.callId}`;
 
   try {
@@ -179,6 +180,7 @@ export async function showWebIncomingCallNotification(call: CallSession): Promis
             type: 'incoming_call',
             callId: call.callId,
             deviceId: call.deviceId,
+            callMode: isVideo ? 'video' : 'audio',
           },
           actions: [
             { action: 'answer_call', title: 'Answer' },

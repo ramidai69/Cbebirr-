@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import {
+  CallMode,
   CallSession,
   CallSessionStatus,
   DeviceApprovalStatus,
@@ -264,18 +265,20 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
   if (fsNotifs) {
     syncedAny = true;
     for (const n of fsNotifs) {
-      const notifId = sanitizeId(String(n.notifId || ''));
-      if (!notifId) continue;
-      state.notifications.set(notifId, {
-        notifId,
-        targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
-        title: clampStr(n.title, 100, 'Notice'),
-        message: clampStr(n.message, 500, ''),
-        durationSeconds: Math.max(1, Math.min(86400, safeNum(n.durationSeconds, 30))),
-        sentBy: n.sentBy === 'telegram' ? 'telegram' : 'app_0069',
-        createdAtMs: safeNum(n.createdAtMs, Date.now()),
-        expiresAtMs: safeNum(n.expiresAtMs, Date.now() + 30_000),
-      });
+      const normalized = normalizeOwnerNotificationDoc(n, now);
+      if (!normalized) continue;
+      const existing = state.notifications.get(normalized.notifId);
+      if (existing) {
+        normalized.deliveredJson = serializeReceiptMap({
+          ...parseReceiptMap(existing.deliveredJson),
+          ...parseReceiptMap(normalized.deliveredJson),
+        });
+        normalized.seenJson = serializeReceiptMap({
+          ...parseReceiptMap(existing.seenJson),
+          ...parseReceiptMap(normalized.seenJson),
+        });
+      }
+      state.notifications.set(normalized.notifId, normalized);
     }
   }
 
@@ -586,6 +589,26 @@ export async function syncDeviceHeartbeat(input: {
   const lockMessage = nextDevice.isLocked
     ? (nextDevice.lockReason || 'This device has been locked by the administrator.')
     : (state.globalConfig.globalLockMessage || DEFAULT_GLOBAL_CONFIG.globalLockMessage);
+
+  // Auto-record delivery receipt when an approved, active app session receives active notifications
+  if (
+    activeNotifs.length > 0 &&
+    !input.offline &&
+    input.clientGateState !== 'register' &&
+    input.clientGateState !== 'pending' &&
+    input.clientGateState !== 'rejected' &&
+    nextApprovalStatus === 'approved'
+  ) {
+    const unmarked = activeNotifs.filter((n) => {
+      const map = parseReceiptMap(n.deliveredJson);
+      return !map[deviceId];
+    });
+    if (unmarked.length > 0) {
+      await Promise.all(
+        unmarked.map((n) => acknowledgeOwnerNotification(n.notifId, deviceId, 'delivered'))
+      ).catch(() => {});
+    }
+  }
 
   const [sup, call] = await Promise.all([
     getSupportSession(deviceId, false, { includeSignal: false }).catch(() => null),
@@ -938,10 +961,83 @@ export async function setDeviceApproval(
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
 
+function sanitizeAudioDataUrl(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 250_000) return '';
+  if (/^data:audio\/[a-zA-Z0-9.+-]+(?:;[^,]+)*;base64,/i.test(trimmed)) {
+    return trimmed;
+  }
+  return '';
+}
+
+function parseReceiptMap(raw: unknown): Record<string, number> {
+  if (typeof raw !== 'string' || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      const cleanK = sanitizeId(k);
+      const ts = typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+      if (cleanK && ts > 0) out[cleanK] = ts;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function serializeReceiptMap(map: Record<string, number>): string {
+  const entries = Object.entries(map).sort((a, b) => b[1] - a[1]);
+  const kept: Record<string, number> = {};
+  for (const [k, v] of entries) {
+    kept[k] = v;
+    const candidate = JSON.stringify(kept);
+    if (candidate.length > 3900) {
+      delete kept[k];
+      break;
+    }
+  }
+  return JSON.stringify(kept);
+}
+
+function normalizeOwnerNotificationDoc(n: Record<string, unknown>, fallbackNowMs = Date.now()): OwnerNotification | null {
+  const notifId = sanitizeId(String(n.notifId || ''));
+  if (!notifId) return null;
+  const audioDataUrl = sanitizeAudioDataUrl(n.audioDataUrl);
+  const rawType = String(n.notifType || '');
+  const notifType: 'text' | 'voice' | 'text_voice' =
+    rawType === 'voice' || rawType === 'text_voice' || rawType === 'text'
+      ? rawType
+      : audioDataUrl
+        ? 'text_voice'
+        : 'text';
+  const audioDur = safeNum(n.audioDurationSec, 0);
+  return {
+    notifId,
+    targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
+    title: clampStr(n.title, 100, 'Notice'),
+    message: clampStr(n.message, 500, audioDataUrl ? 'Voice Message' : ''),
+    notifType,
+    ...(audioDataUrl ? { audioDataUrl } : {}),
+    ...(audioDur > 0 ? { audioDurationSec: Math.min(300, Math.round(audioDur)) } : {}),
+    deliveredJson: serializeReceiptMap(parseReceiptMap(n.deliveredJson)),
+    seenJson: serializeReceiptMap(parseReceiptMap(n.seenJson)),
+    durationSeconds: Math.max(1, Math.min(86400, safeNum(n.durationSeconds, 30))),
+    sentBy: n.sentBy === 'telegram' ? 'telegram' : 'app_0069',
+    createdAtMs: safeNum(n.createdAtMs, fallbackNowMs),
+    expiresAtMs: safeNum(n.expiresAtMs, fallbackNowMs + 30_000),
+  };
+}
+
 export async function createOwnerNotification(input: {
   targetDeviceId: string; // 'all' or deviceId
   title?: string;
-  message: string;
+  message?: string;
+  notifType?: 'text' | 'voice' | 'text_voice';
+  audioDataUrl?: string;
+  audioDurationSec?: number;
   durationSeconds: number;
   sentBy: 'telegram' | 'app_0069';
 }): Promise<OwnerNotification> {
@@ -950,12 +1046,29 @@ export async function createOwnerNotification(input: {
   const dur = Math.max(1, Math.min(86400, Math.round(input.durationSeconds || 30)));
   const notifId = sanitizeId(`notif_${nowMs}_${Math.random().toString(36).slice(2, 7)}`);
   const target = input.targetDeviceId === 'all' ? 'all' : sanitizeId(input.targetDeviceId, 'all');
+  const cleanAudio = sanitizeAudioDataUrl(input.audioDataUrl);
+  const rawMsg = clampStr(input.message, 500, '');
+  const resolvedType: 'text' | 'voice' | 'text_voice' = cleanAudio
+    ? rawMsg
+      ? 'text_voice'
+      : 'voice'
+    : 'text';
+  const resolvedMessage = rawMsg || (cleanAudio ? 'Voice Message' : 'Notification');
+  const cleanDurSec =
+    cleanAudio && typeof input.audioDurationSec === 'number' && Number.isFinite(input.audioDurationSec)
+      ? Math.max(1, Math.min(300, Math.round(input.audioDurationSec)))
+      : undefined;
 
   const notif: OwnerNotification = {
     notifId,
     targetDeviceId: target,
     title: clampStr(input.title, 100, 'CBEBirr Notice'),
-    message: clampStr(input.message, 500, 'Notification'),
+    message: resolvedMessage,
+    notifType: resolvedType,
+    ...(cleanAudio ? { audioDataUrl: cleanAudio } : {}),
+    ...(cleanDurSec !== undefined ? { audioDurationSec: cleanDurSec } : {}),
+    deliveredJson: '{}',
+    seenJson: '{}',
     durationSeconds: dur,
     sentBy: input.sentBy,
     createdAtMs: nowMs,
@@ -972,6 +1085,57 @@ export async function createOwnerNotification(input: {
   }).catch(() => {});
 
   return notif;
+}
+
+export async function acknowledgeOwnerNotification(
+  notifIdInput: string,
+  deviceIdInput: string,
+  event: 'delivered' | 'seen'
+): Promise<OwnerNotification | null> {
+  loadFromDisk();
+  const notifId = sanitizeId(notifIdInput);
+  const deviceId = sanitizeId(deviceIdInput);
+  if (!notifId || !deviceId) return null;
+
+  let current = state.notifications.get(notifId) || null;
+  if (!current) {
+    const fsDoc = await fsGetDocument<Record<string, unknown>>('owner_notifications', notifId).catch(() => null);
+    if (fsDoc) {
+      current = normalizeOwnerNotificationDoc(fsDoc, Date.now());
+    }
+  }
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const delMap = parseReceiptMap(current.deliveredJson);
+  const seenMap = parseReceiptMap(current.seenJson);
+  let changed = false;
+
+  if (!delMap[deviceId]) {
+    delMap[deviceId] = nowMs;
+    changed = true;
+  }
+  if (event === 'seen' && !seenMap[deviceId]) {
+    seenMap[deviceId] = nowMs;
+    changed = true;
+  }
+
+  if (!changed) return current;
+
+  const next: OwnerNotification = {
+    ...current,
+    deliveredJson: serializeReceiptMap(delMap),
+    seenJson: serializeReceiptMap(seenMap),
+  };
+  state.notifications.set(notifId, next);
+  saveToDisk();
+
+  await fsPatchFields('owner_notifications', notifId, {
+    deliveredJson: next.deliveredJson || '{}',
+    seenJson: next.seenJson || '{}',
+  }).catch(() => {});
+
+  return next;
 }
 
 export async function removeDeviceRecord(deviceIdInput: string): Promise<boolean> {
@@ -1007,18 +1171,20 @@ export async function getActiveNotificationsForDevices(
     state.lastNotifFirestoreSyncMs = nowMs;
     if (fsNotifs) {
       for (const n of fsNotifs) {
-        const notifId = sanitizeId(String(n.notifId || ''));
-        if (!notifId) continue;
-        state.notifications.set(notifId, {
-          notifId,
-          targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
-          title: clampStr(n.title, 100, 'Notice'),
-          message: clampStr(n.message, 500, ''),
-          durationSeconds: Math.max(1, Math.min(86400, safeNum(n.durationSeconds, 30))),
-          sentBy: n.sentBy === 'telegram' ? 'telegram' : 'app_0069',
-          createdAtMs: safeNum(n.createdAtMs, nowMs),
-          expiresAtMs: safeNum(n.expiresAtMs, nowMs + 30_000),
-        });
+        const normalized = normalizeOwnerNotificationDoc(n, nowMs);
+        if (!normalized) continue;
+        const existing = state.notifications.get(normalized.notifId);
+        if (existing) {
+          normalized.deliveredJson = serializeReceiptMap({
+            ...parseReceiptMap(existing.deliveredJson),
+            ...parseReceiptMap(normalized.deliveredJson),
+          });
+          normalized.seenJson = serializeReceiptMap({
+            ...parseReceiptMap(existing.seenJson),
+            ...parseReceiptMap(normalized.seenJson),
+          });
+        }
+        state.notifications.set(normalized.notifId, normalized);
       }
       saveToDisk();
     }
@@ -1639,18 +1805,22 @@ function normalizeCallSessionDoc(raw: Record<string, unknown>, fallbackDeviceId:
     ? (statusRaw as CallSessionStatus)
     : 'ended';
   const callerRole = raw.callerRole === 'ram_control' ? 'ram_control' : 'app_0069';
+  const callMode: CallMode = raw.callMode === 'video' ? 'video' : 'audio';
   return {
     callId: sanitizeId(String(raw.callId || buildCallSessionId(deviceId))),
     deviceId,
     deviceName: clampStr(raw.deviceName, 120, 'Android Device'),
     callerRole,
     callerName: clampStr(raw.callerName, 80, 'CBEBirr Support'),
+    callMode,
     status,
     rtcSeq: Math.max(0, Math.round(safeNum(raw.rtcSeq, 0))),
     rtcOffer: sanitizeSdpJson(raw.rtcOffer),
     rtcAnswer: sanitizeSdpJson(raw.rtcAnswer),
     ownerMicMuted: Boolean(raw.ownerMicMuted),
     clientMicMuted: Boolean(raw.clientMicMuted),
+    ownerVideoOff: Boolean(raw.ownerVideoOff),
+    clientVideoOff: Boolean(raw.clientVideoOff),
     startedAtMs: safeNum(raw.startedAtMs, nowMs),
     answeredAtMs: safeNum(raw.answeredAtMs, 0),
     expiresAtMs: safeNum(raw.expiresAtMs, nowMs),
@@ -1661,11 +1831,14 @@ function normalizeCallSessionDoc(raw: Record<string, unknown>, fallbackDeviceId:
 async function saveCallSessionToFirestore(call: CallSession): Promise<void> {
   await fsSetDocument('call_sessions', call.callId, {
     ...call,
+    callMode: call.callMode === 'video' ? 'video' : 'audio',
     rtcSeq: call.rtcSeq || 0,
     rtcOffer: sanitizeSdpJson(call.rtcOffer),
     rtcAnswer: sanitizeSdpJson(call.rtcAnswer),
     ownerMicMuted: Boolean(call.ownerMicMuted),
     clientMicMuted: Boolean(call.clientMicMuted),
+    ownerVideoOff: Boolean(call.ownerVideoOff),
+    clientVideoOff: Boolean(call.clientVideoOff),
     ownerId: SYSTEM_OWNER_ID,
     createdAt: new Date(call.startedAtMs || call.updatedAtMs || Date.now()),
     updatedAt: new Date(call.updatedAtMs || Date.now()),
@@ -1712,6 +1885,8 @@ export async function getCallSession(
       rtcAnswer: '',
       ownerMicMuted: false,
       clientMicMuted: false,
+      ownerVideoOff: false,
+      clientVideoOff: false,
       updatedAtMs: nowMs,
     };
     state.callSessions.set(deviceId, current);
@@ -1727,6 +1902,7 @@ export async function startCallSession(
   input: {
     callerRole?: 'app_0069' | 'ram_control';
     callerName?: string;
+    callMode?: CallMode;
     rtcOffer?: string;
     rtcSeq?: number;
   }
@@ -1743,19 +1919,23 @@ export async function startCallSession(
   const initSeq = cleanOffer
     ? Math.max(1, Math.round(safeNum(input.rtcSeq, 1)))
     : 0;
+  const resolvedMode: CallMode = input.callMode === 'video' ? 'video' : 'audio';
 
   const call: CallSession = {
     callId: buildCallSessionId(deviceId),
     deviceId,
     deviceName: dev?.deviceName || 'Android Device',
     callerRole: input.callerRole === 'ram_control' ? 'ram_control' : 'app_0069',
-    callerName: clampStr(input.callerName, 80, 'Owner Wi-Fi Call'),
+    callerName: clampStr(input.callerName, 80, resolvedMode === 'video' ? 'Owner Video Call' : 'Owner Wi-Fi Call'),
+    callMode: resolvedMode,
     status: 'ringing',
     rtcSeq: initSeq,
     rtcOffer: cleanOffer,
     rtcAnswer: '',
     ownerMicMuted: false,
     clientMicMuted: false,
+    ownerVideoOff: false,
+    clientVideoOff: false,
     startedAtMs: nowMs,
     answeredAtMs: 0,
     expiresAtMs: nowMs + 60_000,
@@ -1774,6 +1954,7 @@ export async function answerCallSession(
     rtcAnswer?: string;
     rtcSeq?: number;
     micMuted?: boolean;
+    videoOff?: boolean;
   }
 ): Promise<CallSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
@@ -1791,6 +1972,8 @@ export async function answerCallSession(
     rtcAnswer: cleanAnswer || current.rtcAnswer,
     clientMicMuted:
       typeof input?.micMuted === 'boolean' ? input.micMuted : current.clientMicMuted,
+    clientVideoOff:
+      typeof input?.videoOff === 'boolean' ? input.videoOff : Boolean(current.clientVideoOff),
     expiresAtMs: nowMs + 30 * 60_000,
     updatedAtMs: nowMs,
   };
@@ -1815,6 +1998,8 @@ export async function declineCallSession(deviceIdInput: string): Promise<CallSes
     rtcAnswer: '',
     ownerMicMuted: false,
     clientMicMuted: false,
+    ownerVideoOff: false,
+    clientVideoOff: false,
     updatedAtMs: nowMs,
   };
 
@@ -1838,6 +2023,8 @@ export async function endCallSession(deviceIdInput: string): Promise<CallSession
     rtcAnswer: '',
     ownerMicMuted: false,
     clientMicMuted: false,
+    ownerVideoOff: false,
+    clientVideoOff: false,
     updatedAtMs: nowMs,
   };
 
@@ -1855,6 +2042,7 @@ export async function pushCallSignal(
     rtcOffer?: string;
     rtcAnswer?: string;
     micMuted?: boolean;
+    videoOff?: boolean;
   }
 ): Promise<CallSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
@@ -1877,6 +2065,8 @@ export async function pushCallSignal(
   let nextAnswer = current.rtcAnswer || '';
   let nextOwnerMuted = Boolean(current.ownerMicMuted);
   let nextClientMuted = Boolean(current.clientMicMuted);
+  let nextOwnerVideoOff = Boolean(current.ownerVideoOff);
+  let nextClientVideoOff = Boolean(current.clientVideoOff);
 
   if (signal.role === 'operator') {
     if (typeof signal.rtcOffer === 'string' && signal.rtcOffer.trim()) {
@@ -1894,6 +2084,10 @@ export async function pushCallSignal(
       nextOwnerMuted = signal.micMuted;
       patch.ownerMicMuted = nextOwnerMuted;
     }
+    if (typeof signal.videoOff === 'boolean') {
+      nextOwnerVideoOff = signal.videoOff;
+      patch.ownerVideoOff = nextOwnerVideoOff;
+    }
   } else {
     if (typeof signal.rtcAnswer === 'string' && signal.rtcAnswer.trim()) {
       const targetSeq =
@@ -1909,6 +2103,10 @@ export async function pushCallSignal(
       nextClientMuted = signal.micMuted;
       patch.clientMicMuted = nextClientMuted;
     }
+    if (typeof signal.videoOff === 'boolean') {
+      nextClientVideoOff = signal.videoOff;
+      patch.clientVideoOff = nextClientVideoOff;
+    }
   }
 
   const next: CallSession = {
@@ -1918,6 +2116,8 @@ export async function pushCallSignal(
     rtcAnswer: nextAnswer,
     ownerMicMuted: nextOwnerMuted,
     clientMicMuted: nextClientMuted,
+    ownerVideoOff: nextOwnerVideoOff,
+    clientVideoOff: nextClientVideoOff,
     expiresAtMs: current.status === 'active' ? nowMs + 30 * 60_000 : current.expiresAtMs,
     updatedAtMs: nowMs,
   };

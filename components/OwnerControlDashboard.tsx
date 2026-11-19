@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Activity,
@@ -8,11 +8,13 @@ import {
   Bell,
   Bot,
   Check,
+  CheckCheck,
   CheckCircle2,
   Clock,
   Cloud,
   CreditCard,
   Lock,
+  Mic,
   Monitor,
   Phone,
   PhoneCall,
@@ -20,9 +22,11 @@ import {
   Send,
   Shield,
   Smartphone,
+  Square,
   Trash2,
   Unlock,
   User,
+  Video,
   Wallet,
   Wifi,
   WifiOff,
@@ -31,6 +35,7 @@ import {
 import SupportViewModal from './SupportViewModal';
 import WiFiCallModal from './WiFiCallModal';
 import {
+  CallMode,
   DeviceClient,
   OwnerDashboardSnapshot,
   formatRelativeTime,
@@ -70,6 +75,7 @@ export default function OwnerControlDashboard({
   const [statusBanner, setStatusBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [supportTargetDevice, setSupportTargetDevice] = useState<DeviceClient | null>(null);
   const [callTargetDevice, setCallTargetDevice] = useState<DeviceClient | null>(null);
+  const [callModalMode, setCallModalMode] = useState<CallMode>('audio');
 
   // Filters
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
@@ -77,12 +83,22 @@ export default function OwnerControlDashboard({
     'This application is temporarily suspended by the administrator.'
   );
 
-  // Notification composer state
+  // Notification composer state (text + compressed voice message)
   const [notifTarget, setNotifTarget] = useState<string>('all');
   const [notifTitle, setNotifTitle] = useState<string>('CBEBirr');
   const [notifMessage, setNotifMessage] = useState<string>('');
   const [notifDurationVal, setNotifDurationVal] = useState<string>('30');
   const [notifDurationUnit, setNotifDurationUnit] = useState<'sec' | 'min'>('sec');
+  const [isRecordingVoice, setIsRecordingVoice] = useState<boolean>(false);
+  const [recordingSec, setRecordingSec] = useState<number>(0);
+  const [voiceDataUrl, setVoiceDataUrl] = useState<string>('');
+  const [voiceDurationSec, setVoiceDurationSec] = useState<number>(0);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<BlobPart[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingStartMsRef = useRef<number>(0);
 
   // Firebase Auth Web Admin Sync (when running in standard browser)
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
@@ -300,11 +316,148 @@ export default function OwnerControlDashboard({
     }
   };
 
+  const stopVoiceRecordingCleanup = useCallback(() => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (recordingStreamRef.current) {
+      for (const track of recordingStreamRef.current.getTracks()) {
+        try {
+          track.stop();
+        } catch {}
+      }
+      recordingStreamRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
+      stopVoiceRecordingCleanup();
+    };
+  }, [stopVoiceRecordingCleanup]);
+
+  const handleStopVoiceRecording = useCallback(() => {
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {}
+    setIsRecordingVoice(false);
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  }, []);
+
+  const handleStartVoiceRecording = async () => {
+    if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      flashBanner('err', 'Microphone recording not supported in this browser');
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined') {
+      flashBanner('err', 'MediaRecorder unavailable on this device');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      recordingStreamRef.current = stream;
+      recordingChunksRef.current = [];
+      setVoiceDataUrl('');
+      setVoiceDurationSec(0);
+
+      const mimeCandidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+      ];
+      let chosenMime = '';
+      for (const cand of mimeCandidates) {
+        if (MediaRecorder.isTypeSupported(cand)) {
+          chosenMime = cand;
+          break;
+        }
+      }
+
+      const recorder = new MediaRecorder(stream, {
+        ...(chosenMime ? { mimeType: chosenMime } : {}),
+        audioBitsPerSecond: 24000,
+      });
+      mediaRecorderRef.current = recorder;
+      recordingStartMsRef.current = Date.now();
+      setRecordingSec(0);
+      setIsRecordingVoice(true);
+
+      recorder.ondataavailable = (evt) => {
+        if (evt.data && evt.data.size > 0) {
+          recordingChunksRef.current.push(evt.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const elapsedSec = Math.max(
+          1,
+          Math.round((Date.now() - recordingStartMsRef.current) / 1000)
+        );
+        const blob = new Blob(recordingChunksRef.current, {
+          type: chosenMime || 'audio/webm',
+        });
+        stopVoiceRecordingCleanup();
+        setIsRecordingVoice(false);
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+          if (!dataUrl) {
+            flashBanner('err', 'Voice encoding failed');
+            return;
+          }
+          if (dataUrl.length > 240_000) {
+            flashBanner(
+              'err',
+              'Voice recording too large (>180KB). Please record a shorter clip (<=35s).'
+            );
+            return;
+          }
+          setVoiceDataUrl(dataUrl);
+          setVoiceDurationSec(elapsedSec);
+        };
+        reader.readAsDataURL(blob);
+      };
+
+      recorder.start(250);
+      recordingTimerRef.current = setInterval(() => {
+        const sec = Math.floor((Date.now() - recordingStartMsRef.current) / 1000);
+        setRecordingSec(sec);
+        if (sec >= 40) {
+          handleStopVoiceRecording();
+        }
+      }, 300);
+    } catch (err: any) {
+      stopVoiceRecordingCleanup();
+      setIsRecordingVoice(false);
+      flashBanner('err', err?.message || 'Microphone permission denied');
+    }
+  };
+
   const handleSendNotification = async (e: React.FormEvent) => {
     e.preventDefault();
     const msg = notifMessage.trim();
-    if (!msg) {
-      flashBanner('err', 'Please write a notification message');
+    if (!msg && !voiceDataUrl) {
+      flashBanner('err', 'Please write a message or record a voice clip');
       return;
     }
     const rawNum = parseFloat(notifDurationVal) || 30;
@@ -320,13 +473,16 @@ export default function OwnerControlDashboard({
         targetDeviceId: notifTarget,
         title: notifTitle.trim() || 'CBEBirr',
         message: msg,
+        ...(voiceDataUrl ? { audioDataUrl: voiceDataUrl, audioDurationSec: voiceDurationSec } : {}),
         durationSeconds,
       });
       setNotifMessage('');
+      setVoiceDataUrl('');
+      setVoiceDurationSec(0);
       await loadSnapshot(true);
       flashBanner(
         'ok',
-        `Notification dispatched (${durationSeconds}s) → ${notifTarget === 'all' ? 'All Devices' : notifTarget}`
+        `${voiceDataUrl ? 'Voice alert' : 'Notification'} dispatched (${durationSeconds}s) → ${notifTarget === 'all' ? 'All Devices' : notifTarget}`
       );
     } catch (err: any) {
       flashBanner('err', err?.message || 'Failed to dispatch notification');
@@ -715,11 +871,14 @@ export default function OwnerControlDashboard({
 
                     {/* Per-Device Actions */}
                     <div className="space-y-1.5">
-                      <div className="grid grid-cols-3 gap-1.5">
+                      <div className="grid grid-cols-4 gap-1.5">
                         <button
                           type="button"
-                          onClick={() => setCallTargetDevice(dev)}
-                          className="py-1.5 px-2 rounded-xl bg-sky-600/90 hover:bg-sky-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                          onClick={() => {
+                            setCallModalMode('audio');
+                            setCallTargetDevice(dev);
+                          }}
+                          className="py-1.5 px-1.5 rounded-xl bg-sky-600/90 hover:bg-sky-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <PhoneCall className="w-3 h-3" />
                           <span>Call</span>
@@ -727,18 +886,30 @@ export default function OwnerControlDashboard({
 
                         <button
                           type="button"
+                          onClick={() => {
+                            setCallModalMode('video');
+                            setCallTargetDevice(dev);
+                          }}
+                          className="py-1.5 px-1.5 rounded-xl bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                        >
+                          <Video className="w-3 h-3" />
+                          <span>Video</span>
+                        </button>
+
+                        <button
+                          type="button"
                           onClick={() => setSupportTargetDevice(dev)}
-                          className="py-1.5 px-2 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                          className="py-1.5 px-1.5 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <Monitor className="w-3 h-3" />
-                          <span>Support</span>
+                          <span>Screen</span>
                         </button>
 
                         <button
                           type="button"
                           onClick={() => handleDeviceLockToggle(dev)}
                           disabled={busyKey === `lock_${dev.deviceId}`}
-                          className={`py-1.5 px-2 rounded-xl text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+                          className={`py-1.5 px-1.5 rounded-xl text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
                             dev.isLocked
                               ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
                               : 'bg-rose-600/85 hover:bg-rose-600 text-white'
@@ -898,7 +1069,7 @@ export default function OwnerControlDashboard({
 
               <div>
                 <label className="block text-[11px] font-semibold text-[#8b9bb0] mb-1">
-                  Message Text
+                  Message Text (optional if sending voice)
                 </label>
                 <textarea
                   value={notifMessage}
@@ -908,6 +1079,55 @@ export default function OwnerControlDashboard({
                   placeholder="Write message to deliver as a real phone notification..."
                   className="w-full bg-[#0e1621] border border-white/10 rounded-xl px-2.5 py-2 text-[12px] text-white outline-none focus:border-[#5eb5f7] resize-none"
                 />
+              </div>
+
+              {/* Voice Message Recorder */}
+              <div className="bg-[#0e1621] border border-white/10 rounded-xl p-2.5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-slate-200 flex items-center gap-1.5">
+                    <Mic className="w-3.5 h-3.5 text-[#5eb5f7]" />
+                    Voice Message (Playable on Target Phone)
+                  </span>
+                  {isRecordingVoice ? (
+                    <button
+                      type="button"
+                      onClick={handleStopVoiceRecording}
+                      className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10.5px] font-bold flex items-center gap-1 cursor-pointer animate-pulse"
+                    >
+                      <Square className="w-3 h-3 fill-white" />
+                      <span>Stop ({String(recordingSec).padStart(2, '0')}s / 40s)</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void handleStartVoiceRecording()}
+                      className="px-2.5 py-1 rounded-lg bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Mic className="w-3 h-3" />
+                      <span>{voiceDataUrl ? 'Re-record' : 'Record Voice'}</span>
+                    </button>
+                  )}
+                </div>
+
+                {voiceDataUrl && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <audio controls src={voiceDataUrl} className="h-8 flex-1" />
+                    <span className="text-[10px] font-mono text-emerald-300 shrink-0">
+                      {voiceDurationSec}s
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVoiceDataUrl('');
+                        setVoiceDurationSec(0);
+                      }}
+                      className="p-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 cursor-pointer"
+                      title="Remove voice clip"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -965,12 +1185,16 @@ export default function OwnerControlDashboard({
 
               <button
                 type="submit"
-                disabled={busyKey === 'send_notif' || !notifMessage.trim()}
+                disabled={busyKey === 'send_notif' || (!notifMessage.trim() && !voiceDataUrl)}
                 className="w-full py-2.5 rounded-xl bg-[#2b5278] hover:bg-[#356696] disabled:opacity-50 text-white font-bold text-[12.5px] flex items-center justify-center gap-2 cursor-pointer"
               >
                 <Send className="w-4 h-4" />
                 <span>
-                  {busyKey === 'send_notif' ? 'Sending...' : 'Send Phone Notification'}
+                  {busyKey === 'send_notif'
+                    ? 'Sending...'
+                    : voiceDataUrl
+                      ? 'Send Voice + Alert Notification'
+                      : 'Send Phone Notification'}
                 </span>
               </button>
             </form>
@@ -995,17 +1219,40 @@ export default function OwnerControlDashboard({
                   </button>
                 </div>
 
-                {snapshot?.notifications?.slice(0, 10).map((n) => {
+                {snapshot?.notifications?.slice(0, 12).map((n) => {
                   const isActive = n.expiresAtMs > serverNow;
+                  let deliveredMap: Record<string, number> = {};
+                  let seenMap: Record<string, number> = {};
+                  try {
+                    if (n.deliveredJson) deliveredMap = JSON.parse(n.deliveredJson) || {};
+                  } catch {}
+                  try {
+                    if (n.seenJson) seenMap = JSON.parse(n.seenJson) || {};
+                  } catch {}
+                  const deliveredEntries = Object.entries(deliveredMap);
+                  const seenEntries = Object.entries(seenMap);
+
+                  const formatTargetLabel = (id: string) => {
+                    const matched = devicesList.find((d) => d.deviceId === id);
+                    return matched ? matched.userName || matched.deviceName : id.slice(0, 12);
+                  };
+
                   return (
                     <div
                       key={n.notifId}
-                      className="bg-[#0e1621] rounded-xl p-2 text-[11px] space-y-1"
+                      className="bg-[#0e1621] rounded-xl p-2.5 text-[11px] space-y-1.5 border border-white/5"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-bold text-white truncate">{n.title}</span>
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-bold text-white truncate">{n.title}</span>
+                          {n.audioDataUrl && (
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 shrink-0">
+                              Voice {n.audioDurationSec ? `${n.audioDurationSec}s` : ''}
+                            </span>
+                          )}
+                        </div>
                         <span
-                          className={`text-[9.5px] font-semibold px-1.5 py-0.5 rounded flex items-center gap-1 ${
+                          className={`text-[9.5px] font-semibold px-1.5 py-0.5 rounded flex items-center gap-1 shrink-0 ${
                             isActive
                               ? 'bg-emerald-500/20 text-emerald-300'
                               : 'bg-white/10 text-slate-400'
@@ -1015,9 +1262,57 @@ export default function OwnerControlDashboard({
                           {isActive ? 'Active' : 'Expired'} • {n.durationSeconds}s
                         </span>
                       </div>
-                      <p className="text-slate-300 break-words">{n.message}</p>
+
+                      {n.message && <p className="text-slate-300 break-words">{n.message}</p>}
+
+                      {n.audioDataUrl && (
+                        <audio controls src={n.audioDataUrl} className="w-full h-8 pt-0.5" />
+                      )}
+
+                      {/* Delivery & Seen Receipts */}
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                        <span
+                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold ${
+                            deliveredEntries.length > 0
+                              ? 'bg-sky-500/20 text-sky-300'
+                              : 'bg-white/5 text-slate-400'
+                          }`}
+                        >
+                          <Check className="w-2.5 h-2.5" />
+                          Delivered ({deliveredEntries.length})
+                        </span>
+
+                        <span
+                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold ${
+                            seenEntries.length > 0
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : 'bg-white/5 text-slate-400'
+                          }`}
+                        >
+                          <CheckCheck className="w-2.5 h-2.5" />
+                          Seen ({seenEntries.length})
+                        </span>
+                      </div>
+
+                      {(deliveredEntries.length > 0 || seenEntries.length > 0) && (
+                        <div className="text-[9.5px] text-slate-400 space-y-0.5 bg-white/[0.03] rounded-lg px-2 py-1">
+                          {seenEntries.map(([devId, ts]) => (
+                            <p key={`seen_${devId}`} className="text-emerald-300/90 truncate">
+                              ✓✓ Seen by {formatTargetLabel(devId)} ({formatRelativeTime(ts, serverNow)})
+                            </p>
+                          ))}
+                          {deliveredEntries
+                            .filter(([devId]) => !seenMap[devId])
+                            .map(([devId, ts]) => (
+                              <p key={`deliv_${devId}`} className="text-sky-300/80 truncate">
+                                ✓ Delivered to {formatTargetLabel(devId)} ({formatRelativeTime(ts, serverNow)})
+                              </p>
+                            ))}
+                        </div>
+                      )}
+
                       <p className="text-[9.5px] text-[#7f91a4]">
-                        Target: {n.targetDeviceId} • via {n.sentBy} •{' '}
+                        Target: {n.targetDeviceId === 'all' ? 'All Devices' : formatTargetLabel(n.targetDeviceId)} • via {n.sentBy} •{' '}
                         {formatRelativeTime(n.createdAtMs, serverNow)}
                       </p>
                     </div>
@@ -1040,12 +1335,13 @@ export default function OwnerControlDashboard({
         )}
       </AnimatePresence>
 
-      {/* Owner Wi-Fi VoIP Call Modal */}
+      {/* Owner Wi-Fi VoIP / Video Call Modal */}
       <AnimatePresence>
         {callTargetDevice && (
           <WiFiCallModal
             device={callTargetDevice}
             callerRole={standalone ? 'ram_control' : 'app_0069'}
+            initialCallMode={callModalMode}
             onClose={() => setCallTargetDevice(null)}
           />
         )}

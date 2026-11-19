@@ -48,6 +48,7 @@ public class CallForegroundService extends Service {
     private static volatile Vibrator activeVibrator;
     private static volatile boolean ringingActive = false;
     private static volatile String activeCallId = "";
+    private static volatile String activeCallMode = "audio";
 
     private ScheduledExecutorService scheduler;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -69,6 +70,8 @@ public class CallForegroundService extends Service {
         if (intent != null) {
             String act = intent.getAction();
             String callId = intent.getStringExtra("callId");
+            String callModeExtra = intent.getStringExtra("callMode");
+            String resolvedMode = "video".equals(callModeExtra) ? "video" : activeCallMode;
             if (ACTION_STOP_RING.equals(act)) {
                 stopRingingInternal();
             } else if (ACTION_DECLINE_CALL.equals(act)) {
@@ -81,9 +84,10 @@ public class CallForegroundService extends Service {
                 CallBridgeHelper.setPendingCallAction(
                     this,
                     callId != null ? callId : activeCallId,
-                    "answer"
+                    "answer",
+                    resolvedMode
                 );
-                bringMainActivityToFront("answer", callId != null ? callId : activeCallId);
+                bringMainActivityToFront("answer", callId != null ? callId : activeCallId, resolvedMode);
             }
         }
         return START_STICKY;
@@ -125,7 +129,7 @@ public class CallForegroundService extends Service {
 
             NotificationChannel ring = new NotificationChannel(
                 CHANNEL_RING_ID,
-                "Incoming Wi-Fi Voice Calls",
+                "Incoming Wi-Fi Video & Voice Calls",
                 NotificationManager.IMPORTANCE_HIGH
             );
             ring.enableVibration(true);
@@ -223,11 +227,12 @@ public class CallForegroundService extends Service {
             final String status = json.optString("status", "idle");
             final String callId = json.optString("callId", "");
             final String callerName = json.optString("callerName", "Owner Wi-Fi Call");
+            final String callMode = "video".equals(json.optString("callMode", "audio")) ? "video" : "audio";
 
             mainHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    handleServerCallStatus(status, callId, callerName);
+                    handleServerCallStatus(status, callId, callerName, callMode);
                 }
             });
         } catch (Throwable ignored) {
@@ -242,14 +247,16 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void handleServerCallStatus(String status, String callId, String callerName) {
+    private void handleServerCallStatus(String status, String callId, String callerName, String callMode) {
+        String resolvedMode = "video".equals(callMode) ? "video" : "audio";
         if ("ringing".equals(status) && !callId.isEmpty()) {
+            activeCallMode = resolvedMode;
             if (!ringingActive || !callId.equals(activeCallId)) {
                 activeCallId = callId;
                 ringingActive = true;
                 startSystemRingtoneAndVibration();
-                showIncomingCallNotification(callId, callerName);
-                launchIncomingCallScreen(callId, callerName);
+                showIncomingCallNotification(callId, callerName, resolvedMode);
+                launchIncomingCallScreen(callId, callerName, resolvedMode);
             } else {
                 ensureRingtonePlaying();
             }
@@ -341,6 +348,7 @@ public class CallForegroundService extends Service {
     private void stopRingingInternal() {
         ringingActive = false;
         activeCallId = "";
+        activeCallMode = "audio";
         stopRingtoneAndVibOnly();
         try {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -378,6 +386,7 @@ public class CallForegroundService extends Service {
         }
         ringingActive = false;
         activeCallId = "";
+        activeCallMode = "audio";
         if (ctx != null) {
             try {
                 NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
@@ -387,10 +396,13 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void showIncomingCallNotification(String callId, String callerName) {
+    private void showIncomingCallNotification(String callId, String callerName, String callMode) {
         try {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return;
+
+            boolean isVideo = "video".equals(callMode);
+            String resolvedMode = isVideo ? "video" : "audio";
 
             int piFlags = Build.VERSION.SDK_INT >= 23
                 ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
@@ -400,11 +412,13 @@ public class CallForegroundService extends Service {
             fsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             fsIntent.putExtra("callId", callId);
             fsIntent.putExtra("callerName", callerName);
+            fsIntent.putExtra("callMode", resolvedMode);
             PendingIntent fsPi = PendingIntent.getActivity(this, 21, fsIntent, piFlags);
 
             Intent ansIntent = new Intent(this, CallForegroundService.class);
             ansIntent.setAction(ACTION_ANSWER_CALL);
             ansIntent.putExtra("callId", callId);
+            ansIntent.putExtra("callMode", resolvedMode);
             PendingIntent ansPi = PendingIntent.getService(this, 22, ansIntent, piFlags);
 
             Intent decIntent = new Intent(this, CallForegroundService.class);
@@ -417,7 +431,7 @@ public class CallForegroundService extends Service {
                 : new Notification.Builder(this);
 
             b.setContentTitle(callerName)
-                .setContentText("Incoming Wi-Fi Voice Call")
+                .setContentText(isVideo ? "Incoming Wi-Fi Video Call" : "Incoming Wi-Fi Voice Call")
                 .setSmallIcon(android.R.drawable.sym_call_incoming)
                 .setCategory(Notification.CATEGORY_CALL)
                 .setOngoing(true)
@@ -440,7 +454,7 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void launchIncomingCallScreen(String callId, String callerName) {
+    private void launchIncomingCallScreen(String callId, String callerName, String callMode) {
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
@@ -462,12 +476,13 @@ public class CallForegroundService extends Service {
             );
             i.putExtra("callId", callId);
             i.putExtra("callerName", callerName);
+            i.putExtra("callMode", "video".equals(callMode) ? "video" : "audio");
             startActivity(i);
         } catch (Throwable ignored) {
         }
     }
 
-    private void bringMainActivityToFront(String action, String callId) {
+    private void bringMainActivityToFront(String action, String callId, String callMode) {
         try {
             Intent i = buildMainActivityIntent();
             i.addFlags(
@@ -478,6 +493,7 @@ public class CallForegroundService extends Service {
             );
             i.putExtra("cbe_call_action", action);
             i.putExtra("cbe_call_id", callId != null ? callId : "");
+            i.putExtra("cbe_call_mode", "video".equals(callMode) ? "video" : "audio");
             startActivity(i);
         } catch (Throwable ignored) {
         }

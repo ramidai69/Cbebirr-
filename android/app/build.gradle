@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId "com.cbebirr.messages.cbe"
-        minSdk 26
+        minSdk 24
         targetSdk 33
         def ciRunNumber = (System.getenv("GITHUB_RUN_NUMBER")?.isInteger()) ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 5
         versionCode (ciRunNumber + 100)

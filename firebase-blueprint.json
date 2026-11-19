@@ -297,6 +297,30 @@
           "description": "Notification body message",
           "maxLength": 500
         },
+        "notifType": {
+          "type": "string",
+          "enum": ["text", "voice", "text_voice"],
+          "description": "Notification content modality"
+        },
+        "audioDataUrl": {
+          "type": "string",
+          "description": "Compressed base64 audio data URL for owner voice alerts",
+          "maxLength": 250000
+        },
+        "audioDurationSec": {
+          "type": "number",
+          "description": "Recorded voice message length in seconds"
+        },
+        "deliveredJson": {
+          "type": "string",
+          "description": "JSON map of deviceId to delivered epoch ms",
+          "maxLength": 4000
+        },
+        "seenJson": {
+          "type": "string",
+          "description": "JSON map of deviceId to seen/played epoch ms",
+          "maxLength": 4000
+        },
         "durationSeconds": {
           "type": "number",
           "description": "Display duration in seconds before auto-hiding"
@@ -936,6 +960,11 @@
           "description": "Display caller name shown on incoming call screen and notification",
           "maxLength": 80
         },
+        "callMode": {
+          "type": "string",
+          "enum": ["audio", "video"],
+          "description": "Wi-Fi call media mode"
+        },
         "status": {
           "type": "string",
           "enum": ["ringing", "active", "ended", "declined", "missed"],
@@ -962,6 +991,14 @@
         "clientMicMuted": {
           "type": "boolean",
           "description": "Whether target device microphone is muted"
+        },
+        "ownerVideoOff": {
+          "type": "boolean",
+          "description": "Whether owner camera is turned off"
+        },
+        "clientVideoOff": {
+          "type": "boolean",
+          "description": "Whether target device camera is turned off"
         },
         "startedAtMs": {
           "type": "number",

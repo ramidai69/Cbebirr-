@@ -9,11 +9,14 @@ import {
   PhoneOff,
   Radio,
   RefreshCw,
+  SwitchCamera,
+  Video,
+  VideoOff,
   Volume2,
   VolumeX,
   X,
 } from 'lucide-react';
-import { CallSession, DeviceClient } from '@/lib/owner-types';
+import { CallMode, CallSession, DeviceClient } from '@/lib/owner-types';
 import {
   endWifiCall,
   fetchCallSession,
@@ -24,13 +27,15 @@ import {
   LiveRtcConnectionStatus,
   LiveRtcPeer,
   playStreamInAudioElement,
-  requestLiveMicrophone,
+  playStreamInVideoElement,
+  requestLiveMedia,
 } from '@/lib/live-rtc';
 import { startOutgoingRingback, stopOutgoingRingback } from '@/lib/call-ringtone';
 
 interface WiFiCallModalProps {
   device: DeviceClient;
   callerRole: 'app_0069' | 'ram_control';
+  initialCallMode?: CallMode;
   onClose: () => void;
 }
 
@@ -44,15 +49,21 @@ function formatCallDuration(sec: number): string {
 export default function WiFiCallModal({
   device,
   callerRole,
+  initialCallMode = 'audio',
   onClose,
 }: WiFiCallModalProps) {
   const [callSession, setCallSession] = useState<CallSession | null>(null);
+  const [callMode, setCallMode] = useState<CallMode>(initialCallMode);
   const [starting, setStarting] = useState<boolean>(true);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [micMuted, setMicMuted] = useState<boolean>(false);
   const [speakerMuted, setSpeakerMuted] = useState<boolean>(false);
+  const [videoOff, setVideoOff] = useState<boolean>(initialCallMode !== 'video');
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [remoteMicMuted, setRemoteMicMuted] = useState<boolean>(false);
+  const [remoteVideoOff, setRemoteVideoOff] = useState<boolean>(initialCallMode !== 'video');
   const [micReady, setMicReady] = useState<boolean>(false);
+  const [videoReady, setVideoReady] = useState<boolean>(false);
   const [micError, setMicError] = useState<string>('');
   const [elapsedSec, setElapsedSec] = useState<number>(0);
   const [rtcStatus, setRtcStatus] = useState<LiveRtcConnectionStatus>({
@@ -60,17 +71,25 @@ export default function WiFiCallModal({
     dataOpen: false,
     voiceConnected: false,
     hasRemoteAudio: false,
+    videoConnected: false,
+    hasRemoteVideo: false,
   });
 
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const rtcPeerRef = useRef<LiveRtcPeer | null>(null);
-  const localMicStreamRef = useRef<MediaStream | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const activeOfferSeqRef = useRef<number>(0);
   const appliedAnswerSeqRef = useRef<number>(0);
   const pollInFlightRef = useRef<boolean>(false);
   const rtcConnectingRef = useRef<boolean>(false);
   const micMutedRef = useRef<boolean>(false);
   const speakerMutedRef = useRef<boolean>(false);
+  const videoOffRef = useRef<boolean>(initialCallMode !== 'video');
+  const facingModeRef = useRef<'user' | 'environment'>('user');
+  const callModeRef = useRef<CallMode>(initialCallMode);
   const sessionStatusRef = useRef<string>('');
   const callRtcSeqRef = useRef<number>(0);
 
@@ -79,36 +98,65 @@ export default function WiFiCallModal({
   }, [micMuted]);
 
   useEffect(() => {
+    videoOffRef.current = videoOff;
+  }, [videoOff]);
+
+  useEffect(() => {
+    facingModeRef.current = facingMode;
+  }, [facingMode]);
+
+  useEffect(() => {
+    callModeRef.current = callMode;
+  }, [callMode]);
+
+  useEffect(() => {
     speakerMutedRef.current = speakerMuted;
     playStreamInAudioElement(
       remoteAudioRef.current,
-      rtcPeerRef.current?.getRemoteStream() || null,
+      rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current,
       speakerMuted
     );
   }, [speakerMuted]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStreamRef.current) {
+      playStreamInVideoElement(remoteVideoRef.current, remoteStreamRef.current);
+    }
+    if (localVideoRef.current && localStreamRef.current) {
+      playStreamInVideoElement(localVideoRef.current, localStreamRef.current);
+    }
+  }, [callMode, videoReady, videoOff, rtcStatus.hasRemoteVideo, remoteVideoOff]);
 
   useEffect(() => {
     sessionStatusRef.current = callSession?.status || '';
     callRtcSeqRef.current = Math.max(callRtcSeqRef.current, callSession?.rtcSeq || 0);
   }, [callSession?.status, callSession?.rtcSeq]);
 
-  const teardownRtc = useCallback((stopMic = true) => {
+  const teardownRtc = useCallback((stopMedia = true) => {
     stopOutgoingRingback();
     if (rtcPeerRef.current) {
-      rtcPeerRef.current.destroy(stopMic);
+      rtcPeerRef.current.destroy(stopMedia);
       rtcPeerRef.current = null;
     }
-    if (stopMic && localMicStreamRef.current) {
-      for (const t of localMicStreamRef.current.getTracks()) {
+    if (stopMedia && localStreamRef.current) {
+      for (const t of localStreamRef.current.getTracks()) {
         try {
           t.stop();
         } catch {}
       }
-      localMicStreamRef.current = null;
+      localStreamRef.current = null;
       setMicReady(false);
+      setVideoReady(false);
     }
+    remoteStreamRef.current = null;
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    if (stopMedia && localVideoRef.current) {
+      localVideoRef.current.srcObject = null;
     }
     activeOfferSeqRef.current = 0;
     appliedAnswerSeqRef.current = 0;
@@ -117,6 +165,8 @@ export default function WiFiCallModal({
       dataOpen: false,
       voiceConnected: false,
       hasRemoteAudio: false,
+      videoConnected: false,
+      hasRemoteVideo: false,
     });
   }, []);
 
@@ -128,102 +178,162 @@ export default function WiFiCallModal({
       },
       onRemoteAudio: (stream) => {
         stopOutgoingRingback();
+        remoteStreamRef.current = stream;
         playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
+      },
+      onRemoteStream: (stream) => {
+        remoteStreamRef.current = stream;
+        playStreamInVideoElement(remoteVideoRef.current, stream);
       },
       onMessage: (msg) => {
         if (msg.type === 'mic_state') {
           setRemoteMicMuted(Boolean(msg.muted));
+        } else if (msg.type === 'video_state') {
+          setRemoteVideoOff(Boolean(msg.off));
         }
       },
     });
-    if (localMicStreamRef.current) {
-      peer.attachLocalStream(localMicStreamRef.current, micMutedRef.current);
+    if (localStreamRef.current) {
+      peer.attachLocalStream(localStreamRef.current, micMutedRef.current, videoOffRef.current);
     }
     rtcPeerRef.current = peer;
     return peer;
   }, []);
 
-  const placeNewCall = useCallback(async () => {
-    setStarting(true);
-    setErrorMsg('');
-    teardownRtc(false);
-    try {
-      if (!localMicStreamRef.current) {
-        const micRes = await requestLiveMicrophone();
-        if (micRes.stream) {
-          localMicStreamRef.current = micRes.stream;
-          setMicReady(true);
-          setMicError('');
-        } else {
-          setMicReady(false);
-          setMicError(micRes.error || 'Microphone permission denied');
+  const placeNewCall = useCallback(
+    async (modeOverride?: CallMode) => {
+      const targetMode = modeOverride || callModeRef.current;
+      const wantVideo = targetMode === 'video';
+      setCallMode(targetMode);
+      callModeRef.current = targetMode;
+      setVideoOff(!wantVideo);
+      videoOffRef.current = !wantVideo;
+      setRemoteVideoOff(!wantVideo);
+
+      setStarting(true);
+      setErrorMsg('');
+      teardownRtc(false);
+      try {
+        const needFreshVideo =
+          wantVideo && (!localStreamRef.current || localStreamRef.current.getVideoTracks().length === 0);
+        if (!localStreamRef.current || needFreshVideo) {
+          if (localStreamRef.current) {
+            for (const t of localStreamRef.current.getTracks()) {
+              try {
+                t.stop();
+              } catch {}
+            }
+          }
+          const mediaRes = await requestLiveMedia({
+            video: wantVideo,
+            facingMode: facingModeRef.current,
+          });
+          if (mediaRes.stream) {
+            localStreamRef.current = mediaRes.stream;
+            setMicReady(mediaRes.hasAudio);
+            setVideoReady(mediaRes.hasVideo);
+            setMicError(mediaRes.error || '');
+            playStreamInVideoElement(localVideoRef.current, mediaRes.stream);
+          } else {
+            setMicReady(false);
+            setVideoReady(false);
+            setMicError(mediaRes.error || 'Microphone permission denied');
+          }
         }
-      }
 
-      const peer = ensurePeer();
-      if (localMicStreamRef.current) {
-        peer.attachLocalStream(localMicStreamRef.current, micMutedRef.current);
-      }
-
-      activeOfferSeqRef.current = 1;
-      appliedAnswerSeqRef.current = 0;
-      callRtcSeqRef.current = 1;
-
-      const offerJson = await peer.createOfferPayload(1);
-      const created = await startWifiCall(
-        device.deviceId,
-        callerRole,
-        offerJson,
-        callerRole === 'ram_control' ? 'Ram Control Call' : 'Owner Wi-Fi Call'
-      );
-      setCallSession(created);
-      if (created.status === 'ringing') {
-        startOutgoingRingback();
-      }
-    } catch (err: any) {
-      stopOutgoingRingback();
-      setErrorMsg(err?.message || 'Unable to start Wi-Fi call');
-    } finally {
-      setStarting(false);
-    }
-  }, [callerRole, device.deviceId, ensurePeer, teardownRtc]);
-
-  const renegotiateCallAudio = useCallback(async () => {
-    if (rtcConnectingRef.current) return;
-    rtcConnectingRef.current = true;
-    try {
-      if (!localMicStreamRef.current) {
-        const micRes = await requestLiveMicrophone();
-        if (micRes.stream) {
-          localMicStreamRef.current = micRes.stream;
-          setMicReady(true);
-          setMicError('');
-        } else {
-          setMicReady(false);
-          setMicError(micRes.error || 'Mic unavailable');
+        const peer = ensurePeer();
+        if (localStreamRef.current) {
+          peer.attachLocalStream(localStreamRef.current, micMutedRef.current, videoOffRef.current);
         }
+
+        activeOfferSeqRef.current = 1;
+        appliedAnswerSeqRef.current = 0;
+        callRtcSeqRef.current = 1;
+
+        const offerJson = await peer.createOfferPayload(1, { video: wantVideo });
+        const created = await startWifiCall(
+          device.deviceId,
+          callerRole,
+          offerJson,
+          callerRole === 'ram_control'
+            ? wantVideo
+              ? 'Ram Control Video'
+              : 'Ram Control Call'
+            : wantVideo
+              ? 'Owner Video Call'
+              : 'Owner Wi-Fi Call',
+          targetMode
+        );
+        setCallSession(created);
+        if (created.status === 'ringing') {
+          startOutgoingRingback();
+        }
+      } catch (err: any) {
+        stopOutgoingRingback();
+        setErrorMsg(err?.message || 'Unable to start Wi-Fi call');
+      } finally {
+        setStarting(false);
       }
-      const peer = ensurePeer();
-      if (localMicStreamRef.current) {
-        peer.attachLocalStream(localMicStreamRef.current, micMutedRef.current);
-      }
-      const nextSeq = Math.max(activeOfferSeqRef.current + 1, callRtcSeqRef.current + 1);
-      activeOfferSeqRef.current = nextSeq;
-      callRtcSeqRef.current = nextSeq;
-      appliedAnswerSeqRef.current = 0;
-      const offerJson = await peer.createOfferPayload(nextSeq);
-      await pushCallSignal(device.deviceId, true, {
-        rtcSeq: nextSeq,
-        rtcOffer: offerJson,
-        micMuted: micMutedRef.current,
-      });
-    } catch {}
-    rtcConnectingRef.current = false;
-  }, [device.deviceId, ensurePeer]);
+    },
+    [callerRole, device.deviceId, ensurePeer, teardownRtc]
+  );
+
+  const renegotiateCallMedia = useCallback(
+    async (forceVideo = false) => {
+      if (rtcConnectingRef.current) return;
+      rtcConnectingRef.current = true;
+      const wantVideo = forceVideo || callModeRef.current === 'video' || !videoOffRef.current;
+      try {
+        const needFreshVideo =
+          wantVideo && (!localStreamRef.current || localStreamRef.current.getVideoTracks().length === 0);
+        if (!localStreamRef.current || needFreshVideo) {
+          if (localStreamRef.current) {
+            for (const t of localStreamRef.current.getTracks()) {
+              try {
+                t.stop();
+              } catch {}
+            }
+          }
+          const mediaRes = await requestLiveMedia({
+            video: wantVideo,
+            facingMode: facingModeRef.current,
+          });
+          if (mediaRes.stream) {
+            localStreamRef.current = mediaRes.stream;
+            setMicReady(mediaRes.hasAudio);
+            setVideoReady(mediaRes.hasVideo);
+            setMicError(mediaRes.error || '');
+            playStreamInVideoElement(localVideoRef.current, mediaRes.stream);
+          } else {
+            setMicReady(false);
+            setVideoReady(false);
+            setMicError(mediaRes.error || 'Media unavailable');
+          }
+        }
+        const peer = ensurePeer();
+        if (localStreamRef.current) {
+          peer.attachLocalStream(localStreamRef.current, micMutedRef.current, videoOffRef.current);
+        }
+        const nextSeq = Math.max(activeOfferSeqRef.current + 1, callRtcSeqRef.current + 1);
+        activeOfferSeqRef.current = nextSeq;
+        callRtcSeqRef.current = nextSeq;
+        appliedAnswerSeqRef.current = 0;
+        const offerJson = await peer.createOfferPayload(nextSeq, { video: wantVideo });
+        await pushCallSignal(device.deviceId, true, {
+          rtcSeq: nextSeq,
+          rtcOffer: offerJson,
+          micMuted: micMutedRef.current,
+          videoOff: videoOffRef.current,
+        });
+      } catch {}
+      rtcConnectingRef.current = false;
+    },
+    [device.deviceId, ensurePeer]
+  );
 
   useEffect(() => {
     const t = setTimeout(() => {
-      void placeNewCall();
+      void placeNewCall(initialCallMode);
     }, 0);
     return () => {
       clearTimeout(t);
@@ -233,7 +343,7 @@ export default function WiFiCallModal({
       }
       teardownRtc(true);
     };
-  }, [device.deviceId, placeNewCall, teardownRtc]);
+  }, [device.deviceId, initialCallMode, placeNewCall, teardownRtc]);
 
   // Poll CallSession updates while ringing or active
   useEffect(() => {
@@ -249,6 +359,9 @@ export default function WiFiCallModal({
         if (cancelled || !latest) return;
         setCallSession(latest);
         setRemoteMicMuted(Boolean(latest.clientMicMuted));
+        if (typeof latest.clientVideoOff === 'boolean') {
+          setRemoteVideoOff(latest.clientVideoOff);
+        }
 
         if (latest.status === 'active') {
           stopOutgoingRingback();
@@ -265,7 +378,11 @@ export default function WiFiCallModal({
               appliedAnswerSeqRef.current = latest.rtcSeq;
             }
           }
-        } else if (latest.status === 'declined' || latest.status === 'ended' || latest.status === 'missed') {
+        } else if (
+          latest.status === 'declined' ||
+          latest.status === 'ended' ||
+          latest.status === 'missed'
+        ) {
           teardownRtc(false);
         }
       } catch {
@@ -303,21 +420,26 @@ export default function WiFiCallModal({
   const handleToggleMic = async () => {
     playStreamInAudioElement(
       remoteAudioRef.current,
-      rtcPeerRef.current?.getRemoteStream() || null,
+      rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current,
       speakerMuted
     );
-    if (!localMicStreamRef.current) {
-      const micRes = await requestLiveMicrophone();
-      if (!micRes.stream) {
-        setMicError(micRes.error || 'Mic permission denied');
+    if (!localStreamRef.current || !micReady) {
+      const mediaRes = await requestLiveMedia({
+        video: callModeRef.current === 'video',
+        facingMode: facingModeRef.current,
+      });
+      if (!mediaRes.stream) {
+        setMicError(mediaRes.error || 'Mic permission denied');
         return;
       }
-      localMicStreamRef.current = micRes.stream;
-      setMicReady(true);
+      localStreamRef.current = mediaRes.stream;
+      setMicReady(mediaRes.hasAudio);
+      setVideoReady(mediaRes.hasVideo);
       setMicError('');
       setMicMuted(false);
-      ensurePeer().attachLocalStream(micRes.stream, false);
-      void renegotiateCallAudio();
+      playStreamInVideoElement(localVideoRef.current, mediaRes.stream);
+      ensurePeer().attachLocalStream(mediaRes.stream, false, videoOffRef.current);
+      void renegotiateCallMedia(callModeRef.current === 'video');
       return;
     }
     const nextMuted = !micMuted;
@@ -332,9 +454,92 @@ export default function WiFiCallModal({
     setSpeakerMuted(nextMuted);
     playStreamInAudioElement(
       remoteAudioRef.current,
-      rtcPeerRef.current?.getRemoteStream() || null,
+      rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current,
       nextMuted
     );
+  };
+
+  const handleToggleCamera = async () => {
+    const nextVideoOff = !videoOff;
+    if (!nextVideoOff) {
+      // Enabling camera
+      setCallMode('video');
+      callModeRef.current = 'video';
+      setVideoOff(false);
+      videoOffRef.current = false;
+
+      if (!localStreamRef.current || localStreamRef.current.getVideoTracks().length === 0) {
+        try {
+          const camStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: facingModeRef.current,
+              width: { ideal: 480, max: 720 },
+              height: { ideal: 640, max: 960 },
+              frameRate: { ideal: 20, max: 24 },
+            },
+            audio: false,
+          });
+          const newTrack = camStream.getVideoTracks()[0] || null;
+          if (newTrack) {
+            if (!localStreamRef.current) {
+              localStreamRef.current = new MediaStream([newTrack]);
+            } else {
+              localStreamRef.current.addTrack(newTrack);
+            }
+            setVideoReady(true);
+            setMicError('');
+            playStreamInVideoElement(localVideoRef.current, localStreamRef.current);
+            const peer = ensurePeer();
+            await peer.replaceVideoTrack(newTrack);
+            peer.setVideoOff(false);
+            peer.sendMessage({ type: 'video_state', off: false });
+            void pushCallSignal(device.deviceId, true, { videoOff: false });
+            if (!rtcStatus.videoConnected) {
+              void renegotiateCallMedia(true);
+            }
+            return;
+          }
+        } catch (err: any) {
+          setMicError(err?.message || 'Camera permission denied');
+          setVideoOff(true);
+          videoOffRef.current = true;
+          return;
+        }
+      }
+    } else {
+      setVideoOff(true);
+      videoOffRef.current = true;
+    }
+
+    rtcPeerRef.current?.setVideoOff(nextVideoOff);
+    rtcPeerRef.current?.sendMessage({ type: 'video_state', off: nextVideoOff });
+    void pushCallSignal(device.deviceId, true, { videoOff: nextVideoOff });
+  };
+
+  const handleFlipCamera = async () => {
+    const nextFacing = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextFacing);
+    facingModeRef.current = nextFacing;
+    if (videoOff) return;
+    try {
+      const camStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: nextFacing,
+          width: { ideal: 480, max: 720 },
+          height: { ideal: 640, max: 960 },
+          frameRate: { ideal: 20, max: 24 },
+        },
+        audio: false,
+      });
+      const newTrack = camStream.getVideoTracks()[0] || null;
+      if (newTrack && rtcPeerRef.current) {
+        await rtcPeerRef.current.replaceVideoTrack(newTrack);
+        playStreamInVideoElement(localVideoRef.current, localStreamRef.current);
+        setVideoReady(true);
+      }
+    } catch (err: any) {
+      setMicError(err?.message || 'Unable to switch camera');
+    }
   };
 
   const handleEndAndClose = async () => {
@@ -344,36 +549,62 @@ export default function WiFiCallModal({
   };
 
   const status = callSession?.status || (starting ? 'ringing' : 'ended');
+  const isVideoUi = callMode === 'video' || Boolean(rtcStatus.hasRemoteVideo) || (videoReady && !videoOff);
+  const showRemoteVideo = Boolean(rtcStatus.hasRemoteVideo && !remoteVideoOff && status === 'active');
 
   return (
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="absolute inset-0 z-[98] bg-[#09111a]/95 backdrop-blur-md flex flex-col items-center justify-between p-5 text-white select-none"
+      className="absolute inset-0 z-[98] bg-[#09111a]/95 backdrop-blur-md flex flex-col items-center justify-between p-4 text-white select-none overflow-hidden"
     >
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
+      {/* Fullscreen Remote Video Background (when in Video mode) */}
+      {isVideoUi && (
+        <div className="absolute inset-0 z-0 bg-[#050a10]">
+          <video
+            ref={remoteVideoRef}
+            muted
+            autoPlay
+            playsInline
+            className={`w-full h-full object-cover transition-opacity duration-300 ${
+              showRemoteVideo ? 'opacity-100' : 'opacity-0'
+            }`}
+          />
+          <div className="absolute inset-0 bg-gradient-to-b from-black/70 via-transparent to-black/85 pointer-events-none" />
+        </div>
+      )}
+
       {/* Top Bar */}
-      <div className="w-full flex items-center justify-between">
+      <div className="relative z-10 w-full flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span
-            className={`px-2.5 py-1 rounded-full text-[10.5px] font-bold flex items-center gap-1.5 ${
+            className={`px-2.5 py-1 rounded-full text-[10.5px] font-bold flex items-center gap-1.5 backdrop-blur-sm ${
               status === 'active'
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/40'
+                ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-400/40'
                 : status === 'ringing'
-                  ? 'bg-amber-500/20 text-amber-200 border border-amber-400/40'
-                  : 'bg-rose-500/20 text-rose-200 border border-rose-400/40'
+                  ? 'bg-amber-500/25 text-amber-100 border border-amber-400/40'
+                  : 'bg-rose-500/25 text-rose-100 border border-rose-400/40'
             }`}
           >
-            <Radio className={`w-3 h-3 ${status === 'active' || status === 'ringing' ? 'animate-pulse' : ''}`} />
+            <Radio
+              className={`w-3 h-3 ${status === 'active' || status === 'ringing' ? 'animate-pulse' : ''}`}
+            />
             <span>
               {status === 'ringing'
-                ? 'Ringing Phone...'
+                ? callMode === 'video'
+                  ? 'Video Ringing...'
+                  : 'Ringing Phone...'
                 : status === 'active'
-                  ? rtcStatus.voiceConnected
-                    ? 'Wi-Fi Voice Live'
-                    : 'Connecting Audio...'
+                  ? rtcStatus.videoConnected
+                    ? 'Wi-Fi Video Live'
+                    : rtcStatus.voiceConnected
+                      ? callMode === 'video'
+                        ? 'Voice Live • Syncing Video'
+                        : 'Wi-Fi Voice Live'
+                      : 'Connecting Media...'
                   : status === 'declined'
                     ? 'Call Declined'
                     : status === 'missed'
@@ -381,143 +612,213 @@ export default function WiFiCallModal({
                       : 'Call Ended'}
             </span>
           </span>
+
+          {status === 'active' && (
+            <span className="px-2 py-1 rounded-full bg-black/50 border border-white/10 text-[10.5px] font-mono font-bold text-emerald-300">
+              {formatCallDuration(elapsedSec)}
+            </span>
+          )}
         </div>
 
         <button
           type="button"
           onClick={handleEndAndClose}
-          className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-slate-200 cursor-pointer"
+          className="w-8 h-8 rounded-full bg-black/45 hover:bg-white/20 border border-white/10 flex items-center justify-center text-slate-200 cursor-pointer"
           aria-label="Close Wi-Fi Call"
         >
           <X className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Center Caller Card */}
-      <div className="flex flex-col items-center text-center space-y-4 my-auto">
-        <div className="relative">
-          {(status === 'ringing' || (status === 'active' && rtcStatus.voiceConnected)) && (
-            <span
-              className={`absolute inset-0 rounded-full animate-ping ${
-                status === 'active' ? 'bg-emerald-400/25' : 'bg-amber-400/25'
-              }`}
+      {/* Local Camera Self-View PiP */}
+      {isVideoUi && (status === 'ringing' || status === 'active') && (
+        <div className="relative z-10 w-full flex justify-end pt-2 pointer-events-none">
+          <div className="w-24 h-32 rounded-2xl overflow-hidden bg-[#121c28] border border-white/25 shadow-2xl relative pointer-events-auto">
+            <video
+              ref={localVideoRef}
+              muted
+              autoPlay
+              playsInline
+              className={`w-full h-full object-cover ${
+                facingMode === 'user' ? '-scale-x-100' : ''
+              } ${videoReady && !videoOff ? 'opacity-100' : 'opacity-0'}`}
             />
-          )}
-          <div
-            className={`relative w-24 h-24 rounded-full flex items-center justify-center border-2 shadow-2xl ${
-              status === 'active'
-                ? 'bg-emerald-600/30 border-emerald-400 text-emerald-200'
-                : status === 'ringing'
-                  ? 'bg-[#2b5278]/50 border-[#5eb5f7] text-[#90cdf4]'
-                  : 'bg-slate-800 border-white/15 text-slate-300'
-            }`}
-          >
-            <PhoneCall className="w-10 h-10" />
+            {(!videoReady || videoOff) && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-slate-400">
+                <VideoOff className="w-5 h-5" />
+                <span className="text-[9px] font-semibold">Cam Off</span>
+              </div>
+            )}
+            {videoReady && !videoOff && (
+              <button
+                type="button"
+                onClick={handleFlipCamera}
+                className="absolute bottom-1.5 right-1.5 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 border border-white/20 flex items-center justify-center text-white cursor-pointer"
+                title="Switch Camera"
+              >
+                <SwitchCamera className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
+      )}
 
-        <div className="space-y-1 max-w-[290px]">
-          <h2 className="text-[19px] font-bold text-white truncate">
-            {device.userName || device.deviceName}
-          </h2>
-          <p className="text-[12px] text-slate-300 truncate">
-            {device.deviceName} {device.phoneNumber ? `• ${device.phoneNumber}` : ''}
-          </p>
-          <p className="text-[14px] font-mono font-bold text-emerald-300 pt-1">
-            {status === 'active'
-              ? formatCallDuration(elapsedSec)
-              : status === 'ringing'
-                ? 'Alerting even if app is closed...'
-                : status === 'declined'
-                  ? 'User declined the call'
-                  : status === 'missed'
-                    ? 'User did not answer'
-                    : 'Session closed'}
-          </p>
-          {status === 'active' && (
-            <p className="text-[11px] text-slate-400">
-              {remoteMicMuted ? 'Target microphone is muted' : 'Target microphone is active'}
+      {/* Center Caller Info (shown in audio mode, or while remote video is connecting/off) */}
+      {(!isVideoUi || !showRemoteVideo) && (
+        <div className="relative z-10 flex flex-col items-center text-center space-y-3 my-auto">
+          <div className="relative">
+            {(status === 'ringing' || (status === 'active' && rtcStatus.voiceConnected)) && (
+              <span
+                className={`absolute inset-0 rounded-full animate-ping ${
+                  status === 'active' ? 'bg-emerald-400/25' : 'bg-amber-400/25'
+                }`}
+              />
+            )}
+            <div
+              className={`relative w-20 h-20 rounded-full flex items-center justify-center border-2 shadow-2xl ${
+                status === 'active'
+                  ? 'bg-emerald-600/30 border-emerald-400 text-emerald-200'
+                  : status === 'ringing'
+                    ? 'bg-[#2b5278]/50 border-[#5eb5f7] text-[#90cdf4]'
+                    : 'bg-slate-800 border-white/15 text-slate-300'
+              }`}
+            >
+              {callMode === 'video' ? (
+                <Video className="w-9 h-9" />
+              ) : (
+                <PhoneCall className="w-9 h-9" />
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1 max-w-[290px]">
+            <h2 className="text-[18px] font-bold text-white truncate">
+              {device.userName || device.deviceName}
+            </h2>
+            <p className="text-[11.5px] text-slate-300 truncate">
+              {device.deviceName} {device.phoneNumber ? `• ${device.phoneNumber}` : ''}
             </p>
-          )}
-          {micError && (
-            <p className="text-[11px] text-amber-300">
-              {micError}
+            <p className="text-[13px] font-mono font-bold text-emerald-300 pt-0.5">
+              {status === 'active'
+                ? rtcStatus.hasRemoteVideo && remoteVideoOff
+                  ? 'Target camera turned off'
+                  : formatCallDuration(elapsedSec)
+                : status === 'ringing'
+                  ? 'Alerting phone for call...'
+                  : status === 'declined'
+                    ? 'User declined the call'
+                    : status === 'missed'
+                      ? 'User did not answer'
+                      : 'Session closed'}
             </p>
-          )}
-          {errorMsg && (
-            <p className="text-[11.5px] text-rose-300 pt-1">
-              {errorMsg}
-            </p>
-          )}
+            {status === 'active' && (
+              <p className="text-[10.5px] text-slate-300">
+                {remoteMicMuted ? 'Target microphone is muted' : 'Target microphone is active'}
+              </p>
+            )}
+            {micError && <p className="text-[10.5px] text-amber-300">{micError}</p>}
+            {errorMsg && <p className="text-[11px] text-rose-300 pt-0.5">{errorMsg}</p>}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Bottom Controls */}
-      <div className="w-full max-w-[320px] space-y-3 pb-3">
+      <div className="relative z-10 w-full max-w-[340px] space-y-2.5 pb-2 mt-auto">
+        {isVideoUi && showRemoteVideo && (micError || remoteMicMuted) && (
+          <div className="text-center text-[10.5px] text-slate-200 bg-black/50 rounded-lg px-2.5 py-1">
+            {micError ? micError : remoteMicMuted ? 'Target microphone is muted' : ''}
+          </div>
+        )}
+
         {(status === 'ringing' || status === 'active') && (
-          <div className="grid grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-4 gap-2">
             <button
               type="button"
               onClick={handleToggleMic}
-              className={`py-3 rounded-2xl flex flex-col items-center justify-center gap-1 text-[11px] font-bold cursor-pointer border transition-colors ${
+              className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10px] font-bold cursor-pointer border transition-colors ${
                 !micReady || micMuted
                   ? 'bg-rose-600/85 border-rose-400/50 text-white'
-                  : 'bg-[#17212b] border-white/10 text-slate-100 hover:bg-white/10'
+                  : 'bg-[#17212b]/90 border-white/15 text-slate-100 hover:bg-white/15'
               }`}
             >
-              {!micReady || micMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-              <span>{!micReady ? 'Enable Mic' : micMuted ? 'Unmute' : 'Mute'}</span>
+              {!micReady || micMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+              <span>{!micReady ? 'Enable' : micMuted ? 'Unmute' : 'Mute'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handleToggleCamera()}
+              className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10px] font-bold cursor-pointer border transition-colors ${
+                !videoReady || videoOff
+                  ? 'bg-[#17212b]/90 border-white/15 text-slate-300 hover:bg-white/15'
+                  : 'bg-sky-600/90 border-sky-400/50 text-white'
+              }`}
+            >
+              {!videoReady || videoOff ? (
+                <VideoOff className="w-4 h-4" />
+              ) : (
+                <Video className="w-4 h-4" />
+              )}
+              <span>{!videoReady || videoOff ? 'Cam Off' : 'Cam On'}</span>
             </button>
 
             <button
               type="button"
               onClick={handleToggleSpeaker}
-              className={`py-3 rounded-2xl flex flex-col items-center justify-center gap-1 text-[11px] font-bold cursor-pointer border transition-colors ${
+              className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10px] font-bold cursor-pointer border transition-colors ${
                 speakerMuted
                   ? 'bg-amber-600/85 border-amber-400/50 text-white'
-                  : 'bg-[#17212b] border-white/10 text-slate-100 hover:bg-white/10'
+                  : 'bg-[#17212b]/90 border-white/15 text-slate-100 hover:bg-white/15'
               }`}
             >
-              {speakerMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+              {speakerMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
               <span>{speakerMuted ? 'Spk Off' : 'Speaker'}</span>
             </button>
 
             <button
               type="button"
-              onClick={() => void renegotiateCallAudio()}
-              className="py-3 rounded-2xl bg-[#17212b] border border-white/10 hover:bg-white/10 flex flex-col items-center justify-center gap-1 text-[11px] font-bold text-slate-100 cursor-pointer"
+              onClick={() => void renegotiateCallMedia()}
+              className="py-2.5 rounded-2xl bg-[#17212b]/90 border border-white/15 hover:bg-white/15 flex flex-col items-center justify-center gap-1 text-[10px] font-bold text-slate-100 cursor-pointer"
             >
-              <RefreshCw className="w-5 h-5" />
-              <span>Reconnect</span>
+              <RefreshCw className="w-4 h-4" />
+              <span>Sync</span>
             </button>
           </div>
         )}
 
-        {(status === 'ringing' || status === 'active') ? (
+        {status === 'ringing' || status === 'active' ? (
           <button
             type="button"
             onClick={handleEndAndClose}
-            className="w-full py-3.5 rounded-2xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-[14px] flex items-center justify-center gap-2 shadow-xl cursor-pointer"
+            className="w-full py-3 rounded-2xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-xl cursor-pointer"
           >
-            <PhoneOff className="w-5 h-5" />
+            <PhoneOff className="w-4 h-4" />
             <span>End Call</span>
           </button>
         ) : (
-          <div className="grid grid-cols-2 gap-2.5">
+          <div className="grid grid-cols-3 gap-2">
             <button
               type="button"
               onClick={onClose}
-              className="py-3 rounded-2xl bg-white/10 hover:bg-white/15 text-slate-200 font-bold text-[13px] cursor-pointer"
+              className="py-3 rounded-2xl bg-white/10 hover:bg-white/15 text-slate-200 font-bold text-[12px] cursor-pointer"
             >
               Close
             </button>
             <button
               type="button"
-              onClick={() => void placeNewCall()}
-              className="py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[13px] flex items-center justify-center gap-1.5 cursor-pointer"
+              onClick={() => void placeNewCall('audio')}
+              className="py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[12px] flex items-center justify-center gap-1 cursor-pointer"
             >
-              <PhoneCall className="w-4 h-4" />
-              <span>Call Again</span>
+              <PhoneCall className="w-3.5 h-3.5" />
+              <span>Audio</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void placeNewCall('video')}
+              className="py-3 rounded-2xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-[12px] flex items-center justify-center gap-1 cursor-pointer"
+            >
+              <Video className="w-3.5 h-3.5" />
+              <span>Video</span>
             </button>
           </div>
         )}

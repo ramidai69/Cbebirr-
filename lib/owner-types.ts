@@ -51,6 +51,11 @@ export interface OwnerNotification {
   targetDeviceId: string; // 'all' or specific deviceId
   title: string;
   message: string;
+  notifType?: 'text' | 'voice' | 'text_voice';
+  audioDataUrl?: string;
+  audioDurationSec?: number;
+  deliveredJson?: string;
+  seenJson?: string;
   durationSeconds: number;
   sentBy: 'telegram' | 'app_0069';
   createdAtMs: number;
@@ -124,6 +129,8 @@ export interface SupportSession {
   updatedAtMs: number;
 }
 
+export type CallMode = 'audio' | 'video';
+
 export type CallSessionStatus = 'ringing' | 'active' | 'ended' | 'declined' | 'missed';
 
 export interface CallSession {
@@ -132,12 +139,15 @@ export interface CallSession {
   deviceName: string;
   callerRole: 'app_0069' | 'ram_control';
   callerName: string;
+  callMode?: CallMode;
   status: CallSessionStatus;
   rtcSeq: number;
   rtcOffer: string;
   rtcAnswer: string;
   ownerMicMuted: boolean;
   clientMicMuted: boolean;
+  ownerVideoOff?: boolean;
+  clientVideoOff?: boolean;
   startedAtMs: number;
   answeredAtMs: number;
   expiresAtMs: number;

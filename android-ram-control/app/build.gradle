@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId "com.ramcontrol.owner"
-        minSdk 26
+        minSdk 24
         targetSdk 34
         def ciRunNumber = (System.getenv("GITHUB_RUN_NUMBER")?.isInteger()) ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 1
         versionCode (ciRunNumber + 100)

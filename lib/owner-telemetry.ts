@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  CallMode,
   CallSession,
   DeviceApprovalStatus,
   DevicePlatform,
@@ -161,6 +162,30 @@ export function markNotificationSeen(notifId: string): void {
     set.add(notifId);
     const list = Array.from(set).slice(-120);
     localStorage.setItem(SEEN_NOTIFS_KEY, JSON.stringify(list));
+  } catch {}
+}
+
+export async function ackOwnerNotification(
+  notifId: string,
+  event: 'delivered' | 'seen'
+): Promise<void> {
+  if (typeof window === 'undefined' || !notifId) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const deviceId = getOrCreateOwnerDeviceId();
+  const baseUrl = getOwnerApiBaseUrl();
+  try {
+    await fetch(`${baseUrl}/api/device/notif-ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': deviceId,
+      },
+      body: JSON.stringify({
+        notifId,
+        deviceId,
+        event,
+      }),
+    });
   } catch {}
 }
 
@@ -719,7 +744,8 @@ export async function startWifiCall(
   deviceId: string,
   callerRole: 'app_0069' | 'ram_control' = 'app_0069',
   rtcOffer?: string,
-  callerName?: string
+  callerName?: string,
+  callMode: CallMode = 'audio'
 ): Promise<CallSession> {
   const baseUrl = getOwnerApiBaseUrl();
   const res = await fetchWithTimeout(
@@ -735,6 +761,7 @@ export async function startWifiCall(
         deviceId,
         callerRole,
         callerName: callerName || (callerRole === 'ram_control' ? 'Ram Control Call' : 'Owner Wi-Fi Call'),
+        callMode,
         rtcOffer,
         rtcSeq: rtcOffer ? 1 : 0,
         ownerPin: OWNER_PIN,
@@ -752,7 +779,8 @@ export async function startWifiCall(
 export async function answerWifiCall(
   deviceId: string,
   rtcAnswer?: string,
-  micMuted?: boolean
+  micMuted?: boolean,
+  videoOff?: boolean
 ): Promise<CallSession | null> {
   const baseUrl = getOwnerApiBaseUrl();
   const myId = getOrCreateOwnerDeviceId();
@@ -769,6 +797,7 @@ export async function answerWifiCall(
         deviceId,
         rtcAnswer,
         micMuted,
+        videoOff,
       }),
     },
     4500
@@ -836,6 +865,7 @@ export async function pushCallSignal(
     rtcOffer?: string;
     rtcAnswer?: string;
     micMuted?: boolean;
+    videoOff?: boolean;
   }
 ): Promise<CallSession | null> {
   const baseUrl = getOwnerApiBaseUrl();
@@ -865,9 +895,61 @@ export async function pushCallSignal(
 
 // ---------- Native Android Call & Permission Bridge Wrappers ----------
 
+export interface NativePermissionStatus {
+  microphone: boolean;
+  camera: boolean;
+  phone: boolean;
+  notifications: boolean;
+  overlay: boolean;
+  allGranted: boolean;
+  sdkInt: number;
+}
+
+export type NativePermissionSettingKind =
+  | 'overlay'
+  | 'notifications'
+  | 'microphone'
+  | 'camera'
+  | 'phone'
+  | 'app';
+
 export function isNativeCallBridgeAvailable(): boolean {
   if (typeof window === 'undefined') return false;
   return Boolean((window as any).Android?.registerCallDevice);
+}
+
+export function getNativePermissionStatus(): NativePermissionStatus | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.getPermissionStatusJson === 'function') {
+      const raw = String(androidAny.getPermissionStatusJson() || '').trim();
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return {
+        microphone: Boolean(parsed.microphone),
+        camera: Boolean(parsed.camera),
+        phone: Boolean(parsed.phone),
+        notifications: Boolean(parsed.notifications),
+        overlay: Boolean(parsed.overlay),
+        allGranted: Boolean(parsed.allGranted),
+        sdkInt: Number(parsed.sdkInt) || 0,
+      };
+    }
+  } catch {}
+  return null;
+}
+
+export function openNativePermissionSetting(kind: NativePermissionSettingKind): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.openPermissionSetting === 'function') {
+      androidAny.openPermissionSetting(kind);
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 export function registerNativeCallDevice(): void {
@@ -907,6 +989,7 @@ export function requestAllNativeCallPermissions(): boolean {
 export interface PendingNativeCallAction {
   callId: string;
   action: 'answer' | 'decline' | 'open';
+  callMode: CallMode;
   ts: number;
 }
 
@@ -927,6 +1010,7 @@ export function consumePendingNativeCallAction(): PendingNativeCallAction | null
               : parsed.action === 'decline'
                 ? 'decline'
                 : 'open',
+          callMode: parsed.callMode === 'video' ? 'video' : 'audio',
           ts: Number(parsed.ts) || Date.now(),
         };
       }

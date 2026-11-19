@@ -19,7 +19,10 @@ import android.widget.TextView;
 public class IncomingCallActivity extends Activity {
     private static volatile IncomingCallActivity currentOpen;
     private String callId = "";
+    private String callMode = "audio";
     private TextView callerNameView;
+    private TextView badgeView;
+    private TextView subtitleView;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -63,7 +66,16 @@ public class IncomingCallActivity extends Activity {
         if (intent == null) return;
         String id = intent.getStringExtra("callId");
         String name = intent.getStringExtra("callerName");
+        String mode = intent.getStringExtra("callMode");
         if (id != null) callId = id;
+        callMode = "video".equals(mode) ? "video" : "audio";
+        boolean isVideo = "video".equals(callMode);
+        if (badgeView != null) {
+            badgeView.setText(isVideo ? "INCOMING WI-FI VIDEO CALL" : "INCOMING WI-FI VOICE CALL");
+        }
+        if (subtitleView != null) {
+            subtitleView.setText(isVideo ? "Tap Answer for live 2-way video & voice" : "Tap Answer for live two-way voice");
+        }
         if (name != null && !name.isEmpty() && callerNameView != null) {
             callerNameView.setText(name);
         }
@@ -93,13 +105,13 @@ public class IncomingCallActivity extends Activity {
         int pad = dp(28);
         root.setPadding(pad, dp(64), pad, dp(48));
 
-        TextView badge = new TextView(this);
-        badge.setText("INCOMING WI-FI VOICE CALL");
-        badge.setTextColor(Color.parseColor("#7DD3FC"));
-        badge.setTextSize(12f);
-        badge.setTypeface(Typeface.DEFAULT_BOLD);
-        badge.setGravity(Gravity.CENTER);
-        root.addView(badge);
+        badgeView = new TextView(this);
+        badgeView.setText("INCOMING WI-FI VOICE CALL");
+        badgeView.setTextColor(Color.parseColor("#7DD3FC"));
+        badgeView.setTextSize(12f);
+        badgeView.setTypeface(Typeface.DEFAULT_BOLD);
+        badgeView.setGravity(Gravity.CENTER);
+        root.addView(badgeView);
 
         View topSpacer = new View(this);
         topSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1f));
@@ -113,18 +125,18 @@ public class IncomingCallActivity extends Activity {
         callerNameView.setGravity(Gravity.CENTER);
         root.addView(callerNameView);
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("Tap Answer for live two-way voice");
-        subtitle.setTextColor(Color.parseColor("#CBD5E1"));
-        subtitle.setTextSize(14f);
-        subtitle.setGravity(Gravity.CENTER);
+        subtitleView = new TextView(this);
+        subtitleView.setText("Tap Answer for live two-way voice");
+        subtitleView.setTextColor(Color.parseColor("#CBD5E1"));
+        subtitleView.setTextSize(14f);
+        subtitleView.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         );
         subLp.topMargin = dp(10);
-        subtitle.setLayoutParams(subLp);
-        root.addView(subtitle);
+        subtitleView.setLayoutParams(subLp);
+        root.addView(subtitleView);
 
         View bottomSpacer = new View(this);
         bottomSpacer.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1.3f));
@@ -163,6 +175,7 @@ public class IncomingCallActivity extends Activity {
                 Intent i = new Intent(IncomingCallActivity.this, CallForegroundService.class);
                 i.setAction(CallForegroundService.ACTION_ANSWER_CALL);
                 i.putExtra("callId", callId);
+                i.putExtra("callMode", callMode);
                 startService(i);
                 finish();
             }

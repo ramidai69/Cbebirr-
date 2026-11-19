@@ -23,6 +23,10 @@ export type LiveCastMessage =
       muted: boolean;
     }
   | {
+      type: 'video_state';
+      off: boolean;
+    }
+  | {
       type: 'ui_state';
       currentStep: number;
       screenTitle: string;
@@ -41,6 +45,8 @@ export interface LiveRtcConnectionStatus {
   dataOpen: boolean;
   voiceConnected: boolean;
   hasRemoteAudio: boolean;
+  videoConnected?: boolean;
+  hasRemoteVideo?: boolean;
 }
 
 const RTC_ICE_SERVERS: RTCIceServer[] = [
@@ -49,32 +55,102 @@ const RTC_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun2.l.google.com:19302' },
 ];
 
+export async function requestLiveMedia(opts?: {
+  video?: boolean;
+  facingMode?: 'user' | 'environment';
+}): Promise<{
+  stream: MediaStream | null;
+  hasAudio: boolean;
+  hasVideo: boolean;
+  error?: string;
+}> {
+  if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+    return {
+      stream: null,
+      hasAudio: false,
+      hasVideo: false,
+      error: 'Media API unavailable in this browser',
+    };
+  }
+
+  const audioConstraints: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+
+  const wantVideo = Boolean(opts?.video);
+  const facingMode = opts?.facingMode || 'user';
+
+  if (wantVideo) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
+        video: {
+          facingMode,
+          width: { ideal: 480, max: 720 },
+          height: { ideal: 640, max: 960 },
+          frameRate: { ideal: 20, max: 24 },
+        },
+      });
+      return {
+        stream,
+        hasAudio: stream.getAudioTracks().length > 0,
+        hasVideo: stream.getVideoTracks().length > 0,
+      };
+    } catch {
+      try {
+        const simpleStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: { facingMode },
+        });
+        return {
+          stream: simpleStream,
+          hasAudio: simpleStream.getAudioTracks().length > 0,
+          hasVideo: simpleStream.getVideoTracks().length > 0,
+        };
+      } catch {
+        // Fallback to audio-only if camera fails or permission is denied so call still connects
+      }
+    }
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: audioConstraints,
+      video: false,
+    });
+    return {
+      stream,
+      hasAudio: stream.getAudioTracks().length > 0,
+      hasVideo: false,
+      ...(wantVideo ? { error: 'Camera unavailable — connected with audio' } : {}),
+    };
+  } catch (firstErr: any) {
+    try {
+      const fallback = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      return {
+        stream: fallback,
+        hasAudio: fallback.getAudioTracks().length > 0,
+        hasVideo: false,
+        ...(wantVideo ? { error: 'Camera unavailable — connected with audio' } : {}),
+      };
+    } catch (err: any) {
+      const msg = String(err?.name || firstErr?.name || err?.message || 'Mic permission denied');
+      return { stream: null, hasAudio: false, hasVideo: false, error: msg };
+    }
+  }
+}
+
 export async function requestLiveMicrophone(): Promise<{
   stream: MediaStream | null;
   error?: string;
 }> {
-  if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-    return { stream: null, error: 'Microphone API unavailable in this browser' };
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
-    return { stream };
-  } catch (firstErr: any) {
-    try {
-      const fallback = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      return { stream: fallback };
-    } catch (err: any) {
-      const msg = String(err?.name || firstErr?.name || err?.message || 'Mic permission denied');
-      return { stream: null, error: msg };
-    }
-  }
+  const res = await requestLiveMedia({ video: false });
+  return {
+    stream: res.stream,
+    error: res.error,
+  };
 }
 
 export function playStreamInAudioElement(
@@ -96,26 +172,51 @@ export function playStreamInAudioElement(
   }
 }
 
+export function playStreamInVideoElement(
+  videoEl: HTMLVideoElement | null,
+  stream: MediaStream | null
+): void {
+  if (!videoEl) return;
+  // Always mute <video> elements; remote audio is routed via dedicated <audio> element to prevent echo
+  videoEl.muted = true;
+  videoEl.playsInline = true;
+  videoEl.autoplay = true;
+  if (videoEl.srcObject !== stream) {
+    videoEl.srcObject = stream;
+  }
+  if (stream) {
+    const p = videoEl.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => {});
+    }
+  }
+}
+
 export class LiveRtcPeer {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private audioSender: RTCRtpSender | null = null;
+  private videoSender: RTCRtpSender | null = null;
   private localStream: MediaStream | null = null;
   private remoteStream: MediaStream | null = null;
   private micMuted = false;
+  private videoOff = false;
   private destroyed = false;
 
   private readonly onStatus?: (status: LiveRtcConnectionStatus) => void;
   private readonly onRemoteAudio?: (stream: MediaStream) => void;
+  private readonly onRemoteStream?: (stream: MediaStream) => void;
   private readonly onMessage?: (msg: LiveCastMessage) => void;
 
   constructor(opts: {
     onStatus?: (status: LiveRtcConnectionStatus) => void;
     onRemoteAudio?: (stream: MediaStream) => void;
+    onRemoteStream?: (stream: MediaStream) => void;
     onMessage?: (msg: LiveCastMessage) => void;
   }) {
     this.onStatus = opts.onStatus;
     this.onRemoteAudio = opts.onRemoteAudio;
+    this.onRemoteStream = opts.onRemoteStream;
     this.onMessage = opts.onMessage;
   }
 
@@ -127,19 +228,37 @@ export class LiveRtcPeer {
     return Boolean(this.localStream && this.localStream.getAudioTracks().length > 0);
   }
 
+  public hasLocalVideo(): boolean {
+    return Boolean(this.localStream && this.localStream.getVideoTracks().length > 0);
+  }
+
   public getRemoteStream(): MediaStream | null {
     return this.remoteStream;
   }
 
-  public attachLocalStream(stream: MediaStream | null, initialMuted: boolean): void {
+  public attachLocalStream(
+    stream: MediaStream | null,
+    initialMuted: boolean,
+    initialVideoOff = false
+  ): void {
     this.localStream = stream;
     this.micMuted = initialMuted;
-    const track = stream?.getAudioTracks()[0] || null;
-    if (track) {
-      track.enabled = !initialMuted;
+    this.videoOff = initialVideoOff;
+
+    const audioTrack = stream?.getAudioTracks()[0] || null;
+    if (audioTrack) {
+      audioTrack.enabled = !initialMuted;
     }
     if (this.audioSender) {
-      this.audioSender.replaceTrack(track).catch(() => {});
+      this.audioSender.replaceTrack(audioTrack).catch(() => {});
+    }
+
+    const videoTrack = stream?.getVideoTracks()[0] || null;
+    if (videoTrack) {
+      videoTrack.enabled = !initialVideoOff;
+    }
+    if (this.videoSender) {
+      this.videoSender.replaceTrack(videoTrack).catch(() => {});
     }
   }
 
@@ -152,9 +271,41 @@ export class LiveRtcPeer {
     }
   }
 
+  public setVideoOff(off: boolean): void {
+    this.videoOff = off;
+    if (this.localStream) {
+      for (const track of this.localStream.getVideoTracks()) {
+        track.enabled = !off;
+      }
+    }
+  }
+
+  public async replaceVideoTrack(track: MediaStreamTrack | null): Promise<void> {
+    if (track) {
+      track.enabled = !this.videoOff;
+    }
+    if (this.localStream) {
+      for (const old of this.localStream.getVideoTracks()) {
+        if (old !== track) {
+          this.localStream.removeTrack(old);
+          try {
+            old.stop();
+          } catch {}
+        }
+      }
+      if (track && !this.localStream.getVideoTracks().includes(track)) {
+        this.localStream.addTrack(track);
+      }
+    } else if (track) {
+      this.localStream = new MediaStream([track]);
+    }
+    if (this.videoSender) {
+      await this.videoSender.replaceTrack(track).catch(() => {});
+    }
+  }
+
   public sendMessage(msg: LiveCastMessage): boolean {
     if (!this.dc || this.dc.readyState !== 'open') return false;
-    // Drop non-critical video frame if SCTP send buffer backs up on slow mobile network
     if (msg.type === 'frame' && this.dc.bufferedAmount > 320_000) {
       return false;
     }
@@ -173,12 +324,19 @@ export class LiveRtcPeer {
     const hasRemoteAudio = Boolean(
       this.remoteStream && this.remoteStream.getAudioTracks().some((t) => t.readyState === 'live')
     );
-    const voiceConnected = (ice === 'connected' || ice === 'completed') && hasRemoteAudio;
+    const hasRemoteVideo = Boolean(
+      this.remoteStream && this.remoteStream.getVideoTracks().some((t) => t.readyState === 'live')
+    );
+    const connected = ice === 'connected' || ice === 'completed';
+    const voiceConnected = connected && hasRemoteAudio;
+    const videoConnected = connected && hasRemoteVideo;
     this.onStatus({
       ice,
       dataOpen,
       voiceConnected,
       hasRemoteAudio,
+      videoConnected,
+      hasRemoteVideo,
     });
   }
 
@@ -212,19 +370,22 @@ export class LiveRtcPeer {
     pc.onconnectionstatechange = () => this.emitStatus();
 
     pc.ontrack = (evt) => {
-      if (this.destroyed) return;
-      if (evt.track && evt.track.kind !== 'audio') return;
+      if (this.destroyed || !evt.track) return;
+      if (evt.track.kind !== 'audio' && evt.track.kind !== 'video') return;
       const stream =
-        (evt.streams && evt.streams[0]) ||
-        (this.remoteStream ? this.remoteStream : new MediaStream([evt.track]));
-      if (evt.track && !stream.getAudioTracks().includes(evt.track)) {
+        this.remoteStream || (evt.streams && evt.streams[0]) || new MediaStream([evt.track]);
+      if (!stream.getTracks().includes(evt.track)) {
         try {
           stream.addTrack(evt.track);
         } catch {}
       }
       this.remoteStream = stream;
       evt.track.onunmute = () => this.emitStatus();
-      this.onRemoteAudio?.(stream);
+      evt.track.onended = () => this.emitStatus();
+      if (evt.track.kind === 'audio') {
+        this.onRemoteAudio?.(stream);
+      }
+      this.onRemoteStream?.(stream);
       this.emitStatus();
     };
 
@@ -270,27 +431,46 @@ export class LiveRtcPeer {
     });
   }
 
-  public async createOfferPayload(seq: number): Promise<string> {
+  public async createOfferPayload(seq: number, opts?: { video?: boolean }): Promise<string> {
     if (this.destroyed) throw new Error('Peer destroyed');
     const pc = this.createPeerConnection();
 
     const dc = pc.createDataChannel('live-cast', { ordered: true });
     this.wireDataChannel(dc);
 
-    const localTrack = this.localStream?.getAudioTracks()[0] || null;
-    if (localTrack) {
-      localTrack.enabled = !this.micMuted;
+    const localAudio = this.localStream?.getAudioTracks()[0] || null;
+    if (localAudio) {
+      localAudio.enabled = !this.micMuted;
     }
-    const transceiver = pc.addTransceiver('audio', {
+    const audioTransceiver = pc.addTransceiver('audio', {
       direction: 'sendrecv',
       ...(this.localStream ? { streams: [this.localStream] } : {}),
     });
-    this.audioSender = transceiver.sender;
-    if (localTrack) {
-      await transceiver.sender.replaceTrack(localTrack).catch(() => {});
+    this.audioSender = audioTransceiver.sender;
+    if (localAudio) {
+      await audioTransceiver.sender.replaceTrack(localAudio).catch(() => {});
     }
 
-    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    const localVideo = this.localStream?.getVideoTracks()[0] || null;
+    const includeVideo = Boolean(opts?.video || localVideo);
+    if (includeVideo) {
+      if (localVideo) {
+        localVideo.enabled = !this.videoOff;
+      }
+      const videoTransceiver = pc.addTransceiver('video', {
+        direction: 'sendrecv',
+        ...(this.localStream ? { streams: [this.localStream] } : {}),
+      });
+      this.videoSender = videoTransceiver.sender;
+      if (localVideo) {
+        await videoTransceiver.sender.replaceTrack(localVideo).catch(() => {});
+      }
+    }
+
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: true,
+      ...(includeVideo ? { offerToReceiveVideo: true } : {}),
+    });
     await pc.setLocalDescription(offer);
     await this.waitForIceGathering(pc, 1100);
 
@@ -299,7 +479,10 @@ export class LiveRtcPeer {
     return JSON.stringify({ type: 'offer', sdp, seq });
   }
 
-  public async acceptOfferAndCreateAnswer(offerJson: string): Promise<string | null> {
+  public async acceptOfferAndCreateAnswer(
+    offerJson: string,
+    opts?: { video?: boolean }
+  ): Promise<string | null> {
     if (this.destroyed) return null;
     let parsed: { type?: string; sdp?: string; seq?: number } | null = null;
     try {
@@ -312,9 +495,9 @@ export class LiveRtcPeer {
     const pc = this.createPeerConnection();
     await pc.setRemoteDescription({ type: 'offer', sdp: parsed.sdp });
 
-    const localTrack = this.localStream?.getAudioTracks()[0] || null;
-    if (localTrack) {
-      localTrack.enabled = !this.micMuted;
+    const localAudio = this.localStream?.getAudioTracks()[0] || null;
+    if (localAudio) {
+      localAudio.enabled = !this.micMuted;
     }
 
     const transceivers = pc.getTransceivers();
@@ -327,8 +510,26 @@ export class LiveRtcPeer {
       audioTransceiver.direction = 'sendrecv';
     }
     this.audioSender = audioTransceiver.sender;
-    if (localTrack) {
-      await audioTransceiver.sender.replaceTrack(localTrack).catch(() => {});
+    if (localAudio) {
+      await audioTransceiver.sender.replaceTrack(localAudio).catch(() => {});
+    }
+
+    const localVideo = this.localStream?.getVideoTracks()[0] || null;
+    const offerHasVideo = parsed.sdp.includes('m=video');
+    let videoTransceiver = transceivers.find(
+      (t) => t.receiver.track?.kind === 'video' || t.sender.track?.kind === 'video'
+    );
+    if (offerHasVideo || opts?.video || localVideo) {
+      if (!videoTransceiver) {
+        videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+      } else {
+        videoTransceiver.direction = 'sendrecv';
+      }
+      this.videoSender = videoTransceiver.sender;
+      if (localVideo) {
+        localVideo.enabled = !this.videoOff;
+        await videoTransceiver.sender.replaceTrack(localVideo).catch(() => {});
+      }
     }
 
     const answer = await pc.createAnswer();
@@ -377,6 +578,7 @@ export class LiveRtcPeer {
       this.pc = null;
     }
     this.audioSender = null;
+    this.videoSender = null;
     this.remoteStream = null;
   }
 

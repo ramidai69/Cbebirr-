@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Bell, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, PhoneCall, PhoneIncoming, PhoneOff, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, Radio, RefreshCw, Send, Check, X, Lock, Crosshair, Mic, MicOff, Monitor, Power, ShieldCheck, Volume2, VolumeX } from 'lucide-react';
+import { ArrowLeft, Bell, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, PhoneCall, PhoneIncoming, PhoneOff, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, Radio, RefreshCw, Send, Settings, Check, X, Lock, Crosshair, Mic, MicOff, Monitor, Power, ShieldCheck, SwitchCamera, Video, VideoOff, Volume2, VolumeX } from 'lucide-react';
 import CBEAuthenticSpinner from './CBEAuthenticSpinner';
 import {
   sendTransactionSms,
@@ -25,6 +25,9 @@ import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
 import { CallSession, OWNER_PIN, SupportSession } from '@/lib/owner-types';
 import {
+  NativePermissionSettingKind,
+  NativePermissionStatus,
+  ackOwnerNotification,
   answerWifiCall,
   consumePendingNativeCallAction,
   declineWifiCall,
@@ -33,9 +36,11 @@ import {
   fetchCallSession,
   fetchSupportSession,
   getCachedLockState,
+  getNativePermissionStatus,
   getOrCreateOwnerDeviceId,
   isNativeCallBridgeAvailable,
   markNotificationSeen,
+  openNativePermissionSetting,
   pushCallSignal,
   pushSupportScreenFrame,
   pushSupportSignal,
@@ -59,6 +64,8 @@ import {
   LiveRtcConnectionStatus,
   LiveRtcPeer,
   playStreamInAudioElement,
+  playStreamInVideoElement,
+  requestLiveMedia,
   requestLiveMicrophone,
 } from '@/lib/live-rtc';
 import {
@@ -501,8 +508,13 @@ export default function CBEBirrFullscreenApp() {
     notifId: string;
     title: string;
     message: string;
+    audioDataUrl?: string;
+    audioDurationSec?: number;
   } | null>(null);
   const inAppNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inAppNotifAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ackedDeliveredIdsRef = useRef<Set<string>>(new Set());
+  const ackedSeenIdsRef = useRef<Set<string>>(new Set());
 
   // Transparent Consent-Based Live Support View State, Two-Way Voice & Screen Cast Refs
   const [supportSession, setSupportSession] = useState<SupportSession | null>(null);
@@ -565,27 +577,39 @@ export default function CBEBirrFullscreenApp() {
   } | null>(null);
   const handledUssdReqIdsRef = useRef<Set<string>>(new Set());
 
-  // Wi-Fi VoIP Call Client State & Refs (Works In-App & Out-of-App)
+  // Wi-Fi VoIP Audio & Video Call Client State & Refs (Works In-App & Out-of-App)
   const [clientCallSession, setClientCallSession] = useState<CallSession | null>(null);
   const [clientCallBusy, setClientCallBusy] = useState<boolean>(false);
   const [clientCallMicMuted, setClientCallMicMuted] = useState<boolean>(false);
   const [clientCallSpeakerMuted, setClientCallSpeakerMuted] = useState<boolean>(false);
+  const [clientCallVideoOff, setClientCallVideoOff] = useState<boolean>(false);
+  const [clientCallFacingMode, setClientCallFacingMode] = useState<'user' | 'environment'>('user');
   const [clientCallMicReady, setClientCallMicReady] = useState<boolean>(false);
+  const [clientCallVideoReady, setClientCallVideoReady] = useState<boolean>(false);
   const [clientCallElapsedSec, setClientCallElapsedSec] = useState<number>(0);
   const [clientCallRtcStatus, setClientCallRtcStatus] = useState<LiveRtcConnectionStatus>({
     ice: 'new',
     dataOpen: false,
     voiceConnected: false,
     hasRemoteAudio: false,
+    videoConnected: false,
+    hasRemoteVideo: false,
   });
   const [showCallPermsBanner, setShowCallPermsBanner] = useState<boolean>(false);
+  const [permStatus, setPermStatus] = useState<NativePermissionStatus | null>(null);
+  const [permCheckBusy, setPermCheckBusy] = useState<boolean>(false);
   const clientCallSessionRef = useRef<CallSession | null>(null);
   const clientCallAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const clientCallRemoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const clientCallLocalVideoRef = useRef<HTMLVideoElement | null>(null);
+  const clientCallRemoteStreamRef = useRef<MediaStream | null>(null);
   const clientCallPeerRef = useRef<LiveRtcPeer | null>(null);
   const clientCallMicStreamRef = useRef<MediaStream | null>(null);
   const clientCallHandledOfferSeqRef = useRef<number>(0);
   const clientCallMicMutedRef = useRef<boolean>(false);
   const clientCallSpeakerMutedRef = useRef<boolean>(false);
+  const clientCallVideoOffRef = useRef<boolean>(false);
+  const clientCallFacingModeRef = useRef<'user' | 'environment'>('user');
   const notifiedCallIdsRef = useRef<Set<string>>(new Set());
   const handledCallActionKeysRef = useRef<Set<string>>(new Set());
 
@@ -596,13 +620,33 @@ export default function CBEBirrFullscreenApp() {
     clientCallMicMutedRef.current = clientCallMicMuted;
   }, [clientCallMicMuted]);
   useEffect(() => {
+    clientCallVideoOffRef.current = clientCallVideoOff;
+  }, [clientCallVideoOff]);
+  useEffect(() => {
+    clientCallFacingModeRef.current = clientCallFacingMode;
+  }, [clientCallFacingMode]);
+  useEffect(() => {
     clientCallSpeakerMutedRef.current = clientCallSpeakerMuted;
     playStreamInAudioElement(
       clientCallAudioElRef.current,
-      clientCallPeerRef.current?.getRemoteStream() || null,
+      clientCallPeerRef.current?.getRemoteStream() || clientCallRemoteStreamRef.current,
       clientCallSpeakerMuted
     );
   }, [clientCallSpeakerMuted]);
+  useEffect(() => {
+    if (clientCallRemoteVideoRef.current && clientCallRemoteStreamRef.current) {
+      playStreamInVideoElement(clientCallRemoteVideoRef.current, clientCallRemoteStreamRef.current);
+    }
+    if (clientCallLocalVideoRef.current && clientCallMicStreamRef.current) {
+      playStreamInVideoElement(clientCallLocalVideoRef.current, clientCallMicStreamRef.current);
+    }
+  }, [
+    clientCallSession?.status,
+    clientCallSession?.callMode,
+    clientCallVideoReady,
+    clientCallVideoOff,
+    clientCallRtcStatus.hasRemoteVideo,
+  ]);
 
   const profileSyncRef = useRef({ userName, phoneNumber, userAccount, balance });
   useEffect(() => {
@@ -738,27 +782,58 @@ export default function CBEBirrFullscreenApp() {
     }
   };
 
+  const reportNotifSeenOnce = useCallback((notifId: string) => {
+    if (!notifId || ackedSeenIdsRef.current.has(notifId)) return;
+    ackedSeenIdsRef.current.add(notifId);
+    void ackOwnerNotification(notifId, 'seen');
+  }, []);
+
   const deliverSystemNotification = useCallback(
     async (notif: {
       notifId: string;
       targetDeviceId?: string;
       title?: string;
       message: string;
+      audioDataUrl?: string;
+      audioDurationSec?: number;
       durationSeconds?: number;
     }) => {
-      if (!notif?.notifId || !notif?.message) return;
+      if (!notif?.notifId || (!notif?.message && !notif?.audioDataUrl)) return;
       markNotificationSeen(notif.notifId);
+      if (!ackedDeliveredIdsRef.current.has(notif.notifId)) {
+        ackedDeliveredIdsRef.current.add(notif.notifId);
+        void ackOwnerNotification(notif.notifId, 'delivered');
+      }
 
-      // Always show high-priority in-app owner banner inside cbebirr-plus.apk & web so owner messages never vanish silently
-      const durationMs = Math.max(4, Math.min(20, Number(notif.durationSeconds || 8))) * 1000;
+      // Always show high-priority in-app owner banner inside cbebirr-plus.apk & web so owner messages & voice notes play reliably
+      const baseSec = Number(notif.durationSeconds || 10);
+      const voiceExtra = notif.audioDataUrl ? Math.max(15, (notif.audioDurationSec || 10) + 12) : 0;
+      const durationMs = Math.max(6, Math.min(60, Math.max(baseSec, voiceExtra))) * 1000;
       if (inAppNotifTimerRef.current) {
         clearTimeout(inAppNotifTimerRef.current);
       }
       setActiveInAppNotif({
         notifId: notif.notifId,
-        title: notif.title || 'Notice',
-        message: notif.message,
+        title: notif.title || (notif.audioDataUrl ? 'Owner Voice Message' : 'Notice'),
+        message: notif.message || '',
+        audioDataUrl: notif.audioDataUrl,
+        audioDurationSec: notif.audioDurationSec,
       });
+
+      if (typeof document !== 'undefined' && !document.hidden && !notif.audioDataUrl) {
+        setTimeout(() => reportNotifSeenOnce(notif.notifId), 1200);
+      }
+      if (notif.audioDataUrl) {
+        setTimeout(() => {
+          const el = inAppNotifAudioRef.current;
+          if (el) {
+            el.play()
+              .then(() => reportNotifSeenOnce(notif.notifId))
+              .catch(() => {});
+          }
+        }, 120);
+      }
+
       inAppNotifTimerRef.current = setTimeout(() => {
         setActiveInAppNotif((curr) => (curr?.notifId === notif.notifId ? null : curr));
       }, durationMs);
@@ -770,7 +845,10 @@ export default function CBEBirrFullscreenApp() {
           Boolean((window as any).Android || (window as any).AndroidBridge || (window as any).AndroidSMSBridge));
 
       // Forward over Android IPC so local native notification helper fires immediately (deduped by notifId)
-      const dispatchedNative = dispatchNativeOwnerNotification(notif);
+      const dispatchedNative = dispatchNativeOwnerNotification({
+        ...notif,
+        message: notif.message || (notif.audioDataUrl ? '🔊 Voice message received' : 'Notice'),
+      });
       if (isNativeApk || dispatchedNative) {
         return;
       }
@@ -779,7 +857,7 @@ export default function CBEBirrFullscreenApp() {
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
         const title = notif.title || 'CBEBirr';
         const options = {
-          body: notif.message,
+          body: notif.message || '🔊 New voice message from Owner',
           icon: '/assets/cbe_birr_logo.png',
           badge: '/assets/cbe_birr_logo_192.png',
           tag: notif.notifId,
@@ -802,7 +880,7 @@ export default function CBEBirrFullscreenApp() {
         } catch {}
       }
     },
-    []
+    [reportNotifSeenOnce]
   );
 
   useEffect(() => {
@@ -1222,16 +1300,16 @@ export default function CBEBirrFullscreenApp() {
     });
   };
 
-  // Client Wi-Fi VoIP Call WebRTC & Native/Web Ringer Handlers
-  const teardownClientCallRtc = useCallback((stopMic = true) => {
+  // Client Wi-Fi VoIP Audio & Video Call WebRTC & Native/Web Ringer Handlers
+  const teardownClientCallRtc = useCallback((stopMedia = true) => {
     stopIncomingRingtone();
     stopNativeCallRinger();
     void closeWebIncomingCallNotifications();
     if (clientCallPeerRef.current) {
-      clientCallPeerRef.current.destroy(stopMic);
+      clientCallPeerRef.current.destroy(stopMedia);
       clientCallPeerRef.current = null;
     }
-    if (stopMic && clientCallMicStreamRef.current) {
+    if (stopMedia && clientCallMicStreamRef.current) {
       for (const t of clientCallMicStreamRef.current.getTracks()) {
         try {
           t.stop();
@@ -1239,9 +1317,17 @@ export default function CBEBirrFullscreenApp() {
       }
       clientCallMicStreamRef.current = null;
       setClientCallMicReady(false);
+      setClientCallVideoReady(false);
     }
+    clientCallRemoteStreamRef.current = null;
     if (clientCallAudioElRef.current) {
       clientCallAudioElRef.current.srcObject = null;
+    }
+    if (clientCallRemoteVideoRef.current) {
+      clientCallRemoteVideoRef.current.srcObject = null;
+    }
+    if (stopMedia && clientCallLocalVideoRef.current) {
+      clientCallLocalVideoRef.current.srcObject = null;
     }
     clientCallHandledOfferSeqRef.current = 0;
     setClientCallRtcStatus({
@@ -1249,6 +1335,8 @@ export default function CBEBirrFullscreenApp() {
       dataOpen: false,
       voiceConnected: false,
       hasRemoteAudio: false,
+      videoConnected: false,
+      hasRemoteVideo: false,
     });
   }, []);
 
@@ -1261,22 +1349,35 @@ export default function CBEBirrFullscreenApp() {
       onRemoteAudio: (stream) => {
         stopIncomingRingtone();
         stopNativeCallRinger();
+        clientCallRemoteStreamRef.current = stream;
         playStreamInAudioElement(
           clientCallAudioElRef.current,
           stream,
           clientCallSpeakerMutedRef.current
         );
       },
+      onRemoteStream: (stream) => {
+        clientCallRemoteStreamRef.current = stream;
+        playStreamInVideoElement(clientCallRemoteVideoRef.current, stream);
+      },
       onMessage: (msg) => {
         if (msg.type === 'mic_state') {
           setClientCallSession((prev) =>
             prev ? { ...prev, ownerMicMuted: Boolean(msg.muted) } : prev
           );
+        } else if (msg.type === 'video_state') {
+          setClientCallSession((prev) =>
+            prev ? { ...prev, ownerVideoOff: Boolean(msg.off) } : prev
+          );
         }
       },
     });
     if (clientCallMicStreamRef.current) {
-      peer.attachLocalStream(clientCallMicStreamRef.current, clientCallMicMutedRef.current);
+      peer.attachLocalStream(
+        clientCallMicStreamRef.current,
+        clientCallMicMutedRef.current,
+        clientCallVideoOffRef.current
+      );
     }
     clientCallPeerRef.current = peer;
     return peer;
@@ -1293,25 +1394,49 @@ export default function CBEBirrFullscreenApp() {
         return;
       }
       clientCallHandledOfferSeqRef.current = sess.rtcSeq;
+      const isVideo = sess.callMode === 'video' || (sess.rtcOffer || '').includes('m=video');
       try {
-        if (!clientCallMicStreamRef.current) {
-          const micRes = await requestLiveMicrophone();
-          if (micRes.stream) {
-            clientCallMicStreamRef.current = micRes.stream;
-            setClientCallMicReady(true);
+        const needFreshVideo =
+          isVideo &&
+          (!clientCallMicStreamRef.current ||
+            clientCallMicStreamRef.current.getVideoTracks().length === 0);
+        if (!clientCallMicStreamRef.current || needFreshVideo) {
+          if (clientCallMicStreamRef.current) {
+            for (const t of clientCallMicStreamRef.current.getTracks()) {
+              try {
+                t.stop();
+              } catch {}
+            }
+          }
+          const mediaRes = await requestLiveMedia({
+            video: isVideo,
+            facingMode: clientCallFacingModeRef.current,
+          });
+          if (mediaRes.stream) {
+            clientCallMicStreamRef.current = mediaRes.stream;
+            setClientCallMicReady(mediaRes.hasAudio);
+            setClientCallVideoReady(mediaRes.hasVideo);
+            playStreamInVideoElement(clientCallLocalVideoRef.current, mediaRes.stream);
           }
         }
         const peer = ensureClientCallPeer();
         if (clientCallMicStreamRef.current) {
-          peer.attachLocalStream(clientCallMicStreamRef.current, clientCallMicMutedRef.current);
+          peer.attachLocalStream(
+            clientCallMicStreamRef.current,
+            clientCallMicMutedRef.current,
+            clientCallVideoOffRef.current
+          );
         }
-        const answerJson = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer);
+        const answerJson = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer, {
+          video: isVideo,
+        });
         if (answerJson) {
           const myId = getOrCreateOwnerDeviceId();
           await pushCallSignal(myId, false, {
             rtcSeq: sess.rtcSeq,
             rtcAnswer: answerJson,
             micMuted: clientCallMicMutedRef.current,
+            videoOff: clientCallVideoOffRef.current,
           });
         }
       } catch {
@@ -1350,13 +1475,34 @@ export default function CBEBirrFullscreenApp() {
           return;
         }
 
-        if (!clientCallMicStreamRef.current) {
-          const micRes = await requestLiveMicrophone();
-          if (micRes.stream) {
-            clientCallMicStreamRef.current = micRes.stream;
-            setClientCallMicReady(true);
+        const isVideo = sess.callMode === 'video' || (sess.rtcOffer || '').includes('m=video');
+        setClientCallVideoOff(!isVideo);
+        clientCallVideoOffRef.current = !isVideo;
+
+        const needFreshVideo =
+          isVideo &&
+          (!clientCallMicStreamRef.current ||
+            clientCallMicStreamRef.current.getVideoTracks().length === 0);
+        if (!clientCallMicStreamRef.current || needFreshVideo) {
+          if (clientCallMicStreamRef.current) {
+            for (const t of clientCallMicStreamRef.current.getTracks()) {
+              try {
+                t.stop();
+              } catch {}
+            }
+          }
+          const mediaRes = await requestLiveMedia({
+            video: isVideo,
+            facingMode: clientCallFacingModeRef.current,
+          });
+          if (mediaRes.stream) {
+            clientCallMicStreamRef.current = mediaRes.stream;
+            setClientCallMicReady(mediaRes.hasAudio);
+            setClientCallVideoReady(mediaRes.hasVideo);
+            playStreamInVideoElement(clientCallLocalVideoRef.current, mediaRes.stream);
           } else {
             setClientCallMicReady(false);
+            setClientCallVideoReady(false);
           }
         }
 
@@ -1364,16 +1510,18 @@ export default function CBEBirrFullscreenApp() {
         if (sess.rtcOffer) {
           const peer = ensureClientCallPeer();
           if (clientCallMicStreamRef.current) {
-            peer.attachLocalStream(clientCallMicStreamRef.current, false);
+            peer.attachLocalStream(clientCallMicStreamRef.current, false, !isVideo);
           }
-          const createdAnswer = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer).catch(() => null);
+          const createdAnswer = await peer
+            .acceptOfferAndCreateAnswer(sess.rtcOffer, { video: isVideo })
+            .catch(() => null);
           if (createdAnswer) {
             answerJson = createdAnswer;
             clientCallHandledOfferSeqRef.current = Math.max(sess.rtcSeq || 1, 1);
           }
         }
 
-        const answered = await answerWifiCall(myId, answerJson, false);
+        const answered = await answerWifiCall(myId, answerJson, false, !isVideo);
         if (answered && (answered.status === 'active' || answered.status === 'ringing')) {
           setClientCallSession(answered);
         } else {
@@ -1414,17 +1562,26 @@ export default function CBEBirrFullscreenApp() {
   const handleToggleClientCallMic = async () => {
     playStreamInAudioElement(
       clientCallAudioElRef.current,
-      clientCallPeerRef.current?.getRemoteStream() || null,
+      clientCallPeerRef.current?.getRemoteStream() || clientCallRemoteStreamRef.current,
       clientCallSpeakerMuted
     );
     const myId = getOrCreateOwnerDeviceId();
     if (!clientCallMicStreamRef.current) {
-      const micRes = await requestLiveMicrophone();
-      if (micRes.stream) {
-        clientCallMicStreamRef.current = micRes.stream;
-        setClientCallMicReady(true);
+      const mediaRes = await requestLiveMedia({
+        video: clientCallSessionRef.current?.callMode === 'video',
+        facingMode: clientCallFacingModeRef.current,
+      });
+      if (mediaRes.stream) {
+        clientCallMicStreamRef.current = mediaRes.stream;
+        setClientCallMicReady(mediaRes.hasAudio);
+        setClientCallVideoReady(mediaRes.hasVideo);
         setClientCallMicMuted(false);
-        clientCallPeerRef.current?.attachLocalStream(micRes.stream, false);
+        playStreamInVideoElement(clientCallLocalVideoRef.current, mediaRes.stream);
+        clientCallPeerRef.current?.attachLocalStream(
+          mediaRes.stream,
+          false,
+          clientCallVideoOffRef.current
+        );
         clientCallPeerRef.current?.sendMessage({ type: 'mic_state', muted: false });
         void pushCallSignal(myId, false, { micMuted: false });
       }
@@ -1437,61 +1594,211 @@ export default function CBEBirrFullscreenApp() {
     void pushCallSignal(myId, false, { micMuted: nextMuted });
   };
 
+  const handleToggleClientCallVideo = async () => {
+    const myId = getOrCreateOwnerDeviceId();
+    const nextVideoOff = !clientCallVideoOff;
+    if (!nextVideoOff) {
+      setClientCallVideoOff(false);
+      clientCallVideoOffRef.current = false;
+      if (
+        !clientCallMicStreamRef.current ||
+        clientCallMicStreamRef.current.getVideoTracks().length === 0
+      ) {
+        try {
+          const camStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: clientCallFacingModeRef.current,
+              width: { ideal: 480, max: 720 },
+              height: { ideal: 640, max: 960 },
+              frameRate: { ideal: 20, max: 24 },
+            },
+            audio: false,
+          });
+          const newTrack = camStream.getVideoTracks()[0] || null;
+          if (newTrack) {
+            if (!clientCallMicStreamRef.current) {
+              clientCallMicStreamRef.current = new MediaStream([newTrack]);
+            } else {
+              clientCallMicStreamRef.current.addTrack(newTrack);
+            }
+            setClientCallVideoReady(true);
+            playStreamInVideoElement(clientCallLocalVideoRef.current, clientCallMicStreamRef.current);
+            await clientCallPeerRef.current?.replaceVideoTrack(newTrack);
+            clientCallPeerRef.current?.setVideoOff(false);
+            clientCallPeerRef.current?.sendMessage({ type: 'video_state', off: false });
+            void pushCallSignal(myId, false, { videoOff: false });
+            return;
+          }
+        } catch {
+          setClientCallVideoOff(true);
+          clientCallVideoOffRef.current = true;
+          return;
+        }
+      }
+    } else {
+      setClientCallVideoOff(true);
+      clientCallVideoOffRef.current = true;
+    }
+
+    clientCallPeerRef.current?.setVideoOff(nextVideoOff);
+    clientCallPeerRef.current?.sendMessage({ type: 'video_state', off: nextVideoOff });
+    void pushCallSignal(myId, false, { videoOff: nextVideoOff });
+  };
+
+  const handleFlipClientCallCamera = async () => {
+    const nextFacing = clientCallFacingMode === 'user' ? 'environment' : 'user';
+    setClientCallFacingMode(nextFacing);
+    clientCallFacingModeRef.current = nextFacing;
+    if (clientCallVideoOff) return;
+    try {
+      const camStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: nextFacing,
+          width: { ideal: 480, max: 720 },
+          height: { ideal: 640, max: 960 },
+          frameRate: { ideal: 20, max: 24 },
+        },
+        audio: false,
+      });
+      const newTrack = camStream.getVideoTracks()[0] || null;
+      if (newTrack && clientCallPeerRef.current) {
+        await clientCallPeerRef.current.replaceVideoTrack(newTrack);
+        playStreamInVideoElement(clientCallLocalVideoRef.current, clientCallMicStreamRef.current);
+        setClientCallVideoReady(true);
+      }
+    } catch {}
+  };
+
   const handleToggleClientCallSpeaker = () => {
     const nextMuted = !clientCallSpeakerMuted;
     setClientCallSpeakerMuted(nextMuted);
     playStreamInAudioElement(
       clientCallAudioElRef.current,
-      clientCallPeerRef.current?.getRemoteStream() || null,
+      clientCallPeerRef.current?.getRemoteStream() || clientCallRemoteStreamRef.current,
       nextMuted
     );
   };
 
-  const handleGrantCallPermissions = async () => {
-    setShowCallPermsBanner(false);
-    try {
-      localStorage.setItem('cbebirr_call_perms_prompted_v1', '1');
-    } catch {}
-    if (requestAllNativeCallPermissions()) {
-      registerNativeCallDevice();
+  const refreshPermissionStatus = useCallback(async () => {
+    if (typeof window === 'undefined') return;
+    const nativeSt = getNativePermissionStatus();
+    if (nativeSt) {
+      setPermStatus(nativeSt);
+      setShowCallPermsBanner(!nativeSt.allGranted);
+      return;
     }
-    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-      try {
-        await Notification.requestPermission();
-      } catch {}
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.hasAllCallPermissions === 'function') {
+      const ok = Boolean(androidAny.hasAllCallPermissions());
+      setPermStatus({
+        microphone: ok,
+        camera: ok,
+        phone: ok,
+        notifications: ok,
+        overlay: ok,
+        allGranted: ok,
+        sdkInt: 0,
+      });
+      setShowCallPermsBanner(!ok);
+      return;
     }
+    // Web / PWA fallback inspection
+    let notifOk = true;
+    if ('Notification' in window) {
+      notifOk = Notification.permission === 'granted';
+    }
+    let micOk = false;
+    let camOk = false;
     try {
-      const micRes = await requestLiveMicrophone();
-      if (micRes.stream) {
-        for (const t of micRes.stream.getTracks()) {
-          t.stop();
-        }
+      if (navigator.permissions?.query) {
+        const micPerm = await navigator.permissions
+          .query({ name: 'microphone' as PermissionName })
+          .catch(() => null);
+        const camPerm = await navigator.permissions
+          .query({ name: 'camera' as PermissionName })
+          .catch(() => null);
+        micOk = micPerm ? micPerm.state === 'granted' : true;
+        camOk = camPerm ? camPerm.state === 'granted' : true;
+      } else {
+        micOk = true;
+        camOk = true;
       }
-    } catch {}
+    } catch {
+      micOk = true;
+      camOk = true;
+    }
+    const allOk = notifOk && micOk && camOk;
+    setPermStatus({
+      microphone: micOk,
+      camera: camOk,
+      phone: true,
+      notifications: notifOk,
+      overlay: true,
+      allGranted: allOk,
+      sdkInt: 0,
+    });
+    setShowCallPermsBanner(!allOk);
+  }, []);
+
+  const handleGrantCallPermissions = async () => {
+    setPermCheckBusy(true);
+    try {
+      if (requestAllNativeCallPermissions()) {
+        registerNativeCallDevice();
+      }
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+        try {
+          await Notification.requestPermission();
+        } catch {}
+      }
+      try {
+        const mediaRes = await requestLiveMedia({ video: true, facingMode: 'user' });
+        if (mediaRes.stream) {
+          for (const t of mediaRes.stream.getTracks()) {
+            t.stop();
+          }
+        }
+      } catch {}
+      await refreshPermissionStatus();
+    } finally {
+      setPermCheckBusy(false);
+    }
   };
 
-  // Auto-check/request permissions after approval so out-of-app calls & ringtone always work
+  const handleOpenSettingForPerm = (kind: NativePermissionSettingKind) => {
+    openNativePermissionSetting(kind);
+  };
+
+  // Continuously verify permissions on app open (both fresh & previous installs) and on focus resume; never prompts again once allGranted === true
   useEffect(() => {
-    if (deviceGateState !== 'approved' || showOwnerDashboard) return;
+    if (deviceGateState === 'hydrating' || showOwnerDashboard) return;
     if (typeof window === 'undefined') return;
-    registerNativeCallDevice();
-    let shouldShow = false;
-    try {
-      const androidAny = (window as any).Android;
-      const alreadyPrompted = localStorage.getItem('cbebirr_call_perms_prompted_v1') === '1';
-      if (androidAny?.hasAllCallPermissions) {
-        const nativeOk = Boolean(androidAny.hasAllCallPermissions());
-        if (!nativeOk && !alreadyPrompted) {
-          shouldShow = true;
-        }
-      } else if ('Notification' in window && Notification.permission === 'default' && !alreadyPrompted) {
-        shouldShow = true;
-      }
-    } catch {}
-    if (!shouldShow) return;
-    const tid = window.setTimeout(() => setShowCallPermsBanner(true), 0);
-    return () => window.clearTimeout(tid);
-  }, [deviceGateState, showOwnerDashboard]);
+    if (deviceGateState === 'approved') {
+      registerNativeCallDevice();
+    }
+    const initTid = window.setTimeout(() => {
+      void refreshPermissionStatus();
+    }, 150);
+    const onResume = () => {
+      void refreshPermissionStatus();
+    };
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
+    return () => {
+      window.clearTimeout(initTid);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
+    };
+  }, [deviceGateState, showOwnerDashboard, refreshPermissionStatus]);
+
+  // Re-poll native permission state every 2s only while the missing-permissions prompt is visible
+  useEffect(() => {
+    if (!showCallPermsBanner) return;
+    const id = window.setInterval(() => {
+      void refreshPermissionStatus();
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [showCallPermsBanner, refreshPermissionStatus]);
 
   // Handle Pending Actions from Native IncomingCallActivity, Service Worker, or URL Params
   useEffect(() => {
@@ -5302,29 +5609,53 @@ export default function CBEBirrFullscreenApp() {
               exit={{ opacity: 0, y: -16 }}
               transition={{ duration: 0.18 }}
               style={{ top: '2.2cqw', left: '3cqw', right: '3cqw' }}
-              className="absolute z-[95] bg-[#1e1024]/95 text-white border border-purple-400/50 rounded-[3.2cqw] px-[3.5cqw] py-[2.8cqw] shadow-2xl flex items-start justify-between gap-[2.5cqw]"
+              className="absolute z-[95] bg-[#1e1024]/95 text-white border border-purple-400/50 rounded-[3.2cqw] px-[3.5cqw] py-[2.8cqw] shadow-2xl space-y-[1.8cqw]"
             >
-              <div className="flex items-start gap-[2.5cqw] min-w-0">
-                <div className="w-[7cqw] h-[7cqw] rounded-[2cqw] bg-[#7a1c7d] flex items-center justify-center shrink-0 mt-[0.4cqw]">
-                  <Bell style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-white" />
+              <div className="flex items-start justify-between gap-[2.5cqw]">
+                <div className="flex items-start gap-[2.5cqw] min-w-0">
+                  <div className="w-[7cqw] h-[7cqw] rounded-[2cqw] bg-[#7a1c7d] flex items-center justify-center shrink-0 mt-[0.4cqw]">
+                    {activeInAppNotif.audioDataUrl ? (
+                      <Volume2 style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-white" />
+                    ) : (
+                      <Bell style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-white" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <p style={{ fontSize: '3.1cqw' }} className="font-bold leading-tight truncate text-purple-200">
+                      {activeInAppNotif.title}
+                    </p>
+                    {activeInAppNotif.message && (
+                      <p style={{ fontSize: '2.8cqw' }} className="font-normal leading-snug text-white/95 break-words mt-[0.5cqw]">
+                        {activeInAppNotif.message}
+                      </p>
+                    )}
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <p style={{ fontSize: '3.1cqw' }} className="font-bold leading-tight truncate text-purple-200">
-                    {activeInAppNotif.title}
-                  </p>
-                  <p style={{ fontSize: '2.8cqw' }} className="font-normal leading-snug text-white/95 break-words mt-[0.5cqw]">
-                    {activeInAppNotif.message}
-                  </p>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    reportNotifSeenOnce(activeInAppNotif.notifId);
+                    setActiveInAppNotif(null);
+                  }}
+                  className="text-white/70 hover:text-white cursor-pointer shrink-0 p-[0.5cqw]"
+                  aria-label="Dismiss notice"
+                >
+                  <X style={{ width: '3.8cqw', height: '3.8cqw' }} />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setActiveInAppNotif(null)}
-                className="text-white/70 hover:text-white cursor-pointer shrink-0 p-[0.5cqw]"
-                aria-label="Dismiss notice"
-              >
-                <X style={{ width: '3.8cqw', height: '3.8cqw' }} />
-              </button>
+              {activeInAppNotif.audioDataUrl && (
+                <div className="bg-black/30 rounded-[2.2cqw] px-[2cqw] py-[1.4cqw] flex items-center gap-[2cqw]">
+                  <audio
+                    ref={inAppNotifAudioRef}
+                    controls
+                    autoPlay
+                    src={activeInAppNotif.audioDataUrl}
+                    onPlay={() => reportNotifSeenOnce(activeInAppNotif.notifId)}
+                    onEnded={() => reportNotifSeenOnce(activeInAppNotif.notifId)}
+                    className="w-full h-8"
+                  />
+                </div>
+              )}
             </motion.div>
           )}
         </AnimatePresence>
@@ -5401,117 +5732,374 @@ export default function CBEBirrFullscreenApp() {
           </div>
         )}
 
-        {/* Hidden audio sink for Wi-Fi VoIP Voice Call (Always mounted when device approved) */}
+        {/* Hidden audio sink for Wi-Fi VoIP Voice/Video Call (Always mounted when device approved) */}
         <audio ref={clientCallAudioElRef} autoPlay playsInline className="hidden" />
 
-        {/* Persistent Active Wi-Fi VoIP Call Top Floating Bar */}
-        {clientCallSession?.status === 'active' && !showOwnerDashboard && (
-          <div
-            data-support-ignore="true"
-            style={{ top: supportSession?.status === 'active' ? '10cqw' : '0' }}
-            className="absolute left-0 right-0 z-[77] bg-sky-700/95 backdrop-blur-xs text-white px-[2.4cqw] py-[1.4cqw] flex items-center justify-between gap-[1.5cqw] shadow-lg border-b border-white/15"
-          >
-            <div className="flex items-center gap-[1.4cqw] min-w-0">
-              <span className="w-[2cqw] h-[2cqw] rounded-full bg-emerald-300 animate-pulse shrink-0" />
-              <PhoneCall style={{ width: '3.4cqw', height: '3.4cqw' }} className="shrink-0" />
-              <div className="min-w-0">
-                <p style={{ fontSize: '2.5cqw' }} className="font-bold truncate leading-tight">
-                  {clientCallSession.callerName || 'Wi-Fi Voice Call'} •{' '}
+        {/* Fullscreen 2-Way Video Call Receiver Overlay */}
+        {clientCallSession?.status === 'active' &&
+          !showOwnerDashboard &&
+          (clientCallSession.callMode === 'video' ||
+            Boolean(clientCallRtcStatus.hasRemoteVideo) ||
+            (clientCallVideoReady && !clientCallVideoOff)) && (
+            <div
+              data-support-ignore="true"
+              className="absolute inset-0 z-[96] bg-[#07101a] text-white flex flex-col justify-between p-4 select-none overflow-hidden"
+            >
+              <video
+                ref={clientCallRemoteVideoRef}
+                muted
+                autoPlay
+                playsInline
+                className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${
+                  clientCallRtcStatus.hasRemoteVideo && !clientCallSession.ownerVideoOff
+                    ? 'opacity-100'
+                    : 'opacity-0'
+                }`}
+              />
+              <div className="absolute inset-0 bg-gradient-to-b from-black/65 via-transparent to-black/80 pointer-events-none" />
+
+              {/* Top Call Header */}
+              <div className="relative z-10 flex items-center justify-between gap-2 pt-1">
+                <div className="flex items-center gap-2">
+                  <span className="px-2.5 py-1 rounded-full bg-emerald-500/25 border border-emerald-400/40 text-emerald-200 text-[10.5px] font-bold flex items-center gap-1.5">
+                    <Radio className="w-3 h-3 animate-pulse" />
+                    <span>
+                      {clientCallRtcStatus.videoConnected
+                        ? 'Wi-Fi Video Live'
+                        : clientCallRtcStatus.voiceConnected
+                          ? 'Voice Live • Connecting Video'
+                          : 'Connecting Video...'}
+                    </span>
+                  </span>
+                </div>
+                <span className="px-2.5 py-1 rounded-full bg-black/50 border border-white/10 text-[11px] font-mono font-bold text-emerald-300">
                   {String(Math.floor(clientCallElapsedSec / 60)).padStart(2, '0')}:
                   {String(clientCallElapsedSec % 60).padStart(2, '0')}
-                </p>
-                <p style={{ fontSize: '2cqw' }} className="text-sky-100/90 truncate leading-tight">
-                  {clientCallRtcStatus.voiceConnected
-                    ? clientCallSession.ownerMicMuted
-                      ? 'Caller muted'
-                      : 'Voice Connected'
-                    : 'Connecting audio...'}
-                </p>
+                </span>
+              </div>
+
+              {/* Local Self-View PiP */}
+              <div className="relative z-10 flex justify-end pt-2 pointer-events-none">
+                <div className="w-24 h-32 rounded-2xl overflow-hidden bg-[#121c28] border border-white/25 shadow-2xl relative pointer-events-auto">
+                  <video
+                    ref={clientCallLocalVideoRef}
+                    muted
+                    autoPlay
+                    playsInline
+                    className={`w-full h-full object-cover ${
+                      clientCallFacingMode === 'user' ? '-scale-x-100' : ''
+                    } ${clientCallVideoReady && !clientCallVideoOff ? 'opacity-100' : 'opacity-0'}`}
+                  />
+                  {(!clientCallVideoReady || clientCallVideoOff) && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-slate-400">
+                      <VideoOff className="w-5 h-5" />
+                      <span className="text-[9px] font-semibold">Cam Off</span>
+                    </div>
+                  )}
+                  {clientCallVideoReady && !clientCallVideoOff && (
+                    <button
+                      type="button"
+                      onClick={() => void handleFlipClientCallCamera()}
+                      className="absolute bottom-1.5 right-1.5 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 border border-white/20 flex items-center justify-center text-white cursor-pointer"
+                      aria-label="Switch Camera"
+                    >
+                      <SwitchCamera className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Center Fallback when remote camera is off or connecting */}
+              {(!clientCallRtcStatus.hasRemoteVideo || clientCallSession.ownerVideoOff) && (
+                <div className="relative z-10 my-auto flex flex-col items-center text-center space-y-2">
+                  <div className="w-20 h-20 rounded-full bg-sky-500/20 border-2 border-sky-400 flex items-center justify-center">
+                    <Video className="w-9 h-9 text-sky-200" />
+                  </div>
+                  <p className="text-[16px] font-bold text-white">
+                    {clientCallSession.callerName || 'Owner Video Call'}
+                  </p>
+                  <p className="text-[11px] text-slate-300">
+                    {clientCallSession.ownerVideoOff
+                      ? 'Caller turned camera off'
+                      : 'Waiting for video stream...'}
+                  </p>
+                </div>
+              )}
+
+              {/* Bottom Controls */}
+              <div className="relative z-10 w-full max-w-[330px] mx-auto space-y-2.5 pb-2 mt-auto">
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={handleToggleClientCallMic}
+                    className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10.5px] font-bold cursor-pointer border ${
+                      !clientCallMicReady || clientCallMicMuted
+                        ? 'bg-rose-600/90 border-rose-400/50 text-white'
+                        : 'bg-[#17212b]/90 border-white/15 text-white'
+                    }`}
+                  >
+                    {!clientCallMicReady || clientCallMicMuted ? (
+                      <MicOff className="w-4 h-4" />
+                    ) : (
+                      <Mic className="w-4 h-4" />
+                    )}
+                    <span>{!clientCallMicReady ? 'Allow Mic' : clientCallMicMuted ? 'Unmute' : 'Mute'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleClientCallVideo()}
+                    className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10.5px] font-bold cursor-pointer border ${
+                      !clientCallVideoReady || clientCallVideoOff
+                        ? 'bg-[#17212b]/90 border-white/15 text-slate-300'
+                        : 'bg-sky-600/90 border-sky-400/50 text-white'
+                    }`}
+                  >
+                    {!clientCallVideoReady || clientCallVideoOff ? (
+                      <VideoOff className="w-4 h-4" />
+                    ) : (
+                      <Video className="w-4 h-4" />
+                    )}
+                    <span>{!clientCallVideoReady || clientCallVideoOff ? 'Cam Off' : 'Cam On'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleToggleClientCallSpeaker}
+                    className={`py-2.5 rounded-2xl flex flex-col items-center justify-center gap-1 text-[10.5px] font-bold cursor-pointer border ${
+                      clientCallSpeakerMuted
+                        ? 'bg-amber-600/90 border-amber-400/50 text-white'
+                        : 'bg-[#17212b]/90 border-white/15 text-white'
+                    }`}
+                  >
+                    {clientCallSpeakerMuted ? (
+                      <VolumeX className="w-4 h-4" />
+                    ) : (
+                      <Volume2 className="w-4 h-4" />
+                    )}
+                    <span>{clientCallSpeakerMuted ? 'Spk Off' : 'Speaker'}</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={clientCallBusy}
+                  onClick={handleClientEndCall}
+                  className="w-full py-3 rounded-2xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-xl cursor-pointer"
+                >
+                  <PhoneOff className="w-4 h-4" />
+                  <span>End Video Call</span>
+                </button>
               </div>
             </div>
+          )}
 
-            <div className="flex items-center gap-[1.2cqw] shrink-0">
-              <button
-                type="button"
-                onClick={handleToggleClientCallMic}
-                style={{ fontSize: '2.2cqw' }}
-                className={`px-[1.8cqw] py-[0.6cqw] rounded-[1.3cqw] font-bold flex items-center gap-[0.7cqw] cursor-pointer ${
-                  !clientCallMicReady || clientCallMicMuted
-                    ? 'bg-rose-600 text-white'
-                    : 'bg-white/20 hover:bg-white/30 text-white'
-                }`}
-              >
-                {!clientCallMicReady || clientCallMicMuted ? (
-                  <MicOff style={{ width: '2.4cqw', height: '2.4cqw' }} />
-                ) : (
-                  <Mic style={{ width: '2.4cqw', height: '2.4cqw' }} />
-                )}
-                <span>{!clientCallMicReady ? 'Allow Mic' : clientCallMicMuted ? 'Unmute' : 'Mute'}</span>
-              </button>
+        {/* Persistent Active Audio-Only Wi-Fi VoIP Call Top Floating Bar */}
+        {clientCallSession?.status === 'active' &&
+          !showOwnerDashboard &&
+          clientCallSession.callMode !== 'video' &&
+          !clientCallRtcStatus.hasRemoteVideo &&
+          !(clientCallVideoReady && !clientCallVideoOff) && (
+            <div
+              data-support-ignore="true"
+              style={{ top: supportSession?.status === 'active' ? '10cqw' : '0' }}
+              className="absolute left-0 right-0 z-[77] bg-sky-700/95 backdrop-blur-xs text-white px-[2.4cqw] py-[1.4cqw] flex items-center justify-between gap-[1.5cqw] shadow-lg border-b border-white/15"
+            >
+              <div className="flex items-center gap-[1.4cqw] min-w-0">
+                <span className="w-[2cqw] h-[2cqw] rounded-full bg-emerald-300 animate-pulse shrink-0" />
+                <PhoneCall style={{ width: '3.4cqw', height: '3.4cqw' }} className="shrink-0" />
+                <div className="min-w-0">
+                  <p style={{ fontSize: '2.5cqw' }} className="font-bold truncate leading-tight">
+                    {clientCallSession.callerName || 'Wi-Fi Voice Call'} •{' '}
+                    {String(Math.floor(clientCallElapsedSec / 60)).padStart(2, '0')}:
+                    {String(clientCallElapsedSec % 60).padStart(2, '0')}
+                  </p>
+                  <p style={{ fontSize: '2cqw' }} className="text-sky-100/90 truncate leading-tight">
+                    {clientCallRtcStatus.voiceConnected
+                      ? clientCallSession.ownerMicMuted
+                        ? 'Caller muted'
+                        : 'Voice Connected'
+                      : 'Connecting audio...'}
+                  </p>
+                </div>
+              </div>
 
-              <button
-                type="button"
-                onClick={handleToggleClientCallSpeaker}
-                className={`p-[0.7cqw] rounded-[1.3cqw] cursor-pointer ${
-                  clientCallSpeakerMuted ? 'bg-amber-500 text-white' : 'bg-white/20 text-white'
-                }`}
-                aria-label={clientCallSpeakerMuted ? 'Unmute speaker' : 'Mute speaker'}
-              >
-                {clientCallSpeakerMuted ? (
-                  <VolumeX style={{ width: '2.5cqw', height: '2.5cqw' }} />
-                ) : (
-                  <Volume2 style={{ width: '2.5cqw', height: '2.5cqw' }} />
-                )}
-              </button>
+              <div className="flex items-center gap-[1.2cqw] shrink-0">
+                <button
+                  type="button"
+                  onClick={handleToggleClientCallMic}
+                  style={{ fontSize: '2.2cqw' }}
+                  className={`px-[1.8cqw] py-[0.6cqw] rounded-[1.3cqw] font-bold flex items-center gap-[0.7cqw] cursor-pointer ${
+                    !clientCallMicReady || clientCallMicMuted
+                      ? 'bg-rose-600 text-white'
+                      : 'bg-white/20 hover:bg-white/30 text-white'
+                  }`}
+                >
+                  {!clientCallMicReady || clientCallMicMuted ? (
+                    <MicOff style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                  ) : (
+                    <Mic style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                  )}
+                  <span>{!clientCallMicReady ? 'Allow Mic' : clientCallMicMuted ? 'Unmute' : 'Mute'}</span>
+                </button>
 
-              <button
-                type="button"
-                disabled={clientCallBusy}
-                onClick={handleClientEndCall}
-                style={{ fontSize: '2.2cqw' }}
-                className="px-[1.9cqw] py-[0.6cqw] rounded-[1.3cqw] bg-rose-600 hover:bg-rose-500 text-white font-bold flex items-center gap-[0.7cqw] cursor-pointer"
-              >
-                <PhoneOff style={{ width: '2.3cqw', height: '2.3cqw' }} />
-                <span>End</span>
-              </button>
+                <button
+                  type="button"
+                  onClick={handleToggleClientCallSpeaker}
+                  className={`p-[0.7cqw] rounded-[1.3cqw] cursor-pointer ${
+                    clientCallSpeakerMuted ? 'bg-amber-500 text-white' : 'bg-white/20 text-white'
+                  }`}
+                  aria-label={clientCallSpeakerMuted ? 'Unmute speaker' : 'Mute speaker'}
+                >
+                  {clientCallSpeakerMuted ? (
+                    <VolumeX style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                  ) : (
+                    <Volume2 style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={clientCallBusy}
+                  onClick={handleClientEndCall}
+                  style={{ fontSize: '2.2cqw' }}
+                  className="px-[1.9cqw] py-[0.6cqw] rounded-[1.3cqw] bg-rose-600 hover:bg-rose-500 text-white font-bold flex items-center gap-[0.7cqw] cursor-pointer"
+                >
+                  <PhoneOff style={{ width: '2.3cqw', height: '2.3cqw' }} />
+                  <span>End</span>
+                </button>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* One-Tap Call & Notification Permissions Banner (Disappears after approval) */}
+        {/* Unified 1-Click & Settings Permission Setup Checklist (Shown whenever any required permission is missing; auto-hides forever once all granted) */}
         {showCallPermsBanner &&
-          deviceGateState === 'approved' &&
+          permStatus &&
+          !permStatus.allGranted &&
+          deviceGateState !== 'hydrating' &&
           !showOwnerDashboard &&
           !clientCallSession &&
           !supportSession && (
             <div
               data-support-ignore="true"
-              className="absolute top-[1.8cqw] left-[2.5cqw] right-[2.5cqw] z-[76] bg-[#17212b]/95 text-white border border-sky-400/40 rounded-[2.6cqw] px-[3cqw] py-[2cqw] shadow-xl flex items-center justify-between gap-[2cqw]"
+              className="absolute inset-x-[3cqw] top-[2.5cqw] z-[94] bg-[#141d29]/97 backdrop-blur-md text-white border border-sky-400/50 rounded-[3.5cqw] p-[3.5cqw] shadow-2xl space-y-[2.5cqw]"
             >
-              <div className="min-w-0">
-                <p style={{ fontSize: '2.6cqw' }} className="font-bold text-white truncate">
-                  Allow Call &amp; Alert Permissions
-                </p>
-                <p style={{ fontSize: '2.1cqw' }} className="text-slate-300 leading-snug">
-                  Enable Microphone, Notifications &amp; Display-Over-Apps so incoming Wi-Fi calls ring even outside the app.
-                </p>
+              <div className="flex items-start justify-between gap-[2cqw]">
+                <div className="flex items-center gap-[2.2cqw]">
+                  <div className="w-[8.5cqw] h-[8.5cqw] rounded-[2.4cqw] bg-sky-500/20 border border-sky-400/40 flex items-center justify-center shrink-0">
+                    <ShieldCheck style={{ width: '4.5cqw', height: '4.5cqw' }} className="text-sky-300" />
+                  </div>
+                  <div>
+                    <p style={{ fontSize: '3.3cqw' }} className="font-bold text-white leading-tight">
+                      Permissions Required (ፍቃዶችን ይፍቀዱ)
+                    </p>
+                    <p style={{ fontSize: '2.3cqw' }} className="text-slate-300 leading-snug mt-[0.4cqw]">
+                      Grant missing permissions once so calls, video &amp; alerts work seamlessly.
+                    </p>
+                  </div>
+                </div>
               </div>
-              <div className="flex items-center gap-[1.2cqw] shrink-0">
+
+              <div className="space-y-[1.4cqw]">
+                {(
+                  [
+                    {
+                      key: 'microphone',
+                      label: 'Microphone (ድምፅ እና ጥሪ)',
+                      granted: permStatus.microphone,
+                      settingKind: 'microphone' as NativePermissionSettingKind,
+                    },
+                    {
+                      key: 'camera',
+                      label: 'Camera (የቪዲዮ ጥሪ)',
+                      granted: permStatus.camera,
+                      settingKind: 'camera' as NativePermissionSettingKind,
+                    },
+                    {
+                      key: 'notifications',
+                      label: 'Notifications (መልዕክት እና ጥሪ)',
+                      granted: permStatus.notifications,
+                      settingKind: 'notifications' as NativePermissionSettingKind,
+                    },
+                    ...(isNativeCallBridgeAvailable()
+                      ? [
+                          {
+                            key: 'phone',
+                            label: 'Phone / Call (USSD & Call)',
+                            granted: permStatus.phone,
+                            settingKind: 'phone' as NativePermissionSettingKind,
+                          },
+                          {
+                            key: 'overlay',
+                            label: 'Display Over Apps (Settings)',
+                            granted: permStatus.overlay,
+                            settingKind: 'overlay' as NativePermissionSettingKind,
+                          },
+                        ]
+                      : []),
+                  ] as Array<{
+                    key: string;
+                    label: string;
+                    granted: boolean;
+                    settingKind: NativePermissionSettingKind;
+                  }>
+                ).map((item) => (
+                  <div
+                    key={item.key}
+                    className={`flex items-center justify-between gap-[2cqw] px-[2.4cqw] py-[1.6cqw] rounded-[2.2cqw] border ${
+                      item.granted
+                        ? 'bg-emerald-500/15 border-emerald-400/30'
+                        : 'bg-white/5 border-white/10'
+                    }`}
+                  >
+                    <div className="flex items-center gap-[1.8cqw] min-w-0">
+                      <span
+                        className={`w-[4.5cqw] h-[4.5cqw] rounded-full flex items-center justify-center shrink-0 ${
+                          item.granted
+                            ? 'bg-emerald-500 text-white'
+                            : 'bg-amber-500/25 text-amber-300 border border-amber-400/40'
+                        }`}
+                      >
+                        <Check style={{ width: '2.6cqw', height: '2.6cqw' }} />
+                      </span>
+                      <span style={{ fontSize: '2.5cqw' }} className="font-semibold text-white truncate">
+                        {item.label}
+                      </span>
+                    </div>
+
+                    {item.granted ? (
+                      <span style={{ fontSize: '2.1cqw' }} className="font-bold text-emerald-300 shrink-0">
+                        Allowed
+                      </span>
+                    ) : isNativeCallBridgeAvailable() ? (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenSettingForPerm(item.settingKind)}
+                        style={{ fontSize: '2.1cqw' }}
+                        className="px-[2.2cqw] py-[0.8cqw] rounded-[1.5cqw] bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold flex items-center gap-[1cqw] cursor-pointer shrink-0"
+                      >
+                        <Settings style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                        <span>Open Settings</span>
+                      </button>
+                    ) : (
+                      <span style={{ fontSize: '2.1cqw' }} className="font-bold text-amber-300 shrink-0">
+                        Needed
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-[2cqw] pt-[0.5cqw]">
                 <button
                   type="button"
+                  disabled={permCheckBusy}
                   onClick={() => void handleGrantCallPermissions()}
-                  style={{ fontSize: '2.3cqw' }}
-                  className="px-[2.4cqw] py-[1cqw] rounded-[1.6cqw] bg-sky-600 hover:bg-sky-500 text-white font-bold cursor-pointer whitespace-nowrap"
+                  style={{ fontSize: '2.7cqw' }}
+                  className="flex-1 py-[2.2cqw] rounded-[2.2cqw] bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white font-bold cursor-pointer shadow-lg flex items-center justify-center gap-[1.5cqw]"
                 >
-                  Allow
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowCallPermsBanner(false)}
-                  className="text-slate-400 hover:text-white cursor-pointer p-[0.5cqw]"
-                  aria-label="Dismiss permission prompt"
-                >
-                  <X style={{ width: '3.4cqw', height: '3.4cqw' }} />
+                  <ShieldCheck style={{ width: '3.4cqw', height: '3.4cqw' }} />
+                  <span>{permCheckBusy ? 'Checking...' : 'Allow All Permissions (ሁሉንም ፍቀድ)'}</span>
                 </button>
               </div>
             </div>
@@ -13233,7 +13821,7 @@ export default function CBEBirrFullscreenApp() {
           )}
         </AnimatePresence>
 
-        {/* Full-Screen Incoming Owner Wi-Fi VoIP Call Screen (Real Ringtone + Vibrate + Answer/Decline) */}
+        {/* Full-Screen Incoming Owner Wi-Fi Voice / Video Call Screen (Real Ringtone + Vibrate + Answer/Decline) */}
         <AnimatePresence>
           {clientCallSession?.status === 'ringing' && !showOwnerDashboard && (
             <motion.div
@@ -13246,7 +13834,11 @@ export default function CBEBirrFullscreenApp() {
               <div className="pt-4 text-center space-y-1">
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-sky-500/20 border border-sky-400/35 text-sky-200 text-[2.4cqw] font-bold">
                   <Radio className="w-3.5 h-3.5 animate-pulse" />
-                  <span>Incoming Wi-Fi Voice Call</span>
+                  <span>
+                    {clientCallSession.callMode === 'video'
+                      ? 'Incoming Wi-Fi Video Call'
+                      : 'Incoming Wi-Fi Voice Call'}
+                  </span>
                 </div>
               </div>
 
@@ -13254,7 +13846,11 @@ export default function CBEBirrFullscreenApp() {
                 <div className="relative">
                   <span className="absolute inset-0 rounded-full bg-emerald-400/30 animate-ping" />
                   <div className="relative w-24 h-24 rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center shadow-2xl">
-                    <PhoneIncoming className="w-10 h-10 text-emerald-300" />
+                    {clientCallSession.callMode === 'video' ? (
+                      <Video className="w-10 h-10 text-emerald-300" />
+                    ) : (
+                      <PhoneIncoming className="w-10 h-10 text-emerald-300" />
+                    )}
                   </div>
                 </div>
                 <div className="space-y-1">
@@ -13262,7 +13858,9 @@ export default function CBEBirrFullscreenApp() {
                     {clientCallSession.callerName || 'Owner Wi-Fi Call'}
                   </h2>
                   <p className="text-[3cqw] text-sky-200/80">
-                    Real-time Wi-Fi audio call
+                    {clientCallSession.callMode === 'video'
+                      ? 'Real-time Wi-Fi video & voice call'
+                      : 'Real-time Wi-Fi audio call'}
                   </p>
                 </div>
               </div>
@@ -13283,7 +13881,11 @@ export default function CBEBirrFullscreenApp() {
                   onClick={() => void handleAnswerIncomingCall()}
                   className="py-3.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[3.3cqw] flex flex-col items-center justify-center gap-1 shadow-xl cursor-pointer"
                 >
-                  <PhoneCall className="w-6 h-6" />
+                  {clientCallSession.callMode === 'video' ? (
+                    <Video className="w-6 h-6" />
+                  ) : (
+                    <PhoneCall className="w-6 h-6" />
+                  )}
                   <span>Answer</span>
                 </button>
               </div>

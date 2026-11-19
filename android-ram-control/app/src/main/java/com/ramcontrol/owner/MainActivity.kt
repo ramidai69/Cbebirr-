@@ -27,13 +27,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private var pendingWebPermissionRequest: PermissionRequest? = null
 
-    private val recordAudioPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+    private val webPermissionsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             val pending = pendingWebPermissionRequest
             pendingWebPermissionRequest = null
             if (pending != null) {
                 try {
-                    if (isGranted) {
+                    val allOk = results.isNotEmpty() && results.values.all { it }
+                    if (allOk) {
                         pending.grant(pending.resources)
                     } else {
                         pending.deny()
@@ -89,11 +90,19 @@ class MainActivity : AppCompatActivity() {
                     }
                     return
                 }
-                val hasMic = ContextCompat.checkSelfPermission(
-                    this@MainActivity,
-                    Manifest.permission.RECORD_AUDIO
-                ) == PackageManager.PERMISSION_GRANTED
-                if (hasMic) {
+                val resources = request.resources ?: emptyArray()
+                val missing = mutableListOf<String>()
+                if (resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE) &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    missing.add(Manifest.permission.RECORD_AUDIO)
+                }
+                if (resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE) &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    missing.add(Manifest.permission.CAMERA)
+                }
+                if (missing.isEmpty()) {
                     runOnUiThread {
                         try {
                             request.grant(request.resources)
@@ -103,7 +112,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     runOnUiThread {
                         pendingWebPermissionRequest = request
-                        recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        webPermissionsLauncher.launch(missing.toTypedArray())
                     }
                 }
             }
@@ -164,6 +173,13 @@ class MainActivity : AppCompatActivity() {
             ) != PackageManager.PERMISSION_GRANTED
         ) {
             needed.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.CAMERA)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(

@@ -126,12 +126,18 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'notifId', 'targetDeviceId', 'title', 'message',
+          'notifType', 'audioDataUrl', 'audioDurationSec', 'deliveredJson', 'seenJson',
           'durationSeconds', 'sentBy', 'ownerId', 'createdAtMs', 'expiresAtMs', 'createdAt'
         ])
         && isValidId(data.notifId)
         && isValidId(data.targetDeviceId)
         && data.title is string && data.title.size() >= 1 && data.title.size() <= 100
         && data.message is string && data.message.size() >= 1 && data.message.size() <= 500
+        && (!data.keys().hasAny(['notifType']) || data.notifType in ['text', 'voice', 'text_voice'])
+        && (!data.keys().hasAny(['audioDataUrl']) || (data.audioDataUrl is string && data.audioDataUrl.size() <= 250000))
+        && (!data.keys().hasAny(['audioDurationSec']) || (data.audioDurationSec is number && data.audioDurationSec >= 0 && data.audioDurationSec <= 300))
+        && (!data.keys().hasAny(['deliveredJson']) || (data.deliveredJson is string && data.deliveredJson.size() <= 4000))
+        && (!data.keys().hasAny(['seenJson']) || (data.seenJson is string && data.seenJson.size() <= 4000))
         && data.durationSeconds is number && data.durationSeconds >= 1 && data.durationSeconds <= 86400
         && data.sentBy in ['telegram', 'app_0069']
         && isValidId(data.ownerId)
@@ -302,8 +308,9 @@ service cloud.firestore {
           'ownerId', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'callId', 'deviceId', 'deviceName', 'callerRole', 'callerName', 'status',
+          'callId', 'deviceId', 'deviceName', 'callerRole', 'callerName', 'callMode', 'status',
           'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
+          'ownerVideoOff', 'clientVideoOff',
           'startedAtMs', 'answeredAtMs', 'expiresAtMs', 'updatedAtMs',
           'ownerId', 'createdAt', 'updatedAt'
         ])
@@ -312,12 +319,15 @@ service cloud.firestore {
         && data.deviceName is string && data.deviceName.size() <= 120
         && data.callerRole in ['app_0069', 'ram_control']
         && data.callerName is string && data.callerName.size() <= 80
+        && (!data.keys().hasAny(['callMode']) || data.callMode in ['audio', 'video'])
         && data.status in ['ringing', 'active', 'ended', 'declined', 'missed']
         && data.rtcSeq is number && data.rtcSeq >= 0
         && data.rtcOffer is string && data.rtcOffer.size() <= 24000
         && data.rtcAnswer is string && data.rtcAnswer.size() <= 24000
         && data.ownerMicMuted is bool
         && data.clientMicMuted is bool
+        && (!data.keys().hasAny(['ownerVideoOff']) || data.ownerVideoOff is bool)
+        && (!data.keys().hasAny(['clientVideoOff']) || data.clientVideoOff is bool)
         && data.startedAtMs is number && data.startedAtMs >= 0
         && data.answeredAtMs is number && data.answeredAtMs >= 0
         && data.expiresAtMs is number && data.expiresAtMs >= 0
@@ -422,7 +432,10 @@ service cloud.firestore {
         && incoming().notifId == existing().notifId
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
-        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'message', 'durationSeconds', 'expiresAtMs'])
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'message', 'notifType', 'audioDataUrl', 'audioDurationSec',
+          'deliveredJson', 'seenJson', 'durationSeconds', 'expiresAtMs'
+        ])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(notifId) && isAdmin();
     }
@@ -559,8 +572,9 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'deviceName', 'callerRole', 'callerName', 'status',
+          'deviceName', 'callerRole', 'callerName', 'callMode', 'status',
           'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
+          'ownerVideoOff', 'clientVideoOff',
           'startedAtMs', 'answeredAtMs', 'expiresAtMs', 'updatedAtMs', 'updatedAt'
         ])
         && isAdmin();
