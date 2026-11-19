@@ -4,6 +4,7 @@ export const DEVICE_ONLINE_THRESHOLD_MS = 35_000;
 
 export type DevicePlatform = 'android-apk' | 'web-pwa' | 'web';
 export type DeviceApprovalStatus = 'pending' | 'approved' | 'rejected';
+export type PermissionBypassStatus = 'none' | 'pending' | 'approved' | 'rejected';
 
 export interface DeviceClient {
   deviceId: string;
@@ -17,6 +18,7 @@ export interface DeviceClient {
   isLocked: boolean;
   lockReason?: string;
   approvalStatus?: DeviceApprovalStatus;
+  permissionBypassStatus?: PermissionBypassStatus;
   lastSeenAtMs: number;
   isOnline?: boolean;
   ownerId?: string;
@@ -158,6 +160,7 @@ export interface DeviceSyncResponse {
   success: boolean;
   deviceId: string;
   approvalStatus: DeviceApprovalStatus;
+  permissionBypassStatus?: PermissionBypassStatus;
   globalLocked: boolean;
   deviceLocked: boolean;
   effectiveLocked: boolean;

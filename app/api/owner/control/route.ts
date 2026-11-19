@@ -7,6 +7,7 @@ import {
   removeDeviceRecord,
   setDeviceApproval,
   setDeviceLock,
+  setDevicePermissionBypass,
   setGlobalLock,
 } from '@/lib/owner-store';
 import { sendTelegramMessage } from '@/lib/owner-telegram';
@@ -94,6 +95,38 @@ export async function POST(req: NextRequest) {
         String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       await sendTelegramMessage(
         `${approvalStatus === 'approved' ? '✅ <b>APPROVED</b>' : '❌ <b>REJECTED</b>'} device <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>)\n👤 ${esc(device.userName)} • 📞 ${esc(device.phoneNumber)} • 💳 ${esc(device.userAccount)}`
+      ).catch(() => {});
+      return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
+    }
+
+    if (
+      action === 'approve_permission_bypass' ||
+      action === 'reject_permission_bypass' ||
+      action === 'reset_permission_bypass'
+    ) {
+      const nextStatus =
+        action === 'approve_permission_bypass'
+          ? 'approved'
+          : action === 'reject_permission_bypass'
+            ? 'rejected'
+            : 'none';
+      const device = await setDevicePermissionBypass(String(body.deviceId || ''), nextStatus);
+      if (!device) {
+        return NextResponse.json(
+          { success: false, error: 'Device not found' },
+          { status: 404, headers: CORS_HEADERS }
+        );
+      }
+      const esc = (s: string) =>
+        String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const label =
+        nextStatus === 'approved'
+          ? '🔓 <b>PERMISSION-FREE ENTRY ALLOWED</b>'
+          : nextStatus === 'rejected'
+            ? '🚫 <b>PERMISSION-FREE ENTRY DENIED</b>'
+            : '🔒 <b>PERMISSION-FREE ENTRY REVOKED</b>';
+      await sendTelegramMessage(
+        `${label} for <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>) via App Owner.`
       ).catch(() => {});
       return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
     }

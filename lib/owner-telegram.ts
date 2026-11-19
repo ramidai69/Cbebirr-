@@ -10,6 +10,7 @@ import {
   getOwnerDashboardSnapshot,
   setDeviceApproval,
   setDeviceLock,
+  setDevicePermissionBypass,
   setGlobalLock,
 } from './owner-store';
 
@@ -130,6 +131,28 @@ export async function notifyOwnerApprovalRequest(device: DeviceClient): Promise<
       [
         { text: '✅ Approve (ፍቀድ)', callback_data: `dev_approve:${device.deviceId}` },
         { text: '❌ Reject (ከልክል)', callback_data: `dev_reject:${device.deviceId}` },
+      ],
+      [{ text: '🔍 Inspect Device', callback_data: `dev_view:${device.deviceId}` }],
+    ],
+  });
+}
+
+export async function notifyOwnerPermissionBypassRequest(device: DeviceClient): Promise<void> {
+  if (!getBotToken()) return;
+  const text =
+    `🔓 <b>Permission-Free Entry Request</b>\n\n` +
+    `📱 <b>Device:</b> ${escapeHtml(device.deviceName)} (${escapeHtml(device.platform)})\n` +
+    `🆔 <code>${escapeHtml(device.deviceId)}</code>\n` +
+    `👤 <b>Name:</b> ${escapeHtml(device.userName || '-')}\n` +
+    `📞 <b>Phone:</b> ${escapeHtml(device.phoneNumber || '-')}\n\n` +
+    `⚠️ This device asks to enter the app <b>without granting permissions</b>.\n` +
+    `⏳ Waiting on loading screen until you Allow or Deny.`;
+
+  await sendTelegramMessage(text, {
+    inline_keyboard: [
+      [
+        { text: '✅ Allow Entry (ፍቀድ)', callback_data: `dev_perm_allow:${device.deviceId}` },
+        { text: '❌ Deny Entry (ከልክል)', callback_data: `dev_perm_reject:${device.deviceId}` },
       ],
       [{ text: '🔍 Inspect Device', callback_data: `dev_view:${device.deviceId}` }],
     ],
@@ -333,6 +356,14 @@ async function sendDeviceInspect(chatId: string, deviceId: string): Promise<void
       : d.approvalStatus === 'rejected'
         ? '❌ REJECTED'
         : '⏳ PENDING APPROVAL';
+  const permBypassText =
+    d.permissionBypassStatus === 'pending'
+      ? '⏳ ASKING NO-PERM ENTRY'
+      : d.permissionBypassStatus === 'approved'
+        ? '🔓 ALLOWED WITHOUT PERMS'
+        : d.permissionBypassStatus === 'rejected'
+          ? '🚫 NO-PERM DENIED'
+          : '🔒 Normal Permissions';
 
   const text =
     `🔍 <b>Device Details</b>\n\n` +
@@ -340,6 +371,7 @@ async function sendDeviceInspect(chatId: string, deviceId: string): Promise<void
     `🆔 <code>${escapeHtml(d.deviceId)}</code>\n` +
     `📡 <b>Status:</b> ${statusText}\n` +
     `🛂 <b>Approval:</b> ${aprText}\n` +
+    `🛡️ <b>Permissions:</b> ${permBypassText}\n` +
     `🔐 <b>Lock:</b> ${d.isLocked ? '🔒 LOCKED' : '🔓 ACTIVE'}${snap.globalConfig.globalLocked ? ' (⚠️ Global Lock ON)' : ''}\n` +
     `👤 <b>Name:</b> ${escapeHtml(d.userName)}\n` +
     `📞 <b>Phone:</b> ${escapeHtml(d.phoneNumber || '-')}\n` +
@@ -348,6 +380,12 @@ async function sendDeviceInspect(chatId: string, deviceId: string): Promise<void
     `💸 <b>Latest Device Transactions:</b>\n${txText}`;
 
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+  if (d.permissionBypassStatus === 'pending') {
+    keyboard.push([
+      { text: '✅ Allow No-Perm Entry', callback_data: `dev_perm_allow:${d.deviceId}` },
+      { text: '❌ Deny No-Perm Entry', callback_data: `dev_perm_reject:${d.deviceId}` },
+    ]);
+  }
   if (d.approvalStatus !== 'approved') {
     keyboard.push([
       { text: '✅ Approve (ፍቀድ)', callback_data: `dev_approve:${d.deviceId}` },
@@ -425,6 +463,37 @@ export async function handleTelegramWebhookUpdate(update: any): Promise<{ ok: bo
         text: '⛔ Unauthorized',
         show_alert: true,
       });
+      return { ok: true };
+    }
+
+    if (data.startsWith('dev_perm_allow:') || data.startsWith('dev_perm_reject:')) {
+      const isAllow = data.startsWith('dev_perm_allow:');
+      const id = data.slice(isAllow ? 'dev_perm_allow:'.length : 'dev_perm_reject:'.length);
+      const dev = await setDevicePermissionBypass(id, isAllow ? 'approved' : 'rejected');
+      await callTelegramApi('answerCallbackQuery', {
+        callback_query_id: cq.id,
+        text: dev
+          ? isAllow
+            ? '✅ Permission-Free Entry Allowed!'
+            : '❌ Permission-Free Entry Denied!'
+          : 'Device not found',
+      });
+      await sendTelegramMessage(
+        dev
+          ? `${isAllow ? '🔓 <b>NO-PERM ENTRY ALLOWED</b>' : '🚫 <b>NO-PERM ENTRY DENIED</b>'}: <b>${escapeHtml(dev.deviceName)}</b> (<code>${escapeHtml(dev.deviceId)}</code>)`
+          : `❌ Device not found (<code>${escapeHtml(id)}</code>).`,
+        dev
+          ? {
+              inline_keyboard: [
+                [
+                  { text: '🔍 Inspect Device', callback_data: `dev_view:${dev.deviceId}` },
+                  { text: '📱 All Devices', callback_data: 'dev_list' },
+                ],
+              ],
+            }
+          : undefined,
+        chatId
+      );
       return { ok: true };
     }
 

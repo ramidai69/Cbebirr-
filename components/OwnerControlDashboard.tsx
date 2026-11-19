@@ -219,15 +219,16 @@ export default function OwnerControlDashboard({
     const FRESH_PENDING_MS = 24 * 60 * 60_000;
     const rankDevice = (d: DeviceClient): number => {
       const status = d.approvalStatus || 'approved';
+      const hasPendingBypass = d.permissionBypassStatus === 'pending';
       const isJustApproved = Boolean(justApprovedIds[d.deviceId]);
       const isFresh =
         nowRef === 0 || nowRef - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_MS;
-      if (status === 'pending' && d.isOnline) return 6;
+      if ((status === 'pending' || hasPendingBypass) && d.isOnline) return 6;
       if (isJustApproved && status === 'approved') return 5;
       if (status === 'approved' && d.isOnline) return 4;
-      if (status === 'pending' && isFresh) return 3;
+      if ((status === 'pending' || hasPendingBypass) && isFresh) return 3;
       if (status === 'approved') return 2;
-      if (status === 'pending') return 1;
+      if (status === 'pending' || hasPendingBypass) return 1;
       return 0;
     };
     return Array.from(map.values()).sort((a, b) => {
@@ -249,7 +250,10 @@ export default function OwnerControlDashboard({
   }, [snapshot]);
 
   const pendingCount = useMemo(
-    () => devicesList.filter((d) => d.approvalStatus === 'pending').length,
+    () =>
+      devicesList.filter(
+        (d) => d.approvalStatus === 'pending' || d.permissionBypassStatus === 'pending'
+      ).length,
     [devicesList]
   );
 
@@ -267,7 +271,13 @@ export default function OwnerControlDashboard({
     const q = deviceSearch.trim().toLowerCase();
     return devicesList.filter((d) => {
       const status = d.approvalStatus || 'approved';
-      if (deviceTabFilter === 'pending' && status !== 'pending') return false;
+      if (
+        deviceTabFilter === 'pending' &&
+        status !== 'pending' &&
+        d.permissionBypassStatus !== 'pending'
+      ) {
+        return false;
+      }
       if (deviceTabFilter === 'approved' && status !== 'approved') return false;
       if (deviceTabFilter === 'online' && !d.isOnline) return false;
       if (q) {
@@ -362,6 +372,29 @@ export default function OwnerControlDashboard({
       );
     } catch (err: any) {
       flashBanner('err', err?.message || 'Approval update failed');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const handlePermissionBypass = async (
+    dev: DeviceClient,
+    action: 'approve_permission_bypass' | 'reject_permission_bypass' | 'reset_permission_bypass'
+  ) => {
+    setBusyKey(`pb_${dev.deviceId}`);
+    try {
+      await postOwnerAction({ action, deviceId: dev.deviceId });
+      await loadSnapshot(true);
+      flashBanner(
+        'ok',
+        action === 'approve_permission_bypass'
+          ? `Allowed ${dev.userName || dev.deviceName} to enter without permissions`
+          : action === 'reject_permission_bypass'
+            ? `Denied permission-free entry for ${dev.userName || dev.deviceName}`
+            : `Revoked permission bypass for ${dev.userName || dev.deviceName}`
+      );
+    } catch (err: any) {
+      flashBanner('err', err?.message || 'Permission bypass update failed');
     } finally {
       setBusyKey('');
     }
@@ -843,6 +876,9 @@ export default function OwnerControlDashboard({
                 const isMe = dev.deviceId === myDeviceId;
                 const isPending = dev.approvalStatus === 'pending';
                 const isRejected = dev.approvalStatus === 'rejected';
+                const isPermBypassPending = dev.permissionBypassStatus === 'pending';
+                const isPermBypassApproved = dev.permissionBypassStatus === 'approved';
+                const isPermBypassRejected = dev.permissionBypassStatus === 'rejected';
                 const isJustApproved =
                   !isPending &&
                   !isRejected &&
@@ -852,7 +888,7 @@ export default function OwnerControlDashboard({
                   <div
                     key={dev.deviceId}
                     className={`border rounded-2xl p-3 space-y-2.5 ${
-                      isPending
+                      isPending || isPermBypassPending
                         ? 'bg-amber-950/25 border-amber-400/60 shadow-[0_0_20px_rgba(251,191,36,0.12)]'
                         : isJustApproved
                           ? 'bg-emerald-950/25 border-emerald-400/60 shadow-[0_0_20px_rgba(16,185,129,0.15)]'
@@ -883,6 +919,29 @@ export default function OwnerControlDashboard({
                               ? 'ONLINE'
                               : `OFFLINE • ${formatRelativeTime(dev.lastSeenAtMs, serverNow)}`}
                           </span>
+                          {isPermBypassPending && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-sky-500/25 text-sky-200 border border-sky-400/50 animate-pulse">
+                              ASKING NO-PERM ENTRY
+                            </span>
+                          )}
+                          {isPermBypassApproved && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-200 border border-cyan-400/40 inline-flex items-center gap-1">
+                              NO-PERM ALLOWED
+                              <button
+                                type="button"
+                                onClick={() => handlePermissionBypass(dev, 'reset_permission_bypass')}
+                                disabled={busyKey === `pb_${dev.deviceId}`}
+                                className="underline text-[9px] text-amber-200 hover:text-white cursor-pointer ml-1"
+                              >
+                                Revoke
+                              </button>
+                            </span>
+                          )}
+                          {isPermBypassRejected && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-rose-500/25 text-rose-200">
+                              NO-PERM DENIED
+                            </span>
+                          )}
                           {isPending && (
                             <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-amber-500/25 text-amber-200 border border-amber-400/40 animate-pulse">
                               REQUESTING PERMISSION
@@ -917,7 +976,7 @@ export default function OwnerControlDashboard({
                         </p>
                       </div>
 
-                      {!isMe && (!dev.isOnline || isPending || isRejected) && (
+                      {!isMe && (!dev.isOnline || isPending || isRejected || isPermBypassPending) && (
                         <button
                           type="button"
                           onClick={() => handleDeleteDevice(dev)}
@@ -960,6 +1019,35 @@ export default function OwnerControlDashboard({
                         </span>
                       </div>
                     </div>
+
+                    {/* Prominent Allow / Deny Prompt for Devices Requesting Permission-Free Entry */}
+                    {isPermBypassPending && (
+                      <div className="bg-sky-950/50 border border-sky-400/50 rounded-xl p-2.5 space-y-2">
+                        <p className="text-[11px] font-semibold text-sky-100 leading-snug">
+                          This device cannot grant permissions and wants to enter the app without permissions. Do you allow it?
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handlePermissionBypass(dev, 'approve_permission_bypass')}
+                            disabled={busyKey === `pb_${dev.deviceId}`}
+                            className="py-2 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Allow (ፍቀድ)</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handlePermissionBypass(dev, 'reject_permission_bypass')}
+                            disabled={busyKey === `pb_${dev.deviceId}`}
+                            className="py-2 px-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-[11.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Deny (ከልክል)</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Prominent Approve / Reject Prompt for New Device Permission Requests */}
                     {(isPending || isRejected) && (

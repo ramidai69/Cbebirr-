@@ -23,12 +23,14 @@ import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import SamsungMessagesApp from './SamsungMessagesApp';
 import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
-import { CallSession, OWNER_PIN, SupportSession } from '@/lib/owner-types';
+import ProportionalScreenStage from './ProportionalScreenStage';
+import { CallSession, OWNER_PIN, PermissionBypassStatus, SupportSession } from '@/lib/owner-types';
 import {
   NativePermissionSettingKind,
   NativePermissionStatus,
   ackOwnerNotification,
   answerWifiCall,
+  cancelOwnerPermissionBypass,
   consumePendingNativeCallAction,
   declineWifiCall,
   endSupportView,
@@ -49,6 +51,7 @@ import {
   registerNativeCallDevice,
   reportDeviceTransaction,
   requestAllNativeCallPermissions,
+  requestOwnerPermissionBypass,
   respondSupportConsent,
   sendOfflineBeacon,
   setNativeAudioMode,
@@ -639,6 +642,14 @@ export default function CBEBirrFullscreenApp() {
   const [showCallPermsBanner, setShowCallPermsBanner] = useState<boolean>(false);
   const [permStatus, setPermStatus] = useState<NativePermissionStatus | null>(null);
   const [permCheckBusy, setPermCheckBusy] = useState<boolean>(false);
+  const PERM_BYPASS_KEY = 'cbebirr_perm_bypass_v1';
+  const [permissionBypassStatus, setPermissionBypassStatus] = useState<PermissionBypassStatus>('none');
+  const [permissionBypassBusy, setPermissionBypassBusy] = useState<boolean>(false);
+  const [permissionBypassMsg, setPermissionBypassMsg] = useState<string>('');
+  const permissionBypassRef = useRef<PermissionBypassStatus>('none');
+  useEffect(() => {
+    permissionBypassRef.current = permissionBypassStatus;
+  }, [permissionBypassStatus]);
   const clientCallSessionRef = useRef<CallSession | null>(null);
   const clientCallAudioElRef = useRef<HTMLAudioElement | null>(null);
   const clientCallRemoteVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -994,7 +1005,39 @@ export default function CBEBirrFullscreenApp() {
       if (gate === 'hydrating') return;
       const p = profileSyncRef.current;
 
-      // On the initial Register screen, poll read-only (checkOnly) so Global Lock & Broadcast Notifications from RamControl.apk
+      const applyPermBypassFromServer = (serverBypass?: PermissionBypassStatus) => {
+        if (!serverBypass) return;
+        const cur = permissionBypassRef.current;
+        if (serverBypass === 'approved') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+          } catch {}
+          setPermissionBypassMsg('');
+          setPermissionBypassStatus('approved');
+        } else if (serverBypass === 'rejected') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'rejected');
+          } catch {}
+          if (cur === 'pending' || cur === 'rejected') {
+            setPermissionBypassMsg(
+              'Owner declined entry without permissions. Please grant permissions above or ask again.'
+            );
+          }
+          setPermissionBypassStatus('rejected');
+        } else if (serverBypass === 'pending') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'pending');
+          } catch {}
+          setPermissionBypassStatus('pending');
+        } else if (cur !== 'none') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'none');
+          } catch {}
+          setPermissionBypassStatus('none');
+        }
+      };
+
+      // On the initial Register screen, poll read-only (checkOnly) so Global Lock, Broadcast Notifications & Permission Bypass
       // work immediately without registering a blank/placeholder device record before submission.
       if (gate === 'register') {
         const res = await syncDeviceTelemetry({
@@ -1003,6 +1046,9 @@ export default function CBEBirrFullscreenApp() {
           clientGateState: 'register',
         });
         if (!active || !res) return;
+        if (res.fromServer) {
+          applyPermBypassFromServer(res.permissionBypassStatus);
+        }
         setRemoteLockState({
           locked: res.lockState.locked,
           message: res.lockState.message,
@@ -1039,6 +1085,7 @@ export default function CBEBirrFullscreenApp() {
 
       const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine !== false;
       if (isOnlineNow && res.fromServer) {
+        applyPermBypassFromServer(res.permissionBypassStatus);
         if (res.approvalStatus === 'rejected') {
           regServerAckRef.current = true;
           pendingNeedsFreshRegRef.current = false;
@@ -1182,7 +1229,8 @@ export default function CBEBirrFullscreenApp() {
     if (deviceGateState === 'approved') {
       registerNativeCallDevice();
     }
-    const pollMs = deviceGateState === 'pending' ? 2000 : 4000;
+    const isBypassPending = permissionBypassStatus === 'pending';
+    const pollMs = deviceGateState === 'pending' || isBypassPending ? 1500 : 4000;
     const intervalId = setInterval(runSync, pollMs);
 
     let lastPairBroadcastMs = 0;
@@ -1229,7 +1277,7 @@ export default function CBEBirrFullscreenApp() {
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pagehide', onPageHide);
     };
-  }, [isStorageHydrated, deviceGateState, deliverSystemNotification, exitAppCleanly]);
+  }, [isStorageHydrated, deviceGateState, permissionBypassStatus, deliverSystemNotification, exitAppCleanly]);
 
   // Immediately push profile/balance edits to owner dashboard when user edits name, phone, or balance
   useEffect(() => {
@@ -1978,6 +2026,67 @@ export default function CBEBirrFullscreenApp() {
 
   const handleOpenSettingForPerm = (kind: NativePermissionSettingKind) => {
     openNativePermissionSetting(kind);
+  };
+
+  const handleRequestPermissionBypass = async () => {
+    if (permissionBypassBusy) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setPermissionBypassMsg('Internet connection required to request owner permission.');
+      return;
+    }
+    setPermissionBypassMsg('');
+    setPermissionBypassBusy(true);
+    setPermissionBypassStatus('pending');
+    try {
+      localStorage.setItem(PERM_BYPASS_KEY, 'pending');
+    } catch {}
+    try {
+      const p = profileSyncRef.current;
+      const res = await requestOwnerPermissionBypass({
+        ...p,
+        clientGateState: deviceGateStateRef.current,
+      });
+      if (res?.fromServer && res.permissionBypassStatus) {
+        if (res.permissionBypassStatus === 'approved') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+          } catch {}
+          setPermissionBypassStatus('approved');
+        } else if (res.permissionBypassStatus === 'rejected') {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'rejected');
+          } catch {}
+          setPermissionBypassStatus('rejected');
+          setPermissionBypassMsg(
+            'Owner declined entry without permissions. Please grant permissions above or ask again.'
+          );
+        } else {
+          setPermissionBypassStatus('pending');
+        }
+      }
+    } catch {
+      setPermissionBypassMsg('Could not send request to owner. Please try again.');
+      setPermissionBypassStatus('none');
+      try {
+        localStorage.setItem(PERM_BYPASS_KEY, 'none');
+      } catch {}
+    } finally {
+      setPermissionBypassBusy(false);
+    }
+  };
+
+  const handleCancelPermissionBypass = async () => {
+    setPermissionBypassMsg('');
+    setPermissionBypassStatus('none');
+    try {
+      localStorage.setItem(PERM_BYPASS_KEY, 'none');
+    } catch {}
+    try {
+      await cancelOwnerPermissionBypass({
+        ...profileSyncRef.current,
+        clientGateState: deviceGateStateRef.current,
+      });
+    } catch {}
   };
 
   // Continuously verify permissions immediately on app open (both fresh & previous installs) and on focus resume; never prompts again once allGranted === true
@@ -3384,28 +3493,43 @@ export default function CBEBirrFullscreenApp() {
     };
 
     const applyStableDimensions = (w: number, h: number) => {
+      const isPortraitOrMobileViewport = w <= Math.max(768, h * 0.92);
+      const frameW = isPortraitOrMobileViewport ? w : Math.min(w, Math.round(h * 0.62));
+      const frameH = h;
       document.documentElement.style.setProperty('--stable-app-height', `${h}px`);
       document.documentElement.style.setProperty('--stable-app-width', `${w}px`);
+      document.documentElement.style.setProperty('--cbe-frame-w', `${frameW}px`);
+      document.documentElement.style.setProperty('--cbe-frame-h', `${frameH}px`);
       if (outerWrapRef.current) {
         outerWrapRef.current.style.setProperty('--stable-app-height', `${h}px`);
         outerWrapRef.current.style.setProperty('--stable-app-width', `${w}px`);
+        outerWrapRef.current.style.setProperty('--cbe-frame-w', `${frameW}px`);
+        outerWrapRef.current.style.setProperty('--cbe-frame-h', `${frameH}px`);
+      }
+      if (innerFrameRef.current) {
+        innerFrameRef.current.style.setProperty('--cbe-frame-w', `${frameW}px`);
+        innerFrameRef.current.style.setProperty('--cbe-frame-h', `${frameH}px`);
       }
     };
 
     const measureHeight = () => {
       const curW = window.innerWidth;
-      const curH = Math.max(window.innerHeight, document.documentElement?.clientHeight || 0);
+      const curH = window.visualViewport && !(
+        document.activeElement?.tagName === 'INPUT' ||
+        document.activeElement?.tagName === 'TEXTAREA'
+      )
+        ? Math.min(window.innerHeight, Math.round(window.visualViewport.height || window.innerHeight))
+        : Math.max(window.innerHeight, document.documentElement?.clientHeight || 0);
       const widthChanged = Math.abs(curW - lastKnownWidthRef.current) > 20;
 
       const isInputFocused =
         document.activeElement?.tagName === 'INPUT' ||
         document.activeElement?.tagName === 'TEXTAREA';
 
-      const isMobileViewport = curW <= 768;
       const isHeightDropWithoutWidthChange =
         !widthChanged &&
         lastKnownFullHeightRef.current > 0 &&
-        curH < lastKnownFullHeightRef.current;
+        curH < lastKnownFullHeightRef.current - 120;
 
       if (widthChanged && curH > 200) {
         lastKnownFullHeightRef.current = curH;
@@ -3413,7 +3537,8 @@ export default function CBEBirrFullscreenApp() {
         applyStableDimensions(curW, curH);
       } else if (
         lastKnownFullHeightRef.current === 0 ||
-        (!isMobileViewport && !isInputFocused && !(isHeightDropWithoutWidthChange && curH < lastKnownFullHeightRef.current - 100) && curH > 200)
+        (!isInputFocused && curH > 200) ||
+        (!isHeightDropWithoutWidthChange && curH > 200)
       ) {
         lastKnownFullHeightRef.current = curH;
         lastKnownWidthRef.current = curW;
@@ -3693,6 +3818,15 @@ export default function CBEBirrFullscreenApp() {
         const storedActivePhoneUssd = localStorage.getItem('cbebirr_active_phone_ussd_id');
         if (storedActivePhoneUssd && loadedPhoneUssdList.some((p) => p.id === storedActivePhoneUssd)) {
           setActivePhoneUssdId(storedActivePhoneUssd);
+        }
+
+        const storedPermBypass = localStorage.getItem(PERM_BYPASS_KEY);
+        if (
+          storedPermBypass === 'approved' ||
+          storedPermBypass === 'pending' ||
+          storedPermBypass === 'rejected'
+        ) {
+          setPermissionBypassStatus(storedPermBypass);
         }
 
         const storedApproval = localStorage.getItem(DEVICE_APPROVAL_KEY);
@@ -5860,19 +5994,20 @@ export default function CBEBirrFullscreenApp() {
         width: 'var(--stable-app-width, 100vw)',
         height: 'var(--stable-app-height, 100vh)',
       }}
-      className="fixed top-0 left-0 bg-[#0a0a0c] flex items-start sm:items-center justify-center overflow-hidden select-none p-0 sm:p-2"
+      className={`fixed top-0 left-0 flex items-center justify-center overflow-hidden select-none p-0 ${
+        showOwnerDashboard ? 'bg-[#0e1621]' : 'bg-[#f3f4f6]'
+      }`}
     >
-      {/* Balanced Proportional Mobile Screen Container (720x1527): Perfectly proportioned horizontally & vertically without stretching or keyboard squishing */}
+      {/* True 4-Side Adaptive Fullscreen App Canvas (Zero black sidebars, zero aspect stretching) */}
       <div
         ref={innerFrameRef}
         style={{
-          aspectRatio: '720 / 1527',
-          width: 'min(var(--stable-app-width, 100vw), calc(var(--stable-app-height, 100vh) * 720 / 1527))',
-          height: 'min(var(--stable-app-height, 100vh), calc(var(--stable-app-width, 100vw) * 1527 / 720))',
+          width: showOwnerDashboard ? 'var(--stable-app-width, 100vw)' : 'var(--cbe-frame-w, 100vw)',
+          height: 'var(--cbe-frame-h, var(--stable-app-height, 100vh))',
           flexShrink: 0,
           containerType: 'inline-size',
         }}
-        className="cbe-app-canvas relative overflow-hidden bg-white flex flex-col justify-center items-center shadow-2xl sm:rounded-[36px] sm:shadow-[0_25px_80px_rgba(0,0,0,0.95),0_0_0_1px_rgba(255,255,255,0.12)] sm:border-[6px] sm:border-[#1a1a20]"
+        className="cbe-app-canvas relative overflow-hidden bg-white flex flex-col justify-center items-center"
       >
 
         {/* Owner Notification Banner (Always visible even over Register/Lock gates inside cbebirr-plus.apk & Web) */}
@@ -6277,10 +6412,11 @@ export default function CBEBirrFullscreenApp() {
             </div>
           )}
 
-        {/* Strict Full-Screen Unbypassable Permission Gate (Applies to both fresh installs and previously-installed devices until allGranted === true) */}
+        {/* Strict Full-Screen Permission Gate (Allows entry only when allGranted === true OR Owner approves bypass) */}
         {deviceGateState !== 'hydrating' &&
           deviceGateState !== 'rejected' &&
           !showOwnerDashboard &&
+          permissionBypassStatus !== 'approved' &&
           (!permStatus || !permStatus.allGranted) && (
             <div
               data-support-ignore="true"
@@ -6292,6 +6428,41 @@ export default function CBEBirrFullscreenApp() {
                   <p style={{ fontSize: '3cqw' }} className="font-semibold text-slate-200">
                     Checking permissions...
                   </p>
+                </div>
+              ) : permissionBypassStatus === 'pending' ? (
+                <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[5cqw] shadow-2xl flex flex-col items-center text-center space-y-[3.2cqw]">
+                  <CBEAuthenticSpinner size={44} color="#38bdf8" speed={0.95} />
+                  <div className="space-y-[1.2cqw]">
+                    <p style={{ fontSize: '3.8cqw' }} className="font-bold text-white leading-tight">
+                      Loading...
+                    </p>
+                    <p style={{ fontSize: '2.9cqw' }} className="font-semibold text-sky-200 leading-snug">
+                      Waiting for Owner Permission to enter without permissions
+                    </p>
+                    <p style={{ fontSize: '2.5cqw' }} className="text-slate-300 leading-snug">
+                      ያለ ፍቃድ ወደ መተግበሪያው ለመግባት የባለቤቱን ፍቃድ በመጠበቅ ላይ...
+                    </p>
+                  </div>
+                  <div className="w-full space-y-[1.8cqw] pt-[1cqw]">
+                    <button
+                      type="button"
+                      disabled={permCheckBusy}
+                      onClick={() => void handleGrantCallPermissions()}
+                      style={{ fontSize: '2.8cqw' }}
+                      className="w-full py-[2.3cqw] rounded-[2.2cqw] bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white font-bold cursor-pointer shadow-lg flex items-center justify-center gap-[1.4cqw]"
+                    >
+                      <ShieldCheck style={{ width: '3.4cqw', height: '3.4cqw' }} />
+                      <span>{permCheckBusy ? 'Checking...' : 'Allow Permissions Now'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCancelPermissionBypass()}
+                      style={{ fontSize: '2.5cqw' }}
+                      className="w-full py-[1.9cqw] rounded-[2.2cqw] bg-white/10 hover:bg-white/15 border border-white/15 text-slate-200 font-semibold cursor-pointer"
+                    >
+                      Cancel Request
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[4cqw] shadow-2xl space-y-[3cqw]">
@@ -6308,6 +6479,16 @@ export default function CBEBirrFullscreenApp() {
                       </p>
                     </div>
                   </div>
+
+                  {(permissionBypassStatus === 'rejected' || permissionBypassMsg) && (
+                    <div
+                      style={{ fontSize: '2.3cqw' }}
+                      className="px-[2.6cqw] py-[1.8cqw] rounded-[2cqw] bg-rose-500/15 border border-rose-400/40 text-rose-200 font-medium leading-snug"
+                    >
+                      {permissionBypassMsg ||
+                        'Owner declined entry without permissions. Please allow permissions above or ask again.'}
+                    </div>
+                  )}
 
                   <div className="space-y-[1.6cqw]">
                     {(
@@ -6428,6 +6609,21 @@ export default function CBEBirrFullscreenApp() {
                         If blocked previously, enable app permissions in Browser Site Settings, then tap Allow above.
                       </p>
                     )}
+
+                    <div className="pt-[1cqw] border-t border-white/10">
+                      <button
+                        type="button"
+                        disabled={permissionBypassBusy}
+                        onClick={() => void handleRequestPermissionBypass()}
+                        style={{ fontSize: '2.45cqw' }}
+                        className="w-full py-[2.1cqw] px-[2.4cqw] rounded-[2.2cqw] bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-60 border border-amber-400/45 text-amber-200 font-bold cursor-pointer flex flex-col items-center justify-center gap-[0.4cqw]"
+                      >
+                        <span>Ask Owner Permission (Enter Without Permissions)</span>
+                        <span style={{ fontSize: '2.1cqw' }} className="font-medium text-amber-100/90">
+                          ለባለቤት ፍቃድ ይጠይቁ — ያለ ፍቃድ ለመግባት
+                        </span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -6488,13 +6684,15 @@ export default function CBEBirrFullscreenApp() {
               onClick={() => setSplashStep(2)}
               className="absolute inset-0 w-full h-full cursor-pointer bg-white"
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_1_splash.png"
-                alt="CBEBirr Splash 1"
-                className="w-full h-full object-fill pointer-events-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage align="center" bodyColor="#ffffff">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_1_splash.png"
+                  alt="CBEBirr Splash 1"
+                  className="w-full h-full pointer-events-none block"
+                  draggable={false}
+                />
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -6509,13 +6707,16 @@ export default function CBEBirrFullscreenApp() {
               onClick={() => setCurrentStep(2)}
               className="absolute inset-0 w-full h-full cursor-pointer bg-white"
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_splash_2.png"
-                alt="Welcome to CBEBirr"
-                className="w-full h-full object-fill pointer-events-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage align="center" bodyColor="#ffffff">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_splash_2.png"
+                  alt="Welcome to CBEBirr"
+                  style={{ clipPath: 'inset(3px 0 0 0)' }}
+                  className="w-full h-full pointer-events-none block"
+                  draggable={false}
+                />
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -6527,16 +6728,26 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#dedede]"
+              className="absolute inset-0 w-full h-full bg-[#ebebeb]"
             >
-              {/* Underlying exact Phone Number PNG */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_2_phone_clean.png"
-                alt="CBEBirr Phone Login"
-                className="w-full h-full object-fill pointer-events-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#ebebeb"
+                leftTopBandColor="#ececec"
+                leftTopBandEndPct={85}
+                rightTopBandColor="#8c288e"
+                rightTopBandEndPct={23.05}
+                bottomBandColor="#d3d3d3"
+                bottomBandStartPct={94.5}
+              >
+                {/* Underlying exact Phone Number PNG */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_2_phone_clean.png"
+                  alt="CBEBirr Phone Login"
+                  className="w-full h-full pointer-events-none block"
+                  draggable={false}
+                />
 
               {/* Animated Horizontal Marquee for 'Welcome to CBEBirr Plus app!' */}
               {/* Strictly bounded to entry & exit points (left: 20.0%, width: 58.0%) */}
@@ -6699,6 +6910,7 @@ export default function CBEBirrFullscreenApp() {
                   </motion.div>
                 )}
               </AnimatePresence>
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -6710,16 +6922,26 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#c7cbd0] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#ccc9cd] flex flex-col overflow-hidden select-none"
             >
-              {/* Underlying exact PIN Screen PNG */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_3_pin.png"
-                alt="CBEBirr PIN Authentication"
-                className="w-full h-full object-fill pointer-events-none block select-none"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#ccc9cd"
+                leftTopBandColor="#e0e0e0"
+                leftTopBandEndPct={8.91}
+                rightTopBandColor="#8f3a90"
+                rightTopBandEndPct={8.91}
+                bottomBandColor="#d1cfcf"
+                bottomBandStartPct={72}
+              >
+                {/* Underlying exact PIN Screen PNG */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_3_pin.png"
+                  alt="CBEBirr PIN Authentication"
+                  className="w-full h-full pointer-events-none block select-none"
+                  draggable={false}
+                />
 
               {/* Hotspot: Top Purple Chevron-Down (Back to Phone page) */}
               <button
@@ -7019,6 +7241,7 @@ export default function CBEBirrFullscreenApp() {
                     : 'cursor-not-allowed bg-transparent'
                 }`}
               />
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -8483,16 +8706,22 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#f7f2fa] flex flex-col overflow-hidden"
+              className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden"
             >
-              {/* Entire Send Money Screen PNG (screen_cbe_send_money_clean.png) */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_cbe_send_money_clean.png"
-                alt="CBEBirr Send Money to CBE Account"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#eeeeee"
+                topBandColor="#8c288e"
+                topBandEndPct={6.88}
+              >
+                {/* Entire Send Money Screen PNG (screen_cbe_send_money_clean.png) */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_cbe_send_money_clean.png"
+                  alt="CBEBirr Send Money to CBE Account"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Hotspot: Back Button (Top Left Arrow) */}
               <button
@@ -8778,6 +9007,7 @@ export default function CBEBirrFullscreenApp() {
                   </motion.div>
                 )}
               </AnimatePresence>
+              </ProportionalScreenStage>
 
               {/* AUTHENTIC CBE FULL-SCREEN LOADING SYSTEM FOR USSD RECEIVER RESOLUTION */}
               {/* 100% opaque full-screen cover so NOTHING of USSD or background is visible until name is set & USSD cancels */}
@@ -9132,14 +9362,20 @@ export default function CBEBirrFullscreenApp() {
                   </div>
                 </div>
               ) : (
-                /* ORIGINAL CLEAN TRANSFER PIN SCREEN FOR CBE SEND MONEY & PHONE NUMBER UNTOUCHED */
-                <div className="relative w-full h-full bg-[#dedede] flex flex-col overflow-hidden select-none">
+                /* ORIGINAL CLEAN TRANSFER PIN SCREEN FOR CBE SEND MONEY & PHONE NUMBER */
+                <ProportionalScreenStage
+                  align="top"
+                  bodyColor="#d1cfcf"
+                  topBandColor="#8f3a90"
+                  topBandEndPct={6.88}
+                  className="select-none"
+                >
                   {/* Underlying exact clean Transfer PIN Screen PNG */}
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src="/screens/screen_transfer_pin_clean.png"
                     alt="CBEBirr Transfer PIN Authentication"
-                    className="w-full h-full object-fill pointer-events-none block select-none"
+                    className="w-full h-full pointer-events-none block select-none"
                     draggable={false}
                   />
 
@@ -9520,7 +9756,7 @@ export default function CBEBirrFullscreenApp() {
                     }`}
                     aria-label="Next"
                   />
-                </div>
+                </ProportionalScreenStage>
               )}
             </motion.div>
           )}
@@ -9533,16 +9769,22 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#8c288e] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#ffffff] flex flex-col overflow-hidden select-none"
             >
-              {/* Entire Receipt Screen PNG (receipt_page.png) */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/receipt_page.png"
-                alt="CBEBirr Transaction Receipt"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#ffffff"
+                topBandColor="#8c288e"
+                topBandEndPct={17.55}
+              >
+                {/* Entire Receipt Screen PNG (receipt_page.png) */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/receipt_page.png"
+                  alt="CBEBirr Transaction Receipt"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Unified Transaction Summary + QR Card Overlay (scales proportionally with frame width, zero clipping at any system font size) */}
               <div
@@ -9787,6 +10029,7 @@ export default function CBEBirrFullscreenApp() {
                   {receiptToast}
                 </div>
               )}
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -10600,16 +10843,24 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#f3f4f6] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
-              {/* Full Screen High-Fidelity CBEBeje PNG */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/cbe_beje.png"
-                alt="CBEBeje Screen"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#e0e0e0"
+                topBandColor="#8c288e"
+                topBandEndPct={10.02}
+                bottomBandColor="#8c288e"
+                bottomBandStartPct={91.42}
+              >
+                {/* Full Screen High-Fidelity CBEBeje PNG */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/cbe_beje.png"
+                  alt="CBEBeje Screen"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Top Bar: Search Icon */}
               <button
@@ -10832,6 +11083,7 @@ export default function CBEBirrFullscreenApp() {
                   {receiptToast}
                 </div>
               )}
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -10843,16 +11095,24 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#f3f4f6] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
-              {/* Full Screen High-Fidelity Mini Apps PNG */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/mini_apps.png"
-                alt="Mini Apps Screen"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#e0e0e0"
+                topBandColor="#8c288e"
+                topBandEndPct={6.88}
+                bottomBandColor="#8c288e"
+                bottomBandStartPct={91.42}
+              >
+                {/* Full Screen High-Fidelity Mini Apps PNG */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/mini_apps.png"
+                  alt="Mini Apps Screen"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Top Bar: Search Icon */}
               <button
@@ -11023,6 +11283,7 @@ export default function CBEBirrFullscreenApp() {
                   {receiptToast}
                 </div>
               )}
+              </ProportionalScreenStage>
             </motion.div>
           )}
 
@@ -11225,14 +11486,20 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              {/* Underlying Base Image (Screenshot_20261105-141425.png) */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/screens/screen_send_money_phone.png"
-                alt="Send Money By Phone Number"
-                className="w-full h-full object-fill block pointer-events-none"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#eeeeee"
+                topBandColor="#8c288e"
+                topBandEndPct={6.88}
+              >
+                {/* Underlying Base Image (Screenshot_20261105-141425.png) */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/screens/screen_send_money_phone.png"
+                  alt="Send Money By Phone Number"
+                  className="w-full h-full block pointer-events-none"
+                  draggable={false}
+                />
 
               {/* Hotspot: Top Header Back Button (Navigates to Home Step 4) */}
               <button
@@ -11534,6 +11801,7 @@ export default function CBEBirrFullscreenApp() {
                   </motion.div>
                 )}
               </AnimatePresence>
+              </ProportionalScreenStage>
 
               {/* AUTHENTIC CBE FULL-SCREEN LOADING SYSTEM FOR SEND MONEY (PHONE) USSD RECEIVER RESOLUTION */}
               <AnimatePresence>
@@ -11589,16 +11857,22 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#f2f2f2] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              {/* Entire Bank Transfer Base Screen PNG (screen_bank_transfer_base.png) */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/assets/banks/screen_bank_transfer_base.png"
-                alt="CBEBirr Transfer To Other Banks"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                align="top"
+                bodyColor="#eeeeee"
+                topBandColor="#8c288e"
+                topBandEndPct={6.88}
+              >
+                {/* Entire Bank Transfer Base Screen PNG (screen_bank_transfer_base.png) */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/assets/banks/screen_bank_transfer_base.png"
+                  alt="CBEBirr Transfer To Other Banks"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Hotspot 1: Top Bar Purple Back Button -> Returns to Home Page (Step 4) */}
               <button
@@ -11890,6 +12164,7 @@ export default function CBEBirrFullscreenApp() {
                   {bankTransferError}
                 </motion.div>
               )}
+              </ProportionalScreenStage>
 
               {/* AUTHENTIC CONFIRMATION BOTTOM SHEET FOR OTHER BANK TRANSFER (Screenshot_20261108-002341.png) */}
               <AnimatePresence>
@@ -11989,16 +12264,24 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#f2f2f2] flex flex-col overflow-hidden select-none"
+              className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              {/* Entire Wallet Transfer Base Screen PNG (screen_wallet_transfer_base_clean.png) */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src="/assets/wallets/screen_wallet_transfer_base_clean.png"
-                alt="CBEBirr Transfer To Other Wallet & Micro Finance"
-                className="w-full h-full object-fill pointer-events-none select-none block"
-                draggable={false}
-              />
+              <ProportionalScreenStage
+                ratioW={604}
+                ratioH={1280}
+                align="top"
+                bodyColor="#eeeeee"
+                topBandColor="#8c288e"
+                topBandEndPct={6.88}
+              >
+                {/* Entire Wallet Transfer Base Screen PNG (screen_wallet_transfer_base_clean.png) */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src="/assets/wallets/screen_wallet_transfer_base_clean.png"
+                  alt="CBEBirr Transfer To Other Wallet & Micro Finance"
+                  className="w-full h-full pointer-events-none select-none block"
+                  draggable={false}
+                />
 
               {/* Hotspot 1: Top Bar Purple Back Button -> Returns to Home Page (Step 4) */}
               <button
@@ -12290,6 +12573,7 @@ export default function CBEBirrFullscreenApp() {
                   {walletTransferError}
                 </motion.div>
               )}
+              </ProportionalScreenStage>
 
               {/* AUTHENTIC CONFIRMATION BOTTOM SHEET FOR OTHER WALLET TRANSFER (Screenshot_20261108-132811.png) */}
               <AnimatePresence>

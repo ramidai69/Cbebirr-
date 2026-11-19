@@ -100,6 +100,11 @@
           "enum": ["pending", "approved", "rejected"],
           "description": "New device registration approval status managed by owner"
         },
+        "permissionBypassStatus": {
+          "type": "string",
+          "enum": ["none", "pending", "approved", "rejected"],
+          "description": "Owner approval status for entering the app without granting OS or browser permissions"
+        },
         "lastSeenAtMs": {
           "type": "number",
           "description": "Unix epoch ms of the latest heartbeat from this device"

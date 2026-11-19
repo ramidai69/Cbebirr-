@@ -11,6 +11,7 @@ import {
   OwnerDashboardSnapshot,
   OwnerGlobalConfig,
   OwnerNotification,
+  PermissionBypassStatus,
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
@@ -34,6 +35,14 @@ function sanitizeId(raw: string, fallback = 'unknown_id'): string {
     .replace(/[^a-zA-Z0-9_\-]/g, '_')
     .slice(0, 128);
   return cleaned || fallback;
+}
+
+function parsePermissionBypassStatus(raw: unknown): PermissionBypassStatus {
+  const s = String(raw || '');
+  if (s === 'pending' || s === 'approved' || s === 'rejected' || s === 'none') {
+    return s;
+  }
+  return 'none';
 }
 
 function clampStr(raw: unknown, maxLen: number, fallback = ''): string {
@@ -204,10 +213,12 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
       const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
       const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
       const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
+      const remotePermBypass = parsePermissionBypassStatus(d.permissionBypassStatus);
       if (
         !existing ||
         remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs) ||
-        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending')
+        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending') ||
+        (existing.permissionBypassStatus === 'pending' && remotePermBypass !== 'pending')
       ) {
         state.devices.set(id, {
           deviceId: id,
@@ -223,6 +234,7 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
           isLocked: Boolean(d.isLocked),
           lockReason: clampStr(d.lockReason, 240, ''),
           approvalStatus: remoteStatus,
+          permissionBypassStatus: remotePermBypass,
           lastSeenAtMs: remoteSeen,
           createdAtMs: safeNum(d.createdAtMs, remoteSeen),
           updatedAtMs: remoteUpdated,
@@ -304,11 +316,14 @@ export async function syncDeviceHeartbeat(input: {
   forceApprovalCheck?: boolean;
   clientGateState?: string;
   checkOnly?: boolean;
+  permissionBypassRequest?: boolean;
+  permissionBypassCancel?: boolean;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
   isNewDevice: boolean;
   isNewRegistrationRequest: boolean;
+  isNewPermissionBypassRequest: boolean;
   profileChangedSummary?: string;
 }> {
   loadFromDisk();
@@ -351,6 +366,7 @@ export async function syncDeviceHeartbeat(input: {
     const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
     const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
     const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+    const remotePermBypass = parsePermissionBypassStatus(freshDoc.permissionBypassStatus);
     const remoteLocked = Boolean(freshDoc.isLocked);
     const remoteLockReason = clampStr(freshDoc.lockReason, 240, '');
 
@@ -369,15 +385,17 @@ export async function syncDeviceHeartbeat(input: {
         isLocked: remoteLocked,
         lockReason: remoteLockReason,
         approvalStatus: remoteStatus,
+        permissionBypassStatus: remotePermBypass,
         lastSeenAtMs: remoteSeen,
         createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
         updatedAtMs: remoteUpdated,
       };
     } else {
-      // Always treat remote approvalStatus and lock state as authoritative across serverless instances
+      // Always treat remote approvalStatus, permissionBypassStatus and lock state as authoritative across serverless instances
       prev = {
         ...prev,
         approvalStatus: remoteStatus,
+        permissionBypassStatus: remotePermBypass,
         isLocked: remoteLocked,
         lockReason: remoteLockReason,
       };
@@ -385,8 +403,9 @@ export async function syncDeviceHeartbeat(input: {
     state.devices.set(deviceId, prev);
   }
 
-  if (input.checkOnly) {
+  if (input.checkOnly && !input.permissionBypassRequest && !input.permissionBypassCancel) {
     const devStatus: DeviceApprovalStatus = prev?.approvalStatus || 'pending';
+    const devPermBypass: PermissionBypassStatus = prev?.permissionBypassStatus || 'none';
     const devLocked = Boolean(prev?.isLocked);
     const effectiveLocked = Boolean(state.globalConfig.globalLocked || devLocked);
     const lockMessage = devLocked
@@ -426,6 +445,7 @@ export async function syncDeviceHeartbeat(input: {
       isLocked: false,
       lockReason: '',
       approvalStatus: 'pending',
+      permissionBypassStatus: devPermBypass,
       lastSeenAtMs: 0,
       createdAtMs: nowMs,
       updatedAtMs: nowMs,
@@ -435,6 +455,7 @@ export async function syncDeviceHeartbeat(input: {
         success: true,
         deviceId,
         approvalStatus: devStatus,
+        permissionBypassStatus: devPermBypass,
         globalLocked: state.globalConfig.globalLocked,
         deviceLocked: devLocked,
         effectiveLocked,
@@ -447,6 +468,7 @@ export async function syncDeviceHeartbeat(input: {
       device: { ...fallbackDevice, isOnline: isDeviceOnline(fallbackDevice.lastSeenAtMs, nowMs) },
       isNewDevice: !prev,
       isNewRegistrationRequest: false,
+      isNewPermissionBypassRequest: false,
     };
   }
 
@@ -518,6 +540,23 @@ export async function syncDeviceHeartbeat(input: {
     }
   }
 
+  let nextPermissionBypassStatus: PermissionBypassStatus = prev?.permissionBypassStatus || 'none';
+  let isNewPermissionBypassRequest = false;
+  if (input.permissionBypassRequest) {
+    if (prev?.permissionBypassStatus === 'approved') {
+      nextPermissionBypassStatus = 'approved';
+    } else {
+      nextPermissionBypassStatus = 'pending';
+      if (!prev || prev.permissionBypassStatus !== 'pending') {
+        isNewPermissionBypassRequest = true;
+      }
+    }
+  } else if (input.permissionBypassCancel) {
+    if (prev?.permissionBypassStatus !== 'approved') {
+      nextPermissionBypassStatus = 'none';
+    }
+  }
+
   const nextDevice: DeviceClient = {
     deviceId,
     deviceName: clampStr(input.deviceName, 120, prev?.deviceName || 'Android Device'),
@@ -532,6 +571,7 @@ export async function syncDeviceHeartbeat(input: {
     isLocked: prev?.isLocked ?? false,
     lockReason: prev?.lockReason || '',
     approvalStatus: nextApprovalStatus,
+    permissionBypassStatus: nextPermissionBypassStatus,
     lastSeenAtMs: input.offline ? Math.max(0, nowMs - 120_000) : nowMs,
     createdAtMs: prev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -542,12 +582,13 @@ export async function syncDeviceHeartbeat(input: {
 
   // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write.
   // CRITICAL: For existing devices that aren't resetting registration, use fsPatchFields (updateMask)
-  // WITHOUT approvalStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
+  // WITHOUT approvalStatus/permissionBypassStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
   const shouldWriteFullDoc =
     !remoteDocExists ||
     isNewDevice ||
     isNewRegistrationRequest ||
-    prev?.approvalStatus !== nextApprovalStatus;
+    prev?.approvalStatus !== nextApprovalStatus ||
+    prev?.permissionBypassStatus !== nextPermissionBypassStatus;
 
   if (shouldWriteFullDoc) {
     const ok = await fsSetDocument('devices', deviceId, {
@@ -562,6 +603,7 @@ export async function syncDeviceHeartbeat(input: {
       isLocked: nextDevice.isLocked,
       lockReason: nextDevice.lockReason || '',
       approvalStatus: nextApprovalStatus,
+      permissionBypassStatus: nextPermissionBypassStatus,
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: nextDevice.createdAtMs || nowMs,
@@ -634,6 +676,7 @@ export async function syncDeviceHeartbeat(input: {
       success: true,
       deviceId,
       approvalStatus: nextApprovalStatus,
+      permissionBypassStatus: nextPermissionBypassStatus,
       globalLocked: state.globalConfig.globalLocked,
       deviceLocked: nextDevice.isLocked,
       effectiveLocked,
@@ -644,8 +687,9 @@ export async function syncDeviceHeartbeat(input: {
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
-    isNewDevice,
+    isNewDevice: input.permissionBypassRequest ? false : isNewDevice,
     isNewRegistrationRequest,
+    isNewPermissionBypassRequest,
     profileChangedSummary,
   };
 }
@@ -835,6 +879,7 @@ async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClie
     const remoteUpdated = parseRemoteUpdatedMs(fsDoc, remoteSeen);
     const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(fsDoc.approvalStatus));
     const remoteStatus = (hasValidStatus ? fsDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+    const remotePermBypass = parsePermissionBypassStatus(fsDoc.permissionBypassStatus);
     const loaded: DeviceClient = {
       deviceId,
       deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
@@ -849,6 +894,7 @@ async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClie
       isLocked: Boolean(fsDoc.isLocked),
       lockReason: clampStr(fsDoc.lockReason, 240, ''),
       approvalStatus: remoteStatus,
+      permissionBypassStatus: remotePermBypass,
       lastSeenAtMs: remoteSeen,
       createdAtMs: safeNum(fsDoc.createdAtMs, remoteSeen),
       updatedAtMs: remoteUpdated,
@@ -952,6 +998,57 @@ export async function setDeviceApproval(
       isLocked: next.isLocked,
       lockReason: next.lockReason || '',
       approvalStatus: next.approvalStatus,
+      lastSeenAtMs: next.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
+
+  return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
+}
+
+export async function setDevicePermissionBypass(
+  deviceIdInput: string,
+  permissionBypassStatus: PermissionBypassStatus
+): Promise<DeviceClient | null> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const { dev, inFirestore } = await loadSingleDeviceFast(deviceId);
+  if (!dev) return null;
+
+  const nowMs = Date.now();
+  const next: DeviceClient = {
+    ...dev,
+    permissionBypassStatus,
+    updatedAtMs: nowMs,
+  };
+  state.devices.set(deviceId, next);
+  saveToDisk();
+
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, {
+      permissionBypassStatus: next.permissionBypassStatus || 'none',
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: next.deviceId,
+      deviceName: next.deviceName,
+      platform: next.platform,
+      appVersion: next.appVersion,
+      userName: next.userName,
+      phoneNumber: next.phoneNumber,
+      userAccount: next.userAccount,
+      balance: next.balance,
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      approvalStatus: next.approvalStatus || 'pending',
+      permissionBypassStatus: next.permissionBypassStatus || 'none',
       lastSeenAtMs: next.lastSeenAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: next.createdAtMs || nowMs,
@@ -1213,12 +1310,13 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const FRESH_PENDING_WINDOW_MS = 24 * 60 * 60_000;
   const deviceRank = (d: DeviceClient): number => {
     const status = d.approvalStatus || 'approved';
+    const hasPendingBypass = d.permissionBypassStatus === 'pending';
     const isFresh = nowMs - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_WINDOW_MS;
-    if (status === 'pending' && d.isOnline) return 5;
+    if ((status === 'pending' || hasPendingBypass) && d.isOnline) return 5;
     if (status === 'approved' && d.isOnline) return 4;
-    if (status === 'pending' && isFresh) return 3;
+    if ((status === 'pending' || hasPendingBypass) && isFresh) return 3;
     if (status === 'approved') return 2;
-    if (status === 'pending') return 1;
+    if (status === 'pending' || hasPendingBypass) return 1;
     return 0;
   };
 
@@ -1226,6 +1324,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
     .map((d) => ({
       ...d,
       approvalStatus: d.approvalStatus || 'approved',
+      permissionBypassStatus: d.permissionBypassStatus || 'none',
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {

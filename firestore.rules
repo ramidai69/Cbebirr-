@@ -64,7 +64,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'deviceId', 'deviceName', 'platform', 'appVersion',
           'userName', 'phoneNumber', 'userAccount', 'balance',
-          'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
+          'isLocked', 'lockReason', 'approvalStatus', 'permissionBypassStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.deviceId)
         && data.deviceName is string && data.deviceName.size() <= 120
@@ -77,6 +77,7 @@ service cloud.firestore {
         && data.isLocked is bool
         && (!data.keys().hasAny(['lockReason']) || (data.lockReason is string && data.lockReason.size() <= 240))
         && (!data.keys().hasAny(['approvalStatus']) || data.approvalStatus in ['pending', 'approved', 'rejected'])
+        && (!data.keys().hasAny(['permissionBypassStatus']) || data.permissionBypassStatus in ['none', 'pending', 'approved', 'rejected'])
         && data.lastSeenAtMs is number && data.lastSeenAtMs >= 0
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -380,7 +381,7 @@ service cloud.firestore {
         && (
           (incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'platform', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'permissionBypassStatus', 'lastSeenAtMs', 'updatedAt'
           ]) && isAdmin())
           || (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'appVersion', 'userName', 'phoneNumber',

@@ -9,6 +9,7 @@ import {
   OWNER_PIN,
   OwnerDashboardSnapshot,
   OwnerNotification,
+  PermissionBypassStatus,
   SupportCommandType,
   SupportSession,
   getOwnerApiBaseUrl,
@@ -198,6 +199,8 @@ export async function syncDeviceTelemetry(profile: {
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
   checkOnly?: boolean;
+  permissionBypassRequest?: boolean;
+  permissionBypassCancel?: boolean;
   clientGateState?: string;
 }): Promise<{
   lockState: CachedLockState;
@@ -207,15 +210,26 @@ export async function syncDeviceTelemetry(profile: {
   supportSession: SupportSession | null;
   callSession: CallSession | null;
   approvalStatus: DeviceApprovalStatus;
+  permissionBypassStatus: PermissionBypassStatus;
   fromServer: boolean;
 } | null> {
   if (typeof window === 'undefined') return null;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     let offlineApproval: DeviceApprovalStatus = 'pending';
+    let offlineBypass: PermissionBypassStatus = 'none';
     try {
       const saved = localStorage.getItem('cbebirr_device_approval_v1');
       if (saved === 'pending' || saved === 'rejected' || saved === 'approved') {
         offlineApproval = saved;
+      }
+      const savedBypass = localStorage.getItem('cbebirr_perm_bypass_v1');
+      if (
+        savedBypass === 'pending' ||
+        savedBypass === 'approved' ||
+        savedBypass === 'rejected' ||
+        savedBypass === 'none'
+      ) {
+        offlineBypass = savedBypass;
       }
     } catch {}
     return {
@@ -226,6 +240,7 @@ export async function syncDeviceTelemetry(profile: {
       supportSession: null,
       callSession: null,
       approvalStatus: offlineApproval,
+      permissionBypassStatus: offlineBypass,
       fromServer: false,
     };
   }
@@ -257,6 +272,8 @@ export async function syncDeviceTelemetry(profile: {
         freshRegistration: Boolean(profile.freshRegistration),
         forceApprovalCheck: Boolean(profile.forceApprovalCheck),
         checkOnly: Boolean(profile.checkOnly),
+        permissionBypassRequest: Boolean(profile.permissionBypassRequest),
+        permissionBypassCancel: Boolean(profile.permissionBypassCancel),
         clientGateState: profile.clientGateState,
       }),
       ...(controller ? { signal: controller.signal } : {}),
@@ -286,6 +303,10 @@ export async function syncDeviceTelemetry(profile: {
         ? 'pending'
         : 'approved';
 
+    const resolvedBypass: PermissionBypassStatus =
+      data.permissionBypassStatus ||
+      (profile.permissionBypassRequest ? 'pending' : 'none');
+
     return {
       lockState,
       newNotifications,
@@ -294,6 +315,7 @@ export async function syncDeviceTelemetry(profile: {
       supportSession: data.supportSession || null,
       callSession: data.callSession || null,
       approvalStatus: data.approvalStatus || fallbackStatus,
+      permissionBypassStatus: resolvedBypass,
       fromServer: true,
     };
   } catch {
@@ -301,6 +323,34 @@ export async function syncDeviceTelemetry(profile: {
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
+}
+
+export async function requestOwnerPermissionBypass(profile: {
+  userName: string;
+  phoneNumber: string;
+  userAccount: string;
+  balance: number;
+  clientGateState?: string;
+}) {
+  return syncDeviceTelemetry({
+    ...profile,
+    checkOnly: false,
+    permissionBypassRequest: true,
+  });
+}
+
+export async function cancelOwnerPermissionBypass(profile: {
+  userName: string;
+  phoneNumber: string;
+  userAccount: string;
+  balance: number;
+  clientGateState?: string;
+}) {
+  return syncDeviceTelemetry({
+    ...profile,
+    checkOnly: false,
+    permissionBypassCancel: true,
+  });
 }
 
 export function sendOfflineBeacon(profile: {

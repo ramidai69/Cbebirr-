@@ -3,6 +3,7 @@ import { syncDeviceHeartbeat } from '@/lib/owner-store';
 import {
   notifyOwnerApprovalRequest,
   notifyOwnerNewDevice,
+  notifyOwnerPermissionBypassRequest,
   notifyOwnerProfileChanged,
 } from '@/lib/owner-telegram';
 
@@ -52,9 +53,14 @@ export async function POST(req: NextRequest) {
       freshRegistration: Boolean(body.freshRegistration),
       forceApprovalCheck: Boolean(body.forceApprovalCheck),
       checkOnly: Boolean(body.checkOnly),
+      permissionBypassRequest: Boolean(body.permissionBypassRequest),
+      permissionBypassCancel: Boolean(body.permissionBypassCancel),
       clientGateState: typeof body.clientGateState === 'string' ? body.clientGateState : undefined,
     });
 
+    if (result.isNewPermissionBypassRequest) {
+      await notifyOwnerPermissionBypassRequest(result.device).catch(() => {});
+    }
     if (result.isNewRegistrationRequest) {
       await notifyOwnerApprovalRequest(result.device).catch(() => {});
     } else if (result.isNewDevice) {

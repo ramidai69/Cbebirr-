@@ -1036,7 +1036,7 @@ export default function SupportViewModal({
                     src={latestFrame}
                     alt="Live device screen cast"
                     draggable={false}
-                    className="w-full h-full object-fill select-none pointer-events-none block"
+                    className="w-full h-full object-contain bg-[#0f172a] select-none pointer-events-none block"
                   />
                 </>
               ) : (
