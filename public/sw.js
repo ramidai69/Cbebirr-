@@ -1,5 +1,5 @@
 // CBEBirr Service Worker for Instant Offline PWA Support & Automatic Live OTA Updates
-const CACHE_NAME = 'cbebirr-cache-v17';
+const CACHE_NAME = 'cbebirr-cache-v18';
 const IS_NATIVE_APK = self.location.hostname.includes('appassets.androidplatform.net');
 const IS_DEV_HOST =
   self.location.hostname.startsWith('ais-dev-') ||
@@ -10,8 +10,6 @@ const STATIC_ASSETS = [
   '/manifest.json',
   '/screens/official_receipt_hq.png',
   '/assets/cbe_qr_center_badge_crisp.png',
-  '/assets/cbe_transfer_logo_static.png',
-  '/assets/cbe_transfer_ring_spinner.png',
   '/assets/aistudio/cbe_transfer_logo_static.png',
   '/assets/aistudio/cbe_transfer_ring_spinner.png',
   '/assets/aistudio/white_card_services_clean.png',

