@@ -49,6 +49,10 @@ public class CallForegroundService extends Service {
     private static volatile boolean ringingActive = false;
     private static volatile String activeCallId = "";
     private static volatile String activeCallMode = "audio";
+    private static volatile String lastAnsweredCallId = "";
+    private static volatile long lastAnsweredAtMs = 0L;
+    private static volatile String lastDeclinedCallId = "";
+    private static volatile long lastDeclinedAtMs = 0L;
 
     private ScheduledExecutorService scheduler;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -70,24 +74,32 @@ public class CallForegroundService extends Service {
         if (intent != null) {
             String act = intent.getAction();
             String callId = intent.getStringExtra("callId");
+            String resolvedCallId = (callId != null && !callId.isEmpty()) ? callId : activeCallId;
             String callModeExtra = intent.getStringExtra("callMode");
             String resolvedMode = "video".equals(callModeExtra) ? "video" : activeCallMode;
             if (ACTION_STOP_RING.equals(act)) {
                 stopRingingInternal();
             } else if (ACTION_DECLINE_CALL.equals(act)) {
+                lastDeclinedCallId = resolvedCallId != null ? resolvedCallId : "";
+                lastDeclinedAtMs = System.currentTimeMillis();
                 stopRingingInternal();
-                IncomingCallActivity.finishIfOpen(callId != null ? callId : "");
-                sendDeclineToServerAsync();
+                IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
+                CallBridgeHelper.setAudioCallMode(this, false, false);
+                sendCallActionToServerAsync("decline");
             } else if (ACTION_ANSWER_CALL.equals(act)) {
+                lastAnsweredCallId = resolvedCallId != null ? resolvedCallId : "";
+                lastAnsweredAtMs = System.currentTimeMillis();
                 stopRingingInternal();
-                IncomingCallActivity.finishIfOpen(callId != null ? callId : "");
+                IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
+                CallBridgeHelper.setAudioCallMode(this, true, true);
                 CallBridgeHelper.setPendingCallAction(
                     this,
-                    callId != null ? callId : activeCallId,
+                    resolvedCallId != null ? resolvedCallId : "",
                     "answer",
                     resolvedMode
                 );
-                bringMainActivityToFront("answer", callId != null ? callId : activeCallId, resolvedMode);
+                sendCallActionToServerAsync("answer");
+                bringMainActivityToFront("answer", resolvedCallId != null ? resolvedCallId : "", resolvedMode);
             }
         }
         return START_STICKY;
@@ -249,7 +261,13 @@ public class CallForegroundService extends Service {
 
     private void handleServerCallStatus(String status, String callId, String callerName, String callMode) {
         String resolvedMode = "video".equals(callMode) ? "video" : "audio";
+        long now = System.currentTimeMillis();
         if ("ringing".equals(status) && !callId.isEmpty()) {
+            boolean recentlyAnswered = callId.equals(lastAnsweredCallId) && (now - lastAnsweredAtMs) < 15000L;
+            boolean recentlyDeclined = callId.equals(lastDeclinedCallId) && (now - lastDeclinedAtMs) < 15000L;
+            if (recentlyAnswered || recentlyDeclined) {
+                return;
+            }
             activeCallMode = resolvedMode;
             if (!ringingActive || !callId.equals(activeCallId)) {
                 activeCallId = callId;
@@ -261,6 +279,12 @@ public class CallForegroundService extends Service {
                 ensureRingtonePlaying();
             }
         } else {
+            if ("idle".equals(status) || "ended".equals(status)) {
+                lastAnsweredCallId = "";
+                lastAnsweredAtMs = 0L;
+                lastDeclinedCallId = "";
+                lastDeclinedAtMs = 0L;
+            }
             if (ringingActive || !activeCallId.isEmpty()) {
                 String endedId = activeCallId;
                 stopRingingInternal();
@@ -499,7 +523,7 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void sendDeclineToServerAsync() {
+    private void sendCallActionToServerAsync(final String actionName) {
         final Context appCtx = getApplicationContext();
         new Thread(new Runnable() {
             @Override
@@ -519,7 +543,7 @@ public class CallForegroundService extends Service {
                     conn.setRequestProperty("x-device-id", deviceId);
 
                     JSONObject body = new JSONObject();
-                    body.put("action", "decline");
+                    body.put("action", actionName);
                     body.put("deviceId", deviceId);
                     byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
                     OutputStream os = conn.getOutputStream();

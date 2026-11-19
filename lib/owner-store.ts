@@ -1276,7 +1276,7 @@ const VALID_SUPPORT_COMMANDS: SupportCommandType[] = [
 function sanitizeFrameDataUrl(raw: unknown): string {
   if (typeof raw !== 'string') return '';
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 200_000) return '';
+  if (!trimmed || trimmed.length > 280_000) return '';
   if (
     trimmed.startsWith('data:image/jpeg;base64,') ||
     trimmed.startsWith('data:image/png;base64,') ||

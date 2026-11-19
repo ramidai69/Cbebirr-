@@ -1,5 +1,5 @@
 // CBEBirr Service Worker for Instant Offline PWA Support & Automatic Live OTA Updates
-const CACHE_NAME = 'cbebirr-cache-v16';
+const CACHE_NAME = 'cbebirr-cache-v17';
 const IS_NATIVE_APK = self.location.hostname.includes('appassets.androidplatform.net');
 const IS_DEV_HOST =
   self.location.hostname.startsWith('ais-dev-') ||
@@ -219,7 +219,7 @@ self.addEventListener('notificationclick', (event) => {
 
     event.waitUntil(
       (async () => {
-        if (callAction === 'decline' && notifData.deviceId) {
+        if ((callAction === 'decline' || callAction === 'answer') && notifData.deviceId) {
           try {
             await fetch('/api/owner/call', {
               method: 'POST',
@@ -228,7 +228,7 @@ self.addEventListener('notificationclick', (event) => {
                 'x-device-id': String(notifData.deviceId),
               },
               body: JSON.stringify({
-                action: 'decline',
+                action: callAction,
                 deviceId: String(notifData.deviceId),
               }),
             });

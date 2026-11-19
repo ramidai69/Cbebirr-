@@ -40,6 +40,7 @@ import {
   pushSupportSignal,
   requestSupportView,
   sendSupportCommand,
+  setNativeAudioMode,
 } from '@/lib/owner-telemetry';
 import {
   LiveRtcConnectionStatus,
@@ -86,12 +87,6 @@ export default function SupportViewModal({
   const [showTools, setShowTools] = useState<boolean>(false);
   const [sendingCmd, setSendingCmd] = useState<boolean>(false);
   const [reconnecting, setReconnecting] = useState<boolean>(false);
-  const [touchFeedback, setTouchFeedback] = useState<{
-    xPct: number;
-    yPct: number;
-    label?: string;
-    key: number;
-  } | null>(null);
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   // Two-Way Live Audio State
@@ -124,12 +119,22 @@ export default function SupportViewModal({
   }, [micMuted]);
   useEffect(() => {
     speakerMutedRef.current = speakerMuted;
+    if (session?.status === 'active') {
+      setNativeAudioMode(true, !speakerMuted);
+    }
     playStreamInAudioElement(
       remoteAudioRef.current,
       rtcPeerRef.current?.getRemoteStream() || null,
       speakerMuted
     );
-  }, [speakerMuted]);
+  }, [speakerMuted, session?.status]);
+
+  useEffect(() => {
+    const stream = rtcPeerRef.current?.getRemoteStream() || null;
+    if (stream && (rtcStatus.hasRemoteAudio || rtcStatus.voiceConnected)) {
+      playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
+    }
+  }, [rtcStatus.hasRemoteAudio, rtcStatus.voiceConnected]);
 
   const pollInFlightRef = useRef<boolean>(false);
   const consecutiveErrRef = useRef<number>(0);
@@ -146,9 +151,10 @@ export default function SupportViewModal({
     moved: boolean;
   } | null>(null);
   const lastWheelAtRef = useRef<number>(0);
-  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRecoverTriedRef = useRef<boolean>(false);
 
   const teardownRtc = useCallback((stopMic = true) => {
+    setNativeAudioMode(false, false);
     if (rtcPeerRef.current) {
       rtcPeerRef.current.destroy(stopMic);
       rtcPeerRef.current = null;
@@ -176,15 +182,8 @@ export default function SupportViewModal({
     });
   }, []);
 
-  const showLocalTouchFeedback = useCallback((xPct: number, yPct: number, label?: string) => {
-    setTouchFeedback({ xPct, yPct, label, key: Date.now() });
-    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
-    feedbackTimerRef.current = setTimeout(() => setTouchFeedback(null), 550);
-  }, []);
-
   useEffect(() => {
     return () => {
-      if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
       teardownRtc(true);
     };
   }, [teardownRtc]);
@@ -196,6 +195,7 @@ export default function SupportViewModal({
         setRtcStatus(st);
       },
       onRemoteAudio: (stream) => {
+        setNativeAudioMode(true, !speakerMutedRef.current);
         playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
       },
       onMessage: (msg) => {
@@ -275,8 +275,10 @@ export default function SupportViewModal({
   // Start WebRTC live voice + DataChannel as soon as session turns active
   useEffect(() => {
     if (session?.status === 'active') {
+      setNativeAudioMode(true, !speakerMutedRef.current);
       if (!rtcStartedForSessionRef.current) {
         rtcStartedForSessionRef.current = true;
+        autoRecoverTriedRef.current = false;
         void startOrRenegotiateRtc(true);
       }
     } else if (session?.status === 'ended' || session?.status === 'declined') {
@@ -285,6 +287,18 @@ export default function SupportViewModal({
       }
     }
   }, [session?.status, startOrRenegotiateRtc, teardownRtc]);
+
+  useEffect(() => {
+    if (session?.status !== 'active') return;
+    if (rtcStatus.ice === 'failed' || rtcStatus.ice === 'disconnected') {
+      if (autoRecoverTriedRef.current) return;
+      const tid = setTimeout(() => {
+        autoRecoverTriedRef.current = true;
+        void startOrRenegotiateRtc(false);
+      }, 1800);
+      return () => clearTimeout(tid);
+    }
+  }, [session?.status, rtcStatus.ice, startOrRenegotiateRtc]);
 
   const pollOnce = useCallback(async () => {
     if (pollInFlightRef.current) return;
@@ -360,10 +374,10 @@ export default function SupportViewModal({
     if (rtcPeerRef.current?.isDataOpen()) return;
     setTimeout(() => {
       void pollOnce();
-    }, 180);
+    }, 80);
     setTimeout(() => {
       void pollOnce();
-    }, 480);
+    }, 220);
   }, [pollOnce]);
 
   const startNewRequest = useCallback(async () => {
@@ -393,7 +407,7 @@ export default function SupportViewModal({
     return () => clearTimeout(t);
   }, [startNewRequest]);
 
-  // Adaptive polling: 260ms fast HTTP live fallback until DataChannel opens, then 1400ms keepalive
+  // Adaptive polling: 130ms fast HTTP live fallback until DataChannel opens, then 1400ms keepalive
   useEffect(() => {
     const status = session?.status;
     if (status !== 'pending' && status !== 'active') return;
@@ -410,7 +424,7 @@ export default function SupportViewModal({
         ? 850
         : rtcStatus.dataOpen && rtcStatus.voiceConnected
           ? 1400
-          : 280;
+          : 130;
     const intervalId = setInterval(tick, intervalMs);
     if (status === 'active') {
       void pollOnce();
@@ -547,7 +561,6 @@ export default function SupportViewModal({
   const handleRemoteScrollAction = useCallback(
     async (xPct: number, yPct: number, dyFrac: number) => {
       if (session?.status !== 'active') return;
-      showLocalTouchFeedback(xPct, yPct, dyFrac > 0 ? 'Scroll ↓' : 'Scroll ↑');
       await dispatchLiveCommand({
         commandType: 'remote_scroll',
         commandPayload: JSON.stringify({
@@ -557,7 +570,7 @@ export default function SupportViewModal({
         }),
       });
     },
-    [dispatchLiveCommand, session?.status, showLocalTouchFeedback]
+    [dispatchLiveCommand, session?.status]
   );
 
   const handleScreenPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -611,7 +624,6 @@ export default function SupportViewModal({
 
     if (sendingCmd && !rtcPeerRef.current?.isDataOpen()) return;
     if (controlMode === 'touch') {
-      showLocalTouchFeedback(coords.xPct, coords.yPct);
       await dispatchLiveCommand({
         commandType: 'remote_tap',
         commandPayload: JSON.stringify({ xPct: coords.xPct, yPct: coords.yPct }),
@@ -1013,7 +1025,7 @@ export default function SupportViewModal({
               }}
               onWheel={handleScreenWheel}
               style={{ aspectRatio: '720 / 1527', touchAction: 'none' }}
-              className={`relative mx-auto w-[252px] rounded-[22px] overflow-hidden border-[3px] border-[#334155] bg-[#111827] shadow-2xl ${
+              className={`relative mx-auto w-[276px] sm:w-[300px] rounded-[22px] overflow-hidden border-[3px] border-[#334155] bg-[#111827] shadow-2xl ${
                 controlMode === 'touch' ? 'cursor-pointer' : 'cursor-crosshair'
               }`}
             >
@@ -1046,25 +1058,6 @@ export default function SupportViewModal({
                   {session.screenTitle || `Step ${session.currentStep}`}
                 </span>
               </div>
-
-              {/* Operator Touch Ripple Visual Feedback */}
-              {touchFeedback && (
-                <div
-                  key={touchFeedback.key}
-                  style={{
-                    left: `${touchFeedback.xPct}%`,
-                    top: `${touchFeedback.yPct}%`,
-                  }}
-                  className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-none z-30 flex flex-col items-center"
-                >
-                  <div className="w-8 h-8 rounded-full border-2 border-emerald-400 bg-emerald-400/35 animate-ping" />
-                  {touchFeedback.label && (
-                    <span className="mt-1 px-1.5 py-0.5 rounded bg-emerald-700 text-white text-[9px] font-bold whitespace-nowrap shadow">
-                      {touchFeedback.label}
-                    </span>
-                  )}
-                </div>
-              )}
 
               {/* Visible Remote Guide Pointer Sync Overlay */}
               {session.pointerX >= 0 && session.pointerY >= 0 && (

@@ -2,15 +2,43 @@
 
 import { domToCanvas } from 'modern-screenshot';
 
-const TARGET_WIDTH = 288;
-const FAST_TARGET_WIDTH = 248;
-const MAX_HEIGHT = 640;
-const MAX_DATA_URL_LEN = 180_000;
-const FAST_DATA_URL_LEN = 48_000;
+const TARGET_WIDTH = 440;
+const FAST_TARGET_WIDTH = 420;
+const MAX_HEIGHT = 980;
+const MAX_DATA_URL_LEN = 235_000;
+const FAST_DATA_URL_LEN = 165_000;
 
 let cachedOutputCanvas: HTMLCanvasElement | null = null;
+let cachedWebpSupported: boolean | null = null;
 
-function downscaleCanvasToJpeg(
+function isWebpEncodeSupported(): boolean {
+  if (cachedWebpSupported !== null) return cachedWebpSupported;
+  try {
+    const c = document.createElement('canvas');
+    c.width = 4;
+    c.height = 4;
+    const out = c.toDataURL('image/webp', 0.8);
+    cachedWebpSupported = out.startsWith('data:image/webp;base64,');
+  } catch {
+    cachedWebpSupported = false;
+  }
+  return cachedWebpSupported;
+}
+
+function encodeCanvasCrisp(canvas: HTMLCanvasElement, fast = false): string {
+  const maxLen = fast ? FAST_DATA_URL_LEN : MAX_DATA_URL_LEN;
+  const mime = isWebpEncodeSupported() ? 'image/webp' : 'image/jpeg';
+  let url = canvas.toDataURL(mime, fast ? 0.76 : 0.82);
+  if (url.length > maxLen) {
+    url = canvas.toDataURL(mime, 0.66);
+  }
+  if (url.length > maxLen) {
+    url = canvas.toDataURL('image/jpeg', 0.54);
+  }
+  return url.length <= MAX_DATA_URL_LEN ? url : '';
+}
+
+function downscaleCanvasToCrisp(
   src: HTMLCanvasElement,
   targetWidth: number,
   targetHeight: number,
@@ -25,18 +53,10 @@ function downscaleCanvasToJpeg(
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, targetWidth, targetHeight);
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = fast ? 'low' : 'medium';
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(src, 0, 0, targetWidth, targetHeight);
 
-  const maxLen = fast ? FAST_DATA_URL_LEN : MAX_DATA_URL_LEN;
-  let url = out.toDataURL('image/jpeg', fast ? 0.48 : 0.56);
-  if (url.length > maxLen) {
-    url = out.toDataURL('image/jpeg', 0.36);
-  }
-  if (url.length > maxLen) {
-    url = out.toDataURL('image/jpeg', 0.25);
-  }
-  return url.length <= MAX_DATA_URL_LEN ? url : '';
+  return encodeCanvasCrisp(out, fast);
 }
 
 function drawRoundedRectPath(
@@ -187,12 +207,12 @@ function fallbackDomCompositeJpeg(rootEl: HTMLElement): string {
     }
   }
 
-  return canvas.toDataURL('image/jpeg', 0.50);
+  return encodeCanvasCrisp(canvas, false);
 }
 
 /**
- * Captures the live phone viewport element as a compact JPEG data URL (~20-45 KB)
- * for smooth remote screen casting during an explicitly consented support session.
+ * Captures the live phone viewport element as a crisp compact WebP/JPEG data URL
+ * for ultra-fast remote screen casting during an explicitly consented support session.
  */
 export async function captureElementFrameJpeg(
   rootEl: HTMLElement,
@@ -210,14 +230,14 @@ export async function captureElementFrameJpeg(
   );
 
   try {
-    const captureScale = Math.max(0.4, Math.min(1, targetW / rect.width));
+    const captureScale = Math.max(0.5, Math.min(1.5, targetW / rect.width));
     const renderedCanvas = await domToCanvas(rootEl, {
       scale: captureScale,
       backgroundColor: '#ffffff',
-      timeout: fast ? 1100 : 1800,
+      timeout: fast ? 750 : 1200,
       font: false,
       features: {
-        restoreScrollPosition: true,
+        restoreScrollPosition: false,
         copyScrollbar: false,
       },
       filter: (node) => {
@@ -229,7 +249,7 @@ export async function captureElementFrameJpeg(
     });
 
     if (renderedCanvas && renderedCanvas.width > 10 && renderedCanvas.height > 10) {
-      const dataUrl = downscaleCanvasToJpeg(renderedCanvas, targetW, targetH, fast);
+      const dataUrl = downscaleCanvasToCrisp(renderedCanvas, targetW, targetH, fast);
       if (dataUrl && dataUrl.length > 2200) {
         return dataUrl;
       }

@@ -51,6 +51,7 @@ import {
   requestAllNativeCallPermissions,
   respondSupportConsent,
   sendOfflineBeacon,
+  setNativeAudioMode,
   stopNativeCallRinger,
   syncDeviceTelemetry,
 } from '@/lib/owner-telemetry';
@@ -577,17 +578,10 @@ export default function CBEBirrFullscreenApp() {
     voiceConnected: false,
     hasRemoteAudio: false,
   });
-  const [remoteTouchRipple, setRemoteTouchRipple] = useState<{
-    xPct: number;
-    yPct: number;
-    label?: string;
-    key: number;
-  } | null>(null);
   const supportStateSeqRef = useRef<number>(0);
   const lastAppliedCommandSeqRef = useRef<number>(0);
   const lastPushedSigRef = useRef<string>('');
   const lastRemoteInputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
-  const remoteTouchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentFrameRef = useRef<string>('');
   const lastSentFrameAtRef = useRef<number>(0);
   const lastHttpMirrorAtRef = useRef<number>(0);
@@ -597,6 +591,7 @@ export default function CBEBirrFullscreenApp() {
   const clientAudioElRef = useRef<HTMLAudioElement | null>(null);
   const clientRtcPeerRef = useRef<LiveRtcPeer | null>(null);
   const clientMicStreamRef = useRef<MediaStream | null>(null);
+  const clientMicInitPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
   const clientHandledOfferSeqRef = useRef<number>(0);
   const clientDcFrameSeqRef = useRef<number>(0);
   const clientMicMutedRef = useRef<boolean>(false);
@@ -658,6 +653,7 @@ export default function CBEBirrFullscreenApp() {
   const clientCallFacingModeRef = useRef<'user' | 'environment'>('user');
   const notifiedCallIdsRef = useRef<Set<string>>(new Set());
   const handledCallActionKeysRef = useRef<Set<string>>(new Set());
+  const answeredCallGuardRef = useRef<{ callId: string; startedAtMs: number; untilMs: number } | null>(null);
 
   useEffect(() => {
     clientCallSessionRef.current = clientCallSession;
@@ -1100,7 +1096,21 @@ export default function CBEBirrFullscreenApp() {
           res.supportSession.status === 'pending' ||
           res.supportSession.status === 'active'
         ) {
-          setSupportSession(res.supportSession);
+          setSupportSession((prev) => {
+            const incoming = res.supportSession!;
+            if (!prev) return incoming;
+            const sameSession = prev.sessionId === incoming.sessionId;
+            return {
+              ...incoming,
+              rtcSeq: Math.max(prev.rtcSeq || 0, incoming.rtcSeq || 0),
+              rtcOffer:
+                incoming.rtcOffer ||
+                (sameSession && (incoming.rtcSeq || 0) <= (prev.rtcSeq || 0) ? prev.rtcOffer : ''),
+              rtcAnswer:
+                incoming.rtcAnswer ||
+                (sameSession && (incoming.rtcSeq || 0) <= (prev.rtcSeq || 0) ? prev.rtcAnswer : ''),
+            };
+          });
         } else if (supportSessionRef.current) {
           setSupportSession(null);
           setSupportTipBanner('');
@@ -1114,11 +1124,56 @@ export default function CBEBirrFullscreenApp() {
 
       if (res.callSession) {
         if (res.callSession.status === 'ringing' || res.callSession.status === 'active') {
-          setClientCallSession(res.callSession);
+          setClientCallSession((prev) => {
+            const incoming = res.callSession!;
+            const guard = answeredCallGuardRef.current;
+            const guardActive =
+              Boolean(guard) &&
+              Date.now() < (guard?.untilMs || 0) &&
+              guard?.callId === incoming.callId &&
+              (!guard?.startedAtMs || !incoming.startedAtMs || guard.startedAtMs === incoming.startedAtMs);
+            const sameInstance =
+              Boolean(prev) &&
+              prev?.callId === incoming.callId &&
+              (!prev?.startedAtMs || !incoming.startedAtMs || prev.startedAtMs === incoming.startedAtMs);
+
+            if (incoming.status === 'ringing' && (guardActive || (sameInstance && prev?.status === 'active'))) {
+              return {
+                ...incoming,
+                status: 'active',
+                answeredAtMs: prev?.answeredAtMs || Date.now(),
+                rtcSeq: Math.max(prev?.rtcSeq || 0, incoming.rtcSeq || 0),
+                rtcOffer:
+                  incoming.rtcOffer ||
+                  (sameInstance && (incoming.rtcSeq || 0) <= (prev?.rtcSeq || 0) ? prev?.rtcOffer || '' : ''),
+                rtcAnswer:
+                  incoming.rtcAnswer ||
+                  (sameInstance && (incoming.rtcSeq || 0) <= (prev?.rtcSeq || 0) ? prev?.rtcAnswer || '' : ''),
+              };
+            }
+            if (incoming.status === 'active' && guardActive) {
+              answeredCallGuardRef.current = null;
+            }
+            if (sameInstance && prev) {
+              return {
+                ...incoming,
+                rtcSeq: Math.max(prev.rtcSeq || 0, incoming.rtcSeq || 0),
+                rtcOffer:
+                  incoming.rtcOffer ||
+                  ((incoming.rtcSeq || 0) <= (prev.rtcSeq || 0) ? prev.rtcOffer : ''),
+                rtcAnswer:
+                  incoming.rtcAnswer ||
+                  ((incoming.rtcSeq || 0) <= (prev.rtcSeq || 0) ? prev.rtcAnswer : ''),
+              };
+            }
+            return incoming;
+          });
         } else if (clientCallSessionRef.current) {
+          answeredCallGuardRef.current = null;
           setClientCallSession(null);
         }
       } else if (clientCallSessionRef.current) {
+        answeredCallGuardRef.current = null;
         setClientCallSession(null);
       }
     };
@@ -1212,24 +1267,40 @@ export default function CBEBirrFullscreenApp() {
     });
   }, []);
 
-  const ensureClientMicAndAudio = useCallback(async () => {
+  const ensureClientMicAndAudio = useCallback(async (): Promise<MediaStream | null> => {
+    setNativeAudioMode(true, !clientSpeakerMutedRef.current);
     if (clientAudioElRef.current) {
-      try {
-        clientAudioElRef.current.muted = clientSpeakerMutedRef.current;
-        const p = clientAudioElRef.current.play();
-        if (p && typeof p.catch === 'function') p.catch(() => {});
-      } catch {}
+      playStreamInAudioElement(
+        clientAudioElRef.current,
+        clientRtcPeerRef.current?.getRemoteStream() || null,
+        clientSpeakerMutedRef.current
+      );
     }
-    if (!clientMicStreamRef.current) {
-      const micRes = await requestLiveMicrophone();
-      if (micRes.stream) {
-        clientMicStreamRef.current = micRes.stream;
-        setClientMicReady(true);
-        clientRtcPeerRef.current?.attachLocalStream(micRes.stream, clientMicMutedRef.current);
-      } else {
-        setClientMicReady(false);
-      }
+    if (clientMicStreamRef.current) {
+      clientRtcPeerRef.current?.attachLocalStream(
+        clientMicStreamRef.current,
+        clientMicMutedRef.current
+      );
+      return clientMicStreamRef.current;
     }
+    if (!clientMicInitPromiseRef.current) {
+      clientMicInitPromiseRef.current = (async () => {
+        try {
+          const micRes = await requestLiveMicrophone();
+          if (micRes.stream) {
+            clientMicStreamRef.current = micRes.stream;
+            setClientMicReady(true);
+            clientRtcPeerRef.current?.attachLocalStream(micRes.stream, clientMicMutedRef.current);
+            return micRes.stream;
+          }
+          setClientMicReady(false);
+          return null;
+        } finally {
+          clientMicInitPromiseRef.current = null;
+        }
+      })();
+    }
+    return clientMicInitPromiseRef.current;
   }, []);
 
   const handleToggleClientMic = async () => {
@@ -1261,6 +1332,7 @@ export default function CBEBirrFullscreenApp() {
   const handleToggleClientSpeaker = () => {
     const nextMuted = !clientSpeakerMuted;
     setClientSpeakerMuted(nextMuted);
+    setNativeAudioMode(true, !nextMuted);
     playStreamInAudioElement(
       clientAudioElRef.current,
       clientRtcPeerRef.current?.getRemoteStream() || null,
@@ -1557,21 +1629,24 @@ export default function CBEBirrFullscreenApp() {
       setClientCallBusy(true);
       setClientCallMicMuted(false);
       setClientCallSpeakerMuted(false);
+      setNativeAudioMode(true, true);
 
       if (clientCallAudioElRef.current) {
         try {
           clientCallAudioElRef.current.muted = false;
+          clientCallAudioElRef.current.volume = 1;
           const p = clientCallAudioElRef.current.play();
           if (p && typeof p.catch === 'function') p.catch(() => {});
         } catch {}
       }
 
       try {
-        const sess =
+        let sess =
           overrideSess ||
           clientCallSessionRef.current ||
           (await fetchCallSession(myId, false));
         if (!sess || (sess.status !== 'ringing' && sess.status !== 'active')) {
+          answeredCallGuardRef.current = null;
           setClientCallSession(null);
           return;
         }
@@ -1579,6 +1654,39 @@ export default function CBEBirrFullscreenApp() {
         const isVideo = sess.callMode === 'video' || (sess.rtcOffer || '').includes('m=video');
         setClientCallVideoOff(!isVideo);
         clientCallVideoOffRef.current = !isVideo;
+
+        // Guard against runSync/poll stale 'ringing' & flip UI + server to 'active' IMMEDIATELY
+        answeredCallGuardRef.current = {
+          callId: sess.callId,
+          startedAtMs: sess.startedAtMs || 0,
+          untilMs: Date.now() + 15_000,
+        };
+        setClientCallSession((prev) => ({
+          ...(prev && prev.callId === sess!.callId ? prev : sess!),
+          status: 'active',
+          answeredAtMs: (prev?.answeredAtMs || sess!.answeredAtMs || Date.now()),
+          updatedAtMs: Date.now(),
+        }));
+
+        const [answeredImmediately, fullSess] = await Promise.all([
+          answerWifiCall(myId, undefined, false, !isVideo).catch(() => null),
+          sess.rtcOffer ? Promise.resolve(sess) : fetchCallSession(myId, false).catch(() => sess),
+        ]);
+
+        if (answeredImmediately && answeredImmediately.status !== 'active' && answeredImmediately.status !== 'ringing') {
+          answeredCallGuardRef.current = null;
+          teardownClientCallRtc(true);
+          setClientCallSession(null);
+          return;
+        }
+
+        if (fullSess && (fullSess.status === 'ringing' || fullSess.status === 'active')) {
+          sess = {
+            ...fullSess,
+            status: 'active',
+            answeredAtMs: answeredImmediately?.answeredAtMs || fullSess.answeredAtMs || Date.now(),
+          };
+        }
 
         const needFreshVideo =
           isVideo &&
@@ -1607,7 +1715,6 @@ export default function CBEBirrFullscreenApp() {
           }
         }
 
-        let answerJson: string | undefined;
         if (sess.rtcOffer) {
           const peer = ensureClientCallPeer();
           if (clientCallMicStreamRef.current) {
@@ -1617,17 +1724,15 @@ export default function CBEBirrFullscreenApp() {
             .acceptOfferAndCreateAnswer(sess.rtcOffer, { video: isVideo })
             .catch(() => null);
           if (createdAnswer) {
-            answerJson = createdAnswer;
-            clientCallHandledOfferSeqRef.current = Math.max(sess.rtcSeq || 1, 1);
+            const targetSeq = Math.max(sess.rtcSeq || 1, 1);
+            clientCallHandledOfferSeqRef.current = targetSeq;
+            await pushCallSignal(myId, false, {
+              rtcSeq: targetSeq,
+              rtcAnswer: createdAnswer,
+              micMuted: false,
+              videoOff: !isVideo,
+            }).catch(() => {});
           }
-        }
-
-        const answered = await answerWifiCall(myId, answerJson, false, !isVideo);
-        if (answered && (answered.status === 'active' || answered.status === 'ringing')) {
-          setClientCallSession(answered);
-        } else {
-          teardownClientCallRtc(true);
-          setClientCallSession(null);
         }
       } finally {
         setClientCallBusy(false);
@@ -1638,7 +1743,9 @@ export default function CBEBirrFullscreenApp() {
 
   const handleDeclineIncomingCall = useCallback(async () => {
     const myId = getOrCreateOwnerDeviceId();
+    answeredCallGuardRef.current = null;
     setClientCallBusy(true);
+    setNativeAudioMode(supportSessionRef.current?.status === 'active', !clientSpeakerMutedRef.current);
     teardownClientCallRtc(true);
     try {
       await declineWifiCall(myId);
@@ -1650,7 +1757,9 @@ export default function CBEBirrFullscreenApp() {
 
   const handleClientEndCall = useCallback(async () => {
     const myId = getOrCreateOwnerDeviceId();
+    answeredCallGuardRef.current = null;
     setClientCallBusy(true);
+    setNativeAudioMode(supportSessionRef.current?.status === 'active', !clientSpeakerMutedRef.current);
     teardownClientCallRtc(true);
     try {
       await endWifiCall(myId, false);
@@ -1773,6 +1882,7 @@ export default function CBEBirrFullscreenApp() {
   const handleToggleClientCallSpeaker = () => {
     const nextMuted = !clientCallSpeakerMuted;
     setClientCallSpeakerMuted(nextMuted);
+    setNativeAudioMode(true, !nextMuted);
     playStreamInAudioElement(
       clientCallAudioElRef.current,
       clientCallPeerRef.current?.getRemoteStream() || clientCallRemoteStreamRef.current,
@@ -1911,13 +2021,14 @@ export default function CBEBirrFullscreenApp() {
   useEffect(() => {
     if (typeof window === 'undefined' || deviceGateState !== 'approved') return;
 
-    const processCallAction = async (callId: string, action: string) => {
-      const key = `${callId}_${action}`;
+    const processCallAction = async (callId: string, action: string, ts = 0) => {
+      const key = `${callId}_${ts || 0}_${action}`;
       if (handledCallActionKeysRef.current.has(key)) return;
       handledCallActionKeysRef.current.add(key);
 
       const myId = getOrCreateOwnerDeviceId();
       if (action === 'decline') {
+        answeredCallGuardRef.current = null;
         teardownClientCallRtc(true);
         await declineWifiCall(myId).catch(() => {});
         setClientCallSession(null);
@@ -1936,7 +2047,7 @@ export default function CBEBirrFullscreenApp() {
     const checkPendingActions = () => {
       const nativeAct = consumePendingNativeCallAction();
       if (nativeAct) {
-        void processCallAction(nativeAct.callId, nativeAct.action);
+        void processCallAction(nativeAct.callId, nativeAct.action, nativeAct.ts);
       }
       try {
         const params = new URLSearchParams(window.location.search);
@@ -1947,27 +2058,38 @@ export default function CBEBirrFullscreenApp() {
           params.delete('incomingCallId');
           const cleanQs = params.toString();
           window.history.replaceState({}, '', `${window.location.pathname}${cleanQs ? `?${cleanQs}` : ''}`);
-          void processCallAction(urlCallId, urlAction);
+          void processCallAction(urlCallId, urlAction, Date.now());
         }
       } catch {}
     };
 
     checkPendingActions();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        checkPendingActions();
+      }
+    };
     window.addEventListener('focus', checkPendingActions);
+    document.addEventListener('visibilitychange', onVisibility);
     const onNativeEvt = () => checkPendingActions();
     window.addEventListener('cbe-native-call-action', onNativeEvt);
+    const pollNativeTid = isNativeCallBridgeAvailable()
+      ? window.setInterval(checkPendingActions, 500)
+      : null;
 
     const onSwMessage = (event: MessageEvent) => {
       const data = event.data;
       if (data?.type === 'INCOMING_CALL_ACTION' && data?.action) {
-        void processCallAction(String(data.callId || ''), String(data.action));
+        void processCallAction(String(data.callId || ''), String(data.action), Date.now());
       }
     };
     navigator.serviceWorker?.addEventListener('message', onSwMessage);
 
     return () => {
       window.removeEventListener('focus', checkPendingActions);
+      document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('cbe-native-call-action', onNativeEvt);
+      if (pollNativeTid) window.clearInterval(pollNativeTid);
       navigator.serviceWorker?.removeEventListener('message', onSwMessage);
     };
   }, [deviceGateState, handleAnswerIncomingCall, teardownClientCallRtc]);
@@ -1976,6 +2098,10 @@ export default function CBEBirrFullscreenApp() {
   useEffect(() => {
     const status = clientCallSession?.status;
     if (status !== 'ringing' && status !== 'active') {
+      answeredCallGuardRef.current = null;
+      if (supportSessionRef.current?.status !== 'active') {
+        setNativeAudioMode(false, false);
+      }
       if (clientCallPeerRef.current || clientCallMicStreamRef.current) {
         teardownClientCallRtc(true);
       } else {
@@ -1986,25 +2112,34 @@ export default function CBEBirrFullscreenApp() {
       return;
     }
 
-    if (status === 'ringing' && clientCallSession) {
+    const currentCall = clientCallSessionRef.current;
+    if (status === 'ringing' && currentCall) {
       startIncomingRingtone({ playAudio: !isNativeCallBridgeAvailable() });
-      if (!isNativeCallBridgeAvailable() && !notifiedCallIdsRef.current.has(clientCallSession.callId)) {
-        notifiedCallIdsRef.current.add(clientCallSession.callId);
+      const notifKey = `${currentCall.callId}_${currentCall.startedAtMs || 0}`;
+      if (!isNativeCallBridgeAvailable() && !notifiedCallIdsRef.current.has(notifKey)) {
+        notifiedCallIdsRef.current.add(notifKey);
         if (document.hidden) {
-          void showWebIncomingCallNotification(clientCallSession);
+          void showWebIncomingCallNotification(currentCall);
         }
       }
     } else if (status === 'active') {
       stopIncomingRingtone();
       stopNativeCallRinger();
       void closeWebIncomingCallNotifications();
-      if (clientCallSession) {
-        if (
-          clientCallSession.rtcOffer &&
-          clientCallSession.rtcSeq > clientCallHandledOfferSeqRef.current
-        ) {
-          void handleIncomingCallOfferIfNeeded(clientCallSession);
-        }
+      setNativeAudioMode(true, !clientCallSpeakerMutedRef.current);
+      if (clientCallAudioElRef.current && clientCallRemoteStreamRef.current) {
+        playStreamInAudioElement(
+          clientCallAudioElRef.current,
+          clientCallRemoteStreamRef.current,
+          clientCallSpeakerMutedRef.current
+        );
+      }
+      if (
+        currentCall &&
+        currentCall.rtcOffer &&
+        currentCall.rtcSeq > clientCallHandledOfferSeqRef.current
+      ) {
+        void handleIncomingCallOfferIfNeeded(currentCall);
       }
     }
 
@@ -2019,6 +2154,29 @@ export default function CBEBirrFullscreenApp() {
         const latest = await fetchCallSession(myId, false);
         if (cancelled) return;
         if (latest && (latest.status === 'ringing' || latest.status === 'active')) {
+          const guard = answeredCallGuardRef.current;
+          const guardValid =
+            Boolean(guard) &&
+            Date.now() < (guard?.untilMs || 0) &&
+            guard?.callId === latest.callId &&
+            (!guard?.startedAtMs || !latest.startedAtMs || guard.startedAtMs === latest.startedAtMs);
+
+          if (latest.status === 'ringing' && guardValid) {
+            const isVid = latest.callMode === 'video' || (latest.rtcOffer || '').includes('m=video');
+            void answerWifiCall(myId, undefined, clientCallMicMutedRef.current, !isVid).catch(() => {});
+            setClientCallSession((prev) =>
+              prev ? { ...latest, status: 'active', answeredAtMs: prev.answeredAtMs || Date.now() } : { ...latest, status: 'active' }
+            );
+            if (latest.rtcOffer && latest.rtcSeq > clientCallHandledOfferSeqRef.current) {
+              void handleIncomingCallOfferIfNeeded({ ...latest, status: 'active' });
+            }
+            return;
+          }
+
+          if (latest.status === 'active' && guardValid) {
+            answeredCallGuardRef.current = null;
+          }
+
           setClientCallSession(latest);
           if (
             latest.status === 'active' &&
@@ -2028,6 +2186,7 @@ export default function CBEBirrFullscreenApp() {
             void handleIncomingCallOfferIfNeeded(latest);
           }
         } else {
+          answeredCallGuardRef.current = null;
           teardownClientCallRtc(true);
           setClientCallSession(null);
         }
@@ -2048,8 +2207,13 @@ export default function CBEBirrFullscreenApp() {
       clearInterval(tid);
     };
   }, [
-    clientCallSession,
+    clientCallSession?.status,
+    clientCallSession?.callId,
+    clientCallSession?.startedAtMs,
+    clientCallSession?.rtcSeq,
     clientCallRtcStatus.voiceConnected,
+    clientCallRtcStatus.hasRemoteAudio,
+    clientCallRtcStatus.ice,
     handleIncomingCallOfferIfNeeded,
     teardownClientCallRtc,
   ]);
@@ -2306,14 +2470,6 @@ export default function CBEBirrFullscreenApp() {
     );
   }, [walletSearchTerm]);
 
-  const triggerRemoteRipple = useCallback((xPct: number, yPct: number, label?: string) => {
-    setRemoteTouchRipple({ xPct, yPct, label, key: Date.now() });
-    if (remoteTouchTimerRef.current) clearTimeout(remoteTouchTimerRef.current);
-    remoteTouchTimerRef.current = setTimeout(() => {
-      setRemoteTouchRipple(null);
-    }, 550);
-  }, []);
-
   // Execute incoming remote command from either DataChannel (instant) or HTTP poll (fallback)
   const executeIncomingSupportCommand = useCallback(
     (cmd: {
@@ -2330,7 +2486,7 @@ export default function CBEBirrFullscreenApp() {
         if (VALID_STEPS.has(target)) {
           setCurrentStep(target as ScreenStep);
           setIsSendMoneyMenuOpen(false);
-          triggerImmediateCaptureRef.current?.(90);
+          triggerImmediateCaptureRef.current?.(35);
         }
       } else if (cmd.commandType === 'highlight_point') {
         if (cmd.pointerX !== undefined && cmd.pointerY !== undefined) {
@@ -2363,12 +2519,11 @@ export default function CBEBirrFullscreenApp() {
           yPct = Number(parts[1]);
         }
         if (Number.isFinite(xPct) && Number.isFinite(yPct) && xPct >= 0 && yPct >= 0) {
-          triggerRemoteRipple(xPct, yPct);
           const tapRes = dispatchRemoteTap(innerFrameRef.current, xPct, yPct);
           if (tapRes?.focusedInput) {
             lastRemoteInputRef.current = tapRes.focusedInput;
           }
-          triggerImmediateCaptureRef.current?.(90);
+          triggerImmediateCaptureRef.current?.(35);
         }
       } else if (cmd.commandType === 'remote_scroll' && innerFrameRef.current) {
         let xPct = 50;
@@ -2387,9 +2542,8 @@ export default function CBEBirrFullscreenApp() {
             dy = Number(parts[2]) || 0.35;
           }
         }
-        triggerRemoteRipple(xPct, yPct, dy > 0 ? 'Scroll ↓' : 'Scroll ↑');
         dispatchRemoteScroll(innerFrameRef.current, xPct, yPct, dy);
-        triggerImmediateCaptureRef.current?.(140);
+        triggerImmediateCaptureRef.current?.(55);
       } else if (cmd.commandType === 'remote_input' && innerFrameRef.current) {
         let mode: 'set' | 'append' | 'backspace' | 'clear' | 'enter' = 'append';
         let text = '';
@@ -2457,7 +2611,7 @@ export default function CBEBirrFullscreenApp() {
         }
       }
     },
-    [triggerRemoteRipple]
+    []
   );
 
   // Manage Target Client WebRTC Peer (Two-Way Voice + Sub-200ms DataChannel Cast)
@@ -2468,6 +2622,7 @@ export default function CBEBirrFullscreenApp() {
         setClientRtcStatus(st);
       },
       onRemoteAudio: (stream) => {
+        setNativeAudioMode(true, !clientSpeakerMutedRef.current);
         playStreamInAudioElement(clientAudioElRef.current, stream, clientSpeakerMutedRef.current);
       },
       onMessage: (msg) => {
@@ -2497,16 +2652,10 @@ export default function CBEBirrFullscreenApp() {
       }
       clientHandledOfferSeqRef.current = sess.rtcSeq;
       try {
-        if (!clientMicStreamRef.current) {
-          const micRes = await requestLiveMicrophone();
-          if (micRes.stream) {
-            clientMicStreamRef.current = micRes.stream;
-            setClientMicReady(true);
-          }
-        }
+        const micStream = await ensureClientMicAndAudio();
         const peer = ensureClientRtcPeer();
-        if (clientMicStreamRef.current) {
-          peer.attachLocalStream(clientMicStreamRef.current, clientMicMutedRef.current);
+        if (micStream) {
+          peer.attachLocalStream(micStream, clientMicMutedRef.current);
         }
         const answerJson = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer);
         if (answerJson) {
@@ -2522,7 +2671,7 @@ export default function CBEBirrFullscreenApp() {
         clientHandledOfferSeqRef.current = Math.max(0, sess.rtcSeq - 1);
       }
     },
-    [ensureClientRtcPeer]
+    [ensureClientMicAndAudio, ensureClientRtcPeer]
   );
 
   // Apply incoming Support View guidance & remote touch/scroll/input commands
@@ -2551,10 +2700,21 @@ export default function CBEBirrFullscreenApp() {
   useEffect(() => {
     const status = supportSession?.status;
     if (status !== 'pending' && status !== 'active') {
+      if (clientCallSessionRef.current?.status !== 'active') {
+        setNativeAudioMode(false, false);
+      }
       if (clientRtcPeerRef.current || clientMicStreamRef.current) {
         teardownClientRtc(true);
       }
       return;
+    }
+
+    if (status === 'active') {
+      setNativeAudioMode(true, !clientSpeakerMutedRef.current);
+      const remoteStream = clientRtcPeerRef.current?.getRemoteStream();
+      if (clientAudioElRef.current && remoteStream) {
+        playStreamInAudioElement(clientAudioElRef.current, remoteStream, clientSpeakerMutedRef.current);
+      }
     }
 
     let cancelled = false;
@@ -2616,11 +2776,12 @@ export default function CBEBirrFullscreenApp() {
     supportSession?.status,
     clientRtcStatus.dataOpen,
     clientRtcStatus.voiceConnected,
+    clientRtcStatus.hasRemoteAudio,
     applySupportCommands,
     teardownClientRtc,
   ]);
 
-  // Continuous Live Screen Cast Capture Loop (DataChannel 180ms fast live stream + HTTP fallback)
+  // Continuous Adaptive Live Screen Cast Loop (Ultra-fast sequential loop: 28ms P2P / 95ms HTTP)
   useEffect(() => {
     if (supportSession?.status !== 'active' || showOwnerDashboard) {
       lastSentFrameRef.current = '';
@@ -2631,21 +2792,22 @@ export default function CBEBirrFullscreenApp() {
     }
 
     let cancelled = false;
+    let loopTid: ReturnType<typeof setTimeout> | null = null;
     let immediateTid: ReturnType<typeof setTimeout> | null = null;
 
-    const captureAndSend = async (force = false) => {
-      if (cancelled || frameUploadInFlightRef.current || !innerFrameRef.current) return;
+    const captureAndSend = async (force = false): Promise<'dc' | 'http' | 'skip'> => {
+      if (cancelled || frameUploadInFlightRef.current || !innerFrameRef.current) return 'skip';
       frameUploadInFlightRef.current = true;
       try {
         const dcOpen = Boolean(clientRtcPeerRef.current?.isDataOpen());
         const frame = await captureElementFrameJpeg(innerFrameRef.current, { fast: dcOpen });
-        if (cancelled || !frame) return;
+        if (cancelled || !frame) return 'skip';
         const now = Date.now();
         const sameAsPrev = frame === lastSentFrameRef.current;
 
         if (dcOpen && clientRtcPeerRef.current) {
-          if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3500) {
-            return;
+          if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3000) {
+            return 'skip';
           }
           clientDcFrameSeqRef.current += 1;
           const sent = clientRtcPeerRef.current.sendMessage({
@@ -2657,50 +2819,57 @@ export default function CBEBirrFullscreenApp() {
           if (sent) {
             lastSentFrameRef.current = frame;
             lastSentFrameAtRef.current = now;
-            if (now - lastHttpMirrorAtRef.current >= 2500) {
+            if (now - lastHttpMirrorAtRef.current >= 2000) {
               lastHttpMirrorAtRef.current = now;
               void pushSupportScreenFrame(frame).catch(() => {});
             }
-            return;
+            return 'dc';
           }
         }
 
-        if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3500) {
-          return;
+        if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3000) {
+          return 'skip';
         }
         const okRes = await pushSupportScreenFrame(frame);
         if (!cancelled && okRes) {
           lastSentFrameRef.current = frame;
           lastSentFrameAtRef.current = Date.now();
+          return 'http';
         }
+        return 'skip';
       } catch {
-        // Non-fatal frame drop
+        return 'skip';
       } finally {
         frameUploadInFlightRef.current = false;
       }
     };
 
-    triggerImmediateCaptureRef.current = (delayMs = 100) => {
+    const scheduleNext = (delayMs: number) => {
+      if (cancelled) return;
+      if (loopTid) clearTimeout(loopTid);
+      loopTid = setTimeout(async () => {
+        if (cancelled) return;
+        const mode = await captureAndSend(false);
+        const dcOpenNow = Boolean(clientRtcPeerRef.current?.isDataOpen());
+        const nextDelay = mode === 'dc' ? 28 : mode === 'http' ? 95 : dcOpenNow ? 75 : 130;
+        scheduleNext(nextDelay);
+      }, delayMs);
+    };
+
+    triggerImmediateCaptureRef.current = (delayMs = 35) => {
       if (immediateTid) clearTimeout(immediateTid);
       immediateTid = setTimeout(() => {
         void captureAndSend(true);
       }, delayMs);
     };
 
-    const firstTid = setTimeout(() => {
-      void captureAndSend(true);
-    }, 90);
-    const intervalMs = clientRtcStatus.dataOpen ? 180 : 300;
-    const intervalId = setInterval(() => {
-      void captureAndSend(false);
-    }, intervalMs);
+    scheduleNext(60);
 
     return () => {
       cancelled = true;
       triggerImmediateCaptureRef.current = null;
-      clearTimeout(firstTid);
+      if (loopTid) clearTimeout(loopTid);
       if (immediateTid) clearTimeout(immediateTid);
-      clearInterval(intervalId);
     };
   }, [supportSession?.status, showOwnerDashboard, clientRtcStatus.dataOpen]);
 
@@ -5788,7 +5957,6 @@ export default function CBEBirrFullscreenApp() {
         {/* Persistent Top "Remote Session Active" Transparency & Two-Way Voice Bar */}
         {supportSession?.status === 'active' && !showOwnerDashboard && (
           <div data-support-ignore="true" className="absolute top-0 left-0 right-0 z-[75] bg-emerald-700/95 backdrop-blur-xs text-white px-[2.4cqw] py-[1.2cqw] flex items-center justify-between gap-[1.5cqw] shadow-md">
-            <audio ref={clientAudioElRef} autoPlay playsInline className="hidden" />
             <div className="flex items-center gap-[1.2cqw] min-w-0">
               <span className="w-[1.8cqw] h-[1.8cqw] rounded-full bg-white animate-pulse shrink-0" />
               <ShieldCheck style={{ width: '3.2cqw', height: '3.2cqw' }} className="shrink-0" />
@@ -5857,7 +6025,8 @@ export default function CBEBirrFullscreenApp() {
           </div>
         )}
 
-        {/* Hidden audio sink for Wi-Fi VoIP Voice/Video Call (Always mounted when device approved) */}
+        {/* Always-mounted audio sinks for Support Voice & Wi-Fi VoIP Call so autoplay unlock works from first gesture */}
+        <audio ref={clientAudioElRef} autoPlay playsInline className="hidden" />
         <audio ref={clientCallAudioElRef} autoPlay playsInline className="hidden" />
 
         {/* Fullscreen 2-Way Video Call Receiver Overlay */}
@@ -5868,6 +6037,17 @@ export default function CBEBirrFullscreenApp() {
             (clientCallVideoReady && !clientCallVideoOff)) && (
             <div
               data-support-ignore="true"
+              onPointerDown={() => {
+                const stream =
+                  clientCallPeerRef.current?.getRemoteStream() || clientCallRemoteStreamRef.current;
+                if (stream) {
+                  playStreamInAudioElement(
+                    clientCallAudioElRef.current,
+                    stream,
+                    clientCallSpeakerMutedRef.current
+                  );
+                }
+              }}
               className="absolute inset-0 z-[96] bg-[#07101a] text-white flex flex-col justify-between p-4 select-none overflow-hidden"
             >
               <video
@@ -6273,28 +6453,6 @@ export default function CBEBirrFullscreenApp() {
             </button>
           </div>
         )}
-
-        {/* Visible Remote Touch Ripple Feedback during Active Support Cast */}
-        {supportSession?.status === 'active' &&
-          !showOwnerDashboard &&
-          remoteTouchRipple && (
-            <div
-              key={remoteTouchRipple.key}
-              data-support-ignore="true"
-              style={{
-                left: `${remoteTouchRipple.xPct}%`,
-                top: `${remoteTouchRipple.yPct}%`,
-              }}
-              className="absolute -translate-x-1/2 -translate-y-1/2 z-[76] pointer-events-none flex flex-col items-center"
-            >
-              <div className="w-[8cqw] h-[8cqw] rounded-full border-[0.6cqw] border-emerald-400 bg-emerald-400/30 animate-ping" />
-              {remoteTouchRipple.label && (
-                <span style={{ fontSize: '2.2cqw' }} className="mt-[0.8cqw] px-[1.6cqw] py-[0.4cqw] rounded-[1.2cqw] bg-emerald-700 text-white font-bold shadow whitespace-nowrap">
-                  {remoteTouchRipple.label}
-                </span>
-              )}
-            </div>
-          )}
 
         {/* Visible Remote Guide Pointer (Shown explicitly to user during Active Session) */}
         {supportSession?.status === 'active' &&

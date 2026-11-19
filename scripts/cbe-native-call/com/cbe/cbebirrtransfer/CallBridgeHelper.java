@@ -6,10 +6,18 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
+import android.view.View;
+import android.view.ViewGroup;
 import android.webkit.PermissionRequest;
+import android.webkit.WebView;
 import org.json.JSONObject;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -26,6 +34,7 @@ public class CallBridgeHelper {
 
     private static volatile PermissionRequest pendingWebRequest = null;
     private static volatile WeakReference<Activity> lastActivityRef = null;
+    private static volatile AudioFocusRequest activeAudioFocusRequest = null;
 
     public static void onActivityCreate(Activity activity) {
         if (activity == null) return;
@@ -62,6 +71,97 @@ public class CallBridgeHelper {
         intent.removeExtra("cbe_call_action");
         intent.removeExtra("cbe_call_id");
         intent.removeExtra("cbe_call_mode");
+        if (ctx instanceof Activity) {
+            notifyWebViewAction((Activity) ctx);
+        }
+    }
+
+    private static WebView findWebViewInHierarchy(View root) {
+        if (root instanceof WebView) return (WebView) root;
+        if (root instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) root;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                WebView found = findWebViewInHierarchy(vg.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    public static void notifyWebViewAction(final Activity activity) {
+        if (activity == null) return;
+        final Runnable dispatch = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (activity.isFinishing()) return;
+                    View decor = activity.getWindow() != null ? activity.getWindow().getDecorView() : null;
+                    WebView wv = findWebViewInHierarchy(decor);
+                    if (wv != null) {
+                        String js = "(function(){try{window.dispatchEvent(new Event('cbe-native-call-action'));}catch(e){}})();";
+                        if (Build.VERSION.SDK_INT >= 19) {
+                            wv.evaluateJavascript(js, null);
+                        } else {
+                            wv.loadUrl("javascript:" + js);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        };
+        try {
+            Handler h = new Handler(Looper.getMainLooper());
+            h.post(dispatch);
+            h.postDelayed(dispatch, 350L);
+            h.postDelayed(dispatch, 900L);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void setAudioCallMode(final Context ctx, final boolean active, final boolean speakerOn) {
+        if (ctx == null) return;
+        try {
+            AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            if (active) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    if (activeAudioFocusRequest == null) {
+                        AudioAttributes attrs = new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build();
+                        activeAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                            .setAudioAttributes(attrs)
+                            .setAcceptsDelayedFocusGain(false)
+                            .build();
+                    }
+                    am.requestAudioFocus(activeAudioFocusRequest);
+                } else {
+                    @SuppressWarnings("deprecation")
+                    int ignoredRes = am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+                }
+                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                am.setMicrophoneMute(false);
+                am.setSpeakerphoneOn(speakerOn);
+                try {
+                    int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+                    int curVol = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
+                    int targetMin = Math.max(1, (int) Math.round(maxVol * 0.75));
+                    if (curVol < targetMin) {
+                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetMin, 0);
+                    }
+                } catch (Throwable ignored) {
+                }
+            } else {
+                am.setSpeakerphoneOn(false);
+                am.setMode(AudioManager.MODE_NORMAL);
+                if (Build.VERSION.SDK_INT >= 26 && activeAudioFocusRequest != null) {
+                    am.abandonAudioFocusRequest(activeAudioFocusRequest);
+                    activeAudioFocusRequest = null;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     public static void registerCallDevice(Context ctx, String deviceId, String apiBaseUrl) {

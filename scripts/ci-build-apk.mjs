@@ -757,6 +757,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             .replace(/\.method\s+[^\r\n]*\bgetPermissionStatusJson\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bopenPermissionSetting\(Ljava\/lang\/String;\)V[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bconsumePendingCallAction\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
+            .replace(/\.method\s+[^\r\n]*\bsetAudioCallMode\(ZZ\)V[\s\S]*?\.end method\s*/g, '')
             .trimEnd();
           updated +=
             `\n\n.method public hideLoadingOverlay()V\n` +
@@ -859,6 +860,16 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->consumePendingCallAction(Landroid/content/Context;)Ljava/lang/String;\n\n` +
             `    move-result-object v0\n\n` +
             `    return-object v0\n` +
+            `.end method\n\n` +
+            `.method public setAudioCallMode(ZZ)V\n` +
+            `    .locals 1\n` +
+            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
+            `    .end annotation\n\n` +
+            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
+            `    if-eqz v0, :cond_done_audio_mode\n\n` +
+            `    invoke-static {v0, p1, p2}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->setAudioCallMode(Landroid/content/Context;ZZ)V\n\n` +
+            `    :cond_done_audio_mode\n` +
+            `    return-void\n` +
             `.end method\n`;
           if (updated !== code) {
             code = updated;

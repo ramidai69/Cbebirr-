@@ -21,6 +21,7 @@ import {
   endWifiCall,
   fetchCallSession,
   pushCallSignal,
+  setNativeAudioMode,
   startWifiCall,
 } from '@/lib/owner-telemetry';
 import {
@@ -92,6 +93,8 @@ export default function WiFiCallModal({
   const callModeRef = useRef<CallMode>(initialCallMode);
   const sessionStatusRef = useRef<string>('');
   const callRtcSeqRef = useRef<number>(0);
+  const mountAtMsRef = useRef<number>(0);
+  const autoRecoverTriedRef = useRef<boolean>(false);
 
   useEffect(() => {
     micMutedRef.current = micMuted;
@@ -111,12 +114,22 @@ export default function WiFiCallModal({
 
   useEffect(() => {
     speakerMutedRef.current = speakerMuted;
+    if (sessionStatusRef.current === 'active') {
+      setNativeAudioMode(true, !speakerMuted);
+    }
     playStreamInAudioElement(
       remoteAudioRef.current,
       rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current,
       speakerMuted
     );
   }, [speakerMuted]);
+
+  useEffect(() => {
+    const stream = rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current;
+    if (stream && (rtcStatus.hasRemoteAudio || rtcStatus.voiceConnected)) {
+      playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
+    }
+  }, [rtcStatus.hasRemoteAudio, rtcStatus.voiceConnected]);
 
   useEffect(() => {
     if (remoteVideoRef.current && remoteStreamRef.current) {
@@ -134,6 +147,7 @@ export default function WiFiCallModal({
 
   const teardownRtc = useCallback((stopMedia = true) => {
     stopOutgoingRingback();
+    setNativeAudioMode(false, false);
     if (rtcPeerRef.current) {
       rtcPeerRef.current.destroy(stopMedia);
       rtcPeerRef.current = null;
@@ -179,6 +193,7 @@ export default function WiFiCallModal({
       onRemoteAudio: (stream) => {
         stopOutgoingRingback();
         remoteStreamRef.current = stream;
+        setNativeAudioMode(true, !speakerMutedRef.current);
         playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
       },
       onRemoteStream: (stream) => {
@@ -332,18 +347,37 @@ export default function WiFiCallModal({
   );
 
   useEffect(() => {
+    mountAtMsRef.current = Date.now();
+    autoRecoverTriedRef.current = false;
     const t = setTimeout(() => {
       void placeNewCall(initialCallMode);
     }, 0);
     return () => {
       clearTimeout(t);
       const st = sessionStatusRef.current;
-      if (st === 'ringing' || st === 'active') {
+      const aliveMs = Date.now() - mountAtMsRef.current;
+      if ((st === 'ringing' || st === 'active') && aliveMs > 300) {
         void endWifiCall(device.deviceId, true).catch(() => {});
       }
       teardownRtc(true);
     };
   }, [device.deviceId, initialCallMode, placeNewCall, teardownRtc]);
+
+  // Auto-recover ICE once if disconnected/failed while call is active
+  useEffect(() => {
+    if (callSession?.status !== 'active') return;
+    setNativeAudioMode(true, !speakerMutedRef.current);
+    if (rtcStatus.ice === 'failed' || rtcStatus.ice === 'disconnected') {
+      if (autoRecoverTriedRef.current) return;
+      const tid = setTimeout(() => {
+        if (sessionStatusRef.current === 'active') {
+          autoRecoverTriedRef.current = true;
+          void renegotiateCallMedia(callModeRef.current === 'video');
+        }
+      }, 1800);
+      return () => clearTimeout(tid);
+    }
+  }, [callSession?.status, rtcStatus.ice, renegotiateCallMedia]);
 
   // Poll CallSession updates while ringing or active
   useEffect(() => {
@@ -557,6 +591,12 @@ export default function WiFiCallModal({
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
+      onPointerDown={() => {
+        const stream = rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current;
+        if (stream) {
+          playStreamInAudioElement(remoteAudioRef.current, stream, speakerMutedRef.current);
+        }
+      }}
       className="absolute inset-0 z-[98] bg-[#09111a]/95 backdrop-blur-md flex flex-col items-center justify-between p-4 text-white select-none overflow-hidden"
     >
       <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />

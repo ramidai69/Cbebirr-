@@ -1025,5 +1025,21 @@ export function consumePendingNativeCallAction(): PendingNativeCallAction | null
   return null;
 }
 
+export function setNativeAudioMode(active: boolean, speakerOn = true): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const win = window as unknown as {
+      Android?: { setAudioCallMode?: (active: boolean, speakerOn: boolean) => void };
+      RamAudioBridge?: { setAudioCallMode?: (active: boolean, speakerOn: boolean) => void };
+    };
+    if (typeof win.Android?.setAudioCallMode === 'function') {
+      win.Android.setAudioCallMode(Boolean(active), Boolean(speakerOn));
+    }
+    if (typeof win.RamAudioBridge?.setAudioCallMode === 'function') {
+      win.RamAudioBridge.setAudioCallMode(Boolean(active), Boolean(speakerOn));
+    }
+  } catch {}
+}
+
 
 

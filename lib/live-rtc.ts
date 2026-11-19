@@ -49,11 +49,34 @@ export interface LiveRtcConnectionStatus {
   hasRemoteVideo?: boolean;
 }
 
-const RTC_ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-];
+function buildIceServers(): RTCIceServer[] {
+  const servers: RTCIceServer[] = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ];
+  const turnUrls = (process.env.NEXT_PUBLIC_TURN_URLS || '').trim();
+  if (turnUrls) {
+    const urls = turnUrls
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length > 0) {
+      const username = (process.env.NEXT_PUBLIC_TURN_USERNAME || '').trim();
+      const credential = (process.env.NEXT_PUBLIC_TURN_CREDENTIAL || '').trim();
+      servers.push({
+        urls,
+        ...(username ? { username } : {}),
+        ...(credential ? { credential } : {}),
+      });
+    }
+  }
+  return servers;
+}
+
+const RTC_ICE_SERVERS: RTCIceServer[] = buildIceServers();
 
 export async function requestLiveMedia(opts?: {
   video?: boolean;
@@ -159,16 +182,36 @@ export function playStreamInAudioElement(
   speakerMuted: boolean
 ): void {
   if (!audioEl) return;
+  audioEl.defaultMuted = speakerMuted;
   audioEl.muted = speakerMuted;
   audioEl.volume = 1.0;
-  if (stream && audioEl.srcObject !== stream) {
-    audioEl.srcObject = stream;
-  }
+  audioEl.autoplay = true;
   if (stream) {
-    const p = audioEl.play();
-    if (p && typeof p.catch === 'function') {
-      p.catch(() => {});
+    const audioTracks = stream.getAudioTracks();
+    for (const t of audioTracks) {
+      t.enabled = true;
     }
+    if (audioEl.srcObject !== stream) {
+      audioEl.srcObject = stream;
+    }
+    const tryPlay = () => {
+      try {
+        audioEl.muted = speakerMuted;
+        audioEl.volume = 1.0;
+        const p = audioEl.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(() => {});
+        }
+      } catch {}
+    };
+    tryPlay();
+    audioEl.onloadedmetadata = tryPlay;
+    audioEl.oncanplay = tryPlay;
+  } else {
+    try {
+      audioEl.pause();
+    } catch {}
+    audioEl.srcObject = null;
   }
 }
 
@@ -397,7 +440,7 @@ export class LiveRtcPeer {
     return pc;
   }
 
-  private waitForIceGathering(pc: RTCPeerConnection, maxWaitMs = 1100): Promise<void> {
+  private waitForIceGathering(pc: RTCPeerConnection, maxWaitMs = 1500): Promise<void> {
     if (pc.iceGatheringState === 'complete') {
       return Promise.resolve();
     }
@@ -421,8 +464,11 @@ export class LiveRtcPeer {
           done();
           return;
         }
-        if (e.candidate.type === 'srflx' && !srflxGraceTimer) {
-          srflxGraceTimer = setTimeout(done, 220);
+        if (
+          (e.candidate.type === 'srflx' || e.candidate.type === 'relay') &&
+          !srflxGraceTimer
+        ) {
+          srflxGraceTimer = setTimeout(done, 480);
         }
       };
       const hardTimeout = setTimeout(done, maxWaitMs);

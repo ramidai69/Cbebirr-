@@ -2,12 +2,17 @@ package com.ramcontrol.owner
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -82,7 +87,8 @@ class MainActivity : AppCompatActivity() {
                 val trusted = originHost == "appassets.androidplatform.net" ||
                     originHost == "localhost" ||
                     originHost == "127.0.0.1" ||
-                    originHost.endsWith("vercel.app")
+                    originHost.endsWith("vercel.app") ||
+                    originHost.endsWith("run.app")
                 if (!trusted) {
                     try {
                         request.deny()
@@ -149,6 +155,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val audioBridge = RamAudioBridge()
+        webView.addJavascriptInterface(audioBridge, "RamAudioBridge")
+        webView.addJavascriptInterface(audioBridge, "Android")
+
         setContentView(webView)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -163,6 +173,55 @@ class MainActivity : AppCompatActivity() {
 
         webView.loadUrl("https://appassets.androidplatform.net/ram-control")
         requestInitialOwnerPermissions()
+    }
+
+    private var focusReq: AudioFocusRequest? = null
+
+    inner class RamAudioBridge {
+        @JavascriptInterface
+        fun setAudioCallMode(active: Boolean, speakerOn: Boolean) {
+            runOnUiThread {
+                try {
+                    val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return@runOnUiThread
+                    if (active) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            val req = focusReq ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                                .setAudioAttributes(
+                                    AudioAttributes.Builder()
+                                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                        .build()
+                                )
+                                .build().also { focusReq = it }
+                            am.requestAudioFocus(req)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                        }
+                        am.mode = AudioManager.MODE_IN_COMMUNICATION
+                        am.isMicrophoneMute = false
+                        am.isSpeakerphoneOn = speakerOn
+                        try {
+                            val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                            val curVol = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+                            val targetMin = kotlin.math.max(1, (maxVol * 0.75).toInt())
+                            if (curVol < targetMin) {
+                                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetMin, 0)
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    } else {
+                        am.isSpeakerphoneOn = false
+                        am.mode = AudioManager.MODE_NORMAL
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            focusReq?.let { am.abandonAudioFocusRequest(it) }
+                            focusReq = null
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
     }
 
     private fun requestInitialOwnerPermissions() {

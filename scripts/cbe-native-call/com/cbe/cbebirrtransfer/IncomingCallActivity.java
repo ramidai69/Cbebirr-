@@ -20,6 +20,7 @@ public class IncomingCallActivity extends Activity {
     private static volatile IncomingCallActivity currentOpen;
     private String callId = "";
     private String callMode = "audio";
+    private boolean actionSent = false;
     private TextView callerNameView;
     private TextView badgeView;
     private TextView subtitleView;
@@ -157,10 +158,12 @@ public class IncomingCallActivity extends Activity {
         declineBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                if (actionSent) return;
+                actionSent = true;
                 Intent i = new Intent(IncomingCallActivity.this, CallForegroundService.class);
                 i.setAction(CallForegroundService.ACTION_DECLINE_CALL);
                 i.putExtra("callId", callId);
-                startService(i);
+                startServiceCompat(i);
                 finish();
             }
         });
@@ -172,11 +175,15 @@ public class IncomingCallActivity extends Activity {
         answerBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                if (actionSent) return;
+                actionSent = true;
+                CallBridgeHelper.setAudioCallMode(getApplicationContext(), true, true);
+                CallBridgeHelper.setPendingCallAction(getApplicationContext(), callId, "answer", callMode);
                 Intent i = new Intent(IncomingCallActivity.this, CallForegroundService.class);
                 i.setAction(CallForegroundService.ACTION_ANSWER_CALL);
                 i.putExtra("callId", callId);
                 i.putExtra("callMode", callMode);
-                startService(i);
+                startServiceCompat(i);
                 finish();
             }
         });
@@ -200,6 +207,21 @@ public class IncomingCallActivity extends Activity {
         gd.setCornerRadius(dp(18));
         b.setBackground(gd);
         return b;
+    }
+
+    private void startServiceCompat(Intent i) {
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        } catch (Throwable ignored) {
+            try {
+                startService(i);
+            } catch (Throwable ignored2) {
+            }
+        }
     }
 
     private int dp(int val) {
