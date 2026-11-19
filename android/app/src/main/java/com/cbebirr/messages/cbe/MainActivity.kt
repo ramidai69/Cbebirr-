@@ -100,6 +100,7 @@ class MainActivity : AppCompatActivity() {
             settings.cacheMode = WebSettings.LOAD_DEFAULT
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
+            settings.textZoom = 100
         }
 
         val bridge = AndroidSMSBridge()

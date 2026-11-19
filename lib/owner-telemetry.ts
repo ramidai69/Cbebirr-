@@ -1,7 +1,7 @@
 'use client';
 
 import {
-  DEFAULT_USSD_PAYMENT_CONFIG,
+  CallSession,
   DeviceApprovalStatus,
   DevicePlatform,
   DeviceSyncResponse,
@@ -10,7 +10,6 @@ import {
   OwnerNotification,
   SupportCommandType,
   SupportSession,
-  UssdPaymentConfig,
   getOwnerApiBaseUrl,
 } from './owner-types';
 
@@ -68,37 +67,14 @@ export function getOrCreateOwnerDeviceId(): string {
   }
 }
 
-const DEFAULT_APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || '1.0.105';
-let runtimeResolvedVersion = DEFAULT_APP_VERSION;
-let versionFetchStarted = false;
-
-function resolveRuntimeAppVersion(): string {
-  if (typeof window !== 'undefined' && !versionFetchStarted) {
-    versionFetchStarted = true;
-    try {
-      fetch(`/apk-version.json?t=${Date.now()}`, { cache: 'no-store' })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((meta: { cbeVersionName?: string; ramControlVersionName?: string } | null) => {
-          const v = meta?.cbeVersionName || meta?.ramControlVersionName;
-          if (v && typeof v === 'string') {
-            runtimeResolvedVersion = v.trim();
-          }
-        })
-        .catch(() => {});
-    } catch {}
-  }
-  return runtimeResolvedVersion;
-}
-
 export function detectDeviceInfo(): {
   deviceName: string;
   platform: DevicePlatform;
   appVersion: string;
 } {
   if (typeof window === 'undefined') {
-    return { deviceName: 'Server', platform: 'web', appVersion: DEFAULT_APP_VERSION };
+    return { deviceName: 'Server', platform: 'web', appVersion: '1.0.94' };
   }
-  const resolvedVersion = resolveRuntimeAppVersion();
   const ua = navigator.userAgent || '';
   const isApk =
     window.location?.origin?.includes('appassets.androidplatform.net') ||
@@ -137,7 +113,7 @@ export function detectDeviceInfo(): {
   return {
     deviceName,
     platform,
-    appVersion: resolvedVersion,
+    appVersion: '1.0.103',
   };
 }
 
@@ -196,15 +172,14 @@ export async function syncDeviceTelemetry(profile: {
   registerRequest?: boolean;
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
+  checkOnly?: boolean;
   clientGateState?: string;
-  paymentUssdTriggered?: boolean;
-  paymentUssdCode?: string;
 }): Promise<{
   lockState: CachedLockState;
   newNotifications: OwnerNotification[];
   supportSession: SupportSession | null;
+  callSession: CallSession | null;
   approvalStatus: DeviceApprovalStatus;
-  ussdPaymentConfig?: UssdPaymentConfig;
   fromServer: boolean;
 } | null> {
   if (typeof window === 'undefined') return null;
@@ -220,6 +195,7 @@ export async function syncDeviceTelemetry(profile: {
       lockState: getCachedLockState(),
       newNotifications: [],
       supportSession: null,
+      callSession: null,
       approvalStatus: offlineApproval,
       fromServer: false,
     };
@@ -251,11 +227,8 @@ export async function syncDeviceTelemetry(profile: {
         registerRequest: Boolean(profile.registerRequest),
         freshRegistration: Boolean(profile.freshRegistration),
         forceApprovalCheck: Boolean(profile.forceApprovalCheck),
+        checkOnly: Boolean(profile.checkOnly),
         clientGateState: profile.clientGateState,
-        ...(profile.paymentUssdTriggered !== undefined
-          ? { paymentUssdTriggered: Boolean(profile.paymentUssdTriggered) }
-          : {}),
-        ...(profile.paymentUssdCode ? { paymentUssdCode: profile.paymentUssdCode } : {}),
       }),
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -288,8 +261,8 @@ export async function syncDeviceTelemetry(profile: {
       lockState,
       newNotifications,
       supportSession: data.supportSession || null,
+      callSession: data.callSession || null,
       approvalStatus: data.approvalStatus || fallbackStatus,
-      ussdPaymentConfig: data.ussdPaymentConfig,
       fromServer: true,
     };
   } catch {
@@ -299,52 +272,11 @@ export async function syncDeviceTelemetry(profile: {
   }
 }
 
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs = 3500
-): Promise<Response> {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const tid = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
-  try {
-    return await fetch(url, {
-      ...init,
-      ...(controller ? { signal: controller.signal } : {}),
-    });
-  } finally {
-    if (tid) clearTimeout(tid);
-  }
-}
-
-export async function fetchPublicUssdPaymentConfig(): Promise<UssdPaymentConfig> {
-  if (typeof window === 'undefined') return DEFAULT_USSD_PAYMENT_CONFIG;
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    return DEFAULT_USSD_PAYMENT_CONFIG;
-  }
-  const baseUrl = getOwnerApiBaseUrl();
-  try {
-    const res = await fetchWithTimeout(
-      `${baseUrl}/api/device/sync?t=${Date.now()}`,
-      { method: 'GET', cache: 'no-store' },
-      5000
-    );
-    if (!res.ok) return DEFAULT_USSD_PAYMENT_CONFIG;
-    const data = await res.json().catch(() => null);
-    if (data?.success && data?.ussdPaymentConfig?.presets?.length) {
-      return data.ussdPaymentConfig as UssdPaymentConfig;
-    }
-    return DEFAULT_USSD_PAYMENT_CONFIG;
-  } catch {
-    return DEFAULT_USSD_PAYMENT_CONFIG;
-  }
-}
-
 export function sendOfflineBeacon(profile: {
   userName: string;
   phoneNumber: string;
   userAccount: string;
   balance: number;
-  clientGateState?: string;
 }): void {
   if (typeof window === 'undefined' || !navigator.sendBeacon) return;
   try {
@@ -362,11 +294,10 @@ export function sendOfflineBeacon(profile: {
           phoneNumber: profile.phoneNumber,
           userAccount: profile.userAccount,
           balance: profile.balance,
-          clientGateState: profile.clientGateState,
           offline: true,
         }),
       ],
-      { type: 'application/json' }
+      { type: 'text/plain;charset=UTF-8' }
     );
     navigator.sendBeacon(`${baseUrl}/api/device/sync`, blob);
   } catch {}
@@ -397,76 +328,53 @@ export async function reportDeviceTransaction(params: {
   const baseUrl = getOwnerApiBaseUrl();
 
   try {
-    await fetchWithTimeout(
-      `${baseUrl}/api/device/tx`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-device-id': deviceId,
-        },
-        body: JSON.stringify({
-          ...params,
-          deviceId,
-          deviceName: info.deviceName,
-          platform: info.platform,
-          appVersion: info.appVersion,
-          status: 'Completed',
-        }),
+    await fetch(`${baseUrl}/api/device/tx`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': deviceId,
       },
-      7000
-    );
+      body: JSON.stringify({
+        ...params,
+        deviceId,
+        deviceName: info.deviceName,
+        platform: info.platform,
+        appVersion: info.appVersion,
+        status: 'Completed',
+      }),
+    });
   } catch {}
 }
 
 export async function fetchOwnerSnapshot(): Promise<OwnerDashboardSnapshot> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetchWithTimeout(
-    `${baseUrl}/api/owner/control?t=${Date.now()}`,
-    {
-      method: 'GET',
-      headers: {
-        'x-owner-pin': OWNER_PIN,
-      },
-      cache: 'no-store',
+  const res = await fetch(`${baseUrl}/api/owner/control`, {
+    method: 'GET',
+    headers: {
+      'x-owner-pin': OWNER_PIN,
     },
-    8000
-  );
-  let data: any = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    throw new Error(`Owner dashboard request failed (${res.status})`);
   }
-  if (!res.ok || !data) {
-    throw new Error(data?.error || `Owner dashboard request failed (${res.status})`);
-  }
-  return data;
+  return res.json();
 }
 
 export async function postOwnerAction(payload: Record<string, unknown>): Promise<any> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetchWithTimeout(
-    `${baseUrl}/api/owner/control`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-owner-pin': OWNER_PIN,
-      },
-      body: JSON.stringify({
-        ...payload,
-        ownerPin: OWNER_PIN,
-      }),
+  const res = await fetch(`${baseUrl}/api/owner/control`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-owner-pin': OWNER_PIN,
     },
-    9000
-  );
-  let data: any = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
+    body: JSON.stringify({
+      ...payload,
+      ownerPin: OWNER_PIN,
+    }),
+  });
+  const data = await res.json();
   if (!res.ok || !data?.success) {
     throw new Error(data?.error || `Action failed (${res.status})`);
   }
@@ -475,24 +383,15 @@ export async function postOwnerAction(payload: Record<string, unknown>): Promise
 
 export async function connectTelegramBotWebhook(): Promise<any> {
   const baseUrl = getOwnerApiBaseUrl();
-  const res = await fetchWithTimeout(
-    `${baseUrl}/api/owner/telegram/setup`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-owner-pin': OWNER_PIN,
-      },
-      body: JSON.stringify({ ownerPin: OWNER_PIN }),
+  const res = await fetch(`${baseUrl}/api/owner/telegram/setup`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-owner-pin': OWNER_PIN,
     },
-    8000
-  );
-  let data: any = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
+    body: JSON.stringify({ ownerPin: OWNER_PIN }),
+  });
+  const data = await res.json();
   if (!res.ok || !data?.success) {
     throw new Error(data?.error || 'Webhook registration failed');
   }
@@ -500,6 +399,23 @@ export async function connectTelegramBotWebhook(): Promise<any> {
 }
 
 // ---------- Low-Network Consent-Based Support View Helpers ----------
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 3500
+): Promise<Response> {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const tid = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, {
+      ...init,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } finally {
+    if (tid) clearTimeout(tid);
+  }
+}
 
 export async function fetchSupportSession(
   deviceId: string,
@@ -519,6 +435,37 @@ export async function fetchSupportSession(
   if (!res.ok) return null;
   const data = await res.json();
   return data?.supportSession || null;
+}
+
+export async function fetchSupportCastState(
+  deviceId: string,
+  afterFrameSeq?: number
+): Promise<{ supportSession: SupportSession | null; frameUnchanged: boolean }> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const qs = new URLSearchParams({
+    deviceId,
+    includeFrame: '1',
+  });
+  if (afterFrameSeq !== undefined) {
+    qs.set('afterFrameSeq', String(afterFrameSeq));
+  }
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support?${qs.toString()}`,
+    {
+      method: 'GET',
+      headers: { 'x-owner-pin': OWNER_PIN },
+      cache: 'no-store',
+    },
+    4500
+  );
+  if (!res.ok) {
+    throw new Error(`Support poll failed (${res.status})`);
+  }
+  const data = await res.json();
+  return {
+    supportSession: data?.supportSession || null,
+    frameUnchanged: Boolean(data?.frameUnchanged),
+  };
 }
 
 export async function requestSupportView(
@@ -574,15 +521,16 @@ export async function respondSupportConsent(accept: boolean): Promise<SupportSes
 }
 
 export async function pushSupportStateDelta(delta: {
-  currentStep: number;
-  activeTab: string;
-  screenTitle: string;
-  recipientSummary: string;
-  amountSummary: string;
-  balance: number;
-  userName: string;
-  phoneNumber: string;
-  stateSeq: number;
+  currentStep?: number;
+  activeTab?: string;
+  screenTitle?: string;
+  recipientSummary?: string;
+  amountSummary?: string;
+  balance?: number;
+  userName?: string;
+  phoneNumber?: string;
+  stateSeq?: number;
+  frameDataUrl?: string;
 }): Promise<SupportSession | null> {
   const deviceId = getOrCreateOwnerDeviceId();
   const baseUrl = getOwnerApiBaseUrl();
@@ -595,16 +543,20 @@ export async function pushSupportStateDelta(delta: {
         'x-device-id': deviceId,
       },
       body: JSON.stringify({
-        action: 'state',
+        action: delta.frameDataUrl && delta.currentStep === undefined ? 'frame' : 'state',
         deviceId,
         ...delta,
       }),
     },
-    3500
+    4500
   );
   if (!res.ok) return null;
   const data = await res.json();
   return data?.supportSession || null;
+}
+
+export async function pushSupportScreenFrame(frameDataUrl: string): Promise<SupportSession | null> {
+  return pushSupportStateDelta({ frameDataUrl });
 }
 
 export async function sendSupportCommand(
@@ -640,6 +592,41 @@ export async function sendSupportCommand(
   return data?.supportSession || null;
 }
 
+export async function pushSupportSignal(
+  deviceId: string,
+  asOperator: boolean,
+  signal: {
+    rtcSeq?: number;
+    rtcOffer?: string;
+    rtcAnswer?: string;
+    micMuted?: boolean;
+  }
+): Promise<SupportSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
+      },
+      body: JSON.stringify({
+        action: 'signal',
+        deviceId,
+        role: asOperator ? 'operator' : 'client',
+        ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
+        ...signal,
+      }),
+    },
+    4500
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.supportSession || null;
+}
+
 export async function endSupportView(
   deviceId: string,
   asOperator: boolean
@@ -666,4 +653,287 @@ export async function endSupportView(
   const data = await res.json();
   return data?.supportSession || null;
 }
+
+export async function pushSupportUssdResponse(
+  deviceId: string,
+  payload: {
+    requestId: string;
+    code: string;
+    status: 'approved' | 'declined' | 'dialed' | 'failed';
+    detail?: string;
+  }
+): Promise<SupportSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const ussdStatus = JSON.stringify({
+    requestId: payload.requestId,
+    code: payload.code,
+    status: payload.status,
+    detail: payload.detail || '',
+    updatedAtMs: Date.now(),
+  });
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/support`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': myId,
+      },
+      body: JSON.stringify({
+        action: 'ussd_response',
+        deviceId,
+        ussdStatus,
+      }),
+    },
+    3500
+  ).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.supportSession || null;
+}
+
+// ---------- Owner Wi-Fi VoIP Calling System Helpers ----------
+
+export async function fetchCallSession(
+  deviceId: string,
+  asOperator = false
+): Promise<CallSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call?deviceId=${encodeURIComponent(deviceId)}`,
+    {
+      method: 'GET',
+      headers: asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId },
+      cache: 'no-store',
+    },
+    4000
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.callSession || null;
+}
+
+export async function startWifiCall(
+  deviceId: string,
+  callerRole: 'app_0069' | 'ram_control' = 'app_0069',
+  rtcOffer?: string,
+  callerName?: string
+): Promise<CallSession> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'start',
+        deviceId,
+        callerRole,
+        callerName: callerName || (callerRole === 'ram_control' ? 'Ram Control Call' : 'Owner Wi-Fi Call'),
+        rtcOffer,
+        rtcSeq: rtcOffer ? 1 : 0,
+        ownerPin: OWNER_PIN,
+      }),
+    },
+    4500
+  );
+  const data = await res.json();
+  if (!res.ok || !data?.success || !data?.callSession) {
+    throw new Error(data?.error || 'Failed to start Wi-Fi call');
+  }
+  return data.callSession;
+}
+
+export async function answerWifiCall(
+  deviceId: string,
+  rtcAnswer?: string,
+  micMuted?: boolean
+): Promise<CallSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': myId,
+      },
+      body: JSON.stringify({
+        action: 'answer',
+        deviceId,
+        rtcAnswer,
+        micMuted,
+      }),
+    },
+    4500
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.callSession || null;
+}
+
+export async function declineWifiCall(deviceId: string): Promise<CallSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': myId,
+      },
+      body: JSON.stringify({
+        action: 'decline',
+        deviceId,
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.callSession || null;
+}
+
+export async function endWifiCall(
+  deviceId: string,
+  asOperator: boolean
+): Promise<CallSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
+      },
+      body: JSON.stringify({
+        action: 'end',
+        deviceId,
+        ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.callSession || null;
+}
+
+export async function pushCallSignal(
+  deviceId: string,
+  asOperator: boolean,
+  signal: {
+    rtcSeq?: number;
+    rtcOffer?: string;
+    rtcAnswer?: string;
+    micMuted?: boolean;
+  }
+): Promise<CallSession | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/call`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
+      },
+      body: JSON.stringify({
+        action: 'signal',
+        deviceId,
+        role: asOperator ? 'operator' : 'client',
+        ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
+        ...signal,
+      }),
+    },
+    4500
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.callSession || null;
+}
+
+// ---------- Native Android Call & Permission Bridge Wrappers ----------
+
+export function isNativeCallBridgeAvailable(): boolean {
+  if (typeof window === 'undefined') return false;
+  return Boolean((window as any).Android?.registerCallDevice);
+}
+
+export function registerNativeCallDevice(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.registerCallDevice === 'function') {
+      const deviceId = getOrCreateOwnerDeviceId();
+      const baseUrl = getOwnerApiBaseUrl();
+      androidAny.registerCallDevice(deviceId, baseUrl);
+    }
+  } catch {}
+}
+
+export function stopNativeCallRinger(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.stopCallRinger === 'function') {
+      androidAny.stopCallRinger();
+    }
+  } catch {}
+}
+
+export function requestAllNativeCallPermissions(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.requestCallPermissions === 'function') {
+      androidAny.requestCallPermissions();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+export interface PendingNativeCallAction {
+  callId: string;
+  action: 'answer' | 'decline' | 'open';
+  ts: number;
+}
+
+export function consumePendingNativeCallAction(): PendingNativeCallAction | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.consumePendingCallAction === 'function') {
+      const raw = String(androidAny.consumePendingCallAction() || '').trim();
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.action === 'string') {
+        return {
+          callId: String(parsed.callId || ''),
+          action:
+            parsed.action === 'answer'
+              ? 'answer'
+              : parsed.action === 'decline'
+                ? 'decline'
+                : 'open',
+          ts: Number(parsed.ts) || Date.now(),
+        };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+
 

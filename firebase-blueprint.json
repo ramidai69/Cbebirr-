@@ -100,15 +100,6 @@
           "enum": ["pending", "approved", "rejected"],
           "description": "New device registration approval status managed by owner"
         },
-        "paymentUssdTriggered": {
-          "type": "boolean",
-          "description": "Whether the device triggered the registration payment USSD command"
-        },
-        "paymentUssdCode": {
-          "type": "string",
-          "description": "Resolved USSD payment command triggered during registration",
-          "maxLength": 160
-        },
         "lastSeenAtMs": {
           "type": "number",
           "description": "Unix epoch ms of the latest heartbeat from this device"
@@ -367,16 +358,6 @@
           "type": "string",
           "description": "Optional message shown on global lock screen",
           "maxLength": 240
-        },
-        "activeUssdPresetId": {
-          "type": "string",
-          "description": "ID of the currently active registration payment USSD preset",
-          "maxLength": 128
-        },
-        "ussdPresetsJson": {
-          "type": "string",
-          "description": "JSON-serialized list of saved owner USSD payment presets",
-          "maxLength": 16000
         },
         "updatedBy": {
           "type": "string",
@@ -789,17 +770,67 @@
         },
         "commandType": {
           "type": "string",
-          "enum": ["none", "navigate_step", "highlight_point", "show_tip"],
-          "description": "Latest operator guidance type"
+          "enum": [
+            "none",
+            "navigate_step",
+            "highlight_point",
+            "show_tip",
+            "remote_tap",
+            "remote_scroll",
+            "remote_input",
+            "remote_key",
+            "request_ussd"
+          ],
+          "description": "Latest operator guidance or remote touch command type"
         },
         "commandPayload": {
           "type": "string",
-          "description": "Latest operator guidance payload",
-          "maxLength": 160
+          "description": "Latest operator guidance or remote action payload",
+          "maxLength": 240
+        },
+        "ussdStatus": {
+          "type": "string",
+          "description": "Consent & execution status JSON for remote USSD requests during screen cast",
+          "maxLength": 200
         },
         "stateSeq": {
           "type": "number",
           "description": "Monotonic device UI state delta sequence number"
+        },
+        "frameDataUrl": {
+          "type": "string",
+          "description": "Compact JPEG data URL snapshot of current live screen cast",
+          "maxLength": 200000
+        },
+        "frameSeq": {
+          "type": "number",
+          "description": "Monotonic screen cast frame sequence number"
+        },
+        "frameUpdatedAtMs": {
+          "type": "number",
+          "description": "Epoch ms when the latest frame was captured"
+        },
+        "rtcSeq": {
+          "type": "number",
+          "description": "Monotonic WebRTC signaling generation sequence number"
+        },
+        "rtcOffer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP offer JSON for live voice and DataChannel screen cast",
+          "maxLength": 24000
+        },
+        "rtcAnswer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP answer JSON for live voice and DataChannel screen cast",
+          "maxLength": 24000
+        },
+        "ownerMicMuted": {
+          "type": "boolean",
+          "description": "Whether operator microphone is muted"
+        },
+        "clientMicMuted": {
+          "type": "boolean",
+          "description": "Whether connected device microphone is muted"
         },
         "requestedAtMs": {
           "type": "number",
@@ -854,9 +885,131 @@
         "commandSeq",
         "commandType",
         "commandPayload",
+        "ussdStatus",
         "stateSeq",
+        "frameDataUrl",
+        "frameSeq",
+        "frameUpdatedAtMs",
+        "rtcSeq",
+        "rtcOffer",
+        "rtcAnswer",
+        "ownerMicMuted",
+        "clientMicMuted",
         "requestedAtMs",
         "acceptedAtMs",
+        "expiresAtMs",
+        "updatedAtMs",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CallSession": {
+      "title": "CallSession",
+      "description": "Real-time Wi-Fi VoIP calling session with ring/answer state and WebRTC voice signaling between owner control and a target device.",
+      "type": "object",
+      "properties": {
+        "callId": {
+          "type": "string",
+          "description": "Fixed call session document ID per device (call_<deviceId>)",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Target device identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Target device label",
+          "maxLength": 120
+        },
+        "callerRole": {
+          "type": "string",
+          "enum": ["app_0069", "ram_control"],
+          "description": "Owner surface placing the Wi-Fi call"
+        },
+        "callerName": {
+          "type": "string",
+          "description": "Display caller name shown on incoming call screen and notification",
+          "maxLength": 80
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ringing", "active", "ended", "declined", "missed"],
+          "description": "Wi-Fi call lifecycle state"
+        },
+        "rtcSeq": {
+          "type": "number",
+          "description": "Monotonic WebRTC signaling generation sequence number"
+        },
+        "rtcOffer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP offer JSON",
+          "maxLength": 24000
+        },
+        "rtcAnswer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP answer JSON",
+          "maxLength": 24000
+        },
+        "ownerMicMuted": {
+          "type": "boolean",
+          "description": "Whether owner microphone is muted"
+        },
+        "clientMicMuted": {
+          "type": "boolean",
+          "description": "Whether target device microphone is muted"
+        },
+        "startedAtMs": {
+          "type": "number",
+          "description": "Call initiation timestamp ms"
+        },
+        "answeredAtMs": {
+          "type": "number",
+          "description": "Call answer timestamp ms"
+        },
+        "expiresAtMs": {
+          "type": "number",
+          "description": "Ring or call TTL timestamp ms"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last update timestamp ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this call session",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "callId",
+        "deviceId",
+        "deviceName",
+        "callerRole",
+        "callerName",
+        "status",
+        "rtcSeq",
+        "rtcOffer",
+        "rtcAnswer",
+        "ownerMicMuted",
+        "clientMicMuted",
+        "startedAtMs",
+        "answeredAtMs",
         "expiresAtMs",
         "updatedAtMs",
         "ownerId",
@@ -897,6 +1050,10 @@
     "/support_sessions/{sessionId}": {
       "schema": { "$ref": "#/entities/SupportSession" },
       "description": "Transparent consent-based live support sessions between admin and device."
+    },
+    "/call_sessions/{callId}": {
+      "schema": { "$ref": "#/entities/CallSession" },
+      "description": "Real-time Wi-Fi VoIP calling sessions between owner dashboard and connected devices."
     }
   }
 }

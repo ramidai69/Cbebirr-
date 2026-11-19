@@ -1,12 +1,14 @@
 package com.ramcontrol.owner
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.webkit.CookieManager
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -14,14 +16,35 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import java.io.ByteArrayInputStream
+import androidx.core.content.ContextCompat
 import java.io.InputStream
 import java.net.URLDecoder
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private var pendingWebPermissionRequest: PermissionRequest? = null
+
+    private val recordAudioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+            val pending = pendingWebPermissionRequest
+            pendingWebPermissionRequest = null
+            if (pending != null) {
+                try {
+                    if (isGranted) {
+                        pending.grant(pending.resources)
+                    } else {
+                        pending.deny()
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+    private val startupPermissionsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ -> }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,16 +70,44 @@ class MainActivity : AppCompatActivity() {
             settings.cacheMode = WebSettings.LOAD_NO_CACHE
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
+            settings.textZoom = 100
+            settings.mediaPlaybackRequiresUserGesture = false
         }
 
-        try {
-            val cm = CookieManager.getInstance()
-            cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(webView, true)
-        } catch (_: Throwable) {
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                if (request == null) return
+                val originHost = request.origin?.host ?: ""
+                val trusted = originHost == "appassets.androidplatform.net" ||
+                    originHost == "localhost" ||
+                    originHost == "127.0.0.1" ||
+                    originHost.endsWith("vercel.app")
+                if (!trusted) {
+                    try {
+                        request.deny()
+                    } catch (_: Throwable) {
+                    }
+                    return
+                }
+                val hasMic = ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+                if (hasMic) {
+                    runOnUiThread {
+                        try {
+                            request.grant(request.resources)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                } else {
+                    runOnUiThread {
+                        pendingWebPermissionRequest = request
+                        recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+            }
         }
-
-        webView.webChromeClient = WebChromeClient()
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
                 view: WebView?,
@@ -67,16 +118,6 @@ class MainActivity : AppCompatActivity() {
                 if (host == "appassets.androidplatform.net" || host == "localhost" || host == "127.0.0.1") {
                     val assetResponse = openLocalAssetResponse(url.path ?: "/")
                     if (assetResponse != null) return assetResponse
-                    if (host == "appassets.androidplatform.net") {
-                        return WebResourceResponse(
-                            "text/plain",
-                            "UTF-8",
-                            404,
-                            "Not Found",
-                            mapOf("Access-Control-Allow-Origin" to "*"),
-                            ByteArrayInputStream(ByteArray(0))
-                        )
-                    }
                 }
                 return super.shouldInterceptRequest(view, request)
             }
@@ -112,32 +153,33 @@ class MainActivity : AppCompatActivity() {
         })
 
         webView.loadUrl("https://appassets.androidplatform.net/ram-control")
+        requestInitialOwnerPermissions()
     }
 
-    override fun onResume() {
-        super.onResume()
-        if (::webView.isInitialized) {
-            webView.onResume()
-            webView.resumeTimers()
-            webView.evaluateJavascript(
-                "try{if(window.onNativeResume)window.onNativeResume();}catch(e){}",
-                null
-            )
+    private fun requestInitialOwnerPermissions() {
+        val needed = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.RECORD_AUDIO)
         }
-    }
-
-    override fun onPause() {
-        if (::webView.isInitialized) {
-            webView.onPause()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                needed.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
-        super.onPause()
-    }
-
-    override fun onDestroy() {
-        if (::webView.isInitialized) {
-            webView.destroy()
+        if (needed.isNotEmpty()) {
+            try {
+                startupPermissionsLauncher.launch(needed.toTypedArray())
+            } catch (_: Throwable) {
+            }
         }
-        super.onDestroy()
     }
 
     private fun openLocalAssetResponse(rawPath: String): WebResourceResponse? {

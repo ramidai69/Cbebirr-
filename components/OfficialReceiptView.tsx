@@ -377,7 +377,10 @@ export function OfficialReceiptCore({
   }
 
   return (
-    <div className="w-full h-full min-h-screen bg-[#f0f2f5] text-slate-800 select-none relative">
+    <div
+      className="w-full h-full min-h-screen bg-[#f0f2f5] text-slate-800 select-none relative"
+      style={{ WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}
+    >
       {/* If inside modal, minimal floating close button at top right */}
       {isModal && onClose && (
         <button
@@ -411,7 +414,7 @@ export function OfficialReceiptCore({
             style={{ imageRendering: '-webkit-optimize-contrast' }}
           />
 
-          <g fontFamily="Arial, Helvetica, sans-serif" fill="#141414" fontSize="11" fontWeight="normal">
+          <g fontFamily="Arial, Helvetica, sans-serif" fill="#141414" fontSize="10.5" fontWeight="normal">
             {/* Customer Name */}
             <rect x="440" y="105" width="215" height="20" fill="#ffffff" />
             <text x="442" y="118">

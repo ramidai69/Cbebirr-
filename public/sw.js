@@ -1,5 +1,5 @@
 // CBEBirr Service Worker for Instant Offline PWA Support & Automatic Live OTA Updates
-const CACHE_NAME = 'cbebirr-cache-v14';
+const CACHE_NAME = 'cbebirr-cache-v16';
 const IS_NATIVE_APK = self.location.hostname.includes('appassets.androidplatform.net');
 const IS_DEV_HOST =
   self.location.hostname.startsWith('ais-dev-') ||
@@ -92,10 +92,8 @@ self.addEventListener('fetch', (event) => {
     url.origin !== self.location.origin ||
     req.method !== 'GET' ||
     url.pathname === '/sw.js' ||
-    url.pathname === '/apk-version.json' ||
     url.pathname.startsWith('/r/') ||
     url.pathname.startsWith('/api/') ||
-    url.pathname === '/download' ||
     url.pathname.startsWith('/download/') ||
     url.pathname.endsWith('.apk')
   ) {
@@ -207,7 +205,67 @@ self.addEventListener('fetch', (event) => {
 });
 
 self.addEventListener('notificationclick', (event) => {
+  const notifData = event.notification?.data || {};
+  const action = event.action || '';
   event.notification.close();
+
+  if (notifData.type === 'incoming_call') {
+    const callAction =
+      action === 'answer_call'
+        ? 'answer'
+        : action === 'decline_call'
+          ? 'decline'
+          : 'open';
+
+    event.waitUntil(
+      (async () => {
+        if (callAction === 'decline' && notifData.deviceId) {
+          try {
+            await fetch('/api/owner/call', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-device-id': String(notifData.deviceId),
+              },
+              body: JSON.stringify({
+                action: 'decline',
+                deviceId: String(notifData.deviceId),
+              }),
+            });
+          } catch {}
+        }
+
+        const clientsArr = await self.clients.matchAll({
+          type: 'window',
+          includeUncontrolled: true,
+        });
+
+        for (const client of clientsArr) {
+          if ('postMessage' in client) {
+            client.postMessage({
+              type: 'INCOMING_CALL_ACTION',
+              action: callAction,
+              callId: notifData.callId || '',
+            });
+          }
+          if (callAction !== 'decline' && 'focus' in client) {
+            return client.focus();
+          }
+        }
+
+        if (callAction !== 'decline' && self.clients.openWindow) {
+          const qs = new URLSearchParams({
+            incomingCallId: String(notifData.callId || ''),
+            callAction,
+          });
+          return self.clients.openWindow(`/?${qs.toString()}`);
+        }
+        return undefined;
+      })()
+    );
+    return;
+  }
+
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientsArr) => {
       for (const client of clientsArr) {

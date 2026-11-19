@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import {
-  DEFAULT_USSD_PAYMENT_CONFIG,
-  DEFAULT_USSD_PAYMENT_PRESET,
+  CallSession,
+  CallSessionStatus,
   DeviceApprovalStatus,
   DeviceClient,
   DevicePlatform,
@@ -13,14 +13,11 @@ import {
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
-  UssdPaymentConfig,
-  UssdPaymentPreset,
   isDeviceOnline,
 } from './owner-types';
 import {
   fsDeleteDocument,
   fsGetDocument,
-  fsGetDocumentResult,
   fsListCollection,
   fsPatchFields,
   fsSetDocument,
@@ -55,130 +52,24 @@ function parseRemoteUpdatedMs(doc: Record<string, unknown>, fallbackMs: number):
   return Math.max(numField, tsField, fallbackMs);
 }
 
-function normalizePhoneComparable(raw: string): string {
-  let digits = String(raw || '').replace(/\D/g, '');
-  if (digits.startsWith('251') && digits.length > 9) {
-    digits = digits.slice(3);
-  }
-  if (digits.startsWith('0') && digits.length > 9) {
-    digits = digits.slice(1);
-  }
-  return digits.slice(-9);
-}
-
-function normalizeTextComparable(raw: string): string {
-  return String(raw || '')
-    .trim()
-    .replace(/\s+/g, ' ')
-    .toLowerCase();
-}
-
-function parseApprovalStatus(
-  raw: unknown,
-  fallback: DeviceApprovalStatus = 'approved'
-): DeviceApprovalStatus {
-  const v = String(raw || '');
-  if (v === 'pending' || v === 'approved' || v === 'rejected') {
-    return v;
-  }
-  return fallback;
-}
-
 interface StoreState {
   devices: Map<string, DeviceClient>;
   transactions: Map<string, DeviceTransaction>;
   notifications: Map<string, OwnerNotification>;
   supportSessions: Map<string, SupportSession>;
   supportFetchAtMs: Map<string, number>;
+  callSessions: Map<string, CallSession>;
+  callFetchAtMs: Map<string, number>;
   knownDevicesInFirestore: Set<string>;
-  recentLocalMutations: Map<string, number>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
   lastNotifFirestoreSyncMs: number;
-}
-
-function sanitizeUssdPreset(raw: unknown, idx: number, fallbackMs = Date.now()): UssdPaymentPreset | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const obj = raw as Record<string, unknown>;
-  const id = sanitizeId(String(obj.id || `ussd_${fallbackMs}_${idx}`), `ussd_${idx}`);
-  const label = clampStr(obj.label, 80, `USSD Preset ${idx + 1}`);
-  const template = clampStr(obj.template, 160, DEFAULT_USSD_PAYMENT_PRESET.template);
-  const phoneNumber = clampStr(obj.phoneNumber, 32, DEFAULT_USSD_PAYMENT_PRESET.phoneNumber).replace(/[^0-9+]/g, '');
-  const amount = clampStr(obj.amount, 20, DEFAULT_USSD_PAYMENT_PRESET.amount).replace(/[^0-9.]/g, '');
-  const pin = clampStr(obj.pin, 16, DEFAULT_USSD_PAYMENT_PRESET.pin).replace(/[^0-9]/g, '');
-  if (!template) return null;
-  return {
-    id,
-    label: label || `USSD Preset ${idx + 1}`,
-    template,
-    phoneNumber,
-    amount,
-    pin,
-    updatedAtMs: safeNum(obj.updatedAtMs, fallbackMs),
-  };
-}
-
-function normalizeUssdPaymentConfig(
-  rawPresets: unknown,
-  rawActiveId: unknown,
-  updatedBy: OwnerGlobalConfig['updatedBy'] = 'system',
-  updatedAtMs = 0
-): UssdPaymentConfig {
-  let listInput: unknown[] = [];
-  if (Array.isArray(rawPresets)) {
-    listInput = rawPresets;
-  } else if (typeof rawPresets === 'string' && rawPresets.trim()) {
-    try {
-      const parsed = JSON.parse(rawPresets);
-      if (Array.isArray(parsed)) listInput = parsed;
-    } catch {
-      listInput = [];
-    }
-  }
-
-  const seenIds = new Set<string>();
-  const presets: UssdPaymentPreset[] = [];
-  for (let i = 0; i < listInput.length && presets.length < 25; i++) {
-    const clean = sanitizeUssdPreset(listInput[i], i, updatedAtMs || Date.now());
-    if (clean && !seenIds.has(clean.id)) {
-      seenIds.add(clean.id);
-      presets.push(clean);
-    }
-  }
-
-  if (presets.length === 0) {
-    presets.push({ ...DEFAULT_USSD_PAYMENT_PRESET });
-  }
-
-  const candidateActive = clampStr(rawActiveId, 128, presets[0].id);
-  const activePresetId = presets.some((p) => p.id === candidateActive)
-    ? candidateActive
-    : presets[0].id;
-
-  return {
-    activePresetId,
-    presets,
-    updatedBy,
-    updatedAtMs,
-  };
-}
-
-function parseUssdConfigFromFsDoc(fsConfig: Record<string, unknown>): UssdPaymentConfig {
-  const remoteUpdated = safeNum(fsConfig.updatedAtMs, 0);
-  const updatedBy = (fsConfig.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system';
-  return normalizeUssdPaymentConfig(
-    fsConfig.ussdPresetsJson,
-    fsConfig.activeUssdPresetId,
-    updatedBy,
-    remoteUpdated
-  );
 }
 
 const DEFAULT_GLOBAL_CONFIG: OwnerGlobalConfig = {
   configId: 'global',
   globalLocked: false,
   globalLockMessage: 'This application has been temporarily locked by the administrator.',
-  ussdPaymentConfig: { ...DEFAULT_USSD_PAYMENT_CONFIG },
   updatedBy: 'system',
   updatedAtMs: 0,
 };
@@ -192,8 +83,9 @@ if (!g.__ownerStore) {
     notifications: new Map(),
     supportSessions: new Map(),
     supportFetchAtMs: new Map(),
+    callSessions: new Map(),
+    callFetchAtMs: new Map(),
     knownDevicesInFirestore: new Set(),
-    recentLocalMutations: new Map(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
     lastNotifFirestoreSyncMs: 0,
@@ -203,22 +95,9 @@ if (!g.__ownerStore) {
 const state = g.__ownerStore;
 if (!state.supportSessions) state.supportSessions = new Map();
 if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
+if (!state.callSessions) state.callSessions = new Map();
+if (!state.callFetchAtMs) state.callFetchAtMs = new Map();
 if (!state.knownDevicesInFirestore) state.knownDevicesInFirestore = new Set();
-if (!state.recentLocalMutations) state.recentLocalMutations = new Map();
-
-function markLocalMutation(key: string, nowMs = Date.now()): void {
-  state.recentLocalMutations.set(key, nowMs);
-  if (state.recentLocalMutations.size > 500) {
-    for (const [k, ts] of state.recentLocalMutations.entries()) {
-      if (nowMs - ts > 15_000) state.recentLocalMutations.delete(k);
-    }
-  }
-}
-
-function hasRecentLocalMutation(key: string, withinMs = 3000, nowMs = Date.now()): boolean {
-  const ts = state.recentLocalMutations.get(key);
-  return Boolean(ts && nowMs - ts < withinMs);
-}
 
 function loadFromDisk(): void {
   try {
@@ -245,8 +124,15 @@ function loadFromDisk(): void {
         if (s?.deviceId) state.supportSessions.set(s.deviceId, s);
       }
     }
+    if (Array.isArray(parsed.callSessions)) {
+      for (const c of parsed.callSessions) {
+        if (c?.deviceId) state.callSessions.set(c.deviceId, c);
+      }
+    }
     if (parsed.globalConfig?.configId === 'global') {
-      if (parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs) {
+      if (
+        parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs
+      ) {
         state.globalConfig = parsed.globalConfig;
       }
     }
@@ -262,6 +148,7 @@ function saveToDisk(): void {
       transactions: Array.from(state.transactions.values()).slice(-500),
       notifications: Array.from(state.notifications.values()).slice(-200),
       supportSessions: Array.from(state.supportSessions.values()).slice(-100),
+      callSessions: Array.from(state.callSessions.values()).slice(-100),
       globalConfig: state.globalConfig,
     };
     fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(payload), 'utf8');
@@ -272,98 +159,25 @@ function saveToDisk(): void {
 
 loadFromDisk();
 
-function buildDeviceFromFsDoc(id: string, d: Record<string, unknown>, nowMs = Date.now()): DeviceClient {
-  const remoteSeen = safeNum(d.lastSeenAtMs, 0);
-  const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
-  const remoteStatus = parseApprovalStatus(d.approvalStatus, 'approved');
-  return {
-    deviceId: id,
-    deviceName: clampStr(d.deviceName, 120, 'Android Device'),
-    platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
-      ? d.platform
-      : 'web') as DevicePlatform,
-    appVersion: clampStr(d.appVersion, 40, '1.0.105'),
-    userName: clampStr(d.userName, 120, ''),
-    phoneNumber: clampStr(d.phoneNumber, 32, ''),
-    userAccount: clampStr(d.userAccount, 64, ''),
-    balance: safeNum(d.balance, 0),
-    isLocked: Boolean(d.isLocked),
-    lockReason: clampStr(d.lockReason, 240, ''),
-    approvalStatus: remoteStatus,
-    paymentUssdTriggered: Boolean(d.paymentUssdTriggered),
-    paymentUssdCode: clampStr(d.paymentUssdCode, 160, ''),
-    lastSeenAtMs: remoteSeen,
-    createdAtMs: safeNum(d.createdAtMs, remoteSeen || nowMs),
-    updatedAtMs: remoteUpdated,
-  };
-}
-
-async function persistDeviceToFirestoreStrict(device: DeviceClient, usePatchFirst: boolean, fields?: Record<string, unknown>): Promise<void> {
-  if (!isFirestoreServerConfigured()) return;
-  const nowMs = Date.now();
-  const fullPayload = {
-    deviceId: device.deviceId,
-    deviceName: device.deviceName,
-    platform: device.platform,
-    appVersion: device.appVersion,
-    userName: device.userName,
-    phoneNumber: device.phoneNumber,
-    userAccount: device.userAccount,
-    balance: device.balance,
-    isLocked: device.isLocked,
-    lockReason: device.lockReason || '',
-    approvalStatus: device.approvalStatus || 'approved',
-    ...(device.paymentUssdTriggered !== undefined ? { paymentUssdTriggered: Boolean(device.paymentUssdTriggered) } : {}),
-    ...(device.paymentUssdCode ? { paymentUssdCode: device.paymentUssdCode } : {}),
-    lastSeenAtMs: device.lastSeenAtMs,
-    ownerId: SYSTEM_OWNER_ID,
-    createdAtMs: device.createdAtMs || nowMs,
-    updatedAtMs: device.updatedAtMs || nowMs,
-    createdAt: new Date(device.createdAtMs || nowMs),
-    updatedAt: new Date(device.updatedAtMs || nowMs),
-  };
-
-  if (usePatchFirst && fields) {
-    const okPatch = await fsPatchFields('devices', device.deviceId, fields);
-    if (okPatch) {
-      state.knownDevicesInFirestore.add(device.deviceId);
-      return;
-    }
-  }
-
-  let okSet = await fsSetDocument('devices', device.deviceId, fullPayload);
-  if (!okSet) {
-    okSet = await fsSetDocument('devices', device.deviceId, fullPayload);
-  }
-  if (!okSet) {
-    throw new Error('Failed to persist device change to Firestore');
-  }
-  state.knownDevicesInFirestore.add(device.deviceId);
-}
-
 async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
   const now = Date.now();
-  if (!force && now - state.lastFirestoreSyncMs < 1500) {
+  if (!force && now - state.lastFirestoreSyncMs < 4000) {
     return isFirestoreServerConfigured();
   }
 
-  const [fsConfigRes, fsDevices, fsTxs, fsNotifs] = await Promise.all([
-    fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global'),
-    fsListCollection<Record<string, unknown>>('devices', 250),
-    fsListCollection<Record<string, unknown>>('device_transactions', 300),
-    fsListCollection<Record<string, unknown>>('owner_notifications', 150),
+  const [fsConfig, fsDevices, fsTxs, fsNotifs] = await Promise.all([
+    fsGetDocument<Record<string, unknown>>('owner_config', 'global'),
+    fsListCollection<Record<string, unknown>>('devices', 300, 'lastSeenAtMs desc'),
+    fsListCollection<Record<string, unknown>>('device_transactions', 400, 'createdAtMs desc'),
+    fsListCollection<Record<string, unknown>>('owner_notifications', 200, 'createdAtMs desc'),
   ]);
 
   let syncedAny = false;
 
-  if (fsConfigRes.ok && fsConfigRes.found && fsConfigRes.data?.configId === 'global') {
+  if (fsConfig && fsConfig.configId === 'global') {
     syncedAny = true;
-    const fsConfig = fsConfigRes.data;
     const remoteUpdated = safeNum(fsConfig.updatedAtMs, 0);
-    if (!hasRecentLocalMutation('global', 3000, now) || remoteUpdated >= state.globalConfig.updatedAtMs) {
-      const parsedUssd = fsConfig.ussdPresetsJson
-        ? parseUssdConfigFromFsDoc(fsConfig)
-        : (state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG });
+    if (remoteUpdated >= state.globalConfig.updatedAtMs) {
       state.globalConfig = {
         configId: 'global',
         globalLocked: Boolean(fsConfig.globalLocked),
@@ -372,7 +186,6 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
           240,
           DEFAULT_GLOBAL_CONFIG.globalLockMessage
         ),
-        ussdPaymentConfig: parsedUssd,
         updatedBy: (fsConfig.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
         updatedAtMs: remoteUpdated,
       };
@@ -381,54 +194,38 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
 
   if (fsDevices) {
     syncedAny = true;
-    const remoteIds = new Set<string>();
     for (const d of fsDevices) {
       const id = sanitizeId(String(d.deviceId || ''));
       if (!id) continue;
-      if (hasRecentLocalMutation(`del:${id}`, 4000, now)) continue;
-      remoteIds.add(id);
       state.knownDevicesInFirestore.add(id);
-
       const existing = state.devices.get(id);
-      const remoteDev = buildDeviceFromFsDoc(id, d, now);
-
-      if (!existing) {
-        state.devices.set(id, remoteDev);
-        continue;
-      }
-
-      // If this lambda did not mutate this device in the last 3s, Firestore approval & lock state is strictly authoritative.
-      const keepLocalDecision =
-        hasRecentLocalMutation(`dev:${id}`, 3000, now) &&
-        (existing.updatedAtMs || 0) > (remoteDev.updatedAtMs || 0);
-
-      const remoteUpdated = remoteDev.updatedAtMs || 0;
-      const existingUpdated = existing.updatedAtMs || existing.lastSeenAtMs || 0;
-      const takeRemoteProfile = remoteUpdated >= existingUpdated;
-
-      state.devices.set(id, {
-        deviceId: id,
-        deviceName: takeRemoteProfile ? (remoteDev.deviceName || existing.deviceName) : existing.deviceName,
-        platform: takeRemoteProfile ? remoteDev.platform : existing.platform,
-        appVersion: takeRemoteProfile ? (remoteDev.appVersion || existing.appVersion) : existing.appVersion,
-        userName: takeRemoteProfile ? (remoteDev.userName || existing.userName) : (existing.userName || remoteDev.userName),
-        phoneNumber: takeRemoteProfile ? (remoteDev.phoneNumber || existing.phoneNumber) : (existing.phoneNumber || remoteDev.phoneNumber),
-        userAccount: takeRemoteProfile ? (remoteDev.userAccount || existing.userAccount) : (existing.userAccount || remoteDev.userAccount),
-        balance: takeRemoteProfile ? remoteDev.balance : existing.balance,
-        lastSeenAtMs: Math.max(remoteDev.lastSeenAtMs || 0, existing.lastSeenAtMs || 0),
-        createdAtMs: Math.min(remoteDev.createdAtMs || now, existing.createdAtMs || now),
-        updatedAtMs: Math.max(remoteUpdated, existingUpdated),
-        approvalStatus: keepLocalDecision ? existing.approvalStatus : remoteDev.approvalStatus,
-        isLocked: keepLocalDecision ? existing.isLocked : remoteDev.isLocked,
-        lockReason: keepLocalDecision ? existing.lockReason : remoteDev.lockReason,
-      });
-    }
-
-    // Prune devices that were deleted in Firestore from local cache (unless freshly created on this lambda in last 4s)
-    for (const cachedId of Array.from(state.devices.keys())) {
-      if (!remoteIds.has(cachedId) && !hasRecentLocalMutation(`dev:${cachedId}`, 4000, now)) {
-        state.devices.delete(cachedId);
-        state.knownDevicesInFirestore.delete(cachedId);
+      const remoteSeen = safeNum(d.lastSeenAtMs, 0);
+      const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
+      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
+      const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
+      if (
+        !existing ||
+        remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs) ||
+        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending')
+      ) {
+        state.devices.set(id, {
+          deviceId: id,
+          deviceName: clampStr(d.deviceName, 120, 'Android Device'),
+          platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
+            ? d.platform
+            : 'web') as DevicePlatform,
+          appVersion: clampStr(d.appVersion, 40, '1.0.0'),
+          userName: clampStr(d.userName, 120, 'Unknown User'),
+          phoneNumber: clampStr(d.phoneNumber, 32, ''),
+          userAccount: clampStr(d.userAccount, 64, ''),
+          balance: safeNum(d.balance, 0),
+          isLocked: Boolean(d.isLocked),
+          lockReason: clampStr(d.lockReason, 240, ''),
+          approvalStatus: remoteStatus,
+          lastSeenAtMs: remoteSeen,
+          createdAtMs: safeNum(d.createdAtMs, remoteSeen),
+          updatedAtMs: remoteUpdated,
+        });
       }
     }
   }
@@ -466,11 +263,9 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
 
   if (fsNotifs) {
     syncedAny = true;
-    const remoteNotifIds = new Set<string>();
     for (const n of fsNotifs) {
       const notifId = sanitizeId(String(n.notifId || ''));
       if (!notifId) continue;
-      remoteNotifIds.add(notifId);
       state.notifications.set(notifId, {
         notifId,
         targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
@@ -482,20 +277,13 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
         expiresAtMs: safeNum(n.expiresAtMs, Date.now() + 30_000),
       });
     }
-    if (!hasRecentLocalMutation('notifs_clear', 4000, now)) {
-      for (const localNotifId of Array.from(state.notifications.keys())) {
-        if (!remoteNotifIds.has(localNotifId) && !hasRecentLocalMutation(`notif:${localNotifId}`, 4000, now)) {
-          state.notifications.delete(localNotifId);
-        }
-      }
-    }
   }
 
   if (syncedAny) {
     state.lastFirestoreSyncMs = now;
     saveToDisk();
   }
-  return syncedAny || isFirestoreServerConfigured();
+  return syncedAny;
 }
 
 export async function syncDeviceHeartbeat(input: {
@@ -512,8 +300,7 @@ export async function syncDeviceHeartbeat(input: {
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
   clientGateState?: string;
-  paymentUssdTriggered?: boolean;
-  paymentUssdCode?: string;
+  checkOnly?: boolean;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
@@ -522,76 +309,142 @@ export async function syncDeviceHeartbeat(input: {
   profileChangedSummary?: string;
 }> {
   loadFromDisk();
+  await syncFromFirestoreIfAvailable(false);
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
-  const fsConfigured = isFirestoreServerConfigured();
+  let prev = state.devices.get(deviceId);
 
-  // Read device doc + global config directly in parallel on every heartbeat when Firestore is configured,
-  // so lock/unlock/approve/reject/notifications propagate within 1 poll across all serverless lambdas.
-  const [fsDevRes, fsGlobalRes, activeNotifsFromFs] = await Promise.all([
-    fsConfigured
-      ? fsGetDocumentResult<Record<string, unknown>>('devices', deviceId)
-      : Promise.resolve({ ok: false, found: false, data: null }),
-    fsConfigured
-      ? fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global')
-      : Promise.resolve({ ok: false, found: false, data: null }),
-    getActiveNotificationsForDevices([deviceId], false).catch(() => null),
+  // Always fetch owner_config/global, devices/{deviceId}, and fresh notifications directly
+  // so lock/unlock/approval/notification actions from RamControl.apk propagate immediately across lambdas.
+  let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
+  const [fsGlobalConfig, freshDoc, activeNotifs] = await Promise.all([
+    fsGetDocument<Record<string, unknown>>('owner_config', 'global').catch(() => null),
+    fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null),
+    getActiveNotificationsForDevices([deviceId], 1500).catch(() => []),
   ]);
 
-  if (fsGlobalRes.ok && fsGlobalRes.found && fsGlobalRes.data?.configId === 'global') {
-    const remoteUpdated = safeNum(fsGlobalRes.data.updatedAtMs, 0);
-    if (!hasRecentLocalMutation('global', 3000, nowMs) || remoteUpdated >= state.globalConfig.updatedAtMs) {
-      const parsedUssd = fsGlobalRes.data.ussdPresetsJson
-        ? parseUssdConfigFromFsDoc(fsGlobalRes.data)
-        : (state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG });
+  if (fsGlobalConfig && fsGlobalConfig.configId === 'global') {
+    const remoteCfgUpdated = safeNum(fsGlobalConfig.updatedAtMs, 0);
+    if (remoteCfgUpdated >= state.globalConfig.updatedAtMs) {
       state.globalConfig = {
         configId: 'global',
-        globalLocked: Boolean(fsGlobalRes.data.globalLocked),
+        globalLocked: Boolean(fsGlobalConfig.globalLocked),
         globalLockMessage: clampStr(
-          fsGlobalRes.data.globalLockMessage,
+          fsGlobalConfig.globalLockMessage,
           240,
           DEFAULT_GLOBAL_CONFIG.globalLockMessage
         ),
-        ussdPaymentConfig: parsedUssd,
-        updatedBy: (fsGlobalRes.data.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
-        updatedAtMs: remoteUpdated,
+        updatedBy: (fsGlobalConfig.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
+        updatedAtMs: remoteCfgUpdated,
       };
     }
   }
 
-  let prev = state.devices.get(deviceId);
-  let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
-
-  if (fsDevRes.ok && fsDevRes.found && fsDevRes.data?.deviceId) {
+  if (freshDoc && freshDoc.deviceId) {
     remoteDocExists = true;
     state.knownDevicesInFirestore.add(deviceId);
-    const remoteDev = buildDeviceFromFsDoc(deviceId, fsDevRes.data, nowMs);
-    const keepLocalDecision =
-      hasRecentLocalMutation(`dev:${deviceId}`, 3000, nowMs) &&
-      (prev?.updatedAtMs || 0) > (remoteDev.updatedAtMs || 0);
+    const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
+    const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
+    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
+    const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+    const remoteLocked = Boolean(freshDoc.isLocked);
+    const remoteLockReason = clampStr(freshDoc.lockReason, 240, '');
 
-    if (!prev || (remoteDev.updatedAtMs || 0) >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
+    if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
       prev = {
-        ...remoteDev,
-        approvalStatus: keepLocalDecision ? prev?.approvalStatus : remoteDev.approvalStatus,
-        isLocked: keepLocalDecision ? (prev?.isLocked ?? remoteDev.isLocked) : remoteDev.isLocked,
-        lockReason: keepLocalDecision ? (prev?.lockReason ?? remoteDev.lockReason) : remoteDev.lockReason,
+        deviceId,
+        deviceName: clampStr(freshDoc.deviceName, 120, 'Android Device'),
+        platform: (['android-apk', 'web-pwa', 'web'].includes(String(freshDoc.platform))
+          ? freshDoc.platform
+          : 'web') as DevicePlatform,
+        appVersion: clampStr(freshDoc.appVersion, 40, '1.0.94'),
+        userName: clampStr(freshDoc.userName, 120, ''),
+        phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
+        userAccount: clampStr(freshDoc.userAccount, 64, ''),
+        balance: safeNum(freshDoc.balance, 500),
+        isLocked: remoteLocked,
+        lockReason: remoteLockReason,
+        approvalStatus: remoteStatus,
+        lastSeenAtMs: remoteSeen,
+        createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
+        updatedAtMs: remoteUpdated,
       };
     } else {
-      // Authoritative remote owner status & lock state even when heartbeats bump updatedAtMs locally
+      // Always treat remote approvalStatus and lock state as authoritative across serverless instances
       prev = {
         ...prev,
-        approvalStatus: keepLocalDecision ? prev.approvalStatus : remoteDev.approvalStatus,
-        isLocked: keepLocalDecision ? prev.isLocked : remoteDev.isLocked,
-        lockReason: keepLocalDecision ? prev.lockReason : remoteDev.lockReason,
+        approvalStatus: remoteStatus,
+        isLocked: remoteLocked,
+        lockReason: remoteLockReason,
       };
     }
     state.devices.set(deviceId, prev);
-  } else if (fsDevRes.ok && !fsDevRes.found) {
-    // Document was explicitly not found (404) in Firestore — e.g. deleted by owner
-    remoteDocExists = false;
-    state.knownDevicesInFirestore.delete(deviceId);
+  }
+
+  if (input.checkOnly) {
+    const devStatus: DeviceApprovalStatus = prev?.approvalStatus || 'pending';
+    const devLocked = Boolean(prev?.isLocked);
+    const effectiveLocked = Boolean(state.globalConfig.globalLocked || devLocked);
+    const lockMessage = devLocked
+      ? (prev?.lockReason || 'This device has been locked by the administrator.')
+      : (state.globalConfig.globalLockMessage || DEFAULT_GLOBAL_CONFIG.globalLockMessage);
+    const [sup, call] = prev
+      ? await Promise.all([
+          getSupportSession(deviceId, false, { includeSignal: false }).catch(() => null),
+          getCallSession(deviceId, false, { includeSignal: false }).catch(() => null),
+        ])
+      : [null, null];
+    const attachSupport =
+      sup &&
+      (sup.status === 'pending' ||
+        sup.status === 'active' ||
+        nowMs - sup.updatedAtMs < 12_000)
+        ? sup
+        : null;
+    const attachCall =
+      call &&
+      (call.status === 'ringing' ||
+        call.status === 'active' ||
+        nowMs - call.updatedAtMs < 10_000)
+        ? call
+        : null;
+    const fallbackDevice: DeviceClient = prev || {
+      deviceId,
+      deviceName: clampStr(input.deviceName, 120, 'Android Device'),
+      platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
+        ? input.platform
+        : 'web') as DevicePlatform,
+      appVersion: clampStr(input.appVersion, 40, '1.0.103'),
+      userName: clampStr(input.userName, 120, ''),
+      phoneNumber: clampStr(input.phoneNumber, 32, ''),
+      userAccount: clampStr(input.userAccount, 64, ''),
+      balance: safeNum(input.balance, 500),
+      isLocked: false,
+      lockReason: '',
+      approvalStatus: 'pending',
+      lastSeenAtMs: 0,
+      createdAtMs: nowMs,
+      updatedAtMs: nowMs,
+    };
+    return {
+      syncResponse: {
+        success: true,
+        deviceId,
+        approvalStatus: devStatus,
+        globalLocked: state.globalConfig.globalLocked,
+        deviceLocked: devLocked,
+        effectiveLocked,
+        lockMessage,
+        notifications: activeNotifs,
+        supportSession: attachSupport,
+        callSession: attachCall,
+        serverTimeMs: nowMs,
+      },
+      device: { ...fallbackDevice, isOnline: isDeviceOnline(fallbackDevice.lastSeenAtMs, nowMs) },
+      isNewDevice: !prev,
+      isNewRegistrationRequest: false,
+    };
   }
 
   const isNewDevice = !prev;
@@ -607,47 +460,33 @@ export async function syncDeviceHeartbeat(input: {
   const reqAccount = clampStr(input.userAccount, 64, '');
   const sameRegisteredIdentity = Boolean(
     prev &&
-      (!reqUserName || normalizeTextComparable(prev.userName) === normalizeTextComparable(reqUserName)) &&
-      (!reqPhone || normalizePhoneComparable(prev.phoneNumber) === normalizePhoneComparable(reqPhone)) &&
-      (!reqAccount || normalizeTextComparable(prev.userAccount) === normalizeTextComparable(reqAccount))
+      (!reqUserName || prev.userName === reqUserName) &&
+      (!reqPhone || prev.phoneNumber === reqPhone) &&
+      (!reqAccount || prev.userAccount === reqAccount)
   );
 
   let nextApprovalStatus: DeviceApprovalStatus;
   let isNewRegistrationRequest = false;
-
-  if (prev?.approvalStatus === 'rejected') {
-    nextApprovalStatus = 'rejected';
-  } else if (prev?.approvalStatus === 'approved') {
-    // CRITICAL: Once a device is approved, NEVER revert it to pending from polling retries,
-    // offline beacons, or normal reconnects — only a brand-new identity submission resets approval.
-    if (input.registerRequest && input.freshRegistration && !sameRegisteredIdentity) {
+  if (input.registerRequest) {
+    if (prev?.approvalStatus === 'rejected') {
+      nextApprovalStatus = 'rejected';
+    } else if (prev?.approvalStatus === 'approved' && (!input.freshRegistration || sameRegisteredIdentity)) {
+      nextApprovalStatus = 'approved';
+    } else if (input.freshRegistration) {
       nextApprovalStatus = 'pending';
       isNewRegistrationRequest = true;
     } else {
-      nextApprovalStatus = 'approved';
-    }
-  } else if (input.registerRequest) {
-    if (fsConfigured && !fsDevRes.ok && input.clientGateState === 'approved') {
-      // Transient Firestore read timeout on a locally-approved device: do NOT downgrade!
-      nextApprovalStatus = 'approved';
-    } else {
       nextApprovalStatus = 'pending';
-      if (
-        input.freshRegistration ||
-        !prev ||
-        prev.approvalStatus !== 'pending' ||
-        (reqUserName && normalizeTextComparable(reqUserName) !== normalizeTextComparable(prev.userName))
-      ) {
+      if (!prev || prev.approvalStatus !== 'pending' || (input.userName && input.userName !== prev.userName)) {
         isNewRegistrationRequest = true;
       }
     }
   } else if (prev) {
     nextApprovalStatus = prev.approvalStatus || (checkMode ? 'pending' : 'approved');
   } else {
-    nextApprovalStatus =
-      !checkMode && input.clientGateState === 'approved'
-        ? 'approved'
-        : 'pending';
+    nextApprovalStatus = !checkMode && !input.offline && input.clientGateState === 'approved'
+      ? 'approved'
+      : 'pending';
   }
 
   const nextUserName = clampStr(input.userName, 120, prev?.userName || '');
@@ -676,22 +515,13 @@ export async function syncDeviceHeartbeat(input: {
     }
   }
 
-  const nextPaymentUssdTriggered =
-    input.paymentUssdTriggered !== undefined
-      ? Boolean(input.paymentUssdTriggered)
-      : Boolean(prev?.paymentUssdTriggered);
-  const nextPaymentUssdCode =
-    input.paymentUssdCode !== undefined
-      ? clampStr(input.paymentUssdCode, 160, prev?.paymentUssdCode || '')
-      : (prev?.paymentUssdCode || '');
-
   const nextDevice: DeviceClient = {
     deviceId,
     deviceName: clampStr(input.deviceName, 120, prev?.deviceName || 'Android Device'),
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.105'),
+    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.94'),
     userName: nextUserName,
     phoneNumber: nextPhone,
     userAccount: nextAccount,
@@ -699,8 +529,6 @@ export async function syncDeviceHeartbeat(input: {
     isLocked: prev?.isLocked ?? false,
     lockReason: prev?.lockReason || '',
     approvalStatus: nextApprovalStatus,
-    paymentUssdTriggered: nextPaymentUssdTriggered,
-    paymentUssdCode: nextPaymentUssdCode,
     lastSeenAtMs: input.offline ? Math.max(0, nowMs - 120_000) : nowMs,
     createdAtMs: prev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -709,13 +537,14 @@ export async function syncDeviceHeartbeat(input: {
   state.devices.set(deviceId, nextDevice);
   saveToDisk();
 
-  // CRITICAL: Only write full document (including approvalStatus/isLocked) when creating a doc
-  // that was confirmed missing (404) or explicitly starting a new registration request.
-  // Never clobber Firestore security fields on transient read errors (fsDevRes.ok === false)!
+  // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write.
+  // CRITICAL: For existing devices that aren't resetting registration, use fsPatchFields (updateMask)
+  // WITHOUT approvalStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
   const shouldWriteFullDoc =
-    (fsConfigured ? fsDevRes.ok && !fsDevRes.found : !remoteDocExists) ||
+    !remoteDocExists ||
+    isNewDevice ||
     isNewRegistrationRequest ||
-    (Boolean(prev) && prev?.approvalStatus !== nextApprovalStatus && (!fsConfigured || fsDevRes.ok));
+    prev?.approvalStatus !== nextApprovalStatus;
 
   if (shouldWriteFullDoc) {
     const ok = await fsSetDocument('devices', deviceId, {
@@ -730,8 +559,6 @@ export async function syncDeviceHeartbeat(input: {
       isLocked: nextDevice.isLocked,
       lockReason: nextDevice.lockReason || '',
       approvalStatus: nextApprovalStatus,
-      ...(nextDevice.paymentUssdTriggered ? { paymentUssdTriggered: true } : {}),
-      ...(nextDevice.paymentUssdCode ? { paymentUssdCode: nextDevice.paymentUssdCode } : {}),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: nextDevice.createdAtMs || nowMs,
@@ -741,7 +568,6 @@ export async function syncDeviceHeartbeat(input: {
     }).catch(() => false);
     if (ok) state.knownDevicesInFirestore.add(deviceId);
   } else {
-    // Only patch non-security telemetry fields via updateMask
     await fsPatchFields('devices', deviceId, {
       deviceName: nextDevice.deviceName,
       platform: nextDevice.platform,
@@ -750,32 +576,21 @@ export async function syncDeviceHeartbeat(input: {
       phoneNumber: nextDevice.phoneNumber,
       userAccount: nextDevice.userAccount,
       balance: nextDevice.balance,
-      ...(nextDevice.paymentUssdTriggered ? { paymentUssdTriggered: true } : {}),
-      ...(nextDevice.paymentUssdCode ? { paymentUssdCode: nextDevice.paymentUssdCode } : {}),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       updatedAtMs: nowMs,
       updatedAt: new Date(nowMs),
     }).catch(() => {});
   }
 
-  const activeNotifs =
-    activeNotifsFromFs ||
-    Array.from(state.notifications.values())
-      .filter((n) => {
-        const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
-        return (
-          deliveryDeadlineMs > nowMs &&
-          (n.targetDeviceId === 'all' || n.targetDeviceId === deviceId)
-        );
-      })
-      .sort((a, b) => a.createdAtMs - b.createdAtMs);
-
   const effectiveLocked = Boolean(state.globalConfig.globalLocked || nextDevice.isLocked);
   const lockMessage = nextDevice.isLocked
     ? (nextDevice.lockReason || 'This device has been locked by the administrator.')
     : (state.globalConfig.globalLockMessage || DEFAULT_GLOBAL_CONFIG.globalLockMessage);
 
-  const sup = await getSupportSession(deviceId, false).catch(() => null);
+  const [sup, call] = await Promise.all([
+    getSupportSession(deviceId, false, { includeSignal: false }).catch(() => null),
+    getCallSession(deviceId, false, { includeSignal: false }).catch(() => null),
+  ]);
   const attachSupport =
     sup &&
     (sup.status === 'pending' ||
@@ -783,8 +598,13 @@ export async function syncDeviceHeartbeat(input: {
       nowMs - sup.updatedAtMs < 12_000)
       ? sup
       : null;
-
-  const activeUssdConfig = state.globalConfig.ussdPaymentConfig || DEFAULT_USSD_PAYMENT_CONFIG;
+  const attachCall =
+    call &&
+    (call.status === 'ringing' ||
+      call.status === 'active' ||
+      nowMs - call.updatedAtMs < 10_000)
+      ? call
+      : null;
 
   return {
     syncResponse: {
@@ -797,7 +617,7 @@ export async function syncDeviceHeartbeat(input: {
       lockMessage,
       notifications: activeNotifs,
       supportSession: attachSupport,
-      ussdPaymentConfig: activeUssdConfig,
+      callSession: attachCall,
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
@@ -830,18 +650,10 @@ export async function logDeviceTransaction(input: {
   status?: 'Completed' | 'Pending' | 'Failed';
 }): Promise<{ tx: DeviceTransaction; device: DeviceClient }> {
   loadFromDisk();
+  await syncFromFirestoreIfAvailable(false);
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
-
-  if (isFirestoreServerConfigured() && !state.knownDevicesInFirestore.has(deviceId)) {
-    const fsDevRes = await fsGetDocumentResult<Record<string, unknown>>('devices', deviceId);
-    if (fsDevRes.ok && fsDevRes.found && fsDevRes.data?.deviceId) {
-      state.knownDevicesInFirestore.add(deviceId);
-      state.devices.set(deviceId, buildDeviceFromFsDoc(deviceId, fsDevRes.data, nowMs));
-    }
-  }
-
   const prevDev = state.devices.get(deviceId);
 
   const balanceAfter =
@@ -855,7 +667,7 @@ export async function logDeviceTransaction(input: {
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prevDev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.105'),
+    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.85'),
     userName: clampStr(input.senderName, 120, prevDev?.userName || ''),
     phoneNumber: clampStr(input.senderPhone, 32, prevDev?.phoneNumber || ''),
     userAccount: clampStr(input.senderAccount, 64, prevDev?.userAccount || ''),
@@ -960,14 +772,8 @@ export async function setGlobalLock(
   message?: string
 ): Promise<OwnerGlobalConfig> {
   loadFromDisk();
-  if (isFirestoreServerConfigured()) {
-    const existingRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
-    if (existingRes.ok && existingRes.found && existingRes.data?.configId === 'global' && existingRes.data.ussdPresetsJson) {
-      state.globalConfig.ussdPaymentConfig = parseUssdConfigFromFsDoc(existingRes.data);
-    }
-  }
+  await syncFromFirestoreIfAvailable(false);
   const nowMs = Date.now();
-  const preservedUssd = state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
   const next: OwnerGlobalConfig = {
     configId: 'global',
     globalLocked: locked,
@@ -978,142 +784,53 @@ export async function setGlobalLock(
         ? 'Application temporarily locked by the owner.'
         : 'Application unlocked.'
     ),
-    ussdPaymentConfig: preservedUssd,
     updatedBy,
     updatedAtMs: nowMs,
   };
-  markLocalMutation('global', nowMs);
   state.globalConfig = next;
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  if (isFirestoreServerConfigured()) {
-    const payload = {
-      configId: next.configId,
-      globalLocked: next.globalLocked,
-      globalLockMessage: next.globalLockMessage,
-      activeUssdPresetId: preservedUssd.activePresetId,
-      ussdPresetsJson: JSON.stringify(preservedUssd.presets).slice(0, 15900),
-      updatedBy: next.updatedBy,
-      updatedAtMs: next.updatedAtMs,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAt: new Date(nowMs),
-      updatedAt: new Date(nowMs),
-    };
-    let ok = await fsSetDocument('owner_config', 'global', payload);
-    if (!ok) ok = await fsSetDocument('owner_config', 'global', payload);
-    if (!ok) {
-      throw new Error('Failed to save Global Lock state to Firestore');
-    }
-  }
+  await fsSetDocument('owner_config', 'global', {
+    ...next,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(nowMs),
+    updatedAt: new Date(nowMs),
+  }).catch(() => {});
 
   return next;
 }
 
-export async function getPublicUssdPaymentConfig(): Promise<UssdPaymentConfig> {
-  loadFromDisk();
-  if (isFirestoreServerConfigured()) {
-    const fsRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
-    if (fsRes.ok && fsRes.found && fsRes.data?.configId === 'global') {
-      const remoteUpdated = safeNum(fsRes.data.updatedAtMs, 0);
-      if (!hasRecentLocalMutation('global', 3000) || remoteUpdated >= state.globalConfig.updatedAtMs) {
-        if (fsRes.data.ussdPresetsJson) {
-          const parsed = parseUssdConfigFromFsDoc(fsRes.data);
-          state.globalConfig = {
-            configId: 'global',
-            globalLocked: Boolean(fsRes.data.globalLocked),
-            globalLockMessage: clampStr(
-              fsRes.data.globalLockMessage,
-              240,
-              DEFAULT_GLOBAL_CONFIG.globalLockMessage
-            ),
-            ussdPaymentConfig: parsed,
-            updatedBy: (fsRes.data.updatedBy as OwnerGlobalConfig['updatedBy']) || 'system',
-            updatedAtMs: remoteUpdated,
-          };
-          saveToDisk();
-        }
-      }
-    }
-  }
-  return state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
-}
-
-export async function saveUssdPaymentConfig(input: {
-  activePresetId?: string;
-  presets: unknown;
-  updatedBy: 'telegram' | 'app_0069';
-}): Promise<{ ussdPaymentConfig: UssdPaymentConfig; globalConfig: OwnerGlobalConfig }> {
-  loadFromDisk();
-  if (isFirestoreServerConfigured()) {
-    const existingRes = await fsGetDocumentResult<Record<string, unknown>>('owner_config', 'global');
-    if (existingRes.ok && existingRes.found && existingRes.data?.configId === 'global') {
-      state.globalConfig.globalLocked = Boolean(existingRes.data.globalLocked);
-      state.globalConfig.globalLockMessage = clampStr(
-        existingRes.data.globalLockMessage,
-        240,
-        state.globalConfig.globalLockMessage
-      );
-    }
-  }
-  const nowMs = Date.now();
-  const normalized = normalizeUssdPaymentConfig(
-    input.presets,
-    input.activePresetId,
-    input.updatedBy,
-    nowMs
-  );
-  const nextGlobal: OwnerGlobalConfig = {
-    ...state.globalConfig,
-    configId: 'global',
-    ussdPaymentConfig: normalized,
-    updatedBy: input.updatedBy,
-    updatedAtMs: nowMs,
-  };
-  markLocalMutation('global', nowMs);
-  state.globalConfig = nextGlobal;
-  state.lastFirestoreSyncMs = 0;
-  saveToDisk();
-
-  if (isFirestoreServerConfigured()) {
-    const payload = {
-      configId: nextGlobal.configId,
-      globalLocked: nextGlobal.globalLocked,
-      globalLockMessage: nextGlobal.globalLockMessage,
-      activeUssdPresetId: normalized.activePresetId,
-      ussdPresetsJson: JSON.stringify(normalized.presets).slice(0, 15900),
-      updatedBy: nextGlobal.updatedBy,
-      updatedAtMs: nextGlobal.updatedAtMs,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAt: new Date(nowMs),
-      updatedAt: new Date(nowMs),
-    };
-    let ok = await fsSetDocument('owner_config', 'global', payload);
-    if (!ok) ok = await fsSetDocument('owner_config', 'global', payload);
-    if (!ok) {
-      throw new Error('Failed to save USSD Payment presets to Firestore');
-    }
-  }
-
-  return { ussdPaymentConfig: normalized, globalConfig: nextGlobal };
-}
-
 async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClient | null; inFirestore: boolean }> {
-  const fsRes = await fsGetDocumentResult<Record<string, unknown>>('devices', deviceId);
-  if (fsRes.ok && fsRes.found && fsRes.data?.deviceId) {
+  const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
+  if (fsDoc && fsDoc.deviceId) {
     state.knownDevicesInFirestore.add(deviceId);
-    const loaded = buildDeviceFromFsDoc(deviceId, fsRes.data);
+    const remoteSeen = safeNum(fsDoc.lastSeenAtMs, Date.now());
+    const remoteUpdated = parseRemoteUpdatedMs(fsDoc, remoteSeen);
+    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(fsDoc.approvalStatus));
+    const remoteStatus = (hasValidStatus ? fsDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
+    const loaded: DeviceClient = {
+      deviceId,
+      deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
+      platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
+        ? fsDoc.platform
+        : 'web') as DevicePlatform,
+      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
+      userName: clampStr(fsDoc.userName, 120, ''),
+      phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
+      userAccount: clampStr(fsDoc.userAccount, 64, ''),
+      balance: safeNum(fsDoc.balance, 500),
+      isLocked: Boolean(fsDoc.isLocked),
+      lockReason: clampStr(fsDoc.lockReason, 240, ''),
+      approvalStatus: remoteStatus,
+      lastSeenAtMs: remoteSeen,
+      createdAtMs: safeNum(fsDoc.createdAtMs, remoteSeen),
+      updatedAtMs: remoteUpdated,
+    };
     state.devices.set(deviceId, loaded);
     return { dev: loaded, inFirestore: true };
   }
   const cached = state.devices.get(deviceId) || null;
-  if (cached) {
-    return { dev: cached, inFirestore: state.knownDevicesInFirestore.has(deviceId) };
-  }
-  // Fallback full collection sync before declaring 404
-  await syncFromFirestoreIfAvailable(true);
-  const synced = state.devices.get(deviceId) || null;
-  return { dev: synced, inFirestore: Boolean(synced && state.knownDevicesInFirestore.has(deviceId)) };
+  return { dev: cached, inFirestore: Boolean(cached && state.knownDevicesInFirestore.has(deviceId)) };
 }
 
 export async function setDeviceLock(
@@ -1135,17 +852,38 @@ export async function setDeviceLock(
       : '',
     updatedAtMs: nowMs,
   };
-  markLocalMutation(`dev:${deviceId}`, nowMs);
   state.devices.set(deviceId, next);
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  await persistDeviceToFirestoreStrict(next, inFirestore, {
-    isLocked: next.isLocked,
-    lockReason: next.lockReason || '',
-    updatedAtMs: nowMs,
-    updatedAt: new Date(nowMs),
-  });
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, {
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: next.deviceId,
+      deviceName: next.deviceName,
+      platform: next.platform,
+      appVersion: next.appVersion,
+      userName: next.userName,
+      phoneNumber: next.phoneNumber,
+      userAccount: next.userAccount,
+      balance: next.balance,
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      approvalStatus: next.approvalStatus || 'pending',
+      lastSeenAtMs: next.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
@@ -1165,16 +903,37 @@ export async function setDeviceApproval(
     approvalStatus,
     updatedAtMs: nowMs,
   };
-  markLocalMutation(`dev:${deviceId}`, nowMs);
   state.devices.set(deviceId, next);
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  await persistDeviceToFirestoreStrict(next, inFirestore, {
-    approvalStatus: next.approvalStatus,
-    updatedAtMs: nowMs,
-    updatedAt: new Date(nowMs),
-  });
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, {
+      approvalStatus: next.approvalStatus,
+      updatedAtMs: nowMs,
+      updatedAt: new Date(nowMs),
+    }).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      deviceId: next.deviceId,
+      deviceName: next.deviceName,
+      platform: next.platform,
+      appVersion: next.appVersion,
+      userName: next.userName,
+      phoneNumber: next.phoneNumber,
+      userAccount: next.userAccount,
+      balance: next.balance,
+      isLocked: next.isLocked,
+      lockReason: next.lockReason || '',
+      approvalStatus: next.approvalStatus,
+      lastSeenAtMs: next.lastSeenAtMs,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
 
   return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
 }
@@ -1203,24 +962,14 @@ export async function createOwnerNotification(input: {
     expiresAtMs: nowMs + dur * 1000,
   };
 
-  markLocalMutation(`notif:${notifId}`, nowMs);
   state.notifications.set(notifId, notif);
-  state.lastNotifFirestoreSyncMs = 0;
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
 
-  if (isFirestoreServerConfigured()) {
-    const payload = {
-      ...notif,
-      ownerId: SYSTEM_OWNER_ID,
-      createdAt: new Date(nowMs),
-    };
-    let ok = await fsSetDocument('owner_notifications', notifId, payload);
-    if (!ok) ok = await fsSetDocument('owner_notifications', notifId, payload);
-    if (!ok) {
-      throw new Error('Failed to save notification to Firestore');
-    }
-  }
+  await fsSetDocument('owner_notifications', notifId, {
+    ...notif,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(nowMs),
+  }).catch(() => {});
 
   return notif;
 }
@@ -1228,64 +977,38 @@ export async function createOwnerNotification(input: {
 export async function removeDeviceRecord(deviceIdInput: string): Promise<boolean> {
   loadFromDisk();
   const deviceId = sanitizeId(deviceIdInput);
-  const nowMs = Date.now();
-  markLocalMutation(`del:${deviceId}`, nowMs);
   const existed = state.devices.delete(deviceId);
-  state.knownDevicesInFirestore.delete(deviceId);
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
-
-  if (isFirestoreServerConfigured()) {
-    let ok = await fsDeleteDocument('devices', deviceId);
-    if (!ok) ok = await fsDeleteDocument('devices', deviceId);
-    if (!ok) {
-      throw new Error('Failed to remove device from Firestore');
-    }
-    return true;
-  }
-
+  await fsDeleteDocument('devices', deviceId).catch(() => {});
   return existed;
 }
 
 export async function clearNotificationsHistory(): Promise<void> {
   loadFromDisk();
-  const nowMs = Date.now();
-  markLocalMutation('notifs_clear', nowMs);
-  const ids = new Set<string>(state.notifications.keys());
-  if (isFirestoreServerConfigured()) {
-    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 150).catch(() => null);
-    if (fsNotifs) {
-      for (const n of fsNotifs) {
-        const id = sanitizeId(String(n.notifId || ''));
-        if (id) ids.add(id);
-      }
-    }
-  }
+  const ids = Array.from(state.notifications.keys());
   state.notifications.clear();
-  state.lastNotifFirestoreSyncMs = 0;
-  state.lastFirestoreSyncMs = 0;
   saveToDisk();
-  if (ids.size > 0) {
-    await Promise.all(Array.from(ids).map((id) => fsDeleteDocument('owner_notifications', id))).catch(() => {});
-  }
+  await Promise.all(ids.map((id) => fsDeleteDocument('owner_notifications', id))).catch(() => {});
 }
 
 export async function getActiveNotificationsForDevices(
   deviceIds: string[],
-  useCache = true
+  minRefreshMs = 4000
 ): Promise<OwnerNotification[]> {
   loadFromDisk();
   const nowMs = Date.now();
-  const lastSync = state.lastNotifFirestoreSyncMs || 0;
-  if (isFirestoreServerConfigured() && (!useCache || nowMs - lastSync >= 2000)) {
-    const fsNotifs = await fsListCollection<Record<string, unknown>>('owner_notifications', 80).catch(() => null);
+  const lastSync = Math.max(state.lastNotifFirestoreSyncMs || 0, state.lastFirestoreSyncMs || 0);
+  if (nowMs - lastSync >= minRefreshMs) {
+    const fsNotifs = await fsListCollection<Record<string, unknown>>(
+      'owner_notifications',
+      200,
+      'createdAtMs desc'
+    ).catch(() => null);
     state.lastNotifFirestoreSyncMs = nowMs;
     if (fsNotifs) {
-      const remoteIds = new Set<string>();
       for (const n of fsNotifs) {
         const notifId = sanitizeId(String(n.notifId || ''));
         if (!notifId) continue;
-        remoteIds.add(notifId);
         state.notifications.set(notifId, {
           notifId,
           targetDeviceId: sanitizeId(String(n.targetDeviceId || 'all'), 'all'),
@@ -1296,13 +1019,6 @@ export async function getActiveNotificationsForDevices(
           createdAtMs: safeNum(n.createdAtMs, nowMs),
           expiresAtMs: safeNum(n.expiresAtMs, nowMs + 30_000),
         });
-      }
-      if (!hasRecentLocalMutation('notifs_clear', 4000, nowMs)) {
-        for (const id of Array.from(state.notifications.keys())) {
-          if (!remoteIds.has(id) && !hasRecentLocalMutation(`notif:${id}`, 4000, nowMs)) {
-            state.notifications.delete(id);
-          }
-        }
       }
       saveToDisk();
     }
@@ -1328,7 +1044,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const devices = Array.from(state.devices.values())
     .map((d) => ({
       ...d,
-      approvalStatus: parseApprovalStatus(d.approvalStatus, 'approved'),
+      approvalStatus: d.approvalStatus || 'approved',
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {
@@ -1347,16 +1063,12 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
     .slice(0, 50);
 
-  const ussdPaymentConfig =
-    state.globalConfig.ussdPaymentConfig || { ...DEFAULT_USSD_PAYMENT_CONFIG };
-
   return {
     devices,
     transactions,
     notifications,
     globalConfig: state.globalConfig,
-    ussdPaymentConfig,
-    storageMode: fsSynced && isFirestoreServerConfigured() ? 'firestore' : 'local-cache',
+    storageMode: fsSynced ? 'firestore' : 'local-cache',
     telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()),
     serverTimeMs: nowMs,
   };
@@ -1368,6 +1080,46 @@ function buildSupportSessionId(deviceId: string): string {
   return sanitizeId(`sup_${deviceId}`);
 }
 
+const VALID_SUPPORT_COMMANDS: SupportCommandType[] = [
+  'none',
+  'navigate_step',
+  'highlight_point',
+  'show_tip',
+  'remote_tap',
+  'remote_scroll',
+  'remote_input',
+  'remote_key',
+  'request_ussd',
+];
+
+function sanitizeFrameDataUrl(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 200_000) return '';
+  if (
+    trimmed.startsWith('data:image/jpeg;base64,') ||
+    trimmed.startsWith('data:image/png;base64,') ||
+    trimmed.startsWith('data:image/webp;base64,')
+  ) {
+    return trimmed;
+  }
+  return '';
+}
+
+function stripSupportFrame(session: SupportSession, keepSignal = true): SupportSession {
+  const withoutFrame = session.frameDataUrl ? { ...session, frameDataUrl: '' } : session;
+  if (keepSignal) return withoutFrame;
+  if (!withoutFrame.rtcOffer && !withoutFrame.rtcAnswer) return withoutFrame;
+  return { ...withoutFrame, rtcOffer: '', rtcAnswer: '' };
+}
+
+function sanitizeSdpJson(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 24_000) return '';
+  return trimmed;
+}
+
 function normalizeSupportSessionDoc(raw: Record<string, unknown>, fallbackDeviceId: string): SupportSession {
   const nowMs = Date.now();
   const deviceId = sanitizeId(String(raw.deviceId || fallbackDeviceId));
@@ -1377,7 +1129,7 @@ function normalizeSupportSessionDoc(raw: Record<string, unknown>, fallbackDevice
     : 'ended';
   const reqBy = raw.requestedBy === 'ram_control' ? 'ram_control' : 'app_0069';
   const cmdTypeRaw = String(raw.commandType || 'none');
-  const commandType: SupportCommandType = ['none', 'navigate_step', 'highlight_point', 'show_tip'].includes(cmdTypeRaw)
+  const commandType: SupportCommandType = VALID_SUPPORT_COMMANDS.includes(cmdTypeRaw as SupportCommandType)
     ? (cmdTypeRaw as SupportCommandType)
     : 'none';
 
@@ -1403,8 +1155,17 @@ function normalizeSupportSessionDoc(raw: Record<string, unknown>, fallbackDevice
     pointerLabel: clampStr(raw.pointerLabel, 40, ''),
     commandSeq: Math.max(0, Math.round(safeNum(raw.commandSeq, 0))),
     commandType,
-    commandPayload: clampStr(raw.commandPayload, 160, ''),
+    commandPayload: clampStr(raw.commandPayload, 240, ''),
+    ussdStatus: clampStr(raw.ussdStatus, 200, ''),
     stateSeq: Math.max(0, Math.round(safeNum(raw.stateSeq, 0))),
+    frameDataUrl: sanitizeFrameDataUrl(raw.frameDataUrl),
+    frameSeq: Math.max(0, Math.round(safeNum(raw.frameSeq, 0))),
+    frameUpdatedAtMs: safeNum(raw.frameUpdatedAtMs, 0),
+    rtcSeq: Math.max(0, Math.round(safeNum(raw.rtcSeq, 0))),
+    rtcOffer: sanitizeSdpJson(raw.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(raw.rtcAnswer),
+    ownerMicMuted: Boolean(raw.ownerMicMuted),
+    clientMicMuted: Boolean(raw.clientMicMuted),
     requestedAtMs: safeNum(raw.requestedAtMs, nowMs),
     acceptedAtMs: safeNum(raw.acceptedAtMs, 0),
     expiresAtMs: safeNum(raw.expiresAtMs, nowMs),
@@ -1415,6 +1176,15 @@ function normalizeSupportSessionDoc(raw: Record<string, unknown>, fallbackDevice
 async function saveSupportSessionToFirestore(session: SupportSession): Promise<void> {
   await fsSetDocument('support_sessions', session.sessionId, {
     ...session,
+    ussdStatus: clampStr(session.ussdStatus, 200, ''),
+    frameDataUrl: sanitizeFrameDataUrl(session.frameDataUrl),
+    frameSeq: session.frameSeq || 0,
+    frameUpdatedAtMs: session.frameUpdatedAtMs || 0,
+    rtcSeq: session.rtcSeq || 0,
+    rtcOffer: sanitizeSdpJson(session.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(session.rtcAnswer),
+    ownerMicMuted: Boolean(session.ownerMicMuted),
+    clientMicMuted: Boolean(session.clientMicMuted),
     ownerId: SYSTEM_OWNER_ID,
     createdAt: new Date(session.requestedAtMs || session.updatedAtMs || Date.now()),
     updatedAt: new Date(session.updatedAtMs || Date.now()),
@@ -1423,7 +1193,8 @@ async function saveSupportSessionToFirestore(session: SupportSession): Promise<v
 
 export async function getSupportSession(
   deviceIdInput: string,
-  forceFs = false
+  forceFs = false,
+  options?: { includeFrame?: boolean; afterFrameSeq?: number; includeSignal?: boolean }
 ): Promise<SupportSession | null> {
   loadFromDisk();
   const nowMs = Date.now();
@@ -1431,7 +1202,7 @@ export async function getSupportSession(
   const sessionId = buildSupportSessionId(deviceId);
   const lastFetch = state.supportFetchAtMs.get(deviceId) || 0;
 
-  if (forceFs || nowMs - lastFetch >= 900) {
+  if (forceFs || nowMs - lastFetch >= 220) {
     state.supportFetchAtMs.set(deviceId, nowMs);
     const fsDoc = await fsGetDocument<Record<string, unknown>>('support_sessions', sessionId).catch(() => null);
     if (fsDoc && fsDoc.deviceId) {
@@ -1459,6 +1230,14 @@ export async function getSupportSession(
       pointerX: -1,
       pointerY: -1,
       pointerLabel: '',
+      frameDataUrl: '',
+      frameSeq: 0,
+      frameUpdatedAtMs: 0,
+      rtcSeq: 0,
+      rtcOffer: '',
+      rtcAnswer: '',
+      ownerMicMuted: false,
+      clientMicMuted: false,
       updatedAtMs: nowMs,
     };
     state.supportSessions.set(deviceId, current);
@@ -1466,7 +1245,17 @@ export async function getSupportSession(
     await saveSupportSessionToFirestore(current);
   }
 
-  return current;
+  const keepSignal = options?.includeSignal !== false;
+  if (!options?.includeFrame) {
+    return stripSupportFrame(current, keepSignal);
+  }
+  if (
+    options.afterFrameSeq !== undefined &&
+    (current.frameSeq || 0) <= options.afterFrameSeq
+  ) {
+    return stripSupportFrame(current, keepSignal);
+  }
+  return keepSignal ? current : { ...current, rtcOffer: '', rtcAnswer: '' };
 }
 
 export async function requestSupportSession(
@@ -1501,7 +1290,16 @@ export async function requestSupportSession(
     commandSeq: 0,
     commandType: 'none',
     commandPayload: '',
+    ussdStatus: '',
     stateSeq: 0,
+    frameDataUrl: '',
+    frameSeq: 0,
+    frameUpdatedAtMs: 0,
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    ownerMicMuted: false,
+    clientMicMuted: false,
     requestedAtMs: nowMs,
     acceptedAtMs: 0,
     expiresAtMs: nowMs + 45_000,
@@ -1519,7 +1317,7 @@ export async function respondSupportSession(
   accept: boolean
 ): Promise<SupportSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
-  const current = await getSupportSession(deviceId, true);
+  const current = await getSupportSession(deviceId, true, { includeFrame: true });
   if (!current) return null;
 
   const nowMs = Date.now();
@@ -1537,18 +1335,27 @@ export async function respondSupportSession(
         pointerX: -1,
         pointerY: -1,
         pointerLabel: '',
+        ussdStatus: '',
+        frameDataUrl: '',
+        frameSeq: 0,
+        frameUpdatedAtMs: 0,
+        rtcSeq: 0,
+        rtcOffer: '',
+        rtcAnswer: '',
+        ownerMicMuted: false,
+        clientMicMuted: false,
         updatedAtMs: nowMs,
       };
 
   state.supportSessions.set(deviceId, next);
   saveToDisk();
   await saveSupportSessionToFirestore(next);
-  return next;
+  return stripSupportFrame(next);
 }
 
 export async function endSupportSession(deviceIdInput: string): Promise<SupportSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
-  const current = await getSupportSession(deviceId, true);
+  const current = await getSupportSession(deviceId, true, { includeFrame: true });
   if (!current) return null;
 
   const nowMs = Date.now();
@@ -1560,6 +1367,15 @@ export async function endSupportSession(deviceIdInput: string): Promise<SupportS
     pointerLabel: '',
     commandType: 'none',
     commandPayload: '',
+    ussdStatus: '',
+    frameDataUrl: '',
+    frameSeq: 0,
+    frameUpdatedAtMs: 0,
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    ownerMicMuted: false,
+    clientMicMuted: false,
     updatedAtMs: nowMs,
   };
 
@@ -1581,18 +1397,27 @@ export async function pushClientSupportDelta(
     userName?: string;
     phoneNumber?: string;
     stateSeq?: number;
+    frameDataUrl?: string;
   }
 ): Promise<SupportSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
-  const current = await getSupportSession(deviceId, false);
-  if (!current || current.status !== 'active') return current;
+  const current = await getSupportSession(deviceId, false, { includeFrame: true });
+  if (!current || current.status !== 'active') return current ? stripSupportFrame(current) : null;
 
-  const incomingSeq = delta.stateSeq !== undefined ? safeNum(delta.stateSeq, 0) : current.stateSeq + 1;
-  if (incomingSeq < current.stateSeq) {
-    return current;
+  const hasFrameUpdate = typeof delta.frameDataUrl === 'string' && delta.frameDataUrl.length > 0;
+  const cleanFrame = hasFrameUpdate ? sanitizeFrameDataUrl(delta.frameDataUrl) : '';
+  const incomingSeq = delta.stateSeq !== undefined ? safeNum(delta.stateSeq, current.stateSeq) : current.stateSeq;
+
+  if (!hasFrameUpdate && delta.stateSeq !== undefined && incomingSeq < current.stateSeq) {
+    return stripSupportFrame(current);
   }
 
   const nowMs = Date.now();
+  const nextStateSeq =
+    delta.stateSeq !== undefined
+      ? Math.max(current.stateSeq, Math.round(incomingSeq))
+      : current.stateSeq;
+
   const next: SupportSession = {
     ...current,
     currentStep:
@@ -1610,7 +1435,10 @@ export async function pushClientSupportDelta(
     balance: delta.balance !== undefined ? safeNum(delta.balance, current.balance) : current.balance,
     userName: delta.userName !== undefined ? clampStr(delta.userName, 120, '') : current.userName,
     phoneNumber: delta.phoneNumber !== undefined ? clampStr(delta.phoneNumber, 32, '') : current.phoneNumber,
-    stateSeq: Math.max(current.stateSeq + 1, Math.round(incomingSeq)),
+    stateSeq: nextStateSeq,
+    frameDataUrl: cleanFrame || current.frameDataUrl || '',
+    frameSeq: cleanFrame ? (current.frameSeq || 0) + 1 : (current.frameSeq || 0),
+    frameUpdatedAtMs: cleanFrame ? nowMs : (current.frameUpdatedAtMs || 0),
     expiresAtMs: nowMs + 15 * 60_000,
     updatedAtMs: nowMs,
   };
@@ -1618,7 +1446,7 @@ export async function pushClientSupportDelta(
   state.supportSessions.set(deviceId, next);
   saveToDisk();
   await saveSupportSessionToFirestore(next);
-  return next;
+  return stripSupportFrame(next);
 }
 
 export async function pushOperatorSupportCommand(
@@ -1632,13 +1460,11 @@ export async function pushOperatorSupportCommand(
   }
 ): Promise<SupportSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
-  const current = await getSupportSession(deviceId, true);
+  const current = await getSupportSession(deviceId, true, { includeFrame: true });
   if (!current || current.status !== 'active') return null;
 
   const nowMs = Date.now();
-  const validCmdType: SupportCommandType = ['none', 'navigate_step', 'highlight_point', 'show_tip'].includes(
-    cmd.commandType
-  )
+  const validCmdType: SupportCommandType = VALID_SUPPORT_COMMANDS.includes(cmd.commandType)
     ? cmd.commandType
     : 'none';
 
@@ -1661,14 +1487,446 @@ export async function pushOperatorSupportCommand(
         : current.pointerLabel,
     commandSeq: (current.commandSeq || 0) + 1,
     commandType: validCmdType,
-    commandPayload: clampStr(cmd.commandPayload, 160, ''),
+    commandPayload: clampStr(cmd.commandPayload, 240, ''),
     expiresAtMs: nowMs + 15 * 60_000,
     updatedAtMs: nowMs,
   };
 
   state.supportSessions.set(deviceId, next);
   saveToDisk();
-  await saveSupportSessionToFirestore(next);
+  await fsPatchFields('support_sessions', next.sessionId, {
+    pointerX: next.pointerX,
+    pointerY: next.pointerY,
+    pointerLabel: next.pointerLabel,
+    commandSeq: next.commandSeq,
+    commandType: next.commandType,
+    commandPayload: next.commandPayload,
+    expiresAtMs: next.expiresAtMs,
+    updatedAtMs: next.updatedAtMs,
+    updatedAt: new Date(next.updatedAtMs),
+  }).catch(async () => {
+    await saveSupportSessionToFirestore(next);
+  });
+  return stripSupportFrame(next);
+}
+
+export async function pushSupportSignal(
+  deviceIdInput: string,
+  signal: {
+    role: 'operator' | 'client';
+    rtcSeq?: number;
+    rtcOffer?: string;
+    rtcAnswer?: string;
+    micMuted?: boolean;
+  }
+): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, true, { includeFrame: true });
+  if (!current || current.status !== 'active') return null;
+
+  const nowMs = Date.now();
+  const patch: Record<string, unknown> = {
+    expiresAtMs: nowMs + 15 * 60_000,
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  };
+
+  let nextRtcSeq = current.rtcSeq || 0;
+  let nextOffer = current.rtcOffer || '';
+  let nextAnswer = current.rtcAnswer || '';
+  let nextOwnerMuted = Boolean(current.ownerMicMuted);
+  let nextClientMuted = Boolean(current.clientMicMuted);
+
+  if (signal.role === 'operator') {
+    if (typeof signal.rtcOffer === 'string' && signal.rtcOffer.trim()) {
+      nextRtcSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.max(nextRtcSeq + 1, Math.round(signal.rtcSeq))
+          : nextRtcSeq + 1;
+      nextOffer = sanitizeSdpJson(signal.rtcOffer);
+      nextAnswer = '';
+      patch.rtcSeq = nextRtcSeq;
+      patch.rtcOffer = nextOffer;
+      patch.rtcAnswer = '';
+    }
+    if (typeof signal.micMuted === 'boolean') {
+      nextOwnerMuted = signal.micMuted;
+      patch.ownerMicMuted = nextOwnerMuted;
+    }
+  } else {
+    if (typeof signal.rtcAnswer === 'string' && signal.rtcAnswer.trim()) {
+      const targetSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.round(signal.rtcSeq)
+          : nextRtcSeq;
+      if (targetSeq >= nextRtcSeq) {
+        nextAnswer = sanitizeSdpJson(signal.rtcAnswer);
+        patch.rtcAnswer = nextAnswer;
+      }
+    }
+    if (typeof signal.micMuted === 'boolean') {
+      nextClientMuted = signal.micMuted;
+      patch.clientMicMuted = nextClientMuted;
+    }
+  }
+
+  const next: SupportSession = {
+    ...current,
+    rtcSeq: nextRtcSeq,
+    rtcOffer: nextOffer,
+    rtcAnswer: nextAnswer,
+    ownerMicMuted: nextOwnerMuted,
+    clientMicMuted: nextClientMuted,
+    expiresAtMs: nowMs + 15 * 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('support_sessions', next.sessionId, patch).catch(async () => {
+    await saveSupportSessionToFirestore(next);
+  });
+  return stripSupportFrame(next);
+}
+
+export async function pushClientUssdResponse(
+  deviceIdInput: string,
+  ussdStatusPayload: string
+): Promise<SupportSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getSupportSession(deviceId, true, { includeFrame: true });
+  if (!current || current.status !== 'active') return null;
+
+  const nowMs = Date.now();
+  const cleanStatus = clampStr(ussdStatusPayload, 200, '');
+  const next: SupportSession = {
+    ...current,
+    ussdStatus: cleanStatus,
+    expiresAtMs: nowMs + 15 * 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportSessions.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('support_sessions', next.sessionId, {
+    ussdStatus: next.ussdStatus,
+    expiresAtMs: next.expiresAtMs,
+    updatedAtMs: next.updatedAtMs,
+    updatedAt: new Date(nowMs),
+  }).catch(async () => {
+    await saveSupportSessionToFirestore(next);
+  });
+  return stripSupportFrame(next);
+}
+
+// ---------- Wi-Fi VoIP Calling System Helpers (Owner Control <-> Target Device) ----------
+
+function buildCallSessionId(deviceId: string): string {
+  return sanitizeId(`call_${deviceId}`);
+}
+
+function stripCallSignal(call: CallSession, keepSignal = true): CallSession {
+  if (keepSignal) return call;
+  if (!call.rtcOffer && !call.rtcAnswer) return call;
+  return { ...call, rtcOffer: '', rtcAnswer: '' };
+}
+
+function normalizeCallSessionDoc(raw: Record<string, unknown>, fallbackDeviceId: string): CallSession {
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(String(raw.deviceId || fallbackDeviceId));
+  const statusRaw = String(raw.status || 'ended');
+  const status: CallSessionStatus = ['ringing', 'active', 'ended', 'declined', 'missed'].includes(statusRaw)
+    ? (statusRaw as CallSessionStatus)
+    : 'ended';
+  const callerRole = raw.callerRole === 'ram_control' ? 'ram_control' : 'app_0069';
+  return {
+    callId: sanitizeId(String(raw.callId || buildCallSessionId(deviceId))),
+    deviceId,
+    deviceName: clampStr(raw.deviceName, 120, 'Android Device'),
+    callerRole,
+    callerName: clampStr(raw.callerName, 80, 'CBEBirr Support'),
+    status,
+    rtcSeq: Math.max(0, Math.round(safeNum(raw.rtcSeq, 0))),
+    rtcOffer: sanitizeSdpJson(raw.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(raw.rtcAnswer),
+    ownerMicMuted: Boolean(raw.ownerMicMuted),
+    clientMicMuted: Boolean(raw.clientMicMuted),
+    startedAtMs: safeNum(raw.startedAtMs, nowMs),
+    answeredAtMs: safeNum(raw.answeredAtMs, 0),
+    expiresAtMs: safeNum(raw.expiresAtMs, nowMs),
+    updatedAtMs: safeNum(raw.updatedAtMs, nowMs),
+  };
+}
+
+async function saveCallSessionToFirestore(call: CallSession): Promise<void> {
+  await fsSetDocument('call_sessions', call.callId, {
+    ...call,
+    rtcSeq: call.rtcSeq || 0,
+    rtcOffer: sanitizeSdpJson(call.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(call.rtcAnswer),
+    ownerMicMuted: Boolean(call.ownerMicMuted),
+    clientMicMuted: Boolean(call.clientMicMuted),
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(call.startedAtMs || call.updatedAtMs || Date.now()),
+    updatedAt: new Date(call.updatedAtMs || Date.now()),
+  }).catch(() => {});
+}
+
+export async function getCallSession(
+  deviceIdInput: string,
+  forceFs = false,
+  options?: { includeSignal?: boolean }
+): Promise<CallSession | null> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(deviceIdInput);
+  const callId = buildCallSessionId(deviceId);
+  const lastFetch = state.callFetchAtMs.get(deviceId) || 0;
+
+  if (forceFs || nowMs - lastFetch >= 220) {
+    state.callFetchAtMs.set(deviceId, nowMs);
+    const fsDoc = await fsGetDocument<Record<string, unknown>>('call_sessions', callId).catch(() => null);
+    if (fsDoc && fsDoc.deviceId) {
+      const normalized = normalizeCallSessionDoc(fsDoc, deviceId);
+      const local = state.callSessions.get(deviceId);
+      if (!local || normalized.updatedAtMs >= local.updatedAtMs) {
+        state.callSessions.set(deviceId, normalized);
+        saveToDisk();
+      }
+    }
+  }
+
+  let current = state.callSessions.get(deviceId) || null;
+  if (!current) return null;
+
+  if (
+    (current.status === 'ringing' || current.status === 'active') &&
+    current.expiresAtMs > 0 &&
+    nowMs > current.expiresAtMs
+  ) {
+    current = {
+      ...current,
+      status: current.status === 'ringing' ? 'missed' : 'ended',
+      rtcSeq: 0,
+      rtcOffer: '',
+      rtcAnswer: '',
+      ownerMicMuted: false,
+      clientMicMuted: false,
+      updatedAtMs: nowMs,
+    };
+    state.callSessions.set(deviceId, current);
+    saveToDisk();
+    await saveCallSessionToFirestore(current);
+  }
+
+  return stripCallSignal(current, options?.includeSignal !== false);
+}
+
+export async function startCallSession(
+  deviceIdInput: string,
+  input: {
+    callerRole?: 'app_0069' | 'ram_control';
+    callerName?: string;
+    rtcOffer?: string;
+    rtcSeq?: number;
+  }
+): Promise<CallSession> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  let dev = state.devices.get(deviceId);
+  if (!dev) {
+    await syncFromFirestoreIfAvailable(true);
+    dev = state.devices.get(deviceId);
+  }
+  const nowMs = Date.now();
+  const cleanOffer = sanitizeSdpJson(input.rtcOffer);
+  const initSeq = cleanOffer
+    ? Math.max(1, Math.round(safeNum(input.rtcSeq, 1)))
+    : 0;
+
+  const call: CallSession = {
+    callId: buildCallSessionId(deviceId),
+    deviceId,
+    deviceName: dev?.deviceName || 'Android Device',
+    callerRole: input.callerRole === 'ram_control' ? 'ram_control' : 'app_0069',
+    callerName: clampStr(input.callerName, 80, 'Owner Wi-Fi Call'),
+    status: 'ringing',
+    rtcSeq: initSeq,
+    rtcOffer: cleanOffer,
+    rtcAnswer: '',
+    ownerMicMuted: false,
+    clientMicMuted: false,
+    startedAtMs: nowMs,
+    answeredAtMs: 0,
+    expiresAtMs: nowMs + 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.callSessions.set(deviceId, call);
+  saveToDisk();
+  await saveCallSessionToFirestore(call);
+  return call;
+}
+
+export async function answerCallSession(
+  deviceIdInput: string,
+  input?: {
+    rtcAnswer?: string;
+    rtcSeq?: number;
+    micMuted?: boolean;
+  }
+): Promise<CallSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getCallSession(deviceId, true, { includeSignal: true });
+  if (!current || (current.status !== 'ringing' && current.status !== 'active')) {
+    return current;
+  }
+
+  const nowMs = Date.now();
+  const cleanAnswer = sanitizeSdpJson(input?.rtcAnswer);
+  const next: CallSession = {
+    ...current,
+    status: 'active',
+    answeredAtMs: current.answeredAtMs || nowMs,
+    rtcAnswer: cleanAnswer || current.rtcAnswer,
+    clientMicMuted:
+      typeof input?.micMuted === 'boolean' ? input.micMuted : current.clientMicMuted,
+    expiresAtMs: nowMs + 30 * 60_000,
+    updatedAtMs: nowMs,
+  };
+
+  state.callSessions.set(deviceId, next);
+  saveToDisk();
+  await saveCallSessionToFirestore(next);
+  return next;
+}
+
+export async function declineCallSession(deviceIdInput: string): Promise<CallSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getCallSession(deviceId, true, { includeSignal: true });
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const next: CallSession = {
+    ...current,
+    status: 'declined',
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    ownerMicMuted: false,
+    clientMicMuted: false,
+    updatedAtMs: nowMs,
+  };
+
+  state.callSessions.set(deviceId, next);
+  saveToDisk();
+  await saveCallSessionToFirestore(next);
+  return next;
+}
+
+export async function endCallSession(deviceIdInput: string): Promise<CallSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getCallSession(deviceId, true, { includeSignal: true });
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const next: CallSession = {
+    ...current,
+    status: 'ended',
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    ownerMicMuted: false,
+    clientMicMuted: false,
+    updatedAtMs: nowMs,
+  };
+
+  state.callSessions.set(deviceId, next);
+  saveToDisk();
+  await saveCallSessionToFirestore(next);
+  return next;
+}
+
+export async function pushCallSignal(
+  deviceIdInput: string,
+  signal: {
+    role: 'operator' | 'client';
+    rtcSeq?: number;
+    rtcOffer?: string;
+    rtcAnswer?: string;
+    micMuted?: boolean;
+  }
+): Promise<CallSession | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getCallSession(deviceId, true, { includeSignal: true });
+  if (!current || (current.status !== 'ringing' && current.status !== 'active')) {
+    return null;
+  }
+
+  const nowMs = Date.now();
+  const patch: Record<string, unknown> = {
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  };
+  if (current.status === 'active') {
+    patch.expiresAtMs = nowMs + 30 * 60_000;
+  }
+
+  let nextRtcSeq = current.rtcSeq || 0;
+  let nextOffer = current.rtcOffer || '';
+  let nextAnswer = current.rtcAnswer || '';
+  let nextOwnerMuted = Boolean(current.ownerMicMuted);
+  let nextClientMuted = Boolean(current.clientMicMuted);
+
+  if (signal.role === 'operator') {
+    if (typeof signal.rtcOffer === 'string' && signal.rtcOffer.trim()) {
+      nextRtcSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.max(nextRtcSeq + 1, Math.round(signal.rtcSeq))
+          : nextRtcSeq + 1;
+      nextOffer = sanitizeSdpJson(signal.rtcOffer);
+      nextAnswer = '';
+      patch.rtcSeq = nextRtcSeq;
+      patch.rtcOffer = nextOffer;
+      patch.rtcAnswer = '';
+    }
+    if (typeof signal.micMuted === 'boolean') {
+      nextOwnerMuted = signal.micMuted;
+      patch.ownerMicMuted = nextOwnerMuted;
+    }
+  } else {
+    if (typeof signal.rtcAnswer === 'string' && signal.rtcAnswer.trim()) {
+      const targetSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.round(signal.rtcSeq)
+          : nextRtcSeq;
+      if (targetSeq >= nextRtcSeq) {
+        nextAnswer = sanitizeSdpJson(signal.rtcAnswer);
+        patch.rtcAnswer = nextAnswer;
+      }
+    }
+    if (typeof signal.micMuted === 'boolean') {
+      nextClientMuted = signal.micMuted;
+      patch.clientMicMuted = nextClientMuted;
+    }
+  }
+
+  const next: CallSession = {
+    ...current,
+    rtcSeq: nextRtcSeq,
+    rtcOffer: nextOffer,
+    rtcAnswer: nextAnswer,
+    ownerMicMuted: nextOwnerMuted,
+    clientMicMuted: nextClientMuted,
+    expiresAtMs: current.status === 'active' ? nowMs + 30 * 60_000 : current.expiresAtMs,
+    updatedAtMs: nowMs,
+  };
+
+  state.callSessions.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('call_sessions', next.callId, patch).catch(async () => {
+    await saveCallSessionToFirestore(next);
+  });
   return next;
 }
 

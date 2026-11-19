@@ -29,7 +29,10 @@ service cloud.firestore {
     }
 
     function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'ramidja69@gmail.com';
+      return isVerifiedUser() && (
+        request.auth.token.email == 'ramidja69@gmail.com' ||
+        request.auth.token.email == 'lalati6969@gmail.com'
+      );
     }
 
     function isAdmin() {
@@ -61,8 +64,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'deviceId', 'deviceName', 'platform', 'appVersion',
           'userName', 'phoneNumber', 'userAccount', 'balance',
-          'isLocked', 'lockReason', 'approvalStatus', 'paymentUssdTriggered', 'paymentUssdCode',
-          'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
+          'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.deviceId)
         && data.deviceName is string && data.deviceName.size() <= 120
@@ -75,8 +77,6 @@ service cloud.firestore {
         && data.isLocked is bool
         && (!data.keys().hasAny(['lockReason']) || (data.lockReason is string && data.lockReason.size() <= 240))
         && (!data.keys().hasAny(['approvalStatus']) || data.approvalStatus in ['pending', 'approved', 'rejected'])
-        && (!data.keys().hasAny(['paymentUssdTriggered']) || data.paymentUssdTriggered is bool)
-        && (!data.keys().hasAny(['paymentUssdCode']) || (data.paymentUssdCode is string && data.paymentUssdCode.size() <= 160))
         && data.lastSeenAtMs is number && data.lastSeenAtMs >= 0
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -145,13 +145,11 @@ service cloud.firestore {
           'configId', 'globalLocked', 'globalLockMessage', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'configId', 'globalLocked', 'globalLockMessage', 'activeUssdPresetId', 'ussdPresetsJson', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
+          'configId', 'globalLocked', 'globalLockMessage', 'updatedBy', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.configId)
         && data.globalLocked is bool
         && data.globalLockMessage is string && data.globalLockMessage.size() <= 240
-        && (!data.keys().hasAny(['activeUssdPresetId']) || (data.activeUssdPresetId is string && data.activeUssdPresetId.size() <= 128))
-        && (!data.keys().hasAny(['ussdPresetsJson']) || (data.ussdPresetsJson is string && data.ussdPresetsJson.size() <= 16000))
         && data.updatedBy in ['telegram', 'app_0069', 'system']
         && isValidId(data.ownerId)
         && data.createdAt is timestamp
@@ -239,7 +237,9 @@ service cloud.firestore {
           'sessionId', 'deviceId', 'deviceName', 'status', 'requestedBy',
           'currentStep', 'activeTab', 'screenTitle', 'recipientSummary', 'amountSummary',
           'balance', 'userName', 'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel',
-          'commandSeq', 'commandType', 'commandPayload', 'stateSeq',
+          'commandSeq', 'commandType', 'commandPayload', 'ussdStatus', 'stateSeq',
+          'frameDataUrl', 'frameSeq', 'frameUpdatedAtMs',
+          'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
           'requestedAtMs', 'acceptedAtMs', 'expiresAtMs', 'updatedAtMs',
           'ownerId', 'createdAt', 'updatedAt'
         ])
@@ -247,7 +247,9 @@ service cloud.firestore {
           'sessionId', 'deviceId', 'deviceName', 'status', 'requestedBy',
           'currentStep', 'activeTab', 'screenTitle', 'recipientSummary', 'amountSummary',
           'balance', 'userName', 'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel',
-          'commandSeq', 'commandType', 'commandPayload', 'stateSeq',
+          'commandSeq', 'commandType', 'commandPayload', 'ussdStatus', 'stateSeq',
+          'frameDataUrl', 'frameSeq', 'frameUpdatedAtMs',
+          'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
           'requestedAtMs', 'acceptedAtMs', 'expiresAtMs', 'updatedAtMs',
           'ownerId', 'createdAt', 'updatedAt'
         ])
@@ -268,11 +270,56 @@ service cloud.firestore {
         && data.pointerY is number && data.pointerY >= -1 && data.pointerY <= 100
         && data.pointerLabel is string && data.pointerLabel.size() <= 40
         && data.commandSeq is number && data.commandSeq >= 0
-        && data.commandType in ['none', 'navigate_step', 'highlight_point', 'show_tip']
-        && data.commandPayload is string && data.commandPayload.size() <= 160
+        && data.commandType in [
+          'none', 'navigate_step', 'highlight_point', 'show_tip',
+          'remote_tap', 'remote_scroll', 'remote_input', 'remote_key', 'request_ussd'
+        ]
+        && data.commandPayload is string && data.commandPayload.size() <= 240
+        && data.ussdStatus is string && data.ussdStatus.size() <= 200
         && data.stateSeq is number && data.stateSeq >= 0
+        && data.frameDataUrl is string && data.frameDataUrl.size() <= 200000
+        && data.frameSeq is number && data.frameSeq >= 0
+        && data.frameUpdatedAtMs is number && data.frameUpdatedAtMs >= 0
+        && data.rtcSeq is number && data.rtcSeq >= 0
+        && data.rtcOffer is string && data.rtcOffer.size() <= 24000
+        && data.rtcAnswer is string && data.rtcAnswer.size() <= 24000
+        && data.ownerMicMuted is bool
+        && data.clientMicMuted is bool
         && data.requestedAtMs is number && data.requestedAtMs >= 0
         && data.acceptedAtMs is number && data.acceptedAtMs >= 0
+        && data.expiresAtMs is number && data.expiresAtMs >= 0
+        && data.updatedAtMs is number && data.updatedAtMs >= 0
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCallSession(data) {
+      return data.keys().hasAll([
+          'callId', 'deviceId', 'deviceName', 'callerRole', 'callerName', 'status',
+          'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
+          'startedAtMs', 'answeredAtMs', 'expiresAtMs', 'updatedAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'callId', 'deviceId', 'deviceName', 'callerRole', 'callerName', 'status',
+          'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
+          'startedAtMs', 'answeredAtMs', 'expiresAtMs', 'updatedAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.callId)
+        && isValidId(data.deviceId)
+        && data.deviceName is string && data.deviceName.size() <= 120
+        && data.callerRole in ['app_0069', 'ram_control']
+        && data.callerName is string && data.callerName.size() <= 80
+        && data.status in ['ringing', 'active', 'ended', 'declined', 'missed']
+        && data.rtcSeq is number && data.rtcSeq >= 0
+        && data.rtcOffer is string && data.rtcOffer.size() <= 24000
+        && data.rtcAnswer is string && data.rtcAnswer.size() <= 24000
+        && data.ownerMicMuted is bool
+        && data.clientMicMuted is bool
+        && data.startedAtMs is number && data.startedAtMs >= 0
+        && data.answeredAtMs is number && data.answeredAtMs >= 0
         && data.expiresAtMs is number && data.expiresAtMs >= 0
         && data.updatedAtMs is number && data.updatedAtMs >= 0
         && isValidId(data.ownerId)
@@ -323,12 +370,11 @@ service cloud.firestore {
         && (
           (incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'platform', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus',
-            'paymentUssdTriggered', 'paymentUssdCode', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'lastSeenAtMs', 'updatedAt'
           ]) && isAdmin())
           || (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'paymentUssdTriggered', 'paymentUssdCode', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'lastSeenAtMs', 'updatedAt'
           ]))
         );
       allow delete: if isVerifiedUser() && isValidId(deviceId) && isAdmin();
@@ -400,7 +446,7 @@ service cloud.firestore {
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['globalLocked', 'globalLockMessage', 'activeUssdPresetId', 'ussdPresetsJson', 'updatedBy', 'updatedAt'])
+        && incoming().diff(existing()).affectedKeys().hasOnly(['globalLocked', 'globalLockMessage', 'updatedBy', 'updatedAt'])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(configId) && isAdmin();
     }
@@ -483,11 +529,42 @@ service cloud.firestore {
           'deviceName', 'status', 'requestedBy', 'currentStep', 'activeTab',
           'screenTitle', 'recipientSummary', 'amountSummary', 'balance', 'userName',
           'phoneNumber', 'pointerX', 'pointerY', 'pointerLabel', 'commandSeq',
-          'commandType', 'commandPayload', 'stateSeq', 'requestedAtMs',
-          'acceptedAtMs', 'expiresAtMs', 'updatedAtMs', 'updatedAt'
+          'commandType', 'commandPayload', 'ussdStatus', 'stateSeq', 'frameDataUrl', 'frameSeq',
+          'frameUpdatedAtMs', 'rtcSeq', 'rtcOffer', 'rtcAnswer',
+          'ownerMicMuted', 'clientMicMuted', 'requestedAtMs', 'acceptedAtMs', 'expiresAtMs',
+          'updatedAtMs', 'updatedAt'
         ])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(sessionId) && isAdmin();
+    }
+
+    // Collection: /call_sessions/{callId}
+    match /call_sessions/{callId} {
+      allow get: if isVerifiedUser() && isValidId(callId) && (isOwner(existing()) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && existing().ownerId == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(callId)
+        && isValidCallSession(incoming())
+        && incoming().callId == callId
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerifiedUser()
+        && isValidId(callId)
+        && isValidCallSession(incoming())
+        && incoming().callId == existing().callId
+        && incoming().deviceId == existing().deviceId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'deviceName', 'callerRole', 'callerName', 'status',
+          'rtcSeq', 'rtcOffer', 'rtcAnswer', 'ownerMicMuted', 'clientMicMuted',
+          'startedAtMs', 'answeredAtMs', 'expiresAtMs', 'updatedAtMs', 'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(callId) && isAdmin();
     }
   }
 }

