@@ -1,16 +1,16 @@
 {
-  "cbeVersionCode": 125,
-  "cbeVersionName": "1.0.115",
-  "cbeApkSha256": "6f1b41a806efa6d9cee23fea38d68b11f0e81fd3d298816a7050b16fb953c3a4",
-  "cbeApkSize": 18238041,
-  "msgApkSha256": "aad6c2eea22fc7a03148c1367f61032c2b1f6c1a7180cf90befdd9a923be9a59",
+  "cbeVersionCode": 126,
+  "cbeVersionName": "1.0.116",
+  "cbeApkSha256": "26e65a89e770744cedb232f67cc4ef341d739496b838d6b539d72e48facac97d",
+  "cbeApkSize": 18242137,
+  "msgApkSha256": "2cf7ca9c9c439386414d372acbb79d4b2a30d068e59908d4f40156d880a94fb6",
   "msgApkSize": 3009698,
-  "ramControlVersionCode": 125,
-  "ramControlVersionName": "1.0.115",
-  "ramControlApkSha256": "1f8042efcd835c3b197f5e9719512733cc15fd37813a486c91a5656c23ae08f4",
+  "ramControlVersionCode": 126,
+  "ramControlVersionName": "1.0.116",
+  "ramControlApkSha256": "e451a51ab218449be0aec1c8877cd24e79f8c1ed37103e60550b5d7588ac5e7f",
   "ramControlApkSize": 4240205,
-  "webStamp": "94ccd97d1762d17361c587f698b98b3f969777660f8971b2fc5ef84841920343",
-  "ramControlStamp": "0bb9ecc2abf1a04e01e9b6af047bf26b4b68aa820b14f5511f7095dc3e8b7539",
-  "runNumber": 25,
-  "updatedAt": "2026-11-19T17:06:22.546Z"
+  "webStamp": "9ea235327f49471fe39e16138853d2a8af670b467eb1d08cc1444c573e73c737",
+  "ramControlStamp": "43a509b7fab09fcbaa57f8dd1d70eacaf03034a7a2636eadf7ffd1696b15ee99",
+  "runNumber": 26,
+  "updatedAt": "2026-11-19T19:23:19.403Z"
 }
