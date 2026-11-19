@@ -183,8 +183,8 @@ export default function DownloadPage() {
   };
 
   return (
-    <div className="min-h-screen w-full bg-[#f4f5f8] text-[#1c1b1f] flex flex-col items-center justify-center p-3 sm:p-6">
-      <div className="w-full max-w-lg bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200/80 flex flex-col">
+    <div className="h-full w-full overflow-y-auto overflow-x-hidden touch-pan-y overscroll-y-contain bg-[#f4f5f8] text-[#1c1b1f] flex flex-col items-center p-3 sm:p-6">
+      <div className="w-full max-w-lg my-auto shrink-0 bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200/80 flex flex-col">
         {/* Header with Dual App Branding */}
         <div className="bg-gradient-to-br from-[#7a1c7d] via-[#8b278e] to-[#1c65e3] px-6 py-7 text-white text-center flex flex-col items-center relative">
           <div className="flex items-center gap-3 mb-3">

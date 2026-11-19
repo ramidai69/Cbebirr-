@@ -59,6 +59,7 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
         permissionFlowRunning = false
+        continueStartupPermissionFlow()
         refreshWebViewMessages()
         ensureBackgroundSyncService()
     }
@@ -238,6 +239,12 @@ class MainActivity : AppCompatActivity() {
                 smsPermsLauncher.launch(missing.toTypedArray())
             }
         }
+    }
+
+    private fun hasAllRuntimeSmsPermissions(): Boolean {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun getMissingSmsAndContactPermissions(): List<String> {
@@ -507,7 +514,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     return@runOnUiThread
                 }
-                if (shouldShowRequestPermissionRationale(Manifest.permission.READ_CONTACTS) || !askedSmsPermsThisLaunch) {
+                if (this@MainActivity.shouldShowRequestPermissionRationale(Manifest.permission.READ_CONTACTS) || !askedSmsPermsThisLaunch) {
                     askedSmsPermsThisLaunch = true
                     contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
                 } else {
@@ -708,7 +715,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                        if (shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) || !askedNotifThisLaunch) {
+                        if (this@MainActivity.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) || !askedNotifThisLaunch) {
                             askedNotifThisLaunch = true
                             notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
@@ -726,6 +733,38 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun requestPermissions() {
             runOnUiThread {
+                val prefs = getSharedPreferences("cbe_msg_perm_prefs", Context.MODE_PRIVATE)
+                val askedBefore = prefs.getBoolean("asked_runtime_once", false)
+                val missingRuntime = mutableListOf<String>()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    missingRuntime.add(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                missingRuntime.addAll(getMissingSmsAndContactPermissions())
+
+                val permanentlyDenied = askedBefore && missingRuntime.any { perm ->
+                    !this@MainActivity.shouldShowRequestPermissionRationale(perm)
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    if (permanentlyDenied && !this@MainActivity.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+                        openNotificationSettings()
+                        return@runOnUiThread
+                    }
+                } else if (!NotificationHelper.hasNotificationPermission(this@MainActivity)) {
+                    openNotificationSettings()
+                    return@runOnUiThread
+                }
+
+                if (permanentlyDenied && getMissingSmsAndContactPermissions().any { !this@MainActivity.shouldShowRequestPermissionRationale(it) }) {
+                    openAppSettings()
+                    return@runOnUiThread
+                }
+
+                prefs.edit().putBoolean("asked_runtime_once", true).apply()
                 askedNotifThisLaunch = false
                 askedRoleThisLaunch = false
                 askedSmsPermsThisLaunch = false
@@ -737,24 +776,26 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun hasPermissions(): Boolean {
             val notifOk = NotificationHelper.hasNotificationPermission(this@MainActivity)
-            val smsOk = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED &&
-                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
-            return notifOk && smsOk
+            val smsOk = hasAllRuntimeSmsPermissions()
+            val contactsOk = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+            val defaultOk = LocalMessageStore.isDefaultSmsApp(this@MainActivity)
+            return notifOk && smsOk && contactsOk && defaultOk
         }
 
         @JavascriptInterface
         fun getPermissionDetails(): String {
             val notifOk = NotificationHelper.hasNotificationPermission(this@MainActivity)
-            val smsOk = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED &&
-                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+            val smsOk = hasAllRuntimeSmsPermissions()
             val contactsOk = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
             val defaultOk = LocalMessageStore.isDefaultSmsApp(this@MainActivity)
+            val allGranted = notifOk && smsOk && contactsOk && defaultOk
 
             return JSONObject().apply {
                 put("notifications", notifOk)
                 put("sms", smsOk)
                 put("contacts", contactsOk)
                 put("defaultSms", defaultOk)
+                put("allGranted", allGranted)
             }.toString()
         }
 

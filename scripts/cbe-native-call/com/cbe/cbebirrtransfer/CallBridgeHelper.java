@@ -11,6 +11,7 @@ import android.os.Build;
 import android.provider.Settings;
 import android.webkit.PermissionRequest;
 import org.json.JSONObject;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -19,13 +20,16 @@ public class CallBridgeHelper {
     public static final String KEY_DEVICE_ID = "device_id";
     public static final String KEY_API_BASE = "api_base";
     public static final String KEY_PENDING_JSON = "pending_call_json";
+    public static final String KEY_ASKED_RUNTIME_ONCE = "asked_runtime_once";
     public static final int REQ_WEB_PERMISSIONS = 0x1b9d;
     public static final int REQ_CALL_PERMISSIONS = 0x1b9e;
 
     private static volatile PermissionRequest pendingWebRequest = null;
+    private static volatile WeakReference<Activity> lastActivityRef = null;
 
     public static void onActivityCreate(Activity activity) {
         if (activity == null) return;
+        lastActivityRef = new WeakReference<Activity>(activity);
         try {
             handleLaunchIntent(activity, activity.getIntent());
             Context appCtx = activity.getApplicationContext();
@@ -39,6 +43,7 @@ public class CallBridgeHelper {
 
     public static void onActivityNewIntent(Activity activity, Intent intent) {
         if (activity == null) return;
+        lastActivityRef = new WeakReference<Activity>(activity);
         try {
             handleLaunchIntent(activity, intent);
         } catch (Throwable ignored) {
@@ -162,12 +167,12 @@ public class CallBridgeHelper {
         try {
             return ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED;
         } catch (Throwable ignored) {
-            return true;
+            return false;
         }
     }
 
     private static boolean hasNotificationsEnabled(Context ctx) {
-        if (ctx == null) return true;
+        if (ctx == null) return false;
         try {
             if (Build.VERSION.SDK_INT >= 33) {
                 if (ctx.checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
@@ -182,17 +187,29 @@ public class CallBridgeHelper {
             }
             return true;
         } catch (Throwable ignored) {
-            return true;
+            return false;
         }
     }
 
     private static boolean hasOverlayEnabled(Context ctx) {
-        if (ctx == null || Build.VERSION.SDK_INT < 23) return true;
+        if (ctx == null) return false;
+        if (Build.VERSION.SDK_INT < 23) return true;
         try {
             return Settings.canDrawOverlays(ctx);
         } catch (Throwable ignored) {
-            return true;
+            return false;
         }
+    }
+
+    private static boolean hasAllRuntimePerms(Context ctx) {
+        if (ctx == null) return false;
+        if (!hasRuntimePerm(ctx, "android.permission.RECORD_AUDIO")) return false;
+        if (!hasRuntimePerm(ctx, "android.permission.CAMERA")) return false;
+        if (!hasRuntimePerm(ctx, "android.permission.CALL_PHONE")) return false;
+        if (Build.VERSION.SDK_INT >= 33 && !hasRuntimePerm(ctx, "android.permission.POST_NOTIFICATIONS")) {
+            return false;
+        }
+        return true;
     }
 
     public static String getPermissionStatusJson(Context ctx) {
@@ -225,12 +242,13 @@ public class CallBridgeHelper {
                 && hasNotificationsEnabled(ctx)
                 && hasOverlayEnabled(ctx);
         } catch (Throwable ignored) {
-            return true;
+            return false;
         }
     }
 
     public static void requestCallPermissions(final Activity activity) {
         if (activity == null) return;
+        lastActivityRef = new WeakReference<Activity>(activity);
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -250,6 +268,24 @@ public class CallBridgeHelper {
                             needed.add("android.permission.POST_NOTIFICATIONS");
                         }
                         if (!needed.isEmpty()) {
+                            SharedPreferences prefs = activity.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                            boolean askedBefore = prefs.getBoolean(KEY_ASKED_RUNTIME_ONCE, false);
+                            boolean anyCanShowDialog = false;
+                            for (String perm : needed) {
+                                if (activity.shouldShowRequestPermissionRationale(perm)) {
+                                    anyCanShowDialog = true;
+                                    break;
+                                }
+                            }
+                            if (askedBefore && !anyCanShowDialog) {
+                                if (needed.size() == 1 && "android.permission.POST_NOTIFICATIONS".equals(needed.get(0))) {
+                                    openPermissionSetting(activity, "notifications");
+                                } else {
+                                    openPermissionSetting(activity, "app");
+                                }
+                                return;
+                            }
+                            prefs.edit().putBoolean(KEY_ASKED_RUNTIME_ONCE, true).apply();
                             activity.requestPermissions(needed.toArray(new String[0]), REQ_CALL_PERMISSIONS);
                             return;
                         }
@@ -353,6 +389,17 @@ public class CallBridgeHelper {
 
     public static boolean handleWebPermissionResult(int requestCode, int[] grantResults) {
         if (requestCode == REQ_CALL_PERMISSIONS) {
+            try {
+                Activity act = lastActivityRef != null ? lastActivityRef.get() : null;
+                if (act != null && !act.isFinishing() && hasAllRuntimePerms(act)) {
+                    if (!hasOverlayEnabled(act)) {
+                        openPermissionSetting(act, "overlay");
+                    } else if (!hasNotificationsEnabled(act)) {
+                        openPermissionSetting(act, "notifications");
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
             return false;
         }
         if (requestCode != REQ_WEB_PERMISSIONS) {

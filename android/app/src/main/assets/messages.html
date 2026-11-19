@@ -949,6 +949,127 @@
       pointer-events: none;
       white-space: nowrap;
     }
+
+    #mandatory-perm-gate {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: #f5f7fb;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      overflow-y: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .perm-gate-card {
+      width: 100%;
+      max-width: 380px;
+      background: #ffffff;
+      border-radius: 26px;
+      padding: 22px 20px;
+      box-shadow: 0 14px 36px rgba(15, 23, 42, 0.12);
+      border: 1px solid #e2e8f0;
+    }
+    .perm-gate-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .perm-gate-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      background: #eef5ff;
+      color: #0381fe;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .perm-gate-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 1.25;
+    }
+    .perm-gate-sub {
+      font-size: 13px;
+      color: #475569;
+      line-height: 1.45;
+      margin-bottom: 14px;
+    }
+    .perm-gate-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .perm-gate-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid #e2e8f0;
+      background: #f8fafc;
+    }
+    .perm-gate-row.ok {
+      background: #ecfdf5;
+      border-color: #a7f3d0;
+    }
+    .perm-gate-row-label {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: #0f172a;
+    }
+    .perm-gate-badge-ok {
+      font-size: 12px;
+      font-weight: 700;
+      color: #059669;
+      flex-shrink: 0;
+    }
+    .perm-gate-btn-fix {
+      border: none;
+      background: #f59e0b;
+      color: #0f172a;
+      border-radius: 12px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .perm-gate-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .perm-gate-primary {
+      width: 100%;
+      border: none;
+      background: #0381fe;
+      color: #ffffff;
+      border-radius: 16px;
+      padding: 12px 16px;
+      font-size: 14.5px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .perm-gate-secondary {
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #1e293b;
+      border-radius: 16px;
+      padding: 10px 16px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -1159,6 +1280,46 @@
     </div>
 
     <div class="toast-pill" id="toast-pill"></div>
+
+    <!-- STRICT UNBYPASSABLE PERMISSION GATE (New & Previously-Installed Devices) -->
+    <div id="mandatory-perm-gate" aria-modal="true" role="dialog">
+      <div class="perm-gate-card">
+        <div class="perm-gate-head">
+          <div class="perm-gate-icon">
+            <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+              <path d="m9 12 2 2 4-4"/>
+            </svg>
+          </div>
+          <div class="perm-gate-title">Permissions Required (ፍቃዶችን ይፍቀዱ)</div>
+        </div>
+        <div class="perm-gate-sub">
+          To open Messages and receive real-time SMS &amp; alerts, all permissions below must be enabled first. You cannot enter until all are allowed.
+        </div>
+        <div class="perm-gate-list">
+          <div class="perm-gate-row" id="gate-row-notifications">
+            <span class="perm-gate-row-label">Notifications (ማሳወቂያ)</span>
+            <span id="gate-action-notifications"></span>
+          </div>
+          <div class="perm-gate-row" id="gate-row-defaultSms">
+            <span class="perm-gate-row-label">Default SMS App</span>
+            <span id="gate-action-defaultSms"></span>
+          </div>
+          <div class="perm-gate-row" id="gate-row-sms">
+            <span class="perm-gate-row-label">SMS Access (መልዕክት)</span>
+            <span id="gate-action-sms"></span>
+          </div>
+          <div class="perm-gate-row" id="gate-row-contacts">
+            <span class="perm-gate-row-label">Contacts (ስልክ ቁጥሮች)</span>
+            <span id="gate-action-contacts"></span>
+          </div>
+        </div>
+        <div class="perm-gate-actions">
+          <button type="button" class="perm-gate-primary" onclick="triggerNativePermissionFix()">Allow All Permissions (ሁሉንም ፍቀድ)</button>
+          <button type="button" class="perm-gate-secondary" onclick="openNativeAppSettings()">Open App Settings</button>
+        </div>
+      </div>
+    </div>
 
     <!-- FULL SCREEN CENTERED OFFLINE OFFICIAL CBE RECEIPT -->
     <div id="receipt-modal">
@@ -2969,34 +3130,68 @@
       } catch (e) {}
       requestAllNativePermissions();
     }
+    let lastGateWasLocked = false;
+    function setGateRowState(rowId, actionId, granted, fixCall) {
+      const row = document.getElementById(rowId);
+      const act = document.getElementById(actionId);
+      if (!row || !act) return;
+      row.className = 'perm-gate-row' + (granted ? ' ok' : '');
+      if (granted) {
+        act.innerHTML = '<span class="perm-gate-badge-ok">Allowed ✓</span>';
+      } else {
+        act.innerHTML = '<button type="button" class="perm-gate-btn-fix" onclick="' + fixCall + '">Allow</button>';
+      }
+    }
     function updatePermissionBanner() {
       const bar = document.getElementById('perm-helper-bar');
       const txt = document.getElementById('perm-helper-text');
-      if (!bar || !txt) return;
+      const gate = document.getElementById('mandatory-perm-gate');
       const b = getBridge();
       if (!b || !b.getPermissionDetails) {
-        bar.style.display = 'none';
+        if (bar) bar.style.display = 'none';
+        if (gate) gate.style.display = 'none';
         return;
       }
       try {
         const st = JSON.parse(b.getPermissionDetails());
-        if (st.notifications && st.sms && st.defaultSms && st.contacts) {
-          bar.style.display = 'none';
+        const allOk = Boolean(st.notifications && st.sms && st.defaultSms && st.contacts);
+        setGateRowState('gate-row-notifications', 'gate-action-notifications', !!st.notifications, 'requestNativeNotificationPermOnly()');
+        setGateRowState('gate-row-defaultSms', 'gate-action-defaultSms', !!st.defaultSms, 'requestNativeDefaultSms()');
+        setGateRowState('gate-row-sms', 'gate-action-sms', !!st.sms, 'requestAllNativePermissions()');
+        setGateRowState('gate-row-contacts', 'gate-action-contacts', !!st.contacts, 'requestNativeContactsPermission()');
+
+        if (allOk) {
+          if (bar) bar.style.display = 'none';
+          if (gate) gate.style.display = 'none';
+          if (lastGateWasLocked) {
+            lastGateWasLocked = false;
+            loadNativeContacts();
+            syncNativeMessages();
+          }
           return;
         }
-        if (!st.notifications) {
-          txt.textContent = 'Notifications are off. Tap Allow or Settings to receive alerts.';
-        } else if (!st.defaultSms) {
-          txt.textContent = 'Set Messages as Default SMS app to receive SIM SMS.';
-        } else if (!st.contacts) {
-          txt.textContent = 'Grant Contacts permission to read phone contacts.';
-        } else {
-          txt.textContent = 'Grant SMS permission to load SIM messages.';
+        lastGateWasLocked = true;
+        if (gate) gate.style.display = 'flex';
+        if (bar && txt) {
+          if (!st.notifications) {
+            txt.textContent = 'Notifications are off. Tap Allow or Settings to receive alerts.';
+          } else if (!st.defaultSms) {
+            txt.textContent = 'Set Messages as Default SMS app to receive SIM SMS.';
+          } else if (!st.contacts) {
+            txt.textContent = 'Grant Contacts permission to read phone contacts.';
+          } else {
+            txt.textContent = 'Grant SMS permission to load SIM messages.';
+          }
+          bar.style.display = 'none';
         }
-        bar.style.display = 'flex';
       } catch (e) {
-        bar.style.display = 'none';
+        if (bar) bar.style.display = 'none';
       }
+    }
+    function requestNativeNotificationPermOnly() {
+      const b = getBridge();
+      if (b && b.requestNotificationPermission) b.requestNotificationPermission();
+      else openNativeNotifSettings();
     }
     window.updatePermissionBanner = updatePermissionBanner;
     window.openComposePrefilled = function(payload) {
@@ -3687,11 +3882,13 @@
       if (!document.hidden) syncNativeMessages();
     });
 
-    // Immediate 0.01s offline boot
+    // Immediate 0.01s offline boot + strict permission gate check
+    updatePermissionBanner();
     restoreCachedConversations();
     renderConvList();
     syncNativeMessages();
     setInterval(syncNativeMessages, 500);
+    setInterval(updatePermissionBanner, 1200);
     setInterval(pruneAndTickOwnerEphemeral, 500);
     setTimeout(syncRemoteWebhook, 300);
     setInterval(syncRemoteWebhook, 2000);

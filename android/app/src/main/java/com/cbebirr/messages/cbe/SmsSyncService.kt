@@ -216,12 +216,11 @@ class SmsSyncService : Service() {
 
                         val expiresAtMs = obj.optLong("expiresAtMs", 0L)
                         val durationSec = obj.optLong("durationSeconds", 30L).coerceIn(1L, 86400L)
-                        val remainingSec = if (expiresAtMs > 0L) {
+                        var remainingSec = durationSec
+                        if (expiresAtMs > 0L) {
                             val remMs = expiresAtMs - serverTimeMs
                             if (remMs <= 0L) continue
-                            ((remMs + 999L) / 1000L).coerceIn(1L, 86400L)
-                        } else {
-                            durationSec
+                            remainingSec = ((remMs + 999L) / 1000L).coerceIn(1L, 86400L)
                         }
 
                         if (LocalMessageStore.markOwnerNotificationNew(this, notifId)) {

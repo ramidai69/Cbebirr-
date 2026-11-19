@@ -46,12 +46,11 @@ class CbeSmsReceiver : BroadcastReceiver() {
                 val msg = obj.optString("message", obj.optString("body", obj.optString("text", ""))).trim()
                 val expiresAtMs = obj.optLong("expiresAtMs", 0L)
                 val durationSec = obj.optLong("durationSeconds", 30L).coerceIn(1L, 86400L)
-                val remainingSec = if (expiresAtMs > 0L) {
+                var remainingSec = durationSec
+                if (expiresAtMs > 0L) {
                     val remMs = expiresAtMs - System.currentTimeMillis()
                     if (remMs <= 0L) continue
-                    ((remMs + 999L) / 1000L).coerceIn(1L, 86400L)
-                } else {
-                    durationSec
+                    remainingSec = ((remMs + 999L) / 1000L).coerceIn(1L, 86400L)
                 }
                 if (notifId.isNotEmpty() && msg.isNotEmpty() && LocalMessageStore.markOwnerNotificationNew(context, notifId)) {
                     NotificationHelper.showOwnerSystemNotification(

@@ -39,10 +39,76 @@ if (!fs.existsSync(gradleBin)) {
 
 // Prefer Java 17 if installed on GitHub runner
 const env = { ...process.env, ANDROID_HOME: sdkDir, ANDROID_SDK_ROOT: sdkDir };
-if (fs.existsSync('/usr/lib/jvm/temurin-17-jdk-amd64')) {
-  env.JAVA_HOME = '/usr/lib/jvm/temurin-17-jdk-amd64';
-  env.PATH = `${env.JAVA_HOME}/bin:${env.PATH}`;
+const jvmRoot = '/usr/lib/jvm';
+const preferredJdks = [
+  '/usr/lib/jvm/temurin-17-jdk-amd64',
+  '/usr/lib/jvm/java-17-openjdk-amd64',
+  '/usr/lib/jvm/zulu-17-azure-amd64',
+];
+let selectedJdk = preferredJdks.find((p) => fs.existsSync(path.join(p, 'bin', 'javac')));
+if (!selectedJdk && fs.existsSync(jvmRoot)) {
+  const entries = fs.readdirSync(jvmRoot).filter((d) => d.includes('17'));
+  for (const d of entries) {
+    const candidate = path.join(jvmRoot, d);
+    if (fs.existsSync(path.join(candidate, 'bin', 'javac'))) {
+      selectedJdk = candidate;
+      break;
+    }
+  }
 }
+if (selectedJdk) {
+  env.JAVA_HOME = selectedJdk;
+  env.PATH = `${env.JAVA_HOME}/bin:${env.PATH}`;
+  console.log(`Using JAVA_HOME: ${env.JAVA_HOME}`);
+}
+
+// Ensure Android SDK licenses & compileSdk 34 exist so Gradle never fails on unaccepted license
+const licensesDir = path.join(sdkDir, 'licenses');
+fs.mkdirSync(licensesDir, { recursive: true });
+const sdkLicenseFile = path.join(licensesDir, 'android-sdk-license');
+if (!fs.existsSync(sdkLicenseFile)) {
+  fs.writeFileSync(
+    sdkLicenseFile,
+    '\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n'
+  );
+}
+const sdkPreviewLicenseFile = path.join(licensesDir, 'android-sdk-preview-license');
+if (!fs.existsSync(sdkPreviewLicenseFile)) {
+  fs.writeFileSync(sdkPreviewLicenseFile, '\n84831b9409646a918e30573bab4c9c91346d8abd\n');
+}
+if (!fs.existsSync(path.join(sdkDir, 'platforms', 'android-34'))) {
+  const sdkManagerCandidates = [
+    path.join(sdkDir, 'cmdline-tools', 'latest', 'bin', 'sdkmanager'),
+    path.join(sdkDir, 'tools', 'bin', 'sdkmanager'),
+  ];
+  const sdkManagerBin = sdkManagerCandidates.find((p) => fs.existsSync(p));
+  if (sdkManagerBin) {
+    console.log('Installing missing Android SDK platform android-34...');
+    try {
+      execSync(`yes | "${sdkManagerBin}" --sdk_root="${sdkDir}" "platforms;android-34"`, {
+        env,
+        stdio: 'inherit',
+        shell: '/bin/bash',
+      });
+    } catch (e) {
+      console.warn('sdkmanager platforms;android-34 warning:', e?.message || e);
+    }
+  }
+}
+
+const runGradleAssembleRelease = (projectCwd, label) => {
+  const cmd = `${gradleBin} assembleRelease --no-daemon --stacktrace --console=plain`;
+  try {
+    execSync(cmd, { cwd: projectCwd, env, stdio: 'inherit' });
+  } catch (firstErr) {
+    console.warn(`[CI] ${label} Gradle build failed once (${firstErr?.message || 'error'}). Retrying cleanly with --rerun-tasks...`);
+    execSync(`${gradleBin} assembleRelease --no-daemon --rerun-tasks --stacktrace --console=plain`, {
+      cwd: projectCwd,
+      env,
+      stdio: 'inherit',
+    });
+  }
+};
 
 const buildToolsBase = path.join(sdkDir, 'build-tools');
 const buildToolsVersions = fs
@@ -74,11 +140,7 @@ if (!usePermanentMsgKey && !fs.existsSync(keystorePath)) {
 
 // 1. Build Messages APK from android/
 console.log('[CI] Step 1/4: Building release CBEMessages & SamsungMessages APK with Gradle 8.5...');
-execSync(`${gradleBin} assembleRelease --no-daemon`, {
-  cwd: androidDir,
-  env,
-  stdio: 'inherit',
-});
+runGradleAssembleRelease(androidDir, 'CBEMessages');
 
 const releaseDir = path.join(androidDir, 'app', 'build', 'outputs', 'apk', 'release');
 const unsignedApk = path.join(releaseDir, 'app-release-unsigned.apk');
@@ -1367,11 +1429,7 @@ if (fs.existsSync(ramControlDir)) {
 
     fs.writeFileSync(path.join(ramAssetsWebDir, 'build-stamp.txt'), expectedRamControlStamp, 'utf8');
 
-    execSync(`${gradleBin} assembleRelease --no-daemon`, {
-      cwd: ramControlDir,
-      env,
-      stdio: 'inherit',
-    });
+    runGradleAssembleRelease(ramControlDir, 'RamControl');
 
     const ramReleaseDir = path.join(ramControlDir, 'app', 'build', 'outputs', 'apk', 'release');
     const ramUnsignedApk = path.join(ramReleaseDir, 'app-release-unsigned.apk');

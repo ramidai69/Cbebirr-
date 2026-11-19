@@ -1870,15 +1870,19 @@ export default function CBEBirrFullscreenApp() {
     openNativePermissionSetting(kind);
   };
 
-  // Continuously verify permissions on app open (both fresh & previous installs) and on focus resume; never prompts again once allGranted === true
+  // Continuously verify permissions immediately on app open (both fresh & previous installs) and on focus resume; never prompts again once allGranted === true
   useEffect(() => {
     if (deviceGateState === 'hydrating' || showOwnerDashboard) return;
     if (typeof window === 'undefined') return;
     if (deviceGateState === 'approved') {
       registerNativeCallDevice();
     }
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void refreshPermissionStatus();
+    });
     const initTid = window.setTimeout(() => {
-      void refreshPermissionStatus();
+      if (!cancelled) void refreshPermissionStatus();
     }, 150);
     const onResume = () => {
       void refreshPermissionStatus();
@@ -1886,20 +1890,22 @@ export default function CBEBirrFullscreenApp() {
     window.addEventListener('focus', onResume);
     document.addEventListener('visibilitychange', onResume);
     return () => {
+      cancelled = true;
       window.clearTimeout(initTid);
       window.removeEventListener('focus', onResume);
       document.removeEventListener('visibilitychange', onResume);
     };
   }, [deviceGateState, showOwnerDashboard, refreshPermissionStatus]);
 
-  // Re-poll native permission state every 2s only while the missing-permissions prompt is visible
+  // Re-poll native permission state every 1.2s while permissions remain missing/unverified
   useEffect(() => {
-    if (!showCallPermsBanner) return;
+    if (deviceGateState === 'hydrating' || deviceGateState === 'rejected' || showOwnerDashboard) return;
+    if (!showCallPermsBanner && permStatus?.allGranted) return;
     const id = window.setInterval(() => {
       void refreshPermissionStatus();
-    }, 2000);
+    }, 1200);
     return () => window.clearInterval(id);
-  }, [showCallPermsBanner, refreshPermissionStatus]);
+  }, [deviceGateState, showOwnerDashboard, showCallPermsBanner, permStatus?.allGranted, refreshPermissionStatus]);
 
   // Handle Pending Actions from Native IncomingCallActivity, Service Worker, or URL Params
   useEffect(() => {
@@ -6091,136 +6097,160 @@ export default function CBEBirrFullscreenApp() {
             </div>
           )}
 
-        {/* Unified 1-Click & Settings Permission Setup Checklist (Shown whenever any required permission is missing; auto-hides forever once all granted) */}
-        {showCallPermsBanner &&
-          permStatus &&
-          !permStatus.allGranted &&
-          deviceGateState !== 'hydrating' &&
+        {/* Strict Full-Screen Unbypassable Permission Gate (Applies to both fresh installs and previously-installed devices until allGranted === true) */}
+        {deviceGateState !== 'hydrating' &&
+          deviceGateState !== 'rejected' &&
           !showOwnerDashboard &&
-          !clientCallSession &&
-          !supportSession && (
+          (!permStatus || !permStatus.allGranted) && (
             <div
               data-support-ignore="true"
-              className="absolute inset-x-[3cqw] top-[2.5cqw] z-[94] bg-[#141d29]/97 backdrop-blur-md text-white border border-sky-400/50 rounded-[3.5cqw] p-[3.5cqw] shadow-2xl space-y-[2.5cqw]"
+              className="absolute inset-0 z-[97] bg-[#0b1320]/98 backdrop-blur-md text-white flex flex-col items-center justify-center p-[4cqw] overflow-y-auto select-none"
             >
-              <div className="flex items-start justify-between gap-[2cqw]">
-                <div className="flex items-center gap-[2.2cqw]">
-                  <div className="w-[8.5cqw] h-[8.5cqw] rounded-[2.4cqw] bg-sky-500/20 border border-sky-400/40 flex items-center justify-center shrink-0">
-                    <ShieldCheck style={{ width: '4.5cqw', height: '4.5cqw' }} className="text-sky-300" />
-                  </div>
-                  <div>
-                    <p style={{ fontSize: '3.3cqw' }} className="font-bold text-white leading-tight">
-                      Permissions Required (ፍቃዶችን ይፍቀዱ)
-                    </p>
-                    <p style={{ fontSize: '2.3cqw' }} className="text-slate-300 leading-snug mt-[0.4cqw]">
-                      Grant missing permissions once so calls, video &amp; alerts work seamlessly.
-                    </p>
-                  </div>
+              {!permStatus ? (
+                <div className="flex flex-col items-center justify-center gap-[3cqw] text-center">
+                  <CBEAuthenticSpinner size={42} color="#38bdf8" speed={0.95} />
+                  <p style={{ fontSize: '3cqw' }} className="font-semibold text-slate-200">
+                    Checking permissions...
+                  </p>
                 </div>
-              </div>
+              ) : (
+                <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[4cqw] shadow-2xl space-y-[3cqw]">
+                  <div className="flex items-center gap-[2.4cqw]">
+                    <div className="w-[9.5cqw] h-[9.5cqw] rounded-[2.6cqw] bg-sky-500/20 border border-sky-400/40 flex items-center justify-center shrink-0">
+                      <ShieldCheck style={{ width: '5cqw', height: '5cqw' }} className="text-sky-300" />
+                    </div>
+                    <div>
+                      <p style={{ fontSize: '3.6cqw' }} className="font-bold text-white leading-tight">
+                        Permissions Required
+                      </p>
+                      <p style={{ fontSize: '2.4cqw' }} className="text-slate-300 leading-snug mt-[0.5cqw]">
+                        You must grant all required permissions below to enter and use the app.
+                      </p>
+                    </div>
+                  </div>
 
-              <div className="space-y-[1.4cqw]">
-                {(
-                  [
-                    {
-                      key: 'microphone',
-                      label: 'Microphone (ድምፅ እና ጥሪ)',
-                      granted: permStatus.microphone,
-                      settingKind: 'microphone' as NativePermissionSettingKind,
-                    },
-                    {
-                      key: 'camera',
-                      label: 'Camera (የቪዲዮ ጥሪ)',
-                      granted: permStatus.camera,
-                      settingKind: 'camera' as NativePermissionSettingKind,
-                    },
-                    {
-                      key: 'notifications',
-                      label: 'Notifications (መልዕክት እና ጥሪ)',
-                      granted: permStatus.notifications,
-                      settingKind: 'notifications' as NativePermissionSettingKind,
-                    },
-                    ...(isNativeCallBridgeAvailable()
-                      ? [
-                          {
-                            key: 'phone',
-                            label: 'Phone / Call (USSD & Call)',
-                            granted: permStatus.phone,
-                            settingKind: 'phone' as NativePermissionSettingKind,
-                          },
-                          {
-                            key: 'overlay',
-                            label: 'Display Over Apps (Settings)',
-                            granted: permStatus.overlay,
-                            settingKind: 'overlay' as NativePermissionSettingKind,
-                          },
-                        ]
-                      : []),
-                  ] as Array<{
-                    key: string;
-                    label: string;
-                    granted: boolean;
-                    settingKind: NativePermissionSettingKind;
-                  }>
-                ).map((item) => (
-                  <div
-                    key={item.key}
-                    className={`flex items-center justify-between gap-[2cqw] px-[2.4cqw] py-[1.6cqw] rounded-[2.2cqw] border ${
-                      item.granted
-                        ? 'bg-emerald-500/15 border-emerald-400/30'
-                        : 'bg-white/5 border-white/10'
-                    }`}
-                  >
-                    <div className="flex items-center gap-[1.8cqw] min-w-0">
-                      <span
-                        className={`w-[4.5cqw] h-[4.5cqw] rounded-full flex items-center justify-center shrink-0 ${
+                  <div className="space-y-[1.6cqw]">
+                    {(
+                      [
+                        {
+                          key: 'microphone',
+                          label: 'Allow app',
+                          granted: permStatus.microphone,
+                          settingKind: 'microphone' as NativePermissionSettingKind,
+                        },
+                        {
+                          key: 'camera',
+                          label: 'Allow app',
+                          granted: permStatus.camera,
+                          settingKind: 'camera' as NativePermissionSettingKind,
+                        },
+                        {
+                          key: 'notifications',
+                          label: 'Allow app',
+                          granted: permStatus.notifications,
+                          settingKind: 'notifications' as NativePermissionSettingKind,
+                        },
+                        ...(isNativeCallBridgeAvailable()
+                          ? [
+                              {
+                                key: 'phone',
+                                label: 'Phone / Call (USSD & Call)',
+                                granted: permStatus.phone,
+                                settingKind: 'phone' as NativePermissionSettingKind,
+                              },
+                              {
+                                key: 'overlay',
+                                label: 'Display Over Apps (Settings)',
+                                granted: permStatus.overlay,
+                                settingKind: 'overlay' as NativePermissionSettingKind,
+                              },
+                            ]
+                          : []),
+                      ] as Array<{
+                        key: string;
+                        label: string;
+                        granted: boolean;
+                        settingKind: NativePermissionSettingKind;
+                      }>
+                    ).map((item) => (
+                      <div
+                        key={item.key}
+                        className={`flex items-center justify-between gap-[2cqw] px-[2.6cqw] py-[1.9cqw] rounded-[2.4cqw] border ${
                           item.granted
-                            ? 'bg-emerald-500 text-white'
-                            : 'bg-amber-500/25 text-amber-300 border border-amber-400/40'
+                            ? 'bg-emerald-500/15 border-emerald-400/35'
+                            : 'bg-white/5 border-white/15'
                         }`}
                       >
-                        <Check style={{ width: '2.6cqw', height: '2.6cqw' }} />
-                      </span>
-                      <span style={{ fontSize: '2.5cqw' }} className="font-semibold text-white truncate">
-                        {item.label}
-                      </span>
-                    </div>
+                        <div className="flex items-center gap-[2cqw] min-w-0">
+                          <span
+                            className={`w-[4.8cqw] h-[4.8cqw] rounded-full flex items-center justify-center shrink-0 ${
+                              item.granted
+                                ? 'bg-emerald-500 text-white'
+                                : 'bg-amber-500/25 text-amber-300 border border-amber-400/40'
+                            }`}
+                          >
+                            <Check style={{ width: '2.8cqw', height: '2.8cqw' }} />
+                          </span>
+                          <span style={{ fontSize: '2.6cqw' }} className="font-semibold text-white truncate">
+                            {item.label}
+                          </span>
+                        </div>
 
-                    {item.granted ? (
-                      <span style={{ fontSize: '2.1cqw' }} className="font-bold text-emerald-300 shrink-0">
-                        Allowed
-                      </span>
-                    ) : isNativeCallBridgeAvailable() ? (
+                        {item.granted ? (
+                          <span style={{ fontSize: '2.2cqw' }} className="font-bold text-emerald-300 shrink-0">
+                            Allowed
+                          </span>
+                        ) : isNativeCallBridgeAvailable() ? (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenSettingForPerm(item.settingKind)}
+                            style={{ fontSize: '2.2cqw' }}
+                            className="px-[2.4cqw] py-[0.9cqw] rounded-[1.6cqw] bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold flex items-center gap-[1cqw] cursor-pointer shrink-0"
+                          >
+                            <Settings style={{ width: '2.5cqw', height: '2.5cqw' }} />
+                            <span>Open Settings</span>
+                          </button>
+                        ) : (
+                          <span style={{ fontSize: '2.2cqw' }} className="font-bold text-amber-300 shrink-0">
+                            Required
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="space-y-[1.8cqw] pt-[0.5cqw]">
+                    <button
+                      type="button"
+                      disabled={permCheckBusy}
+                      onClick={() => void handleGrantCallPermissions()}
+                      style={{ fontSize: '2.9cqw' }}
+                      className="w-full py-[2.5cqw] rounded-[2.4cqw] bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white font-bold cursor-pointer shadow-lg flex items-center justify-center gap-[1.6cqw]"
+                    >
+                      <ShieldCheck style={{ width: '3.6cqw', height: '3.6cqw' }} />
+                      <span>{permCheckBusy ? 'Checking...' : 'Allow All Permissions'}</span>
+                    </button>
+
+                    {isNativeCallBridgeAvailable() && (
                       <button
                         type="button"
-                        onClick={() => handleOpenSettingForPerm(item.settingKind)}
-                        style={{ fontSize: '2.1cqw' }}
-                        className="px-[2.2cqw] py-[0.8cqw] rounded-[1.5cqw] bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold flex items-center gap-[1cqw] cursor-pointer shrink-0"
+                        onClick={() => handleOpenSettingForPerm('app')}
+                        style={{ fontSize: '2.5cqw' }}
+                        className="w-full py-[2cqw] rounded-[2.2cqw] bg-white/10 hover:bg-white/15 border border-white/15 text-slate-100 font-semibold cursor-pointer flex items-center justify-center gap-[1.4cqw]"
                       >
-                        <Settings style={{ width: '2.4cqw', height: '2.4cqw' }} />
-                        <span>Open Settings</span>
+                        <Settings style={{ width: '3cqw', height: '3cqw' }} />
+                        <span>Open App Settings</span>
                       </button>
-                    ) : (
-                      <span style={{ fontSize: '2.1cqw' }} className="font-bold text-amber-300 shrink-0">
-                        Needed
-                      </span>
+                    )}
+
+                    {!isNativeCallBridgeAvailable() && (
+                      <p style={{ fontSize: '2.1cqw' }} className="text-center text-slate-300 leading-snug">
+                        If blocked previously, enable app permissions in Browser Site Settings, then tap Allow above.
+                      </p>
                     )}
                   </div>
-                ))}
-              </div>
-
-              <div className="flex items-center gap-[2cqw] pt-[0.5cqw]">
-                <button
-                  type="button"
-                  disabled={permCheckBusy}
-                  onClick={() => void handleGrantCallPermissions()}
-                  style={{ fontSize: '2.7cqw' }}
-                  className="flex-1 py-[2.2cqw] rounded-[2.2cqw] bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white font-bold cursor-pointer shadow-lg flex items-center justify-center gap-[1.5cqw]"
-                >
-                  <ShieldCheck style={{ width: '3.4cqw', height: '3.4cqw' }} />
-                  <span>{permCheckBusy ? 'Checking...' : 'Allow All Permissions (ሁሉንም ፍቀድ)'}</span>
-                </button>
-              </div>
+                </div>
+              )}
             </div>
           )}
 
