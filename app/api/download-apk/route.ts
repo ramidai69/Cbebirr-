@@ -45,7 +45,17 @@ export async function GET(req: NextRequest) {
       : appType === 'ramcontrol'
       ? 'RamControl.apk'
       : 'cbebirr-plus.apk';
-  const target = new URL(`/${filename}?v=${encodeURIComponent(getVersionTag(appType))}`, req.url);
+  const localExists = fs.existsSync(path.join(process.cwd(), 'public', filename));
+  const fallbackRoute =
+    appType === 'messages'
+      ? '/download/messages'
+      : appType === 'ramcontrol'
+      ? '/download/ram-control'
+      : '/download/cbebirr';
+  const target = new URL(
+    `${localExists ? `/${filename}` : fallbackRoute}?v=${encodeURIComponent(getVersionTag(appType))}`,
+    req.url
+  );
   return NextResponse.redirect(target, {
     status: 307,
     headers: {

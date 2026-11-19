@@ -158,7 +158,10 @@ export default function DownloadPage() {
     try {
       setDownloadingFile(key);
       const res = await fetch(`${endpoint}?t=${Date.now()}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Fetch status ' + res.status);
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok || contentType.includes('application/json') || contentType.startsWith('text/')) {
+        throw new Error('Fetch status ' + res.status);
+      }
       const arrayBuffer = await res.arrayBuffer();
 
       const apkBlob = new Blob([arrayBuffer], { type: 'application/vnd.android.package-archive' });
