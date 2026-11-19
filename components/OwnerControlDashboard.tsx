@@ -79,6 +79,9 @@ export default function OwnerControlDashboard({
 
   // Filters
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
+  const [deviceTabFilter, setDeviceTabFilter] = useState<'all' | 'pending' | 'approved' | 'online'>('all');
+  const [deviceSearch, setDeviceSearch] = useState<string>('');
+  const [justApprovedIds, setJustApprovedIds] = useState<Record<string, number>>({});
   const [globalLockMsgInput, setGlobalLockMsgInput] = useState<string>(
     'This application is temporarily suspended by the administrator.'
   );
@@ -205,7 +208,7 @@ export default function OwnerControlDashboard({
 
   const devicesList = useMemo(() => {
     const apiDevices = snapshot?.devices || [];
-    if (fbDevices.length === 0) return apiDevices;
+    const nowRef = snapshot?.serverTimeMs || 0;
     const map = new Map<string, DeviceClient>();
     for (const d of fbDevices) {
       map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
@@ -213,21 +216,67 @@ export default function OwnerControlDashboard({
     for (const d of apiDevices) {
       map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
     }
+    const FRESH_PENDING_MS = 24 * 60 * 60_000;
+    const rankDevice = (d: DeviceClient): number => {
+      const status = d.approvalStatus || 'approved';
+      const isJustApproved = Boolean(justApprovedIds[d.deviceId]);
+      const isFresh =
+        nowRef === 0 || nowRef - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_MS;
+      if (status === 'pending' && d.isOnline) return 6;
+      if (isJustApproved && status === 'approved') return 5;
+      if (status === 'approved' && d.isOnline) return 4;
+      if (status === 'pending' && isFresh) return 3;
+      if (status === 'approved') return 2;
+      if (status === 'pending') return 1;
+      return 0;
+    };
     return Array.from(map.values()).sort((a, b) => {
-      const aPending = a.approvalStatus === 'pending' ? 1 : 0;
-      const bPending = b.approvalStatus === 'pending' ? 1 : 0;
-      if (aPending !== bPending) return bPending - aPending;
-      const aOnline = a.isOnline ? 1 : 0;
-      const bOnline = b.isOnline ? 1 : 0;
-      if (aOnline !== bOnline) return bOnline - aOnline;
-      return b.lastSeenAtMs - a.lastSeenAtMs;
+      const rDiff = rankDevice(b) - rankDevice(a);
+      if (rDiff !== 0) return rDiff;
+      const aAct = Math.max(a.lastSeenAtMs || 0, a.updatedAtMs || 0);
+      const bAct = Math.max(b.lastSeenAtMs || 0, b.updatedAtMs || 0);
+      return bAct - aAct;
     });
-  }, [snapshot, fbDevices]);
+  }, [snapshot, fbDevices, justApprovedIds]);
+
+  const txCountByDevice = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const tx of snapshot?.transactions || []) {
+      if (!tx?.deviceId) continue;
+      counts.set(tx.deviceId, (counts.get(tx.deviceId) || 0) + 1);
+    }
+    return counts;
+  }, [snapshot]);
+
+  const pendingCount = useMemo(
+    () => devicesList.filter((d) => d.approvalStatus === 'pending').length,
+    [devicesList]
+  );
+
+  const approvedCount = useMemo(
+    () => devicesList.filter((d) => (d.approvalStatus || 'approved') === 'approved').length,
+    [devicesList]
+  );
 
   const onlineCount = useMemo(
     () => devicesList.filter((d) => d.isOnline).length,
     [devicesList]
   );
+
+  const filteredDevicesList = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase();
+    return devicesList.filter((d) => {
+      const status = d.approvalStatus || 'approved';
+      if (deviceTabFilter === 'pending' && status !== 'pending') return false;
+      if (deviceTabFilter === 'approved' && status !== 'approved') return false;
+      if (deviceTabFilter === 'online' && !d.isOnline) return false;
+      if (q) {
+        const hay = `${d.deviceName} ${d.userName} ${d.phoneNumber} ${d.userAccount} ${d.deviceId}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [devicesList, deviceTabFilter, deviceSearch]);
 
   const filteredTransactions = useMemo(() => {
     const list = snapshot?.transactions || [];
@@ -289,11 +338,26 @@ export default function OwnerControlDashboard({
     try {
       const action = approve ? 'approve_device' : 'reject_device';
       await postOwnerAction({ action, deviceId: dev.deviceId });
+      if (approve) {
+        const ts = Date.now();
+        setJustApprovedIds((prev) => ({ ...prev, [dev.deviceId]: ts }));
+        setTimeout(() => {
+          setJustApprovedIds((prev) => {
+            if (prev[dev.deviceId] !== ts) return prev;
+            const next = { ...prev };
+            delete next[dev.deviceId];
+            return next;
+          });
+        }, 180_000);
+        if (deviceTabFilter === 'pending') {
+          setDeviceTabFilter('all');
+        }
+      }
       await loadSnapshot(true);
       flashBanner(
         'ok',
         approve
-          ? `Approved ${dev.userName || dev.deviceName}`
+          ? `Approved ${dev.userName || dev.deviceName} — now active in Approved Devices`
           : `Rejected ${dev.userName || dev.deviceName}`
       );
     } catch (err: any) {
@@ -724,28 +788,77 @@ export default function OwnerControlDashboard({
       <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
         {activeTab === 'devices' && (
           <>
-            {devicesList.length === 0 ? (
+            {devicesList.length > 0 && (
+              <div className="space-y-2">
+                <div className="grid grid-cols-4 gap-1.5 bg-[#17212b] border border-white/10 rounded-xl p-1">
+                  {[
+                    { key: 'all' as const, label: `All (${devicesList.length})` },
+                    { key: 'approved' as const, label: `Approved (${approvedCount})` },
+                    { key: 'pending' as const, label: `Pending (${pendingCount})` },
+                    { key: 'online' as const, label: `Online (${onlineCount})` },
+                  ].map((f) => (
+                    <button
+                      key={f.key}
+                      type="button"
+                      onClick={() => setDeviceTabFilter(f.key)}
+                      className={`py-1.5 px-1 rounded-lg text-[10px] font-bold cursor-pointer transition-colors truncate ${
+                        deviceTabFilter === f.key
+                          ? 'bg-[#2b5278] text-white shadow-xs'
+                          : f.key === 'pending' && pendingCount > 0
+                            ? 'text-amber-300 hover:bg-white/5'
+                            : 'text-[#8b9bb0] hover:text-white'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+
+                {devicesList.length > 3 && (
+                  <input
+                    type="text"
+                    value={deviceSearch}
+                    onChange={(e) => setDeviceSearch(e.target.value)}
+                    placeholder="Search device, name, phone, account..."
+                    className="w-full bg-[#17212b] border border-white/10 rounded-xl px-3 py-1.5 text-[11px] text-white placeholder:text-slate-500 outline-none focus:border-[#5eb5f7]"
+                  />
+                )}
+              </div>
+            )}
+
+            {filteredDevicesList.length === 0 ? (
               <div className="bg-[#17212b] border border-white/10 rounded-2xl p-6 text-center space-y-2">
                 <Smartphone className="w-8 h-8 text-[#5eb5f7] mx-auto opacity-80" />
-                <p className="text-[13px] font-semibold text-white">No Devices Yet</p>
+                <p className="text-[13px] font-semibold text-white">
+                  {devicesList.length === 0 ? 'No Devices Yet' : 'No Matching Devices'}
+                </p>
                 <p className="text-[11px] text-[#7f91a4]">
-                  Every phone that opens the app online will appear here with real-time status & balance.
+                  {devicesList.length === 0
+                    ? 'Every phone that opens the app online will appear here with real-time status & balance.'
+                    : 'Try switching filter tabs or clearing your search.'}
                 </p>
               </div>
             ) : (
-              devicesList.map((dev, index) => {
+              filteredDevicesList.map((dev, index) => {
                 const isMe = dev.deviceId === myDeviceId;
                 const isPending = dev.approvalStatus === 'pending';
                 const isRejected = dev.approvalStatus === 'rejected';
+                const isJustApproved =
+                  !isPending &&
+                  !isRejected &&
+                  Boolean(justApprovedIds[dev.deviceId]);
+                const devTxnCount = txCountByDevice.get(dev.deviceId) || 0;
                 return (
                   <div
                     key={dev.deviceId}
                     className={`border rounded-2xl p-3 space-y-2.5 ${
                       isPending
                         ? 'bg-amber-950/25 border-amber-400/60 shadow-[0_0_20px_rgba(251,191,36,0.12)]'
-                        : isRejected
-                          ? 'bg-rose-950/20 border-rose-500/40'
-                          : 'bg-[#17212b] border-white/10'
+                        : isJustApproved
+                          ? 'bg-emerald-950/25 border-emerald-400/60 shadow-[0_0_20px_rgba(16,185,129,0.15)]'
+                          : isRejected
+                            ? 'bg-rose-950/20 border-rose-500/40'
+                            : 'bg-[#17212b] border-white/10'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
@@ -773,6 +886,11 @@ export default function OwnerControlDashboard({
                           {isPending && (
                             <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-amber-500/25 text-amber-200 border border-amber-400/40 animate-pulse">
                               REQUESTING PERMISSION
+                            </span>
+                          )}
+                          {isJustApproved && (
+                            <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/25 text-emerald-200 border border-emerald-400/40">
+                              APPROVED ✓
                             </span>
                           )}
                           {isRejected && (
@@ -946,7 +1064,7 @@ export default function OwnerControlDashboard({
                           className="py-1.5 px-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <Activity className="w-3 h-3" />
-                          <span>Txns</span>
+                          <span>{devTxnCount > 0 ? `Txns (${devTxnCount})` : 'Txns'}</span>
                         </button>
                       </div>
                     </div>
@@ -1132,7 +1250,7 @@ export default function OwnerControlDashboard({
 
               <div>
                 <label className="block text-[11px] font-semibold text-[#8b9bb0] mb-1">
-                  Delivery Window (Offline retry window)
+                  Message &amp; Voice Auto-Expire Timer (Disappears after exact time)
                 </label>
                 <div className="flex flex-wrap gap-1.5 mb-2">
                   {[

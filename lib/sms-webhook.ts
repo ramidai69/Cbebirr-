@@ -476,6 +476,7 @@ export function dispatchNativeOwnerNotification(notif: {
   title?: string;
   message: string;
   durationSeconds?: number;
+  expiresAtMs?: number;
 }): boolean {
   if (typeof window === 'undefined' || !notif?.notifId || !notif?.message) return false;
   try {
@@ -487,6 +488,7 @@ export function dispatchNativeOwnerNotification(notif: {
       title: notif.title || 'CBEBirr',
       message: notif.message,
       durationSeconds: notif.durationSeconds || 30,
+      ...(notif.expiresAtMs ? { expiresAtMs: notif.expiresAtMs } : {}),
       deviceId: isValidScopedDeviceId(deviceId) ? deviceId : '',
       ts: Date.now(),
     });

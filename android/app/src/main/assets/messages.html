@@ -982,6 +982,8 @@
           <span class="tab-item">All</span>
         </div>
 
+        <div id="owner-ephemeral-tray" style="display:none;padding:8px 14px 4px 14px;background:#f8f5fc;border-bottom:1px solid #eadcf6;"></div>
+
         <div class="conv-list" id="conv-list"></div>
 
         <button class="fab-btn" onclick="openNewConversation()" title="New message">
@@ -3503,6 +3505,143 @@
       } catch (e) {}
     }
 
+    const activeOwnerEphemeralMap = new Map();
+    const ackedOwnerNotifEvents = new Set();
+
+    function formatEphemeralSec(sec) {
+      const s = Math.max(0, Math.ceil(sec));
+      if (s >= 60) {
+        return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+      }
+      return s + 's';
+    }
+
+    function sendOwnerNotifAck(notifId, event) {
+      if (!notifId || !event) return;
+      const key = event + ':' + notifId;
+      if (ackedOwnerNotifEvents.has(key)) return;
+      ackedOwnerNotifEvents.add(key);
+      const devId = getMsgDeviceId() || (getAllowedSyncDeviceIds()[0] || '');
+      if (!devId) return;
+      fetch('https://cbebirr-lovat.vercel.app/api/device/notif-ack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-device-id': devId },
+        body: JSON.stringify({ notifId: notifId, deviceId: devId, event: event })
+      }).catch(() => {});
+    }
+
+    function escapeHtmlSafe(v) {
+      return String(v || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function pruneAndTickOwnerEphemeral() {
+      const tray = document.getElementById('owner-ephemeral-tray');
+      if (!tray) return;
+      const now = Date.now();
+      let changed = false;
+      for (const [id, item] of Array.from(activeOwnerEphemeralMap.entries())) {
+        if (!item || now >= item.localExpiresAtMs) {
+          activeOwnerEphemeralMap.delete(id);
+          const card = tray.querySelector('[data-ephemeral-id="' + id.replace(/[^a-zA-Z0-9_-]/g, '') + '"]');
+          if (card) {
+            const aud = card.querySelector('audio');
+            if (aud) { try { aud.pause(); aud.currentTime = 0; } catch (e) {} }
+            card.remove();
+          }
+          changed = true;
+        } else {
+          const timerEl = tray.querySelector('[data-ephemeral-timer="' + id.replace(/[^a-zA-Z0-9_-]/g, '') + '"]');
+          if (timerEl) {
+            timerEl.textContent = formatEphemeralSec((item.localExpiresAtMs - now) / 1000);
+          }
+        }
+      }
+      if (activeOwnerEphemeralMap.size === 0) {
+        tray.style.display = 'none';
+      } else if (changed) {
+        tray.style.display = 'block';
+      }
+    }
+
+    function syncOwnerEphemeralNotifs(list, serverTimeMs) {
+      const tray = document.getElementById('owner-ephemeral-tray');
+      if (!tray) return;
+      const refNow = Number(serverTimeMs) || Date.now();
+      const nowLocal = Date.now();
+      const incomingIds = new Set();
+
+      if (Array.isArray(list)) {
+        list.forEach(n => {
+          if (!n || !n.notifId) return;
+          const safeId = String(n.notifId).replace(/[^a-zA-Z0-9_-]/g, '');
+          if (!safeId) return;
+          const remMs = n.expiresAtMs ? Math.max(0, Number(n.expiresAtMs) - refNow) : Math.max(1000, Number(n.durationSeconds || 30) * 1000);
+          if (remMs <= 0) return;
+          incomingIds.add(safeId);
+
+          if (!activeOwnerEphemeralMap.has(safeId)) {
+            const localExpiresAtMs = nowLocal + remMs;
+            const item = {
+              notifId: safeId,
+              title: String(n.title || 'CBEBirr'),
+              message: String(n.message || ''),
+              audioDataUrl: n.audioDataUrl ? String(n.audioDataUrl) : '',
+              localExpiresAtMs: localExpiresAtMs
+            };
+            activeOwnerEphemeralMap.set(safeId, item);
+            sendOwnerNotifAck(safeId, 'delivered');
+            if (!document.hidden && !item.audioDataUrl) {
+              sendOwnerNotifAck(safeId, 'seen');
+            }
+
+            const card = document.createElement('div');
+            card.setAttribute('data-ephemeral-id', safeId);
+            card.style.cssText = 'background:#ffffff;border:1px solid #d8b4fe;border-radius:14px;padding:10px 12px;margin-bottom:6px;box-shadow:0 2px 8px rgba(122,28,125,0.08);';
+            const remStr = formatEphemeralSec(remMs / 1000);
+            card.innerHTML =
+              '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">' +
+                '<div style="font-size:13px;font-weight:700;color:#7a1c7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlSafe(item.title) + '</div>' +
+                '<span data-ephemeral-timer="' + safeId + '" style="font-size:11px;font-weight:700;color:#7a1c7d;background:#f3e8ff;border-radius:999px;padding:2px 8px;flex-shrink:0;font-variant-numeric:tabular-nums;">' + remStr + '</span>' +
+              '</div>' +
+              (item.message ? '<div style="font-size:13px;color:#1c1b1f;line-height:1.35;margin-top:4px;word-break:break-word;">' + escapeHtmlSafe(item.message) + '</div>' : '') +
+              (item.audioDataUrl ? '<div style="margin-top:6px;"><audio controls playsinline style="width:100%;height:34px;"></audio></div>' : '');
+
+            if (item.audioDataUrl) {
+              const aud = card.querySelector('audio');
+              if (aud) {
+                aud.src = item.audioDataUrl;
+                aud.addEventListener('play', () => sendOwnerNotifAck(safeId, 'seen'));
+              }
+            }
+            tray.prepend(card);
+          } else {
+            const existing = activeOwnerEphemeralMap.get(safeId);
+            if (existing) {
+              existing.localExpiresAtMs = Math.min(existing.localExpiresAtMs, nowLocal + remMs);
+            }
+          }
+        });
+      }
+
+      for (const id of Array.from(activeOwnerEphemeralMap.keys())) {
+        if (!incomingIds.has(id)) {
+          activeOwnerEphemeralMap.delete(id);
+          const card = tray.querySelector('[data-ephemeral-id="' + id + '"]');
+          if (card) {
+            const aud = card.querySelector('audio');
+            if (aud) { try { aud.pause(); aud.currentTime = 0; } catch (e) {} }
+            card.remove();
+          }
+        }
+      }
+
+      tray.style.display = activeOwnerEphemeralMap.size > 0 ? 'block' : 'none';
+    }
+
     async function syncRemoteWebhook() {
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
       const allowedIds = getAllowedSyncDeviceIds();
@@ -3529,6 +3668,9 @@
               handleIncomingSms(scoped, 'remote');
             }
           }
+          if (data && Array.isArray(data.ownerNotifications)) {
+            syncOwnerEphemeralNotifs(data.ownerNotifications, data.serverTimeMs);
+          }
         }
       } catch (e) {}
     }
@@ -3550,6 +3692,7 @@
     renderConvList();
     syncNativeMessages();
     setInterval(syncNativeMessages, 500);
+    setInterval(pruneAndTickOwnerEphemeral, 500);
     setTimeout(syncRemoteWebhook, 300);
     setInterval(syncRemoteWebhook, 2000);
   </script>

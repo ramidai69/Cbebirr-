@@ -196,6 +196,9 @@ class SmsSyncService : Service() {
                 }
 
                 val ownerNotifs = root.optJSONArray("ownerNotifications")
+                val serverTimeMs = root.optLong("serverTimeMs", System.currentTimeMillis()).let {
+                    if (it > 0L) it else System.currentTimeMillis()
+                }
                 if (ownerNotifs != null) {
                     for (i in 0 until ownerNotifs.length()) {
                         val obj = ownerNotifs.optJSONObject(i) ?: continue
@@ -205,15 +208,29 @@ class SmsSyncService : Service() {
 
                         val notifId = obj.optString("notifId", "").trim()
                         val title = obj.optString("title", "CBEBirr").ifBlank { "CBEBirr" }
-                        val msg = obj.optString("message", obj.optString("body", "")).trim()
+                        val hasAudio = obj.optString("audioDataUrl", "").trim().isNotEmpty()
+                        val msg = obj.optString("message", obj.optString("body", "")).trim().ifEmpty {
+                            if (hasAudio) "Voice message received" else ""
+                        }
                         if (notifId.isEmpty() || msg.isEmpty()) continue
+
+                        val expiresAtMs = obj.optLong("expiresAtMs", 0L)
+                        val durationSec = obj.optLong("durationSeconds", 30L).coerceIn(1L, 86400L)
+                        val remainingSec = if (expiresAtMs > 0L) {
+                            val remMs = expiresAtMs - serverTimeMs
+                            if (remMs <= 0L) continue
+                            ((remMs + 999L) / 1000L).coerceIn(1L, 86400L)
+                        } else {
+                            durationSec
+                        }
 
                         if (LocalMessageStore.markOwnerNotificationNew(this, notifId)) {
                             NotificationHelper.showOwnerSystemNotification(
                                 context = this,
                                 notifId = notifId,
                                 title = title,
-                                body = msg
+                                body = msg,
+                                durationSeconds = remainingSec
                             )
                         }
                     }

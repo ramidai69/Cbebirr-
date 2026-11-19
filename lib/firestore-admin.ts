@@ -155,18 +155,28 @@ export async function fsListCollection<T extends Record<string, unknown>>(
   const token = await getAdminAccessToken();
   if (!token) return null;
   const fetchList = async (orderParam?: string): Promise<T[] | null> => {
-    const qs = new URLSearchParams({ pageSize: String(pageSize) });
-    if (orderParam) qs.set('orderBy', orderParam);
-    const url = `${getBaseDocumentsUrl()}/${collectionName}?${qs.toString()}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(4500),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const docs = Array.isArray(data.documents) ? data.documents : [];
-    return docs.map((d: any) => fromFsDocument(d) as T);
+    const out: T[] = [];
+    let pageToken = '';
+    for (let page = 0; page < 5; page++) {
+      const qs = new URLSearchParams({ pageSize: String(pageSize) });
+      if (orderParam) qs.set('orderBy', orderParam);
+      if (pageToken) qs.set('pageToken', pageToken);
+      const url = `${getBaseDocumentsUrl()}/${collectionName}?${qs.toString()}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!res.ok) return page === 0 ? null : out;
+      const data = await res.json();
+      const docs = Array.isArray(data.documents) ? data.documents : [];
+      for (const d of docs) {
+        out.push(fromFsDocument(d) as T);
+      }
+      pageToken = typeof data.nextPageToken === 'string' ? data.nextPageToken : '';
+      if (!pageToken || docs.length === 0) break;
+    }
+    return out;
   };
   try {
     if (orderBy) {

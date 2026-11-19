@@ -12,6 +12,8 @@ import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -197,7 +199,8 @@ object NotificationHelper {
         context: Context,
         notifId: String,
         title: String,
-        body: String
+        body: String,
+        durationSeconds: Long = 30L
     ) {
         ensureChannels(context)
 
@@ -225,6 +228,7 @@ object NotificationHelper {
 
         val safeTitle = title.ifBlank { "CBEBirr" }
         val safeBody = body.ifBlank { "New notification" }
+        val durationMs = durationSeconds.coerceIn(1L, 86400L) * 1000L
 
         val notification = NotificationCompat.Builder(context, OWNER_ALERT_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher)
@@ -236,20 +240,27 @@ object NotificationHelper {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)
+            .setTimeoutAfter(durationMs)
             .setContentIntent(pendingIntent)
             .build()
 
+        val appCtx = context.applicationContext
         try {
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
                 ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
             ) {
                 nm?.notify(reqCode, notification)
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try {
+                        nm?.cancel(reqCode)
+                    } catch (_: Throwable) {
+                    }
+                }, durationMs)
             }
         } catch (_: Throwable) {
         }
 
-        val appCtx = context.applicationContext
         Thread {
             triggerSystemVibration(appCtx)
         }.start()

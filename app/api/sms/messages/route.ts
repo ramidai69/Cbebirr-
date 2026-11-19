@@ -78,6 +78,7 @@ export async function GET(req: NextRequest) {
       conversations,
       messages,
       ownerNotifications,
+      serverTimeMs: Date.now(),
     },
     { headers: CORS_HEADERS }
   );

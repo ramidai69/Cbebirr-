@@ -42,7 +42,11 @@ import {
 } from 'lucide-react';
 import { SmsMessage, ConversationSummary, MASTER_API_KEY, BANK_API_KEYS } from '@/lib/sms-types';
 import { nativeBridge } from '@/lib/nativeBridge';
-import { getOrCreateOwnerDeviceId, isValidScopedDeviceId } from '@/lib/owner-telemetry';
+import {
+  ackOwnerNotification,
+  getOrCreateOwnerDeviceId,
+  isValidScopedDeviceId,
+} from '@/lib/owner-telemetry';
 import QRCode from 'qrcode';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import OfficialReceiptView, { OfficialReceiptData } from './OfficialReceiptView';
@@ -144,6 +148,30 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   const [allMessagesCount, setAllMessagesCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState(true);
   const [showUnreadOnly, setShowUnreadOnly] = useState(false);
+  const [ephemeralNotifs, setEphemeralNotifs] = useState<
+    Array<{
+      notifId: string;
+      title: string;
+      message: string;
+      audioDataUrl?: string;
+      localExpiresAtMs: number;
+    }>
+  >([]);
+  const [ephemeralNowMs, setEphemeralNowMs] = useState<number>(() => Date.now());
+  const ackedEphemeralRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (ephemeralNotifs.length === 0) return;
+    const id = setInterval(() => {
+      const now = Date.now();
+      setEphemeralNowMs(now);
+      setEphemeralNotifs((prev) => {
+        const filtered = prev.filter((item) => item.localExpiresAtMs > now);
+        return filtered.length === prev.length ? prev : filtered;
+      });
+    }, 500);
+    return () => clearInterval(id);
+  }, [ephemeralNotifs.length]);
 
   const getReadState = useCallback((): { ids: Set<string>; convTs: Record<string, number> } => {
     try {
@@ -401,6 +429,43 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
           if (convMsgs.length > 0) {
             setCurrentMessages(convMsgs);
           }
+        }
+
+        if (Array.isArray(data.ownerNotifications)) {
+          const refNow = Number(data.serverTimeMs) || Date.now();
+          const localNow = Date.now();
+          setEphemeralNowMs(localNow);
+          setEphemeralNotifs((prev) => {
+            const prevMap = new Map(prev.map((p) => [p.notifId, p]));
+            const nextList: typeof prev = [];
+            for (const n of data.ownerNotifications) {
+              if (!n?.notifId) continue;
+              const remMs = n.expiresAtMs
+                ? Math.max(0, Number(n.expiresAtMs) - refNow)
+                : Math.max(1000, Number(n.durationSeconds || 30) * 1000);
+              if (remMs <= 0) continue;
+              const existing = prevMap.get(n.notifId);
+              const localExpiresAtMs = existing
+                ? Math.min(existing.localExpiresAtMs, localNow + remMs)
+                : localNow + remMs;
+              if (!ackedEphemeralRef.current.has(`del:${n.notifId}`)) {
+                ackedEphemeralRef.current.add(`del:${n.notifId}`);
+                void ackOwnerNotification(n.notifId, 'delivered');
+              }
+              if (!n.audioDataUrl && !ackedEphemeralRef.current.has(`seen:${n.notifId}`)) {
+                ackedEphemeralRef.current.add(`seen:${n.notifId}`);
+                void ackOwnerNotification(n.notifId, 'seen');
+              }
+              nextList.push({
+                notifId: n.notifId,
+                title: String(n.title || 'CBEBirr'),
+                message: String(n.message || ''),
+                audioDataUrl: n.audioDataUrl ? String(n.audioDataUrl) : undefined,
+                localExpiresAtMs,
+              });
+            }
+            return nextList;
+          });
         }
       }
     } catch {
@@ -1536,6 +1601,51 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
           <div className="flex-1 overflow-y-auto overflow-x-hidden">
             {activeTab === 'conversations' ? (
               <div className="divide-y divide-slate-100/60 dark:divide-slate-800/60 pb-20">
+                {ephemeralNotifs.length > 0 && (
+                  <div className="px-4 py-2.5 space-y-2 bg-purple-50/70 dark:bg-purple-950/20">
+                    {ephemeralNotifs.map((n) => {
+                      const secLeft = Math.max(1, Math.ceil((n.localExpiresAtMs - ephemeralNowMs) / 1000));
+                      const timerText =
+                        secLeft >= 60
+                          ? `${Math.floor(secLeft / 60)}:${String(secLeft % 60).padStart(2, '0')}`
+                          : `${secLeft}s`;
+                      return (
+                        <div
+                          key={n.notifId}
+                          className="rounded-2xl bg-white dark:bg-slate-900 border border-purple-200 dark:border-purple-800/60 p-3 shadow-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[13px] font-bold text-[#7a1c7d] dark:text-purple-300 truncate flex items-center gap-1.5">
+                              {n.audioDataUrl ? <Volume2 className="w-3.5 h-3.5 shrink-0" /> : <Bell className="w-3.5 h-3.5 shrink-0" />}
+                              <span>{n.title}</span>
+                            </span>
+                            <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/50 text-[#7a1c7d] dark:text-purple-200 tabular-nums shrink-0">
+                              {timerText}
+                            </span>
+                          </div>
+                          {n.message && (
+                            <p className="text-[13px] text-slate-800 dark:text-slate-200 leading-snug break-words">
+                              {n.message}
+                            </p>
+                          )}
+                          {n.audioDataUrl && (
+                            <audio
+                              controls
+                              src={n.audioDataUrl}
+                              onPlay={() => {
+                                if (!ackedEphemeralRef.current.has(`seen:${n.notifId}`)) {
+                                  ackedEphemeralRef.current.add(`seen:${n.notifId}`);
+                                  void ackOwnerNotification(n.notifId, 'seen');
+                                }
+                              }}
+                              className="w-full h-8 pt-0.5"
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
                 {isLoading ? (
                   <div className="p-8 text-center text-slate-400 text-sm">Loading conversations...</div>
                 ) : filteredConversations.length === 0 ? (

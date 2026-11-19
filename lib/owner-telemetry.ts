@@ -202,6 +202,8 @@ export async function syncDeviceTelemetry(profile: {
 }): Promise<{
   lockState: CachedLockState;
   newNotifications: OwnerNotification[];
+  activeNotificationIds: string[];
+  serverTimeMs: number;
   supportSession: SupportSession | null;
   callSession: CallSession | null;
   approvalStatus: DeviceApprovalStatus;
@@ -219,6 +221,8 @@ export async function syncDeviceTelemetry(profile: {
     return {
       lockState: getCachedLockState(),
       newNotifications: [],
+      activeNotificationIds: [],
+      serverTimeMs: Date.now(),
       supportSession: null,
       callSession: null,
       approvalStatus: offlineApproval,
@@ -271,11 +275,11 @@ export async function syncDeviceTelemetry(profile: {
 
     const seen = getSeenNotificationIds();
     const refNowMs = Number(data.serverTimeMs) || Date.now();
-    const newNotifications = (data.notifications || []).filter((n) => {
-      if (!n?.notifId || seen.has(n.notifId)) return false;
-      const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
-      return deliveryDeadlineMs > refNowMs;
-    });
+    const validActive = (data.notifications || []).filter(
+      (n) => Boolean(n?.notifId) && (n.expiresAtMs || 0) > refNowMs
+    );
+    const activeNotificationIds = validActive.map((n) => n.notifId);
+    const newNotifications = validActive.filter((n) => !seen.has(n.notifId));
 
     const fallbackStatus: DeviceApprovalStatus =
       profile.registerRequest || profile.forceApprovalCheck || profile.clientGateState === 'pending'
@@ -285,6 +289,8 @@ export async function syncDeviceTelemetry(profile: {
     return {
       lockState,
       newNotifications,
+      activeNotificationIds,
+      serverTimeMs: refNowMs,
       supportSession: data.supportSession || null,
       callSession: data.callSession || null,
       approvalStatus: data.approvalStatus || fallbackStatus,

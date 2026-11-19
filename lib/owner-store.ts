@@ -677,7 +677,11 @@ export async function logDeviceTransaction(input: {
 
   const nowMs = Date.now();
   const deviceId = sanitizeId(input.deviceId, `dev_${nowMs}`);
-  const prevDev = state.devices.get(deviceId);
+  let prevDev = state.devices.get(deviceId);
+  if (!prevDev) {
+    const fast = await loadSingleDeviceFast(deviceId);
+    if (fast.dev) prevDev = fast.dev;
+  }
 
   const balanceAfter =
     input.balanceAfter !== undefined
@@ -1193,9 +1197,8 @@ export async function getActiveNotificationsForDevices(
   const allowedSet = new Set(deviceIds.map((id) => sanitizeId(id)).filter(Boolean));
   return Array.from(state.notifications.values())
     .filter((n) => {
-      const deliveryDeadlineMs = Math.max(n.expiresAtMs || 0, (n.createdAtMs || 0) + 3_600_000);
       return (
-        deliveryDeadlineMs > nowMs &&
+        (n.expiresAtMs || 0) > nowMs &&
         (n.targetDeviceId === 'all' || allowedSet.has(n.targetDeviceId))
       );
     })
@@ -1207,6 +1210,18 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const fsSynced = await syncFromFirestoreIfAvailable(forceSync);
   const nowMs = Date.now();
 
+  const FRESH_PENDING_WINDOW_MS = 24 * 60 * 60_000;
+  const deviceRank = (d: DeviceClient): number => {
+    const status = d.approvalStatus || 'approved';
+    const isFresh = nowMs - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_WINDOW_MS;
+    if (status === 'pending' && d.isOnline) return 5;
+    if (status === 'approved' && d.isOnline) return 4;
+    if (status === 'pending' && isFresh) return 3;
+    if (status === 'approved') return 2;
+    if (status === 'pending') return 1;
+    return 0;
+  };
+
   const devices = Array.from(state.devices.values())
     .map((d) => ({
       ...d,
@@ -1214,11 +1229,11 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {
-      const aPending = a.approvalStatus === 'pending' ? 1 : 0;
-      const bPending = b.approvalStatus === 'pending' ? 1 : 0;
-      if (aPending !== bPending) return bPending - aPending;
-      if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
-      return b.lastSeenAtMs - a.lastSeenAtMs;
+      const rankDiff = deviceRank(b) - deviceRank(a);
+      if (rankDiff !== 0) return rankDiff;
+      const aActivity = Math.max(a.lastSeenAtMs || 0, a.updatedAtMs || 0);
+      const bActivity = Math.max(b.lastSeenAtMs || 0, b.updatedAtMs || 0);
+      return bActivity - aActivity;
     });
 
   const transactions = Array.from(state.transactions.values())
