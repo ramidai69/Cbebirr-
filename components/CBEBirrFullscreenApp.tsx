@@ -24,6 +24,7 @@ import SamsungMessagesApp from './SamsungMessagesApp';
 import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
 import ProportionalScreenStage from './ProportionalScreenStage';
+import { CBE_UI_TEXT, CbeLang } from '@/lib/cbe-ui-i18n';
 import { CallSession, OWNER_PIN, PermissionBypassStatus, SupportSession } from '@/lib/owner-types';
 import {
   NativePermissionSettingKind,
@@ -294,7 +295,6 @@ const DEFAULT_SAVED_PHONE_RECEIVERS: SavedReceiver[] = [];
 
 const ALL_APP_ASSETS: string[] = [
   '/screens/screen_send_money_phone.png',
-  '/screens/send_money_options_popup_rounded.png',
   '/screens/screen_1_splash.png',
   '/screens/screen_splash_2.png',
   '/screens/screen_2_phone_clean.png',
@@ -308,23 +308,9 @@ const ALL_APP_ASSETS: string[] = [
   '/screens/recent_tx_header_tabs.png',
   '/screens/tx_arrow_up_icon.png',
   '/screens/tx_arrow_down_green_icon.png',
-  '/screens/floating_qr_clean.png',
-  '/screens/home_bottom_nav.png',
-  '/screens/others_middle_scroll.png',
-  '/screens/others_menu_clean_list_v2.png',
-  '/screens/others_logout_bottom.png',
   '/screens/map_fab_perfect.png',
-  '/screens/others_fixed_bottom.png',
   '/assets/aistudio/Screenshot_20261027-145909_9889e698.png',
   '/assets/aistudio/loding__d053620a.png',
-  '/assets/aistudio/home_page__bc682fdb.png',
-  '/assets/aistudio/home_page_balance_hidden.png',
-  '/assets/aistudio/home_page_bal_show_rew_show.png',
-  '/assets/aistudio/home_page_bal_hide_rew_show.png',
-  '/assets/aistudio/white_card_top_authentic.png',
-  '/assets/aistudio/white_card_services_clean.png',
-  '/assets/aistudio/home_scroll_down___1__4a940d15.png',
-  '/assets/aistudio/home_scroll_down___2__759e601d.png',
   '/assets/aistudio/cbe_transfer_logo_static.png',
   '/assets/aistudio/cbe_transfer_ring_spinner.png',
   '/assets/cbe_authentic_receipt_qr_exact.png',
@@ -341,11 +327,24 @@ const ALL_APP_ASSETS: string[] = [
   '/assets/banners/cbe_banner_dots_3.png',
   '/assets/banners/cbe_banner_dots_4.png',
   '/assets/banners/cbe_banner_dots_5.png',
-  '/screens/cbe_beje.png',
-  '/screens/mini_apps.png',
-  '/screens/pay_fixed_top.png',
-  '/screens/pay_middle_scroll.png',
-  '/screens/pay_fixed_bottom.png',
+  '/screens/clean/home_bottom_nav_notext.png',
+  '/screens/clean/floating_qr_notext.png',
+  '/screens/clean/send_money_popup_notext.png',
+  '/screens/clean/pay_fixed_top_notext.png',
+  '/screens/clean/pay_middle_scroll_notext.png',
+  '/screens/clean/pay_fixed_bottom_notext.png',
+  '/screens/clean/cbe_beje_notext.png',
+  '/screens/clean/mini_apps_notext.png',
+  '/screens/clean/others_fixed_top_notext.png',
+  '/screens/clean/others_menu_notext.png',
+  '/screens/clean/others_logout_notext.png',
+  '/screens/clean/others_fixed_bottom_notext.png',
+  '/assets/clean/home_top_bs_rh_notext.png',
+  '/assets/clean/home_top_bh_rh_notext.png',
+  '/assets/clean/home_top_bs_rs_notext.png',
+  '/assets/clean/home_top_bh_rs_notext.png',
+  '/assets/clean/white_card_services_notext.png',
+  '/assets/clean/home_scroll_down_notext.png',
   '/assets/banks/screen_bank_transfer_base.png',
   '/assets/banks/sheet_header.png',
   '/assets/wallets/screen_wallet_transfer_base_clean.png',
@@ -415,10 +414,23 @@ export default function CBEBirrFullscreenApp() {
   const [phoneNumber, setPhoneNumber] = useState<string>('');
   const [isBalanceShown, setIsBalanceShown] = useState<boolean>(true);
   const [isRewardShown, setIsRewardShown] = useState<boolean>(false);
+  const [appLang, setAppLang] = useState<CbeLang>('en');
+  const toggleAppLang = useCallback(() => {
+    setAppLang((prev) => (prev === 'en' ? 'am' : 'en'));
+  }, []);
 
   // Dynamic numeric Balance and Reward values (new devices start at 500 ETB each, persisted in localStorage)
   const [balance, setBalance] = useState<number>(500.0);
   const [reward, setReward] = useState<number>(500.0);
+
+  useEffect(() => {
+    if (!isStorageHydrated) return;
+    try {
+      localStorage.setItem('cbe_app_lang', appLang);
+    } catch {
+      // ignore
+    }
+  }, [appLang, isStorageHydrated]);
 
   // Keep Balance, Reward, and Phone Number persisted in localStorage across all sessions
   useEffect(() => {
@@ -2486,13 +2498,14 @@ export default function CBEBirrFullscreenApp() {
     }
   };
 
-  // Typewriter Greeting Animation Text (dynamic with customized user name in real time)
+  // Typewriter Greeting Animation Text (dynamic with customized user name & active language in real time)
   const [displayText, setDisplayText] = useState<string>('WELCOME BACK');
   useEffect(() => {
     const trimmed = userName.trim();
     const firstName = trimmed ? trimmed.split(/\s+/)[0] : 'CBE BIRR';
     const cleanFirst = firstName.replace(/!+$/, '').trim().toUpperCase();
-    const phrases = ['WELCOME BACK', `${cleanFirst} !`];
+    const welcomePhrase = CBE_UI_TEXT.home.welcomeBack[appLang];
+    const phrases = [welcomePhrase, `${cleanFirst} !`];
     let phraseIdx = 0;
     let charIdx = phrases[0].length;
     let isDeleting = true;
@@ -2522,9 +2535,15 @@ export default function CBEBirrFullscreenApp() {
       timeoutId = setTimeout(tick, delta);
     };
 
+    const initId = setTimeout(() => {
+      setDisplayText(welcomePhrase);
+    }, 0);
     timeoutId = setTimeout(tick, 1000);
-    return () => clearTimeout(timeoutId);
-  }, [userName]);
+    return () => {
+      clearTimeout(initId);
+      clearTimeout(timeoutId);
+    };
+  }, [userName, appLang]);
 
   // Send Money form state (Step 6)
   const [receiverAccount, setReceiverAccount] = useState<string>('');
@@ -3595,11 +3614,8 @@ export default function CBEBirrFullscreenApp() {
     };
 
     const applyStableDimensions = (w: number, h: number) => {
-      const BASE_W = 720;
-      const BASE_H = 1527;
-      const scale = Math.min(w / BASE_W, h / BASE_H);
-      const frameW = Math.max(1, Math.round(BASE_W * scale * 100) / 100);
-      const frameH = Math.max(1, Math.round(BASE_H * scale * 100) / 100);
+      const frameW = Math.max(1, Math.round(w * 100) / 100);
+      const frameH = Math.max(1, Math.round(h * 100) / 100);
       document.documentElement.style.setProperty('--stable-app-height', `${h}px`);
       document.documentElement.style.setProperty('--stable-app-width', `${w}px`);
       document.documentElement.style.setProperty('--cbe-frame-w', `${frameW}px`);
@@ -3939,6 +3955,10 @@ export default function CBEBirrFullscreenApp() {
           setPermissionBypassStatus('approved');
           setDeviceGateState('approved');
         } else {
+          const storedLang = localStorage.getItem('cbe_app_lang');
+          if (storedLang === 'en' || storedLang === 'am') {
+            setAppLang(storedLang);
+          }
           const storedPermBypass = localStorage.getItem(PERM_BYPASS_KEY);
           if (
             storedPermBypass === 'approved' ||
@@ -6115,23 +6135,19 @@ export default function CBEBirrFullscreenApp() {
         height: 'var(--stable-app-height, 100vh)',
       }}
       className={`fixed top-0 left-0 flex items-center justify-center overflow-hidden select-none p-0 ${
-        showOwnerDashboard ? 'bg-[#0e1621]' : 'bg-[#f3f4f6]'
+        showOwnerDashboard ? 'bg-[#0e1621]' : 'bg-black'
       }`}
     >
-      {/* True 4-Side Proportional App Canvas (All 4 sides grow and shrink equally, zero added bands) */}
+      {/* True Full-Screen Edge-to-Edge App Canvas (PNG fills 100% of screen width and height, zero sidebars) */}
       <div
         ref={innerFrameRef}
         style={{
-          width: showOwnerDashboard
-            ? 'var(--stable-app-width, 100vw)'
-            : 'var(--cbe-frame-w, min(100vw, calc(100vh * 720 / 1527)))',
-          height: showOwnerDashboard
-            ? 'var(--stable-app-height, 100vh)'
-            : 'var(--cbe-frame-h, min(100vh, calc(100vw * 1527 / 720)))',
+          width: 'var(--stable-app-width, 100vw)',
+          height: 'var(--stable-app-height, 100vh)',
           flexShrink: 0,
           containerType: 'inline-size',
         }}
-        className="cbe-app-canvas relative overflow-hidden bg-white flex flex-col justify-center items-center"
+        className="cbe-app-canvas relative overflow-hidden bg-black flex flex-col justify-center items-center"
       >
 
         {/* Owner Notification Banner (Always visible even over Register/Lock gates inside cbebirr-plus.apk & Web) */}
@@ -7374,10 +7390,10 @@ export default function CBEBirrFullscreenApp() {
                   className="w-full relative overflow-hidden bg-[#7a1c7d]"
                   style={{ aspectRatio: '710 / 543' }}
                 >
-                  {/* 1. Balance Shown, Reward Hidden (Default PNG) */}
+                  {/* 1. Balance Shown, Reward Hidden (Pixel-Clean No-Text PNG) */}
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/assets/aistudio/home_page__bc682fdb.png"
+                    src="/assets/clean/home_top_bs_rh_notext.png"
                     alt="Balance Shown, Reward Hidden"
                     className={`w-full h-auto block pointer-events-none transition-opacity duration-150 ${
                       isBalanceShown && !isRewardShown ? 'opacity-100' : 'opacity-0'
@@ -7388,7 +7404,7 @@ export default function CBEBirrFullscreenApp() {
                   {/* 2. Balance Hidden, Reward Hidden */}
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/assets/aistudio/home_page_balance_hidden.png"
+                    src="/assets/clean/home_top_bh_rh_notext.png"
                     alt="Balance Hidden, Reward Hidden"
                     className={`absolute inset-0 w-full h-auto block pointer-events-none transition-opacity duration-150 ${
                       !isBalanceShown && !isRewardShown ? 'opacity-100' : 'opacity-0'
@@ -7399,7 +7415,7 @@ export default function CBEBirrFullscreenApp() {
                   {/* 3. Balance Shown, Reward Shown */}
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/assets/aistudio/home_page_bal_show_rew_show.png"
+                    src="/assets/clean/home_top_bs_rs_notext.png"
                     alt="Balance Shown, Reward Shown"
                     className={`absolute inset-0 w-full h-auto block pointer-events-none transition-opacity duration-150 ${
                       isBalanceShown && isRewardShown ? 'opacity-100' : 'opacity-0'
@@ -7410,7 +7426,7 @@ export default function CBEBirrFullscreenApp() {
                   {/* 4. Balance Hidden, Reward Shown */}
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/assets/aistudio/home_page_bal_hide_rew_show.png"
+                    src="/assets/clean/home_top_bh_rs_notext.png"
                     alt="Balance Hidden, Reward Shown"
                     className={`absolute inset-0 w-full h-auto block pointer-events-none transition-opacity duration-150 ${
                       !isBalanceShown && isRewardShown ? 'opacity-100' : 'opacity-0'
@@ -7418,7 +7434,68 @@ export default function CBEBirrFullscreenApp() {
                     draggable={false}
                   />
 
-                  {/* 1. Complete, seamless solid patch covering the underlying phone number and name/welcome text in the PNG */}
+                  {/* Crisp Vector Brand Title & Slogan (Top-Left Header) */}
+                  <div
+                    style={{ position: 'absolute', top: '7.4%', left: '15.9%' }}
+                    className="pointer-events-none select-none z-10 flex flex-col items-start"
+                  >
+                    <span
+                      style={{ fontSize: '3.05cqw', fontWeight: 500, letterSpacing: '0.01em' }}
+                      className="text-white leading-none whitespace-nowrap font-sans"
+                    >
+                      {CBE_UI_TEXT.home.brandName[appLang]}
+                    </span>
+                    <span
+                      style={{ fontSize: '2.10cqw', fontWeight: 400, marginTop: '1.15cqw' }}
+                      className="text-[#f5d8f6] leading-none whitespace-nowrap font-sans"
+                    >
+                      {CBE_UI_TEXT.home.brandSlogan[appLang]}
+                    </span>
+                  </div>
+
+                  {/* Top-Right Interactive Live Language Switcher (EN / አማ) */}
+                  <button
+                    type="button"
+                    onClick={toggleAppLang}
+                    style={{
+                      position: 'absolute',
+                      top: '5.5%',
+                      right: '1.6%',
+                      width: '7.8%',
+                      height: '9.5%',
+                    }}
+                    aria-label="Toggle Language"
+                    title="Change Language / ቋንቋ ይምረጡ"
+                    className="cursor-pointer bg-transparent border-0 outline-none flex items-center justify-center active:opacity-60 transition-opacity z-30 rounded-lg"
+                  >
+                    <span
+                      style={{ fontSize: '2.35cqw', fontWeight: 500, letterSpacing: '0.02em' }}
+                      className="text-white leading-none select-none font-sans"
+                    >
+                      {CBE_UI_TEXT.langBadge[appLang]}
+                    </span>
+                  </button>
+
+                  {/* Crisp Vector Bank Titles (Commercial Bank of Ethiopia) */}
+                  <div
+                    style={{ position: 'absolute', top: '30.0%', left: '22.0%', width: '56.0%' }}
+                    className="pointer-events-none select-none z-10 flex flex-col items-center text-center"
+                  >
+                    <span
+                      style={{ fontSize: '2.40cqw', fontWeight: 500, letterSpacing: '0.01em' }}
+                      className="text-[#f4d2ab] leading-none whitespace-nowrap font-sans"
+                    >
+                      {CBE_UI_TEXT.home.bankNameAm}
+                    </span>
+                    <span
+                      style={{ fontSize: '2.28cqw', fontWeight: 400, marginTop: '1.35cqw', letterSpacing: '0.02em' }}
+                      className="text-[#f4d2ab] leading-none whitespace-nowrap font-sans"
+                    >
+                      {CBE_UI_TEXT.home.bankNameEn[appLang]}
+                    </span>
+                  </div>
+
+                  {/* 1. Seamless Transparent Phone & Welcome Overlay (Zero patch needed on clean PNG) */}
                   <div
                     onPointerDown={startProfileLongPress}
                     onPointerUp={endProfileLongPress}
@@ -7430,19 +7507,18 @@ export default function CBEBirrFullscreenApp() {
                       left: '20.0%',
                       width: '60.0%',
                       height: '12.5%',
-                      background: 'linear-gradient(to bottom, #72227d 0%, #74237f 50%, #772582 100%)',
                     }}
                     className="flex flex-col items-center justify-center z-20 select-none overflow-hidden cursor-pointer active:scale-[0.99] transition-transform pointer-events-auto"
                     title="Long-press to edit profile and details"
                   >
-                    {/* Row 1: Authentic Phone Icon + Number (soft muted peach matching top PNG text) */}
+                    {/* Row 1: Authentic Phone Icon + Number */}
                     <div className="flex items-center justify-center gap-[0.55cqw]">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
                         src="/assets/cbe_balance_phone_icon.png"
                         alt=""
                         style={{ width: '2.15cqw', height: '2.15cqw' }}
-                        className="object-contain opacity-80 shrink-0 pointer-events-none select-none"
+                        className="object-contain opacity-85 shrink-0 pointer-events-none select-none"
                         draggable={false}
                       />
                       <span
@@ -7453,13 +7529,13 @@ export default function CBEBirrFullscreenApp() {
                       </span>
                     </div>
 
-                    {/* Row 2: Typewriter Animated Greeting / First Name with blinking cursor (Actionable, matches WELCOME BACK & AYMEN !) */}
+                    {/* Row 2: Typewriter Animated Greeting / First Name with blinking cursor */}
                     <div style={{ marginTop: '0.7cqw' }} className="flex items-center justify-center">
                       <span
                         style={{ fontSize: '2.40cqw', fontWeight: 400, letterSpacing: '0.07em' }}
                         className="text-[#eebd9c] select-none whitespace-nowrap leading-none uppercase font-sans"
                       >
-                        {displayText || 'WELCOME BACK'}
+                        {displayText || CBE_UI_TEXT.home.welcomeBack[appLang]}
                       </span>
                       <span
                         style={{ fontSize: '2.40cqw', marginLeft: '0.35cqw' }}
@@ -7470,7 +7546,39 @@ export default function CBEBirrFullscreenApp() {
                     </div>
                   </div>
 
-                  {/* Hotspot: Phone Number / Profile (Strictly Long-Press ONLY to edit profile details; normal click does nothing) */}
+                  {/* Crisp Balance (ETB) & Reward (Pts) Labels */}
+                  <div
+                    style={{ position: 'absolute', top: '70.8%', left: '6.3%', maxWidth: '18.2%' }}
+                    className="pointer-events-none select-none z-10 flex items-center overflow-hidden"
+                  >
+                    <span
+                      style={{
+                        fontSize: appLang === 'am' ? '2.02cqw' : '2.35cqw',
+                        fontWeight: 400,
+                        letterSpacing: '0.01em',
+                      }}
+                      className="text-white leading-none whitespace-nowrap font-sans truncate"
+                    >
+                      {CBE_UI_TEXT.home.balanceLabel[appLang]}
+                    </span>
+                  </div>
+                  <div
+                    style={{ position: 'absolute', top: '70.5%', right: '10.3%', maxWidth: '28.0%' }}
+                    className="pointer-events-none select-none z-10 flex items-center justify-end overflow-hidden"
+                  >
+                    <span
+                      style={{
+                        fontSize: appLang === 'am' ? '2.05cqw' : '2.35cqw',
+                        fontWeight: 400,
+                        letterSpacing: '0.01em',
+                      }}
+                      className="text-white leading-none whitespace-nowrap font-sans truncate"
+                    >
+                      {CBE_UI_TEXT.home.rewardLabel[appLang]}
+                    </span>
+                  </div>
+
+                  {/* Hotspot: Phone Number / Profile (Strictly Long-Press ONLY to edit profile details) */}
                   <button
                     type="button"
                     onPointerDown={startProfileLongPress}
@@ -7492,16 +7600,15 @@ export default function CBEBirrFullscreenApp() {
                     className="cursor-pointer bg-transparent border-0 outline-none select-none z-20"
                   />
 
-                  {/* 2. Dynamic Balance Loading System: 3 tightly-packed white dots smoothly gliding right */}
+                  {/* 2. Dynamic Balance Loading System */}
                   {isBalanceLoading && (
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.5%',
+                        top: '76.8%',
                         left: '6.0%',
                         width: '12%',
                         height: '4.2%',
-                        backgroundColor: '#842789',
                       }}
                       className="pointer-events-none z-10 overflow-hidden"
                     >
@@ -7512,44 +7619,41 @@ export default function CBEBirrFullscreenApp() {
                     </div>
                   )}
 
-                  {/* 3. Dynamic Balance Amount Display (When shown) at exact initial position */}
-                  {isBalanceShown && !isBalanceLoading && (
+                  {/* 3. Dynamic Balance Amount Display (Shown or Masked ****** crisp vector) */}
+                  {!isBalanceLoading && (
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.6%',
-                        left: '6.2%',
-                        maxWidth: '45%',
+                        top: isBalanceShown ? '77.5%' : '78.0%',
+                        left: '6.3%',
+                        maxWidth: '42%',
                         minHeight: '4.1%',
-                        backgroundColor: '#842789',
                       }}
                       className="flex items-center pointer-events-none z-10"
                     >
                       <span
-                        className="cbe-balance-reveal-anim whitespace-nowrap leading-none"
+                        className="cbe-balance-reveal-anim whitespace-nowrap leading-none font-sans"
                         style={{
                           color: '#ffffff',
-                          fontSize: '2.55cqw',
-                          fontWeight: 400,
-                          letterSpacing: '0.02em',
+                          fontSize: isBalanceShown ? '2.55cqw' : '2.70cqw',
+                          fontWeight: isBalanceShown ? 400 : 700,
+                          letterSpacing: isBalanceShown ? '0.02em' : '0.08em',
                         }}
                       >
-                        {formatAmount(balance)}
+                        {isBalanceShown ? formatAmount(balance) : '******'}
                       </span>
                     </div>
                   )}
-                  {/* Note: When unshow/hidden (!isBalanceShown && !isBalanceLoading), original PNG stars/dots show through untouched ("balance lay star beneberebet yhun") */}
 
-                  {/* 4. Dynamic Reward Loading System: 3 tightly-packed white dots smoothly gliding right */}
+                  {/* 4. Dynamic Reward Loading System */}
                   {isRewardLoading && (
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.5%',
+                        top: '76.8%',
                         right: '6.0%',
                         width: '12%',
                         height: '4.2%',
-                        backgroundColor: '#842789',
                       }}
                       className="pointer-events-none z-10 overflow-hidden"
                     >
@@ -7560,28 +7664,28 @@ export default function CBEBirrFullscreenApp() {
                     </div>
                   )}
 
-                  {/* 4. Dynamic Reward Amount Display (When shown and not loading) at exact initial position */}
-                  {isRewardShown && !isRewardLoading && (
+                  {/* 4. Dynamic Reward Amount Display (Shown or Masked ****** crisp vector) */}
+                  {!isRewardLoading && (
                     <div
                       style={{
                         position: 'absolute',
-                        top: '76.6%',
-                        right: '7.2%',
-                        maxWidth: '45%',
+                        top: isRewardShown ? '77.5%' : '78.0%',
+                        right: '7.5%',
+                        maxWidth: '42%',
                         minHeight: '4.1%',
                       }}
-                      className="flex items-center justify-end bg-[#842789] pointer-events-none z-10"
+                      className="flex items-center justify-end pointer-events-none z-10"
                     >
                       <span
-                        className="cbe-balance-reveal-anim whitespace-nowrap leading-none"
+                        className="cbe-balance-reveal-anim whitespace-nowrap leading-none font-sans"
                         style={{
                           color: '#ffffff',
-                          fontSize: '2.55cqw',
-                          fontWeight: 400,
-                          letterSpacing: '0.02em',
+                          fontSize: isRewardShown ? '2.55cqw' : '2.70cqw',
+                          fontWeight: isRewardShown ? 400 : 700,
+                          letterSpacing: isRewardShown ? '0.02em' : '0.08em',
                         }}
                       >
-                        {formatAmount(reward)}
+                        {isRewardShown ? formatAmount(reward) : '******'}
                       </span>
                     </div>
                   )}
@@ -7604,7 +7708,7 @@ export default function CBEBirrFullscreenApp() {
                     className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20"
                   />
 
-                  {/* Hotspot 2: Reward (Toggle Show/Unshow on tap with loader, Open Edit Modal on Long Press - EXACTLY LIKE BALANCE) */}
+                  {/* Hotspot 2: Reward (Toggle Show/Unshow on tap with loader, Open Edit Modal on Long Press) */}
                   <button
                     type="button"
                     onPointerDown={startRewardLongPress}
@@ -7621,8 +7725,6 @@ export default function CBEBirrFullscreenApp() {
                     aria-label="Toggle Reward Visibility or Long Press to Edit Reward"
                     className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20"
                   />
-
-                  {/* Hotspot: Top Header Language Switcher (EN / አማ) */}
                 </div>
               </div>
 
@@ -7642,15 +7744,71 @@ export default function CBEBirrFullscreenApp() {
                   }}
                 >
                   <div className="w-full flex flex-col items-center bg-white">
-                    {/* 1. AUTHENTIC SERVICES SECTION - STARTING EXACTLY AT ARROW BOUNDARY (SLIDES UNDER FIXED TOP) */}
+                    {/* 1. AUTHENTIC SERVICES SECTION - CLEAN PNG + CRISP PROPORTIONAL VECTOR TEXT */}
                     <div className="relative w-full">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
-                        src="/assets/aistudio/white_card_services_clean.png"
+                        src="/assets/clean/white_card_services_notext.png"
                         alt="CBEBirr Mekedonia and Services"
                         className="w-full h-auto block object-contain pointer-events-none"
                         draggable={false}
                       />
+
+                      {/* Mekedonia & Transaction Detail Section Headers */}
+                      <div
+                        style={{ position: 'absolute', top: '11.8%', left: '3.6%' }}
+                        className="pointer-events-none select-none z-10 flex items-center"
+                      >
+                        <span
+                          style={{ fontSize: '2.40cqw', fontWeight: 700, color: '#871f89' }}
+                          className="leading-none whitespace-nowrap font-sans"
+                        >
+                          {CBE_UI_TEXT.home.mekedonia[appLang]}
+                        </span>
+                      </div>
+                      <div
+                        style={{ position: 'absolute', top: '11.8%', right: '9.2%' }}
+                        className="pointer-events-none select-none z-10 flex items-center justify-end"
+                      >
+                        <span
+                          style={{ fontSize: '2.40cqw', fontWeight: 700, color: '#871f89' }}
+                          className="leading-none whitespace-nowrap font-sans"
+                        >
+                          {CBE_UI_TEXT.home.txDetail[appLang]}
+                        </span>
+                      </div>
+
+                      {/* Upper 8 Service Card Labels (4x2 Grid, crisp centered HTML text) */}
+                      {CBE_UI_TEXT.home.upperServices.map((svc, idx) => {
+                        const row = Math.floor(idx / 4);
+                        const col = idx % 4;
+                        const colLefts = ['5.2%', '28.6%', '51.9%', '75.2%'];
+                        return (
+                          <div
+                            key={svc.id}
+                            style={{
+                              position: 'absolute',
+                              top: row === 0 ? '40.4%' : '79.2%',
+                              left: colLefts[col],
+                              width: '18.5%',
+                              height: '12.6%',
+                            }}
+                            className="pointer-events-none select-none z-10 flex items-center justify-center text-center"
+                          >
+                            <span
+                              style={{
+                                fontSize: appLang === 'am' ? '2.05cqw' : '2.22cqw',
+                                fontWeight: 700,
+                                lineHeight: 1.24,
+                                color: '#1b1b1b',
+                              }}
+                              className="whitespace-pre-line font-sans"
+                            >
+                              {svc[appLang]}
+                            </span>
+                          </div>
+                        );
+                      })}
 
                       {/* Hotspot: Click "To CBE Acct" card to navigate to CBE Send Money (Step 6) */}
                       <button
@@ -7667,7 +7825,7 @@ export default function CBEBirrFullscreenApp() {
                         className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-2xl"
                       />
 
-                      {/* Hotspot: Click "Send Money" card to open Send Money Menu Popup (Screenshot_20261105-141411.png) */}
+                      {/* Hotspot: Click "Send Money" card to open Send Money Menu Popup */}
                       <button
                         type="button"
                         onClick={() => {
@@ -7688,7 +7846,6 @@ export default function CBEBirrFullscreenApp() {
                       <AnimatePresence>
                         {isSendMoneyMenuOpen && (
                           <>
-                            {/* Invisible Backdrop to dismiss on outside tap */}
                             <div
                               onClick={() => setIsSendMoneyMenuOpen(false)}
                               className="fixed inset-0 z-30 bg-transparent"
@@ -7710,11 +7867,33 @@ export default function CBEBirrFullscreenApp() {
                             >
                               {/* eslint-disable-next-line @next/next/no-img-element */}
                               <img
-                                src="/screens/send_money_options_popup_rounded.png"
+                                src="/screens/clean/send_money_popup_notext.png"
                                 alt="Send Money Options"
                                 className="w-full h-full object-fill block pointer-events-none"
                                 draggable={false}
                               />
+                              <div
+                                style={{ position: 'absolute', top: '0%', left: '28.0%', width: '68.0%', height: '50%' }}
+                                className="pointer-events-none select-none flex items-center z-10"
+                              >
+                                <span
+                                  style={{ fontSize: '2.35cqw', fontWeight: 500, color: '#222222' }}
+                                  className="leading-none whitespace-nowrap font-sans"
+                                >
+                                  {CBE_UI_TEXT.home.toIndividual[appLang]}
+                                </span>
+                              </div>
+                              <div
+                                style={{ position: 'absolute', top: '50%', left: '28.0%', width: '68.0%', height: '50%' }}
+                                className="pointer-events-none select-none flex items-center z-10"
+                              >
+                                <span
+                                  style={{ fontSize: '2.35cqw', fontWeight: 500, color: '#222222' }}
+                                  className="leading-none whitespace-nowrap font-sans"
+                                >
+                                  {CBE_UI_TEXT.home.toGroup[appLang]}
+                                </span>
+                              </div>
                               {/* Option 1: To Individual -> navigates to Step 15 */}
                               <button
                                 type="button"
@@ -8040,17 +8219,51 @@ export default function CBEBirrFullscreenApp() {
                       </div>
                     </div>
 
-                    {/* 3. USER'S CROPPED LOWER 8 ICONS PNG (home_scroll_down___2__759e601d.png) */}
+                    {/* 3. CLEAN LOWER 8 ICONS PNG + CRISP PROPORTIONAL VECTOR LABELS */}
                     <div className="w-full flex justify-center pt-1 pb-4 bg-white">
                       <div className="relative w-[92.2%]">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
-                          src="/assets/aistudio/home_scroll_down___2__759e601d.png"
+                          src="/assets/clean/home_scroll_down_notext.png"
                           alt="CBEBirr Transfer, Pay and Win"
                           className="w-full h-auto block object-contain pointer-events-none select-none"
                           draggable={false}
                         />
-                        {/* Hotspot 1: Transfer To Other Banks (1st icon in 2x4 grid: top-left quadrant) */}
+
+                        {/* Lower 8 Service Card Labels (4x2 Grid, razor-sharp crisp text with zero clipping) */}
+                        {CBE_UI_TEXT.home.lowerServices.map((svc, idx) => {
+                          const row = Math.floor(idx / 4);
+                          const col = idx % 4;
+                          const colLefts = ['0.8%', '26.4%', '52.1%', '77.8%'];
+                          const isLong = svc.id === 'other_wallet';
+                          return (
+                            <div
+                              key={svc.id}
+                              style={{
+                                position: 'absolute',
+                                top: row === 0 ? '25.2%' : '76.8%',
+                                left: colLefts[col],
+                                width: '21.4%',
+                                height: '18.2%',
+                              }}
+                              className="pointer-events-none select-none z-10 flex items-center justify-center text-center"
+                            >
+                              <span
+                                style={{
+                                  fontSize: isLong ? '1.90cqw' : appLang === 'am' ? '1.98cqw' : '2.15cqw',
+                                  fontWeight: 700,
+                                  lineHeight: isLong ? 1.18 : 1.24,
+                                  color: '#1b1b1b',
+                                }}
+                                className="whitespace-pre-line font-sans"
+                              >
+                                {svc[appLang]}
+                              </span>
+                            </div>
+                          );
+                        })}
+
+                        {/* Hotspot 1: Transfer To Other Banks */}
                         <button
                           type="button"
                           onClick={openOtherBanksTransfer}
@@ -8064,7 +8277,7 @@ export default function CBEBirrFullscreenApp() {
                           aria-label="Transfer To Other Banks"
                           className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity pointer-events-auto rounded-xl"
                         />
-                        {/* Hotspot 2: Transfer To Other Wallet & Micro Finance (2nd icon in 2x4 grid) */}
+                        {/* Hotspot 2: Transfer To Other Wallet & Micro Finance */}
                         <button
                           type="button"
                           onClick={openOtherWalletsTransfer}
@@ -8087,7 +8300,7 @@ export default function CBEBirrFullscreenApp() {
                 </div>
               </div>
 
-              {/* FLOATING QR CODE BUTTON (Crop placed exactly where it used to be) */}
+              {/* FLOATING QR CODE BUTTON */}
               <div
                 style={{
                   position: 'absolute',
@@ -8096,29 +8309,61 @@ export default function CBEBirrFullscreenApp() {
                   width: '28.3%',
                   zIndex: 25,
                 }}
-                className="pointer-events-auto cursor-pointer active:scale-95 transition-transform drop-shadow-xl select-none"
+                className="pointer-events-auto cursor-pointer active:scale-95 transition-transform drop-shadow-xl select-none relative"
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/floating_qr_clean.png"
+                  src="/screens/clean/floating_qr_notext.png"
                   alt="QR code"
                   className="w-full h-auto block select-none pointer-events-none"
                   draggable={false}
                 />
+                <div
+                  style={{ position: 'absolute', top: '0%', left: '42%', width: '50%', height: '100%' }}
+                  className="pointer-events-none select-none flex items-center"
+                >
+                  <span
+                    style={{ fontSize: '2.35cqw', fontWeight: 500, color: '#ffffff' }}
+                    className="leading-none whitespace-nowrap font-sans"
+                  >
+                    {CBE_UI_TEXT.home.qrCode[appLang]}
+                  </span>
+                </div>
               </div>
 
-              {/* 3. FIXED BOTTOM: PURPLE NAVIGATION BAR ONLY (PURE WHITE BASE BEHIND & ABOVE IT) */}
+              {/* 3. FIXED BOTTOM: PURPLE NAVIGATION BAR (CLEAN PNG + CRISP BILINGUAL LABELS) */}
               <div
                 className="shrink-0 w-full z-20 select-none relative bg-white"
                 style={{ aspectRatio: '720 / 167' }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/home_bottom_nav.png"
+                  src="/screens/clean/home_bottom_nav_notext.png"
                   alt="CBEBirr Bottom Navigation - Home Active"
                   className="w-full h-auto block drop-shadow-2xl pointer-events-none"
                   draggable={false}
                 />
+
+                {/* Crisp Bottom Nav Labels (Inactive Tabs) */}
+                {[
+                  { label: CBE_UI_TEXT.nav.pay[appLang], left: '20%' },
+                  { label: CBE_UI_TEXT.nav.cbebeje[appLang], left: '40%' },
+                  { label: CBE_UI_TEXT.nav.miniApps[appLang], left: '60%' },
+                  { label: CBE_UI_TEXT.nav.others[appLang], left: '80%' },
+                ].map((tab) => (
+                  <div
+                    key={tab.left}
+                    style={{ position: 'absolute', top: '70.5%', left: tab.left, width: '20%' }}
+                    className="pointer-events-none select-none flex justify-center z-20"
+                  >
+                    <span
+                      style={{ fontSize: appLang === 'am' ? '1.90cqw' : '2.05cqw', fontWeight: 400 }}
+                      className="text-white leading-none whitespace-nowrap font-sans"
+                    >
+                      {tab.label}
+                    </span>
+                  </div>
+                ))}
 
                 {/* Hotspot: Click "Pay" tab to navigate to Pay Page (Step 14) */}
                 <button
@@ -8554,35 +8799,73 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden"
             >
-              {/* 1. FIXED TOP: OTHERS HEADER & PROFILE CARD (others_fixed_top.png) */}
+              {/* 1. FIXED TOP: OTHERS HEADER & PROFILE CARD (CLEAN PNG + CRISP BILINGUAL OVERLAYS) */}
               <div
                 className="shrink-0 w-full z-20 shadow-md relative overflow-hidden bg-[#8c288e]"
                 style={{ aspectRatio: '720 / 341' }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/others_fixed_top.png"
+                  src="/screens/clean/others_fixed_top_notext.png"
                   alt="CBEBirr Others Header and Profile Card"
                   className="w-full h-auto block pointer-events-none"
                   draggable={false}
                 />
 
-                {/* Dynamic User Name Display (Real-time synchronization across all pages) */}
+                {/* Crisp Header Title: Others / ሌሎች */}
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '9.5%',
+                    left: '20.0%',
+                    width: '60.0%',
+                    height: '11.5%',
+                  }}
+                  className="pointer-events-none select-none flex items-center justify-center z-10"
+                >
+                  <span
+                    style={{ fontSize: '2.8cqw', fontWeight: 700 }}
+                    className="text-white leading-none whitespace-nowrap font-sans tracking-wide"
+                  >
+                    {CBE_UI_TEXT.others.headerTitle[appLang]}
+                  </span>
+                </div>
+
+                {/* Dynamic User Name Display (Transparent over clean purple background) */}
                 <div
                   style={{
                     position: 'absolute',
                     top: '52.6%',
                     left: '28.6%',
-                    width: '35.0%',
-                    height: '6.2%',
+                    width: '40.0%',
+                    height: '6.5%',
                   }}
-                  className="bg-[#7b237c] flex items-center z-10 pointer-events-none select-none"
+                  className="bg-transparent flex items-center z-10 pointer-events-none select-none"
                 >
                   <span
                     style={{ fontSize: '2.58cqw', fontWeight: 400, letterSpacing: '0.04em' }}
                     className="text-white whitespace-nowrap overflow-hidden text-ellipsis uppercase leading-none"
                   >
                     {userName.length > 9 ? `${userName.slice(0, 8).toUpperCase()}****` : userName.toUpperCase()}
+                  </span>
+                </div>
+
+                {/* Level 3 Badge Text inside preserved Gold Pill */}
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '64.5%',
+                    left: '28.75%',
+                    width: '10.7%',
+                    height: '8.8%',
+                  }}
+                  className="pointer-events-none select-none flex items-center justify-center z-10"
+                >
+                  <span
+                    style={{ fontSize: appLang === 'am' ? '1.85cqw' : '2.05cqw', fontWeight: 600 }}
+                    className="text-white leading-none whitespace-nowrap font-sans"
+                  >
+                    {CBE_UI_TEXT.others.levelBadge[appLang]}
                   </span>
                 </div>
 
@@ -8604,21 +8887,28 @@ export default function CBEBirrFullscreenApp() {
                   className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-2xl"
                 />
 
-                {/* Hotspot: Top Right Language Switcher (EN) */}
+                {/* Interactive Top-Right Language Switcher (EN / አማ) */}
                 <button
                   type="button"
-                  onClick={() => {}}
+                  onClick={toggleAppLang}
                   style={{
                     position: 'absolute',
-                    top: '7.0%',
-                    left: '91.0%',
+                    top: '7.5%',
+                    left: '90.5%',
                     width: '8.0%',
-                    height: '24.0%',
+                    height: '15.5%',
                   }}
                   aria-label="Change Language"
                   title="Change Language / ቋንቋ ይምረጡ"
-                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-lg"
-                />
+                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-30 rounded-lg flex items-center justify-center"
+                >
+                  <span
+                    style={{ fontSize: '2.35cqw', fontWeight: 600 }}
+                    className="text-white leading-none whitespace-nowrap font-sans"
+                  >
+                    {CBE_UI_TEXT.langBadge[appLang]}
+                  </span>
+                </button>
 
                 {/* Hidden Hotspot: Silent Long-Press Search Icon on Others Page */}
                 <button
@@ -8632,8 +8922,8 @@ export default function CBEBirrFullscreenApp() {
                     position: 'absolute',
                     top: '6.0%',
                     left: '81.5%',
-                    width: '9.5%',
-                    height: '26.0%',
+                    width: '9.0%',
+                    height: '24.0%',
                     touchAction: 'none',
                     WebkitTapHighlightColor: 'transparent',
                   }}
@@ -8642,7 +8932,7 @@ export default function CBEBirrFullscreenApp() {
                 />
               </div>
 
-              {/* 2. SCROLLABLE MIDDLE: MENU OPTIONS LIST (Scrolls smoothly between header and stationary bottom controls) */}
+              {/* 2. SCROLLABLE MIDDLE: MENU OPTIONS LIST (CLEAN PNG + CRISP BILINGUAL ROW LABELS) */}
               <div
                 ref={othersScrollRef}
                 onPointerDown={handleOthersPointerDown}
@@ -8656,29 +8946,42 @@ export default function CBEBirrFullscreenApp() {
                   WebkitOverflowScrolling: 'touch',
                 }}
               >
-                <div className="w-full flex flex-col items-center bg-[#e0e0e0] relative pb-6">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src="/screens/others_menu_clean_list_v2.png"
-                    alt="CBEBirr Others Menu Options"
-                    className="w-full h-auto block object-contain pointer-events-none"
-                    draggable={false}
-                  />
+                <div className="w-full flex flex-col items-center bg-[#e0e0e0] pb-6">
+                  <div className="relative w-full">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src="/screens/clean/others_menu_notext.png"
+                      alt="CBEBirr Others Menu Options"
+                      className="w-full h-auto block object-contain pointer-events-none"
+                      draggable={false}
+                    />
 
-                  {/* Hotspot: Click "Change Language" row in the menu list */}
-                  <button
-                    type="button"
-                    onClick={() => {}}
-                    style={{
-                      position: 'absolute',
-                      top: '22.5%',
-                      left: '5.0%',
-                      width: '90.0%',
-                      height: '8.2%',
-                    }}
-                    aria-label="Change Language"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:bg-black/5 rounded-2xl z-20"
-                  />
+                    {/* Crisp Menu Row Labels */}
+                    {CBE_UI_TEXT.others.menuRows.map((row, idx) => (
+                      <div
+                        key={row.id}
+                        style={{
+                          position: 'absolute',
+                          top: `${((55 + idx * 90) / 1218) * 100}%`,
+                          left: '16.5%',
+                          width: '68.0%',
+                          height: `${(38 / 1218) * 100}%`,
+                        }}
+                        className="pointer-events-none select-none flex items-center z-10"
+                      >
+                        <span
+                          style={{
+                            fontSize: appLang === 'am' ? '2.22cqw' : '2.35cqw',
+                            fontWeight: 500,
+                            color: '#222222',
+                          }}
+                          className="leading-none whitespace-nowrap overflow-hidden text-ellipsis font-sans"
+                        >
+                          {row[appLang]}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -8707,11 +9010,11 @@ export default function CBEBirrFullscreenApp() {
                   />
                 </div>
 
-                {/* Fixed Log Out Button */}
-                <div className="w-full relative cursor-pointer" style={{ aspectRatio: '720 / 140' }}>
+                {/* Fixed Log Out Button (Clean PNG + Crisp Bilingual Label) */}
+                <div className="w-full relative cursor-pointer" style={{ aspectRatio: '720 / 153' }}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src="/screens/others_logout_bottom.png"
+                    src="/screens/clean/others_logout_notext.png"
                     alt="Log Out"
                     className="w-full h-auto block pointer-events-none"
                     draggable={false}
@@ -8727,26 +9030,54 @@ export default function CBEBirrFullscreenApp() {
                       top: '14%',
                       left: '5.0%',
                       width: '90.0%',
-                      height: '54%',
+                      height: '56%',
                     }}
                     aria-label="Log Out"
-                    className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20"
-                  />
+                    className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 flex items-center justify-center"
+                  >
+                    <span
+                      style={{ fontSize: '2.55cqw', fontWeight: 700 }}
+                      className="text-white leading-none whitespace-nowrap font-sans tracking-wide"
+                    >
+                      {CBE_UI_TEXT.others.logOut[appLang]}
+                    </span>
+                  </button>
                 </div>
               </div>
 
-              {/* 3. FIXED BOTTOM: OTHERS ACTIVE NAVIGATION BAR (others_fixed_bottom.png) */}
+              {/* 3. FIXED BOTTOM: OTHERS ACTIVE NAVIGATION BAR (CLEAN PNG + CRISP BILINGUAL LABELS) */}
               <div
                 className="shrink-0 w-full z-20 select-none relative"
                 style={{ aspectRatio: '720 / 167' }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/others_fixed_bottom.png"
+                  src="/screens/clean/others_fixed_bottom_notext.png"
                   alt="CBEBirr Bottom Navigation - Others Active"
                   className="w-full h-auto block drop-shadow-2xl pointer-events-none"
                   draggable={false}
                 />
+
+                {/* Crisp Bottom Nav Labels (Inactive Tabs) */}
+                {[
+                  { label: CBE_UI_TEXT.nav.home[appLang], left: '0%' },
+                  { label: CBE_UI_TEXT.nav.pay[appLang], left: '20%' },
+                  { label: CBE_UI_TEXT.nav.cbebeje[appLang], left: '40%' },
+                  { label: CBE_UI_TEXT.nav.miniApps[appLang], left: '60%' },
+                ].map((tab) => (
+                  <div
+                    key={tab.left}
+                    style={{ position: 'absolute', top: '70.5%', left: tab.left, width: '20%' }}
+                    className="pointer-events-none select-none flex justify-center z-20"
+                  >
+                    <span
+                      style={{ fontSize: appLang === 'am' ? '1.90cqw' : '2.05cqw', fontWeight: 400 }}
+                      className="text-white leading-none whitespace-nowrap font-sans"
+                    >
+                      {tab.label}
+                    </span>
+                  </div>
+                ))}
 
                 {/* Hotspot: Click "Home" tab to navigate back to Home Page (Step 4) */}
                 <button
@@ -10946,20 +11277,39 @@ export default function CBEBirrFullscreenApp() {
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
               <ProportionalScreenStage align="center">
-                {/* Full Screen High-Fidelity CBEBeje PNG */}
+                {/* Clean Text-Free CBEBeje Screen PNG + Crisp Bilingual Overlays */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/cbe_beje.png"
+                  src="/screens/clean/cbe_beje_notext.png"
                   alt="CBEBeje Screen"
                   className="w-full h-full pointer-events-none select-none block"
                   draggable={false}
                 />
 
+              {/* Crisp Header Title: CBEBeje / ሲቢኢበጄ */}
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '3.45%',
+                  left: '20.0%',
+                  width: '60.0%',
+                  height: '2.5%',
+                }}
+                className="pointer-events-none select-none flex items-center justify-center z-10"
+              >
+                <span
+                  style={{ fontSize: '2.8cqw', fontWeight: 700 }}
+                  className="text-white leading-none whitespace-nowrap font-sans tracking-wide"
+                >
+                  {CBE_UI_TEXT.cbebeje.headerTitle[appLang]}
+                </span>
+              </div>
+
               {/* Top Bar: Search Icon */}
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('ፈልግ (Search CBEBeje)');
+                  setReceiptToast(appLang === 'am' ? 'ፈልግ (Search CBEBeje)' : 'Search CBEBeje');
                   setTimeout(() => setReceiptToast(''), 2000);
                 }}
                 style={{
@@ -10973,29 +11323,109 @@ export default function CBEBirrFullscreenApp() {
                 className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-20 rounded-full"
               />
 
-              {/* Top Bar: Language Toggle */}
+              {/* Top Bar: Interactive Language Toggle (EN / አማ) */}
               <button
                 type="button"
-                onClick={() => {}}
+                onClick={toggleAppLang}
                 style={{
                   position: 'absolute',
-                  top: '2.4%',
-                  right: '4.0%',
-                  width: '8.5%',
-                  height: '4.2%',
+                  top: '2.95%',
+                  right: '1.8%',
+                  width: '7.5%',
+                  height: '3.6%',
                 }}
                 aria-label="Change Language"
                 title="Change Language / ቋንቋ ይምረጡ"
-                className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-20 rounded-lg"
-              />
-              
+                className="cursor-pointer bg-transparent border-0 outline-none active:opacity-60 transition-opacity z-30 rounded-lg flex items-center justify-center"
+              >
+                <span
+                  style={{ fontSize: '2.3cqw', fontWeight: 600 }}
+                  className="text-white leading-none whitespace-nowrap font-sans"
+                >
+                  {CBE_UI_TEXT.langBadge[appLang]}
+                </span>
+              </button>
+
+              {/* Crisp Sub-Tab Labels: Ordinary / Overdraft */}
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '31.75%',
+                  left: '33.4%',
+                  width: '16.0%',
+                }}
+                className="pointer-events-none select-none flex justify-center z-10"
+              >
+                <span
+                  style={{
+                    fontSize: appLang === 'am' ? '1.95cqw' : '2.05cqw',
+                    fontWeight: 700,
+                    color: cbeBejeTab === 'ordinary' ? '#822284' : '#a8a8a8',
+                  }}
+                  className="leading-none whitespace-nowrap font-sans"
+                >
+                  {CBE_UI_TEXT.cbebeje.ordinaryTab[appLang]}
+                </span>
+              </div>
+
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '31.75%',
+                  left: '50.5%',
+                  width: '16.0%',
+                }}
+                className="pointer-events-none select-none flex justify-center z-10"
+              >
+                <span
+                  style={{
+                    fontSize: appLang === 'am' ? '1.95cqw' : '2.05cqw',
+                    fontWeight: 700,
+                    color: cbeBejeTab === 'overdraft' ? '#822284' : '#a8a8a8',
+                  }}
+                  className="leading-none whitespace-nowrap font-sans"
+                >
+                  {CBE_UI_TEXT.cbebeje.overdraftTab[appLang]}
+                </span>
+              </div>
+
+              {/* Crisp Service Card Titles & Descriptions */}
+              {CBE_UI_TEXT.cbebeje.cards.map((card) => (
+                <div
+                  key={card.id}
+                  style={{
+                    position: 'absolute',
+                    top: `${card.topPct}%`,
+                    left: '23.8%',
+                    width: '62.0%',
+                  }}
+                  className="pointer-events-none select-none flex flex-col gap-[0.65cqw] z-10"
+                >
+                  <span
+                    style={{ fontSize: '2.55cqw', fontWeight: 700, color: '#1f1f1f' }}
+                    className="leading-tight whitespace-nowrap font-sans"
+                  >
+                    {card.title[appLang]}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: appLang === 'am' ? '1.95cqw' : '2.02cqw',
+                      fontWeight: 400,
+                      color: '#555555',
+                    }}
+                    className="leading-[1.3] font-sans"
+                  >
+                    {card.description[appLang]}
+                  </span>
+                </div>
+              ))}
 
               {/* Ordinary Tab Hotspot */}
               <button
                 type="button"
                 onClick={() => {
                   setCbeBejeTab('ordinary');
-                  setReceiptToast('Ordinary Savings Account');
+                  setReceiptToast(appLang === 'am' ? 'መደበኛ የቁጠባ ሂሳብ' : 'Ordinary Savings Account');
                   setTimeout(() => setReceiptToast(''), 2000);
                 }}
                 style={{
@@ -11003,7 +11433,7 @@ export default function CBEBirrFullscreenApp() {
                   top: '24.2%',
                   left: '34.0%',
                   width: '15.0%',
-                  height: '7.8%',
+                  height: '9.5%',
                 }}
                 aria-label="Ordinary Tab"
                 className="cursor-pointer bg-transparent border-0 outline-none active:scale-95 transition-transform z-20 rounded-full"
@@ -11014,15 +11444,19 @@ export default function CBEBirrFullscreenApp() {
                 type="button"
                 onClick={() => {
                   setCbeBejeTab('overdraft');
-                  setReceiptToast('Overdraft Credit Service - No Active Overdraft');
+                  setReceiptToast(
+                    appLang === 'am'
+                      ? 'የኦቨርድራፍት አገልግሎት - ንቁ ብድር የለም'
+                      : 'Overdraft Credit Service - No Active Overdraft'
+                  );
                   setTimeout(() => setReceiptToast(''), 2200);
                 }}
                 style={{
                   position: 'absolute',
                   top: '24.2%',
-                  left: '52.0%',
+                  left: '51.5%',
                   width: '15.0%',
-                  height: '7.8%',
+                  height: '9.5%',
                 }}
                 aria-label="Overdraft Tab"
                 className="cursor-pointer bg-transparent border-0 outline-none active:scale-95 transition-transform z-20 rounded-full"
@@ -11032,7 +11466,11 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('Micro Saving: 7% የወለድ ተመን (7% Annual Interest)');
+                  setReceiptToast(
+                    appLang === 'am'
+                      ? 'ማይክሮ ቁጠባ: 7% የወለድ ተመን'
+                      : 'Micro Saving: 7% Annual Interest'
+                  );
                   setTimeout(() => setReceiptToast(''), 2500);
                 }}
                 style={{
@@ -11050,7 +11488,11 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('Micro Loan: ማይክሮ ብድር (Assistance to Process Micro Loan Easily)');
+                  setReceiptToast(
+                    appLang === 'am'
+                      ? 'ማይክሮ ብድር: ማይክሮ ብድር በቀላሉ ያግኙ'
+                      : 'Micro Loan: Assistance to Process Micro Loan Easily'
+                  );
                   setTimeout(() => setReceiptToast(''), 2500);
                 }}
                 style={{
@@ -11068,7 +11510,11 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('Fixed Saving: 8%+ የወለድ ተመን (Earn 8%+ Interest with CBEBirr)');
+                  setReceiptToast(
+                    appLang === 'am'
+                      ? 'ቋሚ ቁጠባ: 8%+ የወለድ ተመን በሲቢኢ ብር'
+                      : 'Fixed Saving: Earn 8%+ Interest with CBEBirr'
+                  );
                   setTimeout(() => setReceiptToast(''), 2500);
                 }}
                 style={{
@@ -11082,7 +11528,28 @@ export default function CBEBirrFullscreenApp() {
                 className="cursor-pointer bg-transparent border-0 outline-none active:bg-black/5 active:scale-[0.99] transition-all z-20 rounded-2xl"
               />
 
-              {/* Bottom Navigation Bar */}
+              {/* Crisp Bottom Nav Labels (Inactive Tabs; center CBEBeje has raised logo) */}
+              {[
+                { label: CBE_UI_TEXT.nav.home[appLang], left: '0%' },
+                { label: CBE_UI_TEXT.nav.pay[appLang], left: '20%' },
+                { label: CBE_UI_TEXT.nav.miniApps[appLang], left: '60%' },
+                { label: CBE_UI_TEXT.nav.others[appLang], left: '80%' },
+              ].map((tab) => (
+                <div
+                  key={tab.left}
+                  style={{ position: 'absolute', top: '96.65%', left: tab.left, width: '20%' }}
+                  className="pointer-events-none select-none flex justify-center z-20"
+                >
+                  <span
+                    style={{ fontSize: appLang === 'am' ? '1.90cqw' : '2.05cqw', fontWeight: 400 }}
+                    className="text-white leading-none whitespace-nowrap font-sans"
+                  >
+                    {tab.label}
+                  </span>
+                </div>
+              ))}
+
+              {/* Bottom Navigation Bar Hotspots */}
               {/* Tab 1: Home */}
               <button
                 type="button"
@@ -11117,7 +11584,7 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('CBEBeje Active');
+                  setReceiptToast(appLang === 'am' ? 'ሲቢኢበጄ' : 'CBEBeje Active');
                   setTimeout(() => setReceiptToast(''), 1500);
                 }}
                 style={{
@@ -11191,88 +11658,144 @@ export default function CBEBirrFullscreenApp() {
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
               <ProportionalScreenStage align="center">
-                {/* Full Screen High-Fidelity Mini Apps PNG */}
+                {/* Clean Text-Free Mini Apps Screen PNG + Crisp Bilingual Overlays */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/mini_apps.png"
+                  src="/screens/clean/mini_apps_notext.png"
                   alt="Mini Apps Screen"
                   className="w-full h-full pointer-events-none select-none block"
                   draggable={false}
                 />
 
+              {/* Crisp Header Title: Mini Apps / ሚኒ አፕስ */}
+              <div
+                style={{
+                  position: 'absolute',
+                  top: '2.25%',
+                  left: '20.0%',
+                  width: '60.0%',
+                  height: '2.4%',
+                }}
+                className="pointer-events-none select-none flex items-center justify-center z-10"
+              >
+                <span
+                  style={{ fontSize: '2.8cqw', fontWeight: 700 }}
+                  className="text-white leading-none whitespace-nowrap font-sans tracking-wide"
+                >
+                  {CBE_UI_TEXT.miniApps.headerTitle[appLang]}
+                </span>
+              </div>
+
               {/* Top Bar: Search Icon */}
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('ፈልግ (Search Mini Apps)');
+                  setReceiptToast(appLang === 'am' ? 'ፈልግ (Search Mini Apps)' : 'Search Mini Apps');
                   setTimeout(() => setReceiptToast(''), 2000);
                 }}
                 style={{
                   position: 'absolute',
-                  top: '2.4%',
+                  top: '1.8%',
                   right: '13.5%',
                   width: '9.0%',
-                  height: '4.2%',
+                  height: '3.6%',
                 }}
                 aria-label="Search"
                 className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-20 rounded-full"
               />
 
-              {/* Top Bar: Language Toggle */}
+              {/* Top Bar: Interactive Language Toggle (EN / አማ) */}
               <button
                 type="button"
-                onClick={() => {}}
+                onClick={toggleAppLang}
                 style={{
                   position: 'absolute',
-                  top: '2.4%',
-                  right: '4.0%',
-                  width: '8.5%',
-                  height: '4.2%',
+                  top: '1.8%',
+                  right: '1.8%',
+                  width: '7.5%',
+                  height: '3.4%',
                 }}
                 aria-label="Language Toggle"
-                className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-20 rounded-lg"
-              />
+                title="Change Language / ቋንቋ ይምረጡ"
+                className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-30 rounded-lg flex items-center justify-center"
+              >
+                <span
+                  style={{ fontSize: '2.3cqw', fontWeight: 600 }}
+                  className="text-white leading-none whitespace-nowrap font-sans"
+                >
+                  {CBE_UI_TEXT.langBadge[appLang]}
+                </span>
+              </button>
+
+              {/* Crisp Labels for all 20 Mini App Cards */}
+              {CBE_UI_TEXT.miniApps.items.map((item) => (
+                <div
+                  key={`label-${item.id}`}
+                  style={{
+                    position: 'absolute',
+                    top: `${item.textTopPct}%`,
+                    left: item.cardLeft,
+                    width: '29.2%',
+                  }}
+                  className="pointer-events-none select-none flex justify-center px-[0.8cqw] z-10"
+                >
+                  <span
+                    style={{
+                      fontSize: appLang === 'am' ? '1.85cqw' : '1.98cqw',
+                      fontWeight: 400,
+                      color: '#3f3f3f',
+                    }}
+                    className="leading-tight text-center whitespace-nowrap overflow-hidden text-ellipsis max-w-full font-sans"
+                  >
+                    {item.label[appLang]}
+                  </span>
+                </div>
+              ))}
 
               {/* 20 Interactive Mini App Card Hotspots */}
-              {[
-                { name: 'Henon School Pay', top: '7.8%', left: '3.8%' },
-                { name: 'Entoto Park Cbe Run', top: '7.8%', left: '35.4%' },
-                { name: 'ETRE', top: '7.8%', left: '67.0%' },
-                { name: 'Commercepal', top: '18.6%', left: '3.8%' },
-                { name: 'SeregelaGebeya', top: '18.6%', left: '35.4%' },
-                { name: 'Digital Equb', top: '18.6%', left: '67.0%' },
-                { name: 'eQUB', top: '29.4%', left: '3.8%' },
-                { name: 'Get Rest', top: '29.4%', left: '35.4%' },
-                { name: 'iChereta', top: '29.4%', left: '67.0%' },
-                { name: 'Kelal Gateway', top: '40.2%', left: '3.8%' },
-                { name: 'Hello Equb', top: '40.2%', left: '35.4%' },
-                { name: 'Qetero', top: '40.2%', left: '67.0%' },
-                { name: 'Ethio Sport', top: '51.0%', left: '3.8%' },
-                { name: 'Virtual Equb', top: '51.0%', left: '35.4%' },
-                { name: 'Cbe Employee Cooperative', top: '51.0%', left: '67.0%' },
-                { name: 'A-Trip', top: '61.8%', left: '3.8%' },
-                { name: 'Adey School System', top: '61.8%', left: '35.4%' },
-                { name: 'Moteregna Delivery', top: '61.8%', left: '67.0%' },
-                { name: 'AABTE', top: '72.6%', left: '3.8%' },
-                { name: 'Filmbet', top: '72.6%', left: '35.4%' },
-              ].map((app) => (
+              {CBE_UI_TEXT.miniApps.items.map((item) => (
                 <button
-                  key={app.name}
+                  key={item.id}
                   type="button"
                   onClick={() => {
-                    setReceiptToast(`${app.name} እየተከፈተ ነው... (Opening ${app.name})`);
+                    setReceiptToast(
+                      appLang === 'am'
+                        ? `${item.label.am} እየተከፈተ ነው...`
+                        : `Opening ${item.enName}...`
+                    );
                     setTimeout(() => setReceiptToast(''), 2200);
                   }}
                   style={{
                     position: 'absolute',
-                    top: app.top,
-                    left: app.left,
+                    top: item.cardTop,
+                    left: item.cardLeft,
                     width: '29.2%',
                     height: '9.4%',
                   }}
-                  aria-label={app.name}
+                  aria-label={item.enName}
                   className="cursor-pointer bg-transparent border-0 outline-none active:scale-95 transition-transform rounded-2xl z-20"
                 />
+              ))}
+
+              {/* Crisp Bottom Nav Labels (Inactive Tabs; Mini Apps is active raised icon) */}
+              {[
+                { label: CBE_UI_TEXT.nav.home[appLang], left: '0%' },
+                { label: CBE_UI_TEXT.nav.pay[appLang], left: '20%' },
+                { label: CBE_UI_TEXT.nav.cbebeje[appLang], left: '40%' },
+                { label: CBE_UI_TEXT.nav.others[appLang], left: '80%' },
+              ].map((tab) => (
+                <div
+                  key={tab.left}
+                  style={{ position: 'absolute', top: '96.65%', left: tab.left, width: '20%' }}
+                  className="pointer-events-none select-none flex justify-center z-20"
+                >
+                  <span
+                    style={{ fontSize: appLang === 'am' ? '1.90cqw' : '2.05cqw', fontWeight: 400 }}
+                    className="text-white leading-none whitespace-nowrap font-sans"
+                  >
+                    {tab.label}
+                  </span>
+                </div>
               ))}
 
               {/* Bottom Navigation Bar */}
@@ -11325,7 +11848,7 @@ export default function CBEBirrFullscreenApp() {
               <button
                 type="button"
                 onClick={() => {
-                  setReceiptToast('Mini Apps Active');
+                  setReceiptToast(appLang === 'am' ? 'ሚኒ አፕስ' : 'Mini Apps Active');
                   setTimeout(() => setReceiptToast(''), 1500);
                 }}
                 style={{
@@ -11383,18 +11906,37 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
-              {/* 1. FIXED TOP: PAY BILL HEADER (pay_fixed_top.png) */}
+              {/* 1. FIXED TOP: PAY BILL HEADER (CLEAN PNG + CRISP BILINGUAL OVERLAYS) */}
               <div
                 className="shrink-0 w-full z-20 shadow-md relative overflow-hidden bg-[#8c288e]"
                 style={{ aspectRatio: '720 / 232' }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/pay_fixed_top.png"
+                  src="/screens/clean/pay_fixed_top_notext.png"
                   alt="CBEBirr Pay Bill Header"
                   className="w-full h-auto block pointer-events-none"
                   draggable={false}
                 />
+
+                {/* Crisp Header Title: Pay Bill / ክፍያ ይፈጽሙ */}
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '21.5%',
+                    left: '20.0%',
+                    width: '60.0%',
+                    height: '16.5%',
+                  }}
+                  className="pointer-events-none select-none flex items-center justify-center z-10"
+                >
+                  <span
+                    style={{ fontSize: '2.8cqw', fontWeight: 700 }}
+                    className="text-white leading-none whitespace-nowrap font-sans tracking-wide"
+                  >
+                    {CBE_UI_TEXT.pay.headerTitle[appLang]}
+                  </span>
+                </div>
 
                 {/* Hotspot: Search Icon (disabled / no action) */}
                 <button
@@ -11411,23 +11953,31 @@ export default function CBEBirrFullscreenApp() {
                   className="bg-transparent border-0 outline-none z-20 rounded-full"
                 />
 
-                {/* Hotspot: Language Toggle */}
+                {/* Interactive Language Toggle (EN / አማ) */}
                 <button
                   type="button"
-                  onClick={() => {}}
+                  onClick={toggleAppLang}
                   style={{
                     position: 'absolute',
-                    top: '15.0%',
-                    right: '4.0%',
-                    width: '8.5%',
-                    height: '28.0%',
+                    top: '21.5%',
+                    right: '1.8%',
+                    width: '7.5%',
+                    height: '23.0%',
                   }}
                   aria-label="Language Toggle"
-                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-20 rounded-lg"
-                />
+                  title="Change Language / ቋንቋ ይምረጡ"
+                  className="cursor-pointer bg-transparent border-0 outline-none active:opacity-50 transition-opacity z-30 rounded-lg flex items-center justify-center"
+                >
+                  <span
+                    style={{ fontSize: '2.3cqw', fontWeight: 600 }}
+                    className="text-white leading-none whitespace-nowrap font-sans"
+                  >
+                    {CBE_UI_TEXT.langBadge[appLang]}
+                  </span>
+                </button>
               </div>
 
-              {/* 2. SCROLLABLE MIDDLE: ALL 7 PAY CARDS WITH SMOOTH TOUCH DRAG SCROLL */}
+              {/* 2. SCROLLABLE MIDDLE: ALL 7 PAY CARDS (CLEAN PNG + CRISP BILINGUAL LABELS) */}
               <div
                 ref={payScrollRef}
                 onPointerDown={handlePayPointerDown}
@@ -11441,32 +11991,87 @@ export default function CBEBirrFullscreenApp() {
                   WebkitOverflowScrolling: 'touch',
                 }}
               >
-                <div className="w-full flex flex-col items-center bg-[#e0e0e0] relative">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src="/screens/pay_middle_scroll.png"
-                    alt="CBEBirr Pay Bill Services and Utilities"
-                    className="w-full h-auto block object-contain pointer-events-none"
-                    draggable={false}
-                  />
+                <div className="w-full flex flex-col items-center bg-[#e0e0e0]">
+                  <div className="relative w-full">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src="/screens/clean/pay_middle_scroll_notext.png"
+                      alt="CBEBirr Pay Bill Services and Utilities"
+                      className="w-full h-auto block object-contain pointer-events-none"
+                      draggable={false}
+                    />
+
+                    {/* Crisp Bilingual Titles & Descriptions for all 7 Pay Bill Cards */}
+                    {CBE_UI_TEXT.pay.cards.map((card) => (
+                      <div
+                        key={card.id}
+                        style={{
+                          position: 'absolute',
+                          top: `${card.topPct}%`,
+                          left: '21.9%',
+                          width: '61.5%',
+                          height: `${card.heightPct}%`,
+                        }}
+                        className="pointer-events-none select-none flex flex-col justify-center gap-[0.65cqw] z-10 overflow-hidden"
+                      >
+                        <span
+                          style={{ fontSize: '2.55cqw', fontWeight: 700, color: '#1f1f1f' }}
+                          className="leading-tight whitespace-nowrap font-sans"
+                        >
+                          {card.title[appLang]}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: appLang === 'am' ? '1.92cqw' : '2.00cqw',
+                            fontWeight: 400,
+                            color: '#555555',
+                          }}
+                          className="leading-[1.28] font-sans"
+                        >
+                          {card.description[appLang]}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
 
                   {/* Pay Bill options do nothing on click (scroll-only view) */}
                   <div className="w-full h-8 bg-[#e0e0e0]" />
                 </div>
               </div>
 
-              {/* 3. FIXED BOTTOM: PAY ACTIVE NAVIGATION BAR (pay_fixed_bottom.png) */}
+              {/* 3. FIXED BOTTOM: PAY ACTIVE NAVIGATION BAR (CLEAN PNG + CRISP BILINGUAL LABELS) */}
               <div
                 className="shrink-0 w-full z-20 select-none relative bg-[#e0e0e0]"
                 style={{ aspectRatio: '720 / 167' }}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src="/screens/pay_fixed_bottom.png"
+                  src="/screens/clean/pay_fixed_bottom_notext.png"
                   alt="CBEBirr Bottom Navigation - Pay Active"
                   className="w-full h-auto block drop-shadow-2xl pointer-events-none"
                   draggable={false}
                 />
+
+                {/* Crisp Bottom Nav Labels (Inactive Tabs; Pay is active raised icon) */}
+                {[
+                  { label: CBE_UI_TEXT.nav.home[appLang], left: '0%' },
+                  { label: CBE_UI_TEXT.nav.cbebeje[appLang], left: '40%' },
+                  { label: CBE_UI_TEXT.nav.miniApps[appLang], left: '60%' },
+                  { label: CBE_UI_TEXT.nav.others[appLang], left: '80%' },
+                ].map((tab) => (
+                  <div
+                    key={tab.left}
+                    style={{ position: 'absolute', top: '70.5%', left: tab.left, width: '20%' }}
+                    className="pointer-events-none select-none flex justify-center z-20"
+                  >
+                    <span
+                      style={{ fontSize: appLang === 'am' ? '1.90cqw' : '2.05cqw', fontWeight: 400 }}
+                      className="text-white leading-none whitespace-nowrap font-sans"
+                    >
+                      {tab.label}
+                    </span>
+                  </div>
+                ))}
 
                 {/* Hotspot: Click "Home" tab to navigate back to Home Page (Step 4) */}
                 <button

@@ -112,8 +112,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       `;
 
   return (
-    <html lang="en" className="h-full w-full" suppressHydrationWarning>
-      <body className="h-full w-full overflow-hidden" suppressHydrationWarning>
+    <html lang="en" className="h-full w-full bg-black" suppressHydrationWarning>
+      <body className="h-full w-full overflow-hidden bg-black" suppressHydrationWarning>
         {children}
         <OtaAutoUpdater />
         <script

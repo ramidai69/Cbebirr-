@@ -13,32 +13,27 @@ interface ProportionalScreenStageProps {
 
 export default function ProportionalScreenStage({
   children,
-  ratioW = 720,
-  ratioH = 1527,
   align = 'center',
   onClick,
   className = '',
 }: ProportionalScreenStageProps) {
-  const stageW = `min(100%, calc(var(--cbe-frame-h, 100vh) * ${ratioW} / ${ratioH}))`;
-  const stageH = `min(100%, calc(var(--cbe-frame-w, 100vw) * ${ratioH} / ${ratioW}))`;
-
   return (
     <div
       onClick={onClick}
       style={{
-        ['--cbe-stage-w' as string]: stageW,
-        ['--cbe-stage-h' as string]: stageH,
+        ['--cbe-stage-w' as string]: '100%',
+        ['--cbe-stage-h' as string]: '100%',
       }}
       className={`relative w-full h-full flex ${
         align === 'center' ? 'items-center' : 'items-start'
       } justify-center overflow-hidden ${className}`}
     >
-      {/* Pure 4-Side Proportional PNG Stage & Overlays (zero added bands or extra designs) */}
+      {/* Full-Screen 100% Edge-to-Edge PNG Stage & Overlays (zero black/white sidebars) */}
       <div
         style={{
           position: 'relative',
-          width: stageW,
-          height: stageH,
+          width: '100%',
+          height: '100%',
           flexShrink: 0,
           containerType: 'inline-size',
         }}

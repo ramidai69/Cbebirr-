@@ -1,5 +1,5 @@
 // CBEBirr Service Worker for Instant Offline PWA Support & Automatic Live OTA Updates
-const CACHE_NAME = 'cbebirr-cache-v18';
+const CACHE_NAME = 'cbebirr-cache-v19';
 const IS_NATIVE_APK = self.location.hostname.includes('appassets.androidplatform.net');
 const IS_DEV_HOST =
   self.location.hostname.startsWith('ais-dev-') ||
@@ -12,16 +12,29 @@ const STATIC_ASSETS = [
   '/assets/cbe_qr_center_badge_crisp.png',
   '/assets/aistudio/cbe_transfer_logo_static.png',
   '/assets/aistudio/cbe_transfer_ring_spinner.png',
-  '/assets/aistudio/white_card_services_clean.png',
-  '/assets/aistudio/white_card_top_authentic.png',
-  '/screens/floating_qr_clean.png',
+  '/assets/clean/home_top_bs_rh_notext.png',
+  '/assets/clean/home_top_bh_rh_notext.png',
+  '/assets/clean/home_top_bs_rs_notext.png',
+  '/assets/clean/home_top_bh_rs_notext.png',
+  '/assets/clean/white_card_services_notext.png',
+  '/assets/clean/home_scroll_down_notext.png',
+  '/screens/clean/floating_qr_notext.png',
+  '/screens/clean/send_money_popup_notext.png',
+  '/screens/clean/home_bottom_nav_notext.png',
+  '/screens/clean/pay_fixed_top_notext.png',
+  '/screens/clean/pay_middle_scroll_notext.png',
+  '/screens/clean/pay_fixed_bottom_notext.png',
+  '/screens/clean/cbe_beje_notext.png',
+  '/screens/clean/mini_apps_notext.png',
+  '/screens/clean/others_fixed_top_notext.png',
+  '/screens/clean/others_menu_notext.png',
+  '/screens/clean/others_logout_notext.png',
+  '/screens/clean/others_fixed_bottom_notext.png',
   '/screens/screen_1_splash.png',
   '/screens/screen_2_phone_clean.png',
   '/screens/screen_3_pin.png',
   '/screens/screen_cbe_send_money_clean.png',
   '/screens/screen_send_money_phone.png',
-  '/screens/send_money_options_popup_rounded.png',
-  '/screens/home_bottom_nav.png',
   '/screens/receipt_page.png',
   '/screens/confirm_pin_page.png',
   '/screens/screen_transfer_pin_clean.png',
