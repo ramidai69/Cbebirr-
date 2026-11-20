@@ -4,6 +4,7 @@ import React from 'react';
 
 interface CBEAuthenticSpinnerProps {
   size?: number; // overall width/height in px
+  cssSize?: string; // optional container-relative size (e.g. '100%', '10cqw')
   color?: string; // dot color (brand purple #8b278e)
   className?: string;
   speed?: number; // animation cycle duration in seconds
@@ -12,19 +13,18 @@ interface CBEAuthenticSpinnerProps {
 
 export default function CBEAuthenticSpinner({
   size = 38,
+  cssSize,
   color = '#8b278e',
   className = '',
   speed = 0.85,
   dotCount = 8,
 }: CBEAuthenticSpinnerProps) {
-  // Dot diameter proportional to spinner size (matches CBEBirr authentic dot chaser)
-  const dotDiameter = Math.max(4, Math.round(size * 0.19));
-  const radius = Math.round(size * 0.36);
+  const dim = cssSize || `${size}px`;
 
   return (
     <div
       className={`relative inline-flex items-center justify-center select-none pointer-events-none ${className}`}
-      style={{ width: `${size}px`, height: `${size}px` }}
+      style={{ width: dim, height: dim }}
       aria-label="Loading..."
       role="status"
     >
@@ -38,11 +38,11 @@ export default function CBEAuthenticSpinner({
             key={index}
             className="absolute origin-center flex items-center justify-center pointer-events-none select-none"
             style={{
-              width: `${dotDiameter}px`,
-              height: `${dotDiameter}px`,
+              width: '19%',
+              height: '19%',
               top: '50%',
               left: '50%',
-              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-${radius}px)`,
+              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-189.5%)`,
             }}
           >
             <span
@@ -60,3 +60,4 @@ export default function CBEAuthenticSpinner({
     </div>
   );
 }
+

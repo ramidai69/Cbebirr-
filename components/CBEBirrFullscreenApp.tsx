@@ -3595,9 +3595,11 @@ export default function CBEBirrFullscreenApp() {
     };
 
     const applyStableDimensions = (w: number, h: number) => {
-      const isPortraitOrMobileViewport = w <= Math.max(768, h * 0.92);
-      const frameW = isPortraitOrMobileViewport ? w : Math.min(w, Math.round(h * 0.62));
-      const frameH = h;
+      const BASE_W = 720;
+      const BASE_H = 1527;
+      const scale = Math.min(w / BASE_W, h / BASE_H);
+      const frameW = Math.max(1, Math.round(BASE_W * scale * 100) / 100);
+      const frameH = Math.max(1, Math.round(BASE_H * scale * 100) / 100);
       document.documentElement.style.setProperty('--stable-app-height', `${h}px`);
       document.documentElement.style.setProperty('--stable-app-width', `${w}px`);
       document.documentElement.style.setProperty('--cbe-frame-w', `${frameW}px`);
@@ -3662,6 +3664,11 @@ export default function CBEBirrFullscreenApp() {
       setTimeout(resetViewportScroll, 380);
     };
 
+    const handleVisualViewportResize = () => {
+      measureHeight();
+      scheduleScrollLock();
+    };
+
     const handleOrientation = () => {
       setTimeout(measureHeight, 150);
       setTimeout(measureHeight, 350);
@@ -3673,11 +3680,12 @@ export default function CBEBirrFullscreenApp() {
     window.addEventListener('scroll', resetViewportScroll, { passive: true });
     document.addEventListener('focusin', scheduleScrollLock);
     document.addEventListener('focusout', scheduleScrollLock);
+    document.addEventListener('fullscreenchange', measureHeight);
     window.addEventListener('orientationchange', handleOrientation);
 
     const vv = window.visualViewport;
     if (vv) {
-      vv.addEventListener('resize', scheduleScrollLock);
+      vv.addEventListener('resize', handleVisualViewportResize);
       vv.addEventListener('scroll', resetViewportScroll);
     }
 
@@ -3686,9 +3694,10 @@ export default function CBEBirrFullscreenApp() {
       window.removeEventListener('scroll', resetViewportScroll);
       document.removeEventListener('focusin', scheduleScrollLock);
       document.removeEventListener('focusout', scheduleScrollLock);
+      document.removeEventListener('fullscreenchange', measureHeight);
       window.removeEventListener('orientationchange', handleOrientation);
       if (vv) {
-        vv.removeEventListener('resize', scheduleScrollLock);
+        vv.removeEventListener('resize', handleVisualViewportResize);
         vv.removeEventListener('scroll', resetViewportScroll);
       }
     };
@@ -6109,12 +6118,16 @@ export default function CBEBirrFullscreenApp() {
         showOwnerDashboard ? 'bg-[#0e1621]' : 'bg-[#f3f4f6]'
       }`}
     >
-      {/* True 4-Side Adaptive Fullscreen App Canvas (Zero black sidebars, zero aspect stretching) */}
+      {/* True 4-Side Proportional App Canvas (All 4 sides grow and shrink equally, zero added bands) */}
       <div
         ref={innerFrameRef}
         style={{
-          width: showOwnerDashboard ? 'var(--stable-app-width, 100vw)' : 'var(--cbe-frame-w, 100vw)',
-          height: 'var(--cbe-frame-h, var(--stable-app-height, 100vh))',
+          width: showOwnerDashboard
+            ? 'var(--stable-app-width, 100vw)'
+            : 'var(--cbe-frame-w, min(100vw, calc(100vh * 720 / 1527)))',
+          height: showOwnerDashboard
+            ? 'var(--stable-app-height, 100vh)'
+            : 'var(--cbe-frame-h, min(100vh, calc(100vw * 1527 / 720)))',
           flexShrink: 0,
           containerType: 'inline-size',
         }}
@@ -6802,7 +6815,7 @@ export default function CBEBirrFullscreenApp() {
               onClick={() => setSplashStep(2)}
               className="absolute inset-0 w-full h-full cursor-pointer bg-white"
             >
-              <ProportionalScreenStage align="center" bodyColor="#ffffff">
+              <ProportionalScreenStage align="center">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src="/screens/screen_1_splash.png"
@@ -6825,12 +6838,12 @@ export default function CBEBirrFullscreenApp() {
               onClick={() => setCurrentStep(2)}
               className="absolute inset-0 w-full h-full cursor-pointer bg-white"
             >
-              <ProportionalScreenStage align="center" bodyColor="#ffffff">
+              <ProportionalScreenStage align="center">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src="/screens/screen_splash_2.png"
                   alt="Welcome to CBEBirr"
-                  style={{ clipPath: 'inset(3px 0 0 0)' }}
+                  style={{ clipPath: 'inset(0.2% 0 0 0)' }}
                   className="w-full h-full pointer-events-none block"
                   draggable={false}
                 />
@@ -6846,18 +6859,9 @@ export default function CBEBirrFullscreenApp() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.06, ease: 'easeOut' }}
-              className="absolute inset-0 w-full h-full bg-[#ebebeb]"
+              className="absolute inset-0 w-full h-full bg-white"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#ebebeb"
-                leftTopBandColor="#ececec"
-                leftTopBandEndPct={85}
-                rightTopBandColor="#8c288e"
-                rightTopBandEndPct={23.05}
-                bottomBandColor="#d3d3d3"
-                bottomBandStartPct={94.5}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Underlying exact Phone Number PNG */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -7021,9 +7025,9 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center z-30 pointer-events-auto"
                   >
-                    <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
+                    <div className="relative w-[10cqw] h-[10cqw] flex items-center justify-center pointer-events-none select-none">
                       {/* Authentic CBE dots turning on & off sequentially in turn (chaser animation) */}
-                      <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                      <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                     </div>
                   </motion.div>
                 )}
@@ -7042,16 +7046,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#ccc9cd] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#ccc9cd"
-                leftTopBandColor="#e0e0e0"
-                leftTopBandEndPct={8.91}
-                rightTopBandColor="#8f3a90"
-                rightTopBandEndPct={8.91}
-                bottomBandColor="#d1cfcf"
-                bottomBandStartPct={72}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Underlying exact PIN Screen PNG */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -8826,12 +8821,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#eeeeee"
-                topBandColor="#8c288e"
-                topBandEndPct={6.88}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Entire Send Money Screen PNG (screen_cbe_send_money_clean.png) */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -9146,15 +9136,15 @@ export default function CBEBirrFullscreenApp() {
                     className="fixed inset-0 z-[9999] w-screen h-screen bg-[#7a1c7d] flex items-center justify-center pointer-events-auto select-none"
                   >
                     <div
-                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center p-4"
+                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center"
                       style={{
-                        width: '92px',
-                        height: '92px',
+                        width: 'min(22vw, 22vh)',
+                        height: 'min(22vw, 22vh)',
                       }}
                     >
-                      <div className="relative w-10 h-10 flex items-center justify-center pointer-events-none select-none">
+                      <div className="relative w-[52%] h-[52%] flex items-center justify-center pointer-events-none select-none">
                         {/* Authentic CBE dots turning on & off sequentially in turn (chaser animation, matching non-USSD loading speed) */}
-                        <CBEAuthenticSpinner size={40} color="#8b278e" speed={0.95} />
+                        <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                       </div>
                     </div>
                   </motion.div>
@@ -9482,10 +9472,7 @@ export default function CBEBirrFullscreenApp() {
               ) : (
                 /* ORIGINAL CLEAN TRANSFER PIN SCREEN FOR CBE SEND MONEY & PHONE NUMBER */
                 <ProportionalScreenStage
-                  align="top"
-                  bodyColor="#d1cfcf"
-                  topBandColor="#8f3a90"
-                  topBandEndPct={6.88}
+                  align="center"
                   className="select-none"
                 >
                   {/* Underlying exact clean Transfer PIN Screen PNG */}
@@ -9889,12 +9876,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#ffffff] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#ffffff"
-                topBandColor="#8c288e"
-                topBandEndPct={17.55}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Entire Receipt Screen PNG (receipt_page.png) */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -10124,8 +10106,8 @@ export default function CBEBirrFullscreenApp() {
                       }}
                       className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center"
                     >
-                      <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
-                        <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                      <div className="relative w-[10cqw] h-[10cqw] flex items-center justify-center pointer-events-none select-none">
+                        <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                       </div>
                     </motion.div>
                   </div>
@@ -10690,10 +10672,10 @@ export default function CBEBirrFullscreenApp() {
                   setOfficialReceiptBackStep(10);
                   setCurrentStep(9); // Opens Official Receipt (Step 9) per user request
                 }}
-                className="absolute bottom-6 right-5 w-[88px] h-[88px] bg-[#7a1c7d] hover:bg-[#68146a] active:scale-95 text-white rounded-2xl shadow-2xl flex flex-col items-center justify-center space-y-1 cursor-pointer z-40 transition-all border border-purple-300/30"
+                className="absolute bottom-[4.5cqw] right-[4.5cqw] w-[22cqw] h-[22cqw] bg-[#7a1c7d] hover:bg-[#68146a] active:scale-95 text-white rounded-[4cqw] shadow-2xl flex flex-col items-center justify-center space-y-[1cqw] cursor-pointer z-40 transition-all border border-purple-300/30"
                 aria-label="Get Receipt"
               >
-                <Receipt className="w-7 h-7 text-white" strokeWidth={2.2} />
+                <Receipt style={{ width: '7cqw', height: '7cqw' }} className="text-white" strokeWidth={2.2} />
                 <span className="text-[2.45cqw] font-bold text-white tracking-wide">
                   Get Receipt
                 </span>
@@ -10963,14 +10945,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#e0e0e0"
-                topBandColor="#8c288e"
-                topBandEndPct={10.02}
-                bottomBandColor="#8c288e"
-                bottomBandStartPct={91.42}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Full Screen High-Fidelity CBEBeje PNG */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -11215,14 +11190,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#e0e0e0] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#e0e0e0"
-                topBandColor="#8c288e"
-                topBandEndPct={6.88}
-                bottomBandColor="#8c288e"
-                bottomBandStartPct={91.42}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Full Screen High-Fidelity Mini Apps PNG */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -11604,12 +11572,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#eeeeee"
-                topBandColor="#8c288e"
-                topBandEndPct={6.88}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Underlying Base Image (Screenshot_20261105-141425.png) */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -11913,8 +11876,8 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center z-50 pointer-events-auto"
                   >
-                    <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
-                      <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                    <div className="relative w-[10cqw] h-[10cqw] flex items-center justify-center pointer-events-none select-none">
+                      <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                     </div>
                   </motion.div>
                 )}
@@ -11939,10 +11902,14 @@ export default function CBEBirrFullscreenApp() {
                     className="fixed inset-0 z-[9999] w-screen h-screen bg-[#7a1c7d] flex items-center justify-center pointer-events-auto select-none"
                   >
                     <div
-                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center p-4 w-[19cqw] h-[19cqw]"
+                      className="bg-white rounded-2xl shadow-[0_8px_32px_rgba(0,0,0,0.28)] border border-black/[0.05] flex items-center justify-center"
+                      style={{
+                        width: 'min(22vw, 22vh)',
+                        height: 'min(22vw, 22vh)',
+                      }}
                     >
-                      <div className="relative w-10 h-10 flex items-center justify-center pointer-events-none select-none">
-                        <CBEAuthenticSpinner size={40} color="#8b278e" speed={0.95} />
+                      <div className="relative w-[52%] h-[52%] flex items-center justify-center pointer-events-none select-none">
+                        <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                       </div>
                     </div>
                   </motion.div>
@@ -11977,12 +11944,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                align="top"
-                bodyColor="#eeeeee"
-                topBandColor="#8c288e"
-                topBandEndPct={6.88}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Entire Bank Transfer Base Screen PNG (screen_bank_transfer_base.png) */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -12257,8 +12219,8 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center z-50 pointer-events-auto"
                   >
-                    <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
-                      <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                    <div className="relative w-[10cqw] h-[10cqw] flex items-center justify-center pointer-events-none select-none">
+                      <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                     </div>
                   </motion.div>
                 )}
@@ -12384,14 +12346,7 @@ export default function CBEBirrFullscreenApp() {
               transition={{ duration: 0.06, ease: 'easeOut' }}
               className="absolute inset-0 w-full h-full bg-[#eeeeee] flex flex-col overflow-hidden select-none"
             >
-              <ProportionalScreenStage
-                ratioW={604}
-                ratioH={1280}
-                align="top"
-                bodyColor="#eeeeee"
-                topBandColor="#8c288e"
-                topBandEndPct={6.88}
-              >
+              <ProportionalScreenStage align="center">
                 {/* Entire Wallet Transfer Base Screen PNG (screen_wallet_transfer_base_clean.png) */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -12666,8 +12621,8 @@ export default function CBEBirrFullscreenApp() {
                     }}
                     className="bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,0.18)] border border-black/[0.04] flex items-center justify-center z-50 pointer-events-auto"
                   >
-                    <div className="relative w-9 h-9 flex items-center justify-center pointer-events-none select-none">
-                      <CBEAuthenticSpinner size={36} color="#8b278e" speed={0.95} />
+                    <div className="relative w-[10cqw] h-[10cqw] flex items-center justify-center pointer-events-none select-none">
+                      <CBEAuthenticSpinner cssSize="100%" color="#8b278e" speed={0.95} />
                     </div>
                   </motion.div>
                 )}
