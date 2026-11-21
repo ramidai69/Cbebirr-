@@ -844,24 +844,37 @@ export async function pushSupportUssdResponse(
 
 // ---------- Owner Wi-Fi VoIP Calling System Helpers ----------
 
+export async function fetchCallSessionDetailed(
+  deviceId: string,
+  asOperator = false
+): Promise<{ ok: boolean; callSession: CallSession | null }> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  try {
+    const res = await fetchWithTimeout(
+      `${baseUrl}/api/owner/call?deviceId=${encodeURIComponent(deviceId)}`,
+      {
+        method: 'GET',
+        headers: asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId },
+        cache: 'no-store',
+      },
+      4500
+    );
+    if (!res.ok) return { ok: false, callSession: null };
+    const data = await res.json().catch(() => null);
+    if (!data?.success) return { ok: false, callSession: null };
+    return { ok: true, callSession: data.callSession || null };
+  } catch {
+    return { ok: false, callSession: null };
+  }
+}
+
 export async function fetchCallSession(
   deviceId: string,
   asOperator = false
 ): Promise<CallSession | null> {
-  const baseUrl = getOwnerApiBaseUrl();
-  const myId = getOrCreateOwnerDeviceId();
-  const res = await fetchWithTimeout(
-    `${baseUrl}/api/owner/call?deviceId=${encodeURIComponent(deviceId)}`,
-    {
-      method: 'GET',
-      headers: asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId },
-      cache: 'no-store',
-    },
-    4000
-  );
-  if (!res.ok) return null;
-  const data = await res.json().catch(() => null);
-  return data?.callSession || null;
+  const res = await fetchCallSessionDetailed(deviceId, asOperator);
+  return res.callSession;
 }
 
 export async function startWifiCall(
@@ -956,7 +969,8 @@ export async function declineWifiCall(deviceId: string): Promise<CallSession | n
 
 export async function endWifiCall(
   deviceId: string,
-  asOperator: boolean
+  asOperator: boolean,
+  reason: 'ended' | 'missed' = 'ended'
 ): Promise<CallSession | null> {
   const baseUrl = getOwnerApiBaseUrl();
   const myId = getOrCreateOwnerDeviceId();
@@ -969,7 +983,8 @@ export async function endWifiCall(
         ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
       },
       body: JSON.stringify({
-        action: 'end',
+        action: reason === 'missed' ? 'miss' : 'end',
+        reason,
         deviceId,
         ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
       }),

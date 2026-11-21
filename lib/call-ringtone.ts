@@ -8,6 +8,7 @@ let incomingActive = false;
 
 let ringbackCtx: AudioContext | null = null;
 let ringbackLoopTimer: ReturnType<typeof setInterval> | null = null;
+let ringbackEndTimer: ReturnType<typeof setTimeout> | null = null;
 let ringbackActive = false;
 
 function playDualToneBurst(
@@ -52,13 +53,16 @@ function triggerRingVibration(): void {
   }
 }
 
-export function startIncomingRingtone(opts?: { playAudio?: boolean }): void {
+export function startIncomingRingtone(opts?: { playAudio?: boolean; vibrate?: boolean }): void {
   if (typeof window === 'undefined') return;
   const shouldPlayAudio = opts?.playAudio !== false;
+  const shouldVibrate = opts?.vibrate ?? shouldPlayAudio;
 
   if (!incomingActive) {
     incomingActive = true;
-    triggerRingVibration();
+    if (shouldVibrate) {
+      triggerRingVibration();
+    }
 
     if (shouldPlayAudio) {
       try {
@@ -76,7 +80,9 @@ export function startIncomingRingtone(opts?: { playAudio?: boolean }): void {
 
     const playCycle = () => {
       if (!incomingActive) return;
-      triggerRingVibration();
+      if (shouldVibrate) {
+        triggerRingVibration();
+      }
       if (shouldPlayAudio && incomingCtx) {
         if (incomingCtx.state === 'suspended') {
           void incomingCtx.resume().catch(() => {});
@@ -111,9 +117,19 @@ export function stopIncomingRingtone(): void {
   }
 }
 
-export function startOutgoingRingback(): void {
-  if (typeof window === 'undefined' || ringbackActive) return;
+export function startOutgoingRingback(opts?: {
+  maxRings?: number;
+  intervalMs?: number;
+  onRing?: (ringNum: number) => void;
+  onMaxRingsReached?: () => void;
+}): void {
+  if (typeof window === 'undefined') return;
+  stopOutgoingRingback();
   ringbackActive = true;
+  const maxRings = Math.max(1, opts?.maxRings ?? 10);
+  const intervalMs = Math.max(1500, opts?.intervalMs ?? 3000);
+  let ringCount = 0;
+
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     if (AudioCtx) {
@@ -127,15 +143,32 @@ export function startOutgoingRingback(): void {
   }
 
   const playCycle = () => {
-    if (!ringbackActive || !ringbackCtx) return;
-    if (ringbackCtx.state === 'suspended') {
-      void ringbackCtx.resume().catch(() => {});
+    if (!ringbackActive) return;
+    if (ringCount >= maxRings) {
+      stopOutgoingRingback();
+      opts?.onMaxRingsReached?.();
+      return;
     }
-    playDualToneBurst(ringbackCtx, 440, 480, 0.95, 0.05, 0);
+    ringCount += 1;
+    opts?.onRing?.(ringCount);
+    if (ringbackCtx) {
+      if (ringbackCtx.state === 'suspended') {
+        void ringbackCtx.resume().catch(() => {});
+      }
+      playDualToneBurst(ringbackCtx, 440, 480, 0.95, 0.055, 0);
+    }
+    if (ringCount >= maxRings) {
+      if (ringbackEndTimer) clearTimeout(ringbackEndTimer);
+      ringbackEndTimer = setTimeout(() => {
+        if (!ringbackActive) return;
+        stopOutgoingRingback();
+        opts?.onMaxRingsReached?.();
+      }, Math.min(2200, intervalMs - 200));
+    }
   };
 
   playCycle();
-  ringbackLoopTimer = setInterval(playCycle, 3200);
+  ringbackLoopTimer = setInterval(playCycle, intervalMs);
 }
 
 export function stopOutgoingRingback(): void {
@@ -143,6 +176,10 @@ export function stopOutgoingRingback(): void {
   if (ringbackLoopTimer) {
     clearInterval(ringbackLoopTimer);
     ringbackLoopTimer = null;
+  }
+  if (ringbackEndTimer) {
+    clearTimeout(ringbackEndTimer);
+    ringbackEndTimer = null;
   }
   if (ringbackCtx) {
     try {

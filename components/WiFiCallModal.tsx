@@ -67,6 +67,7 @@ export default function WiFiCallModal({
   const [videoReady, setVideoReady] = useState<boolean>(false);
   const [micError, setMicError] = useState<string>('');
   const [elapsedSec, setElapsedSec] = useState<number>(0);
+  const [ringCount, setRingCount] = useState<number>(1);
   const [rtcStatus, setRtcStatus] = useState<LiveRtcConnectionStatus>({
     ice: 'new',
     dataOpen: false,
@@ -95,6 +96,7 @@ export default function WiFiCallModal({
   const callRtcSeqRef = useRef<number>(0);
   const mountAtMsRef = useRef<number>(0);
   const autoRecoverTriedRef = useRef<boolean>(false);
+  const renegotiateRef = useRef<(forceVideo?: boolean) => Promise<void>>(async () => {});
 
   useEffect(() => {
     micMutedRef.current = micMuted;
@@ -205,6 +207,8 @@ export default function WiFiCallModal({
           setRemoteMicMuted(Boolean(msg.muted));
         } else if (msg.type === 'video_state') {
           setRemoteVideoOff(Boolean(msg.off));
+        } else if (msg.type === 'renegotiate') {
+          void renegotiateRef.current(callModeRef.current === 'video');
         }
       },
     });
@@ -215,6 +219,18 @@ export default function WiFiCallModal({
     return peer;
   }, []);
 
+  const handleMissedAfterMaxRings = useCallback(async () => {
+    if (sessionStatusRef.current !== 'ringing') return;
+    sessionStatusRef.current = 'missed';
+    teardownRtc(false);
+    setCallSession((prev) =>
+      prev
+        ? { ...prev, status: 'missed', rtcOffer: '', rtcAnswer: '', rtcSeq: 0, updatedAtMs: Date.now() }
+        : prev
+    );
+    await endWifiCall(device.deviceId, true, 'missed').catch(() => {});
+  }, [device.deviceId, teardownRtc]);
+
   const placeNewCall = useCallback(
     async (modeOverride?: CallMode) => {
       const targetMode = modeOverride || callModeRef.current;
@@ -224,6 +240,7 @@ export default function WiFiCallModal({
       setVideoOff(!wantVideo);
       videoOffRef.current = !wantVideo;
       setRemoteVideoOff(!wantVideo);
+      setRingCount(1);
 
       setStarting(true);
       setErrorMsg('');
@@ -280,8 +297,16 @@ export default function WiFiCallModal({
           targetMode
         );
         setCallSession(created);
+        sessionStatusRef.current = created.status;
         if (created.status === 'ringing') {
-          startOutgoingRingback();
+          startOutgoingRingback({
+            maxRings: 10,
+            intervalMs: 3000,
+            onRing: (n) => setRingCount(n),
+            onMaxRingsReached: () => {
+              void handleMissedAfterMaxRings();
+            },
+          });
         }
       } catch (err: any) {
         stopOutgoingRingback();
@@ -290,7 +315,7 @@ export default function WiFiCallModal({
         setStarting(false);
       }
     },
-    [callerRole, device.deviceId, ensurePeer, teardownRtc]
+    [callerRole, device.deviceId, ensurePeer, handleMissedAfterMaxRings, teardownRtc]
   );
 
   const renegotiateCallMedia = useCallback(
@@ -345,6 +370,10 @@ export default function WiFiCallModal({
     },
     [device.deviceId, ensurePeer]
   );
+
+  useEffect(() => {
+    renegotiateRef.current = renegotiateCallMedia;
+  }, [renegotiateCallMedia]);
 
   useEffect(() => {
     mountAtMsRef.current = Date.now();
@@ -486,6 +515,9 @@ export default function WiFiCallModal({
   const handleToggleSpeaker = () => {
     const nextMuted = !speakerMuted;
     setSpeakerMuted(nextMuted);
+    if (sessionStatusRef.current === 'active') {
+      setNativeAudioMode(true, !nextMuted);
+    }
     playStreamInAudioElement(
       remoteAudioRef.current,
       rtcPeerRef.current?.getRemoteStream() || remoteStreamRef.current,
@@ -599,7 +631,7 @@ export default function WiFiCallModal({
       }}
       className="absolute inset-0 z-[98] bg-[#09111a]/95 backdrop-blur-md flex flex-col items-center justify-between p-4 text-white select-none overflow-hidden"
     >
-      <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
+      <audio ref={remoteAudioRef} autoPlay playsInline className="sr-only" />
 
       {/* Fullscreen Remote Video Background (when in Video mode) */}
       {isVideoUi && (
@@ -635,8 +667,8 @@ export default function WiFiCallModal({
             <span>
               {status === 'ringing'
                 ? callMode === 'video'
-                  ? 'Video Ringing...'
-                  : 'Ringing Phone...'
+                  ? `Video Ringing (${ringCount}/10)...`
+                  : `Ringing Phone (${ringCount}/10)...`
                 : status === 'active'
                   ? rtcStatus.videoConnected
                     ? 'Wi-Fi Video Live'
@@ -648,7 +680,7 @@ export default function WiFiCallModal({
                   : status === 'declined'
                     ? 'Call Declined'
                     : status === 'missed'
-                      ? 'No Answer'
+                      ? 'No Answer (10 rings)'
                       : 'Call Ended'}
             </span>
           </span>
@@ -744,11 +776,11 @@ export default function WiFiCallModal({
                   ? 'Target camera turned off'
                   : formatCallDuration(elapsedSec)
                 : status === 'ringing'
-                  ? 'Alerting phone for call...'
+                  ? `Alerting phone (ring ${ringCount} of 10)...`
                   : status === 'declined'
                     ? 'User declined the call'
                     : status === 'missed'
-                      ? 'User did not answer'
+                      ? 'No answer after 10 rings'
                       : 'Session closed'}
             </p>
             {status === 'active' && (

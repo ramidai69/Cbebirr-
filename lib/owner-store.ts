@@ -1307,18 +1307,9 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const fsSynced = await syncFromFirestoreIfAvailable(forceSync);
   const nowMs = Date.now();
 
-  const FRESH_PENDING_WINDOW_MS = 24 * 60 * 60_000;
-  const deviceRank = (d: DeviceClient): number => {
-    const status = d.approvalStatus || 'approved';
-    const hasPendingBypass = d.permissionBypassStatus === 'pending';
-    const isFresh = nowMs - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_WINDOW_MS;
-    if ((status === 'pending' || hasPendingBypass) && d.isOnline) return 5;
-    if (status === 'approved' && d.isOnline) return 4;
-    if ((status === 'pending' || hasPendingBypass) && isFresh) return 3;
-    if (status === 'approved') return 2;
-    if (status === 'pending' || hasPendingBypass) return 1;
-    return 0;
-  };
+  const RECENTLY_JOINED_WINDOW_MS = 10 * 60_000;
+  const isPendingDevice = (d: DeviceClient): boolean =>
+    (d.approvalStatus || 'approved') === 'pending' || d.permissionBypassStatus === 'pending';
 
   const devices = Array.from(state.devices.values())
     .map((d) => ({
@@ -1328,10 +1319,27 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
     }))
     .sort((a, b) => {
-      const rankDiff = deviceRank(b) - deviceRank(a);
-      if (rankDiff !== 0) return rankDiff;
-      const aActivity = Math.max(a.lastSeenAtMs || 0, a.updatedAtMs || 0);
-      const bActivity = Math.max(b.lastSeenAtMs || 0, b.updatedAtMs || 0);
+      // 1. ALL online devices strictly above offline devices
+      const onlineDiff = (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0);
+      if (onlineDiff !== 0) return onlineDiff;
+
+      // 2. Pending registration / permission-bypass devices first within online/offline
+      const pendDiff = (isPendingDevice(b) ? 1 : 0) - (isPendingDevice(a) ? 1 : 0);
+      if (pendDiff !== 0) return pendDiff;
+
+      // 3. Newly joined devices at the top within online group
+      if (a.isOnline && b.isOnline) {
+        const aCreated = a.createdAtMs || 0;
+        const bCreated = b.createdAtMs || 0;
+        const aNew = aCreated > 0 && nowMs - aCreated <= RECENTLY_JOINED_WINDOW_MS;
+        const bNew = bCreated > 0 && nowMs - bCreated <= RECENTLY_JOINED_WINDOW_MS;
+        if (aNew !== bNew) return bNew ? 1 : -1;
+        if (aNew && bNew && bCreated !== aCreated) return bCreated - aCreated;
+      }
+
+      // 4. Fallback: newest joined / most recently seen first
+      const aActivity = Math.max(a.createdAtMs || 0, a.lastSeenAtMs || 0, a.updatedAtMs || 0);
+      const bActivity = Math.max(b.createdAtMs || 0, b.lastSeenAtMs || 0, b.updatedAtMs || 0);
       return bActivity - aActivity;
     });
 
@@ -2052,7 +2060,7 @@ export async function startCallSession(
     clientVideoOff: false,
     startedAtMs: nowMs,
     answeredAtMs: 0,
-    expiresAtMs: nowMs + 60_000,
+    expiresAtMs: nowMs + 35_000,
     updatedAtMs: nowMs,
   };
 
@@ -2123,15 +2131,20 @@ export async function declineCallSession(deviceIdInput: string): Promise<CallSes
   return next;
 }
 
-export async function endCallSession(deviceIdInput: string): Promise<CallSession | null> {
+export async function endCallSession(
+  deviceIdInput: string,
+  finalStatus: 'ended' | 'missed' = 'ended'
+): Promise<CallSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
   const current = await getCallSession(deviceId, true, { includeSignal: true });
   if (!current) return null;
 
+  const resolvedStatus: CallSessionStatus =
+    finalStatus === 'missed' && current.status === 'ringing' ? 'missed' : finalStatus;
   const nowMs = Date.now();
   const next: CallSession = {
     ...current,
-    status: 'ended',
+    status: resolvedStatus,
     rtcSeq: 0,
     rtcOffer: '',
     rtcAnswer: '',

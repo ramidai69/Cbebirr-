@@ -180,14 +180,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (action === 'end') {
+    if (action === 'end' || action === 'miss') {
       if (!isOp && !isClient) {
         return NextResponse.json(
           { success: false, error: 'Unauthorized' },
           { status: 401, headers: CORS_HEADERS }
         );
       }
-      const callSession = await endCallSession(deviceId);
+      const finalStatus = action === 'miss' || body.reason === 'missed' ? 'missed' : 'ended';
+      const callSession = await endCallSession(deviceId, finalStatus);
       return NextResponse.json(
         { success: true, callSession, serverTimeMs: Date.now() },
         { headers: CORS_HEADERS }

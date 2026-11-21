@@ -19,6 +19,7 @@ import android.widget.TextView;
 public class IncomingCallActivity extends Activity {
     private static volatile IncomingCallActivity currentOpen;
     private String callId = "";
+    private long startedAtMs = 0L;
     private String callMode = "audio";
     private boolean actionSent = false;
     private TextView callerNameView;
@@ -66,9 +67,11 @@ public class IncomingCallActivity extends Activity {
     private void readExtras(Intent intent) {
         if (intent == null) return;
         String id = intent.getStringExtra("callId");
+        long extraStarted = intent.getLongExtra("startedAtMs", 0L);
         String name = intent.getStringExtra("callerName");
         String mode = intent.getStringExtra("callMode");
         if (id != null) callId = id;
+        if (extraStarted > 0L) startedAtMs = extraStarted;
         callMode = "video".equals(mode) ? "video" : "audio";
         boolean isVideo = "video".equals(callMode);
         if (badgeView != null) {
@@ -160,9 +163,11 @@ public class IncomingCallActivity extends Activity {
             public void onClick(View v) {
                 if (actionSent) return;
                 actionSent = true;
+                CallForegroundService.stopRingingStatic(getApplicationContext());
                 Intent i = new Intent(IncomingCallActivity.this, CallForegroundService.class);
                 i.setAction(CallForegroundService.ACTION_DECLINE_CALL);
                 i.putExtra("callId", callId);
+                i.putExtra("startedAtMs", startedAtMs);
                 startServiceCompat(i);
                 finish();
             }
@@ -177,11 +182,13 @@ public class IncomingCallActivity extends Activity {
             public void onClick(View v) {
                 if (actionSent) return;
                 actionSent = true;
+                CallForegroundService.stopRingingStatic(getApplicationContext());
                 CallBridgeHelper.setAudioCallMode(getApplicationContext(), true, true);
                 CallBridgeHelper.setPendingCallAction(getApplicationContext(), callId, "answer", callMode);
                 Intent i = new Intent(IncomingCallActivity.this, CallForegroundService.class);
                 i.setAction(CallForegroundService.ACTION_ANSWER_CALL);
                 i.putExtra("callId", callId);
+                i.putExtra("startedAtMs", startedAtMs);
                 i.putExtra("callMode", callMode);
                 startServiceCompat(i);
                 finish();

@@ -4,7 +4,7 @@ import firebaseRulesPlugin from "@firebase/eslint-plugin-security-rules";
 
 export default defineConfig([
   {
-    ignores: [".next/**", "out/**", "android/**", "public/**", "dist/**"],
+    ignores: [".next/**", ".next-dev/**", "out/**", "android/**", "public/**", "dist/**"],
   },
   {
     extends: [...next],

@@ -118,6 +118,43 @@ public class CallBridgeHelper {
         }
     }
 
+    @SuppressWarnings("deprecation")
+    private static void applySpeakerRoutingCompat(AudioManager am, boolean active, boolean speakerOn) {
+        if (am == null) return;
+        if (active) {
+            am.setSpeakerphoneOn(speakerOn);
+        } else {
+            am.setSpeakerphoneOn(false);
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                if (!active) {
+                    AudioManager.class.getMethod("clearCommunicationDevice").invoke(am);
+                    return;
+                }
+                int desiredType = speakerOn ? 2 : 1; // AudioDeviceInfo.TYPE_BUILTIN_SPEAKER = 2, TYPE_BUILTIN_EARPIECE = 1
+                Object devicesObj = AudioManager.class.getMethod("getAvailableCommunicationDevices").invoke(am);
+                if (devicesObj instanceof List<?>) {
+                    List<?> devices = (List<?>) devicesObj;
+                    Object chosen = null;
+                    for (Object dev : devices) {
+                        if (dev == null) continue;
+                        Object t = dev.getClass().getMethod("getType").invoke(dev);
+                        if (t instanceof Integer && ((Integer) t).intValue() == desiredType) {
+                            chosen = dev;
+                            break;
+                        }
+                    }
+                    if (chosen != null) {
+                        Class<?> infoCls = Class.forName("android.media.AudioDeviceInfo");
+                        AudioManager.class.getMethod("setCommunicationDevice", infoCls).invoke(am, chosen);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     public static void setAudioCallMode(final Context ctx, final boolean active, final boolean speakerOn) {
         if (ctx == null) return;
         try {
@@ -142,18 +179,18 @@ public class CallBridgeHelper {
                 }
                 am.setMode(AudioManager.MODE_IN_COMMUNICATION);
                 am.setMicrophoneMute(false);
-                am.setSpeakerphoneOn(speakerOn);
+                applySpeakerRoutingCompat(am, true, speakerOn);
                 try {
                     int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
                     int curVol = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
-                    int targetMin = Math.max(1, (int) Math.round(maxVol * 0.75));
+                    int targetMin = Math.max(1, (int) Math.round(maxVol * 0.8));
                     if (curVol < targetMin) {
                         am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetMin, 0);
                     }
                 } catch (Throwable ignored) {
                 }
             } else {
-                am.setSpeakerphoneOn(false);
+                applySpeakerRoutingCompat(am, false, false);
                 am.setMode(AudioManager.MODE_NORMAL);
                 if (Build.VERSION.SDK_INT >= 26 && activeAudioFocusRequest != null) {
                     am.abandonAudioFocusRequest(activeAudioFocusRequest);
@@ -218,7 +255,7 @@ public class CallBridgeHelper {
             obj.put("callMode", "video".equals(callMode) ? "video" : "audio");
             obj.put("ts", System.currentTimeMillis());
             SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            prefs.edit().putString(KEY_PENDING_JSON, obj.toString()).apply();
+            prefs.edit().putString(KEY_PENDING_JSON, obj.toString()).commit();
         } catch (Throwable ignored) {
         }
     }

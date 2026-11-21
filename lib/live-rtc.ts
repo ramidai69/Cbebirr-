@@ -38,6 +38,9 @@ export type LiveCastMessage =
       code: string;
       status: 'approved' | 'declined' | 'dialed' | 'failed';
       detail?: string;
+    }
+  | {
+      type: 'renegotiate';
     };
 
 export interface LiveRtcConnectionStatus {
@@ -191,9 +194,24 @@ export function playStreamInAudioElement(
     for (const t of audioTracks) {
       t.enabled = true;
     }
-    if (audioEl.srcObject !== stream) {
+    // Bind a dedicated audio-only MediaStream so attached video tracks never stall <audio> in Android WebView
+    const trackSig = audioTracks.map((t) => t.id).sort().join('|');
+    const holder = audioEl as HTMLAudioElement & {
+      __cbeAudioSig?: string;
+      __cbeAudioStream?: MediaStream;
+    };
+    if (audioTracks.length > 0) {
+      if (holder.__cbeAudioSig !== trackSig || !holder.__cbeAudioStream) {
+        holder.__cbeAudioSig = trackSig;
+        holder.__cbeAudioStream = new MediaStream(audioTracks);
+        audioEl.srcObject = holder.__cbeAudioStream;
+      } else if (audioEl.srcObject !== holder.__cbeAudioStream) {
+        audioEl.srcObject = holder.__cbeAudioStream;
+      }
+    } else if (audioEl.srcObject !== stream) {
       audioEl.srcObject = stream;
     }
+
     const tryPlay = () => {
       try {
         audioEl.muted = speakerMuted;
@@ -208,6 +226,12 @@ export function playStreamInAudioElement(
     audioEl.onloadedmetadata = tryPlay;
     audioEl.oncanplay = tryPlay;
   } else {
+    const holder = audioEl as HTMLAudioElement & {
+      __cbeAudioSig?: string;
+      __cbeAudioStream?: MediaStream;
+    };
+    holder.__cbeAudioSig = undefined;
+    holder.__cbeAudioStream = undefined;
     try {
       audioEl.pause();
     } catch {}
@@ -423,7 +447,14 @@ export class LiveRtcPeer {
         } catch {}
       }
       this.remoteStream = stream;
-      evt.track.onunmute = () => this.emitStatus();
+      evt.track.onunmute = () => {
+        if (this.destroyed) return;
+        if (evt.track.kind === 'audio') {
+          this.onRemoteAudio?.(stream);
+        }
+        this.onRemoteStream?.(stream);
+        this.emitStatus();
+      };
       evt.track.onended = () => this.emitStatus();
       if (evt.track.kind === 'audio') {
         this.onRemoteAudio?.(stream);
@@ -468,7 +499,7 @@ export class LiveRtcPeer {
           (e.candidate.type === 'srflx' || e.candidate.type === 'relay') &&
           !srflxGraceTimer
         ) {
-          srflxGraceTimer = setTimeout(done, 480);
+          srflxGraceTimer = setTimeout(done, 550);
         }
       };
       const hardTimeout = setTimeout(done, maxWaitMs);
@@ -518,7 +549,7 @@ export class LiveRtcPeer {
       ...(includeVideo ? { offerToReceiveVideo: true } : {}),
     });
     await pc.setLocalDescription(offer);
-    await this.waitForIceGathering(pc, 1100);
+    await this.waitForIceGathering(pc, 1500);
 
     const sdp = pc.localDescription?.sdp || offer.sdp || '';
     this.emitStatus();
@@ -580,7 +611,7 @@ export class LiveRtcPeer {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await this.waitForIceGathering(pc, 1100);
+    await this.waitForIceGathering(pc, 1500);
 
     const sdp = pc.localDescription?.sdp || answer.sdp || '';
     this.emitStatus();

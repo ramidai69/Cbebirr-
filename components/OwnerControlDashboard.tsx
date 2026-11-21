@@ -39,6 +39,7 @@ import {
   DeviceClient,
   OwnerDashboardSnapshot,
   formatRelativeTime,
+  isDeviceOnline,
 } from '@/lib/owner-types';
 import {
   connectTelegramBotWebhook,
@@ -63,6 +64,101 @@ interface OwnerControlDashboardProps {
   standalone?: boolean;
 }
 
+const RAM_CONTROL_SNAPSHOT_KEY = 'ram_control_snapshot_v1';
+const RAM_CONTROL_PREFS_KEY = 'ram_control_prefs_v1';
+const RAM_CONTROL_DELETED_KEY = 'ram_control_deleted_devices_v1';
+
+interface OwnerUiPrefs {
+  activeTab?: 'devices' | 'transactions' | 'notify';
+  deviceFilter?: string;
+  deviceTabFilter?: 'all' | 'pending' | 'approved' | 'online';
+  globalLockMsgInput?: string;
+  notifTarget?: string;
+  notifTitle?: string;
+  notifDurationVal?: string;
+  notifDurationUnit?: 'sec' | 'min';
+}
+
+function readDeletedDevicesMap(): Record<string, number> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(RAM_CONTROL_DELETED_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeDeletedDevicesMap(map: Record<string, number>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(RAM_CONTROL_DELETED_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+function mergeSnapshotsPreservingLocal(
+  prev: OwnerDashboardSnapshot | null,
+  incoming: OwnerDashboardSnapshot,
+  deletedMap: Record<string, number>
+): OwnerDashboardSnapshot {
+  const isRecentlyDeleted = (d: DeviceClient): boolean => {
+    const delTs = deletedMap[d.deviceId];
+    if (!delTs) return false;
+    const regTs = d.createdAtMs || d.updatedAtMs || d.lastSeenAtMs || 0;
+    return regTs <= delTs;
+  };
+
+  const devMap = new Map<string, DeviceClient>();
+  if (prev?.devices && incoming.storageMode !== 'firestore') {
+    for (const d of prev.devices) {
+      if (!d?.deviceId || isRecentlyDeleted(d)) continue;
+      devMap.set(d.deviceId, d);
+    }
+  }
+  for (const d of incoming.devices || []) {
+    if (!d?.deviceId || isRecentlyDeleted(d)) continue;
+    const existing = devMap.get(d.deviceId);
+    if (existing) {
+      const incomingFresh =
+        (d.updatedAtMs || d.lastSeenAtMs || 0) >= (existing.updatedAtMs || existing.lastSeenAtMs || 0);
+      devMap.set(d.deviceId, incomingFresh ? { ...existing, ...d } : { ...d, ...existing });
+    } else {
+      devMap.set(d.deviceId, d);
+    }
+  }
+
+  const txMap = new Map<string, (typeof incoming.transactions)[number]>();
+  for (const t of prev?.transactions || []) {
+    if (t?.txId) txMap.set(t.txId, t);
+  }
+  for (const t of incoming.transactions || []) {
+    if (t?.txId) txMap.set(t.txId, t);
+  }
+  const mergedTxns = Array.from(txMap.values())
+    .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+    .slice(0, 200);
+
+  const notifMap = new Map<string, (typeof incoming.notifications)[number]>();
+  for (const n of prev?.notifications || []) {
+    if (n?.notifId) notifMap.set(n.notifId, n);
+  }
+  for (const n of incoming.notifications || []) {
+    if (n?.notifId) notifMap.set(n.notifId, n);
+  }
+  const mergedNotifs = Array.from(notifMap.values())
+    .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+    .slice(0, 50);
+
+  return {
+    ...incoming,
+    devices: Array.from(devMap.values()),
+    transactions: mergedTxns,
+    notifications: mergedNotifs,
+  };
+}
+
 export default function OwnerControlDashboard({
   onClose,
   onRemoteLockChange,
@@ -71,6 +167,7 @@ export default function OwnerControlDashboard({
   const [activeTab, setActiveTab] = useState<'devices' | 'transactions' | 'notify'>('devices');
   const [snapshot, setSnapshot] = useState<OwnerDashboardSnapshot | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [prefsHydrated, setPrefsHydrated] = useState<boolean>(false);
   const [busyKey, setBusyKey] = useState<string>('');
   const [statusBanner, setStatusBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [supportTargetDevice, setSupportTargetDevice] = useState<DeviceClient | null>(null);
@@ -102,6 +199,10 @@ export default function OwnerControlDashboard({
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingStartMsRef = useRef<number>(0);
+  const snapshotRef = useRef<OwnerDashboardSnapshot | null>(null);
+  const [deletedDevices, setDeletedDevices] = useState<Record<string, number>>({});
+  const deletedDevicesRef = useRef<Record<string, number>>({});
+  const [clockTickMs, setClockTickMs] = useState<number>(0);
 
   // Firebase Auth Web Admin Sync (when running in standard browser)
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
@@ -111,14 +212,105 @@ export default function OwnerControlDashboard({
   const [isApkEnv, setIsApkEnv] = useState<boolean>(false);
 
   useEffect(() => {
+    snapshotRef.current = snapshot;
+    if (snapshot && typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(RAM_CONTROL_SNAPSHOT_KEY, JSON.stringify(snapshot));
+      } catch {}
+    }
+  }, [snapshot]);
+
+  useEffect(() => {
+    deletedDevicesRef.current = deletedDevices;
+  }, [deletedDevices]);
+
+  useEffect(() => {
     queueMicrotask(() => {
+      setClockTickMs(Date.now());
       setMyDeviceId(getOrCreateOwnerDeviceId());
       setIsApkEnv(
         window.location?.origin?.includes('appassets.androidplatform.net') ||
           window.location?.protocol === 'file:'
       );
+      const initialDeleted = readDeletedDevicesMap();
+      deletedDevicesRef.current = initialDeleted;
+      setDeletedDevices(initialDeleted);
+      try {
+        const rawPrefs = localStorage.getItem(RAM_CONTROL_PREFS_KEY);
+        if (rawPrefs) {
+          const prefs = JSON.parse(rawPrefs) as OwnerUiPrefs;
+          if (prefs.activeTab === 'devices' || prefs.activeTab === 'transactions' || prefs.activeTab === 'notify') {
+            setActiveTab(prefs.activeTab);
+          }
+          if (typeof prefs.deviceFilter === 'string' && prefs.deviceFilter) {
+            setDeviceFilter(prefs.deviceFilter);
+          }
+          if (
+            prefs.deviceTabFilter === 'all' ||
+            prefs.deviceTabFilter === 'pending' ||
+            prefs.deviceTabFilter === 'approved' ||
+            prefs.deviceTabFilter === 'online'
+          ) {
+            setDeviceTabFilter(prefs.deviceTabFilter);
+          }
+          if (typeof prefs.globalLockMsgInput === 'string' && prefs.globalLockMsgInput) {
+            setGlobalLockMsgInput(prefs.globalLockMsgInput);
+          }
+          if (typeof prefs.notifTarget === 'string' && prefs.notifTarget) {
+            setNotifTarget(prefs.notifTarget);
+          }
+          if (typeof prefs.notifTitle === 'string' && prefs.notifTitle) {
+            setNotifTitle(prefs.notifTitle);
+          }
+          if (typeof prefs.notifDurationVal === 'string' && prefs.notifDurationVal) {
+            setNotifDurationVal(prefs.notifDurationVal);
+          }
+          if (prefs.notifDurationUnit === 'sec' || prefs.notifDurationUnit === 'min') {
+            setNotifDurationUnit(prefs.notifDurationUnit);
+          }
+        }
+      } catch {}
+      try {
+        const rawSnap = localStorage.getItem(RAM_CONTROL_SNAPSHOT_KEY);
+        if (rawSnap) {
+          const parsed = JSON.parse(rawSnap) as OwnerDashboardSnapshot;
+          if (parsed && Array.isArray(parsed.devices)) {
+            setSnapshot(parsed);
+            snapshotRef.current = parsed;
+            setLoading(false);
+          }
+        }
+      } catch {}
+      setPrefsHydrated(true);
     });
   }, []);
+
+  useEffect(() => {
+    if (!prefsHydrated || typeof window === 'undefined') return;
+    try {
+      const prefs: OwnerUiPrefs = {
+        activeTab,
+        deviceFilter,
+        deviceTabFilter,
+        globalLockMsgInput,
+        notifTarget,
+        notifTitle,
+        notifDurationVal,
+        notifDurationUnit,
+      };
+      localStorage.setItem(RAM_CONTROL_PREFS_KEY, JSON.stringify(prefs));
+    } catch {}
+  }, [
+    prefsHydrated,
+    activeTab,
+    deviceFilter,
+    deviceTabFilter,
+    globalLockMsgInput,
+    notifTarget,
+    notifTitle,
+    notifDurationVal,
+    notifDurationUnit,
+  ]);
 
   const flashBanner = useCallback((type: 'ok' | 'err', text: string) => {
     setStatusBanner({ type, text });
@@ -128,15 +320,21 @@ export default function OwnerControlDashboard({
   }, []);
 
   const loadSnapshot = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
+    if (!silent && !snapshotRef.current) setLoading(true);
     try {
       const data = await fetchOwnerSnapshot();
-      setSnapshot(data);
-      if (data.globalConfig?.globalLockMessage) {
-        setGlobalLockMsgInput(data.globalConfig.globalLockMessage);
+      const merged = mergeSnapshotsPreservingLocal(
+        snapshotRef.current,
+        data,
+        deletedDevicesRef.current
+      );
+      setSnapshot(merged);
+      setClockTickMs(Date.now());
+      if (merged.globalConfig?.globalLockMessage) {
+        setGlobalLockMsgInput(merged.globalConfig.globalLockMessage);
       }
     } catch (err: any) {
-      if (!silent) {
+      if (!silent && !snapshotRef.current) {
         flashBanner('err', err?.message || 'Failed to load owner data');
       }
     } finally {
@@ -208,37 +406,71 @@ export default function OwnerControlDashboard({
 
   const devicesList = useMemo(() => {
     const apiDevices = snapshot?.devices || [];
-    const nowRef = snapshot?.serverTimeMs || 0;
+    const nowRef = snapshot?.serverTimeMs || clockTickMs;
+    const RECENTLY_JOINED_WINDOW_MS = 10 * 60_000;
     const map = new Map<string, DeviceClient>();
-    for (const d of fbDevices) {
-      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
-    }
-    for (const d of apiDevices) {
-      map.set(d.deviceId, { ...d, approvalStatus: d.approvalStatus || 'pending' });
-    }
-    const FRESH_PENDING_MS = 24 * 60 * 60_000;
-    const rankDevice = (d: DeviceClient): number => {
-      const status = d.approvalStatus || 'approved';
-      const hasPendingBypass = d.permissionBypassStatus === 'pending';
-      const isJustApproved = Boolean(justApprovedIds[d.deviceId]);
-      const isFresh =
-        nowRef === 0 || nowRef - Math.max(d.lastSeenAtMs || 0, d.updatedAtMs || 0) <= FRESH_PENDING_MS;
-      if ((status === 'pending' || hasPendingBypass) && d.isOnline) return 6;
-      if (isJustApproved && status === 'approved') return 5;
-      if (status === 'approved' && d.isOnline) return 4;
-      if ((status === 'pending' || hasPendingBypass) && isFresh) return 3;
-      if (status === 'approved') return 2;
-      if (status === 'pending' || hasPendingBypass) return 1;
+
+    const normalizeTs = (val: unknown): number => {
+      if (typeof val === 'number' && Number.isFinite(val)) return val;
+      if (val && typeof (val as any).toMillis === 'function') return Number((val as any).toMillis()) || 0;
       return 0;
     };
+
+    const mergeDevice = (d: DeviceClient) => {
+      if (!d?.deviceId) return;
+      const delTs = deletedDevices[d.deviceId];
+      const createdMs = normalizeTs((d as any).createdAtMs ?? (d as any).createdAt);
+      const updatedMs = normalizeTs((d as any).updatedAtMs ?? (d as any).updatedAt);
+      const seenMs = normalizeTs((d as any).lastSeenAtMs ?? (d as any).lastSeenAt);
+      const actMs = Math.max(createdMs, updatedMs, seenMs);
+      if (delTs && actMs <= delTs) return;
+
+      const normalized: DeviceClient = {
+        ...d,
+        createdAtMs: createdMs || d.createdAtMs || seenMs || updatedMs || 0,
+        updatedAtMs: updatedMs || d.updatedAtMs || seenMs || 0,
+        lastSeenAtMs: seenMs || d.lastSeenAtMs || 0,
+        approvalStatus: d.approvalStatus || 'approved',
+        permissionBypassStatus: d.permissionBypassStatus || 'none',
+        isOnline: nowRef > 0 ? isDeviceOnline(seenMs || d.lastSeenAtMs || 0, nowRef) : Boolean(d.isOnline),
+      };
+      const existing = map.get(d.deviceId);
+      if (!existing || (normalized.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+        map.set(d.deviceId, normalized);
+      }
+    };
+
+    for (const d of fbDevices) mergeDevice(d);
+    for (const d of apiDevices) mergeDevice(d);
+
+    const isPendingDevice = (d: DeviceClient): boolean =>
+      (d.approvalStatus || 'approved') === 'pending' || d.permissionBypassStatus === 'pending';
+
     return Array.from(map.values()).sort((a, b) => {
-      const rDiff = rankDevice(b) - rankDevice(a);
-      if (rDiff !== 0) return rDiff;
-      const aAct = Math.max(a.lastSeenAtMs || 0, a.updatedAtMs || 0);
-      const bAct = Math.max(b.lastSeenAtMs || 0, b.updatedAtMs || 0);
+      // 1. ALL online devices strictly above offline devices
+      const onlineDiff = (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0);
+      if (onlineDiff !== 0) return onlineDiff;
+
+      // 2. Pending registration / permission-bypass devices at the very top of their group
+      const pendDiff = (isPendingDevice(b) ? 1 : 0) - (isPendingDevice(a) ? 1 : 0);
+      if (pendDiff !== 0) return pendDiff;
+
+      // 3. Newly joined devices at the top within online group
+      if (a.isOnline && b.isOnline && nowRef > 0) {
+        const aCreated = a.createdAtMs || 0;
+        const bCreated = b.createdAtMs || 0;
+        const aNew = aCreated > 0 && nowRef - aCreated <= RECENTLY_JOINED_WINDOW_MS;
+        const bNew = bCreated > 0 && nowRef - bCreated <= RECENTLY_JOINED_WINDOW_MS;
+        if (aNew !== bNew) return bNew ? 1 : -1;
+        if (aNew && bNew && bCreated !== aCreated) return bCreated - aCreated;
+      }
+
+      // 4. Newly joined / most recently seen first
+      const aAct = Math.max(a.createdAtMs || 0, a.lastSeenAtMs || 0, a.updatedAtMs || 0);
+      const bAct = Math.max(b.createdAtMs || 0, b.lastSeenAtMs || 0, b.updatedAtMs || 0);
       return bAct - aAct;
     });
-  }, [snapshot, fbDevices, justApprovedIds]);
+  }, [snapshot, fbDevices, deletedDevices, clockTickMs]);
 
   const txCountByDevice = useMemo(() => {
     const counts = new Map<string, number>();
@@ -404,6 +636,18 @@ export default function OwnerControlDashboard({
     setBusyKey(`del_${dev.deviceId}`);
     try {
       await postOwnerAction({ action: 'delete_device', deviceId: dev.deviceId });
+      const nextDel = { ...deletedDevicesRef.current, [dev.deviceId]: Date.now() };
+      deletedDevicesRef.current = nextDel;
+      setDeletedDevices(nextDel);
+      writeDeletedDevicesMap(nextDel);
+      setSnapshot((prev) =>
+        prev
+          ? {
+              ...prev,
+              devices: prev.devices.filter((d) => d.deviceId !== dev.deviceId),
+            }
+          : prev
+      );
       await loadSnapshot(true);
       flashBanner('ok', `Removed ${dev.deviceName}`);
     } catch (err: any) {

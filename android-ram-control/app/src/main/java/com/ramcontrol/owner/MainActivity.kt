@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
@@ -200,17 +201,39 @@ class MainActivity : AppCompatActivity() {
                         }
                         am.mode = AudioManager.MODE_IN_COMMUNICATION
                         am.isMicrophoneMute = false
+                        @Suppress("DEPRECATION")
                         am.isSpeakerphoneOn = speakerOn
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            try {
+                                val desiredType = if (speakerOn) {
+                                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                                } else {
+                                    AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                                }
+                                val target = am.availableCommunicationDevices.firstOrNull { it.type == desiredType }
+                                if (target != null) {
+                                    am.setCommunicationDevice(target)
+                                }
+                            } catch (_: Throwable) {
+                            }
+                        }
                         try {
                             val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
                             val curVol = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-                            val targetMin = kotlin.math.max(1, (maxVol * 0.75).toInt())
+                            val targetMin = kotlin.math.max(1, (maxVol * 0.8).toInt())
                             if (curVol < targetMin) {
                                 am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetMin, 0)
                             }
                         } catch (_: Throwable) {
                         }
                     } else {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            try {
+                                am.clearCommunicationDevice()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                        @Suppress("DEPRECATION")
                         am.isSpeakerphoneOn = false
                         am.mode = AudioManager.MODE_NORMAL
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

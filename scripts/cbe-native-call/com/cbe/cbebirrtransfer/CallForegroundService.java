@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
+import android.media.MediaPlayer;
 import android.media.Ringtone;
 import android.media.RingtoneManager;
 import android.net.Uri;
@@ -44,19 +45,38 @@ public class CallForegroundService extends Service {
     private static final int NOTIF_CALL_ID = 7002;
 
     private static volatile CallForegroundService instance;
+    private static volatile MediaPlayer activeMediaPlayer;
     private static volatile Ringtone activeRingtone;
     private static volatile Vibrator activeVibrator;
     private static volatile boolean ringingActive = false;
     private static volatile String activeCallId = "";
+    private static volatile long activeCallStartedAtMs = 0L;
     private static volatile String activeCallMode = "audio";
-    private static volatile String lastAnsweredCallId = "";
+    private static volatile String lastAnsweredCallKey = "";
     private static volatile long lastAnsweredAtMs = 0L;
-    private static volatile String lastDeclinedCallId = "";
+    private static volatile String lastDeclinedCallKey = "";
     private static volatile long lastDeclinedAtMs = 0L;
+    private static volatile String lastSuppressedCallKey = "";
+    private static volatile long lastSuppressedAtMs = 0L;
 
     private ScheduledExecutorService scheduler;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean pollInFlight = false;
+
+    private static String buildCallKey(String callId, long startedAtMs) {
+        if (callId == null || callId.isEmpty()) return "";
+        return startedAtMs > 0L ? (callId + "_" + startedAtMs) : callId;
+    }
+
+    private static boolean matchesCallKey(String trackedKey, String incomingKey, String callId, long startedAtMs) {
+        if (trackedKey == null || trackedKey.isEmpty() || callId == null || callId.isEmpty()) {
+            return false;
+        }
+        if (trackedKey.equals(incomingKey) || trackedKey.equals(callId)) {
+            return true;
+        }
+        return startedAtMs <= 0L && trackedKey.startsWith(callId + "_");
+    }
 
     @Override
     public void onCreate() {
@@ -75,20 +95,27 @@ public class CallForegroundService extends Service {
             String act = intent.getAction();
             String callId = intent.getStringExtra("callId");
             String resolvedCallId = (callId != null && !callId.isEmpty()) ? callId : activeCallId;
+            long extraStartedAt = intent.getLongExtra("startedAtMs", 0L);
+            long resolvedStartedAt = extraStartedAt > 0L ? extraStartedAt : activeCallStartedAtMs;
+            String resolvedCallKey = buildCallKey(resolvedCallId, resolvedStartedAt);
             String callModeExtra = intent.getStringExtra("callMode");
             String resolvedMode = "video".equals(callModeExtra) ? "video" : activeCallMode;
+
             if (ACTION_STOP_RING.equals(act)) {
+                markSuppressed(resolvedCallKey);
                 stopRingingInternal();
             } else if (ACTION_DECLINE_CALL.equals(act)) {
-                lastDeclinedCallId = resolvedCallId != null ? resolvedCallId : "";
+                lastDeclinedCallKey = resolvedCallKey;
                 lastDeclinedAtMs = System.currentTimeMillis();
+                markSuppressed(resolvedCallKey);
                 stopRingingInternal();
                 IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
                 CallBridgeHelper.setAudioCallMode(this, false, false);
                 sendCallActionToServerAsync("decline");
             } else if (ACTION_ANSWER_CALL.equals(act)) {
-                lastAnsweredCallId = resolvedCallId != null ? resolvedCallId : "";
+                lastAnsweredCallKey = resolvedCallKey;
                 lastAnsweredAtMs = System.currentTimeMillis();
+                markSuppressed(resolvedCallKey);
                 stopRingingInternal();
                 IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
                 CallBridgeHelper.setAudioCallMode(this, true, true);
@@ -103,6 +130,16 @@ public class CallForegroundService extends Service {
             }
         }
         return START_STICKY;
+    }
+
+    private static void markSuppressed(String callKey) {
+        if (callKey != null && !callKey.isEmpty()) {
+            lastSuppressedCallKey = callKey;
+            lastSuppressedAtMs = System.currentTimeMillis();
+        } else if (!activeCallId.isEmpty()) {
+            lastSuppressedCallKey = buildCallKey(activeCallId, activeCallStartedAtMs);
+            lastSuppressedAtMs = System.currentTimeMillis();
+        }
     }
 
     @Override
@@ -238,13 +275,14 @@ public class CallForegroundService extends Service {
 
             final String status = json.optString("status", "idle");
             final String callId = json.optString("callId", "");
+            final long startedAtMs = json.optLong("startedAtMs", 0L);
             final String callerName = json.optString("callerName", "Owner Wi-Fi Call");
             final String callMode = "video".equals(json.optString("callMode", "audio")) ? "video" : "audio";
 
             mainHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    handleServerCallStatus(status, callId, callerName, callMode);
+                    handleServerCallStatus(status, callId, startedAtMs, callerName, callMode);
                 }
             });
         } catch (Throwable ignored) {
@@ -259,31 +297,49 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void handleServerCallStatus(String status, String callId, String callerName, String callMode) {
+    private void handleServerCallStatus(
+        String status,
+        String callId,
+        long startedAtMs,
+        String callerName,
+        String callMode
+    ) {
         String resolvedMode = "video".equals(callMode) ? "video" : "audio";
+        String callKey = buildCallKey(callId, startedAtMs);
         long now = System.currentTimeMillis();
+
         if ("ringing".equals(status) && !callId.isEmpty()) {
-            boolean recentlyAnswered = callId.equals(lastAnsweredCallId) && (now - lastAnsweredAtMs) < 15000L;
-            boolean recentlyDeclined = callId.equals(lastDeclinedCallId) && (now - lastDeclinedAtMs) < 15000L;
-            if (recentlyAnswered || recentlyDeclined) {
+            boolean recentlyAnswered = matchesCallKey(lastAnsweredCallKey, callKey, callId, startedAtMs)
+                && (now - lastAnsweredAtMs) < 30000L;
+            boolean recentlyDeclined = matchesCallKey(lastDeclinedCallKey, callKey, callId, startedAtMs)
+                && (now - lastDeclinedAtMs) < 30000L;
+            boolean recentlySuppressed = matchesCallKey(lastSuppressedCallKey, callKey, callId, startedAtMs)
+                && (now - lastSuppressedAtMs) < 30000L;
+            if (recentlyAnswered || recentlyDeclined || recentlySuppressed) {
                 return;
             }
             activeCallMode = resolvedMode;
-            if (!ringingActive || !callId.equals(activeCallId)) {
+            boolean isSameActive = ringingActive
+                && callId.equals(activeCallId)
+                && (startedAtMs <= 0L || activeCallStartedAtMs <= 0L || startedAtMs == activeCallStartedAtMs);
+            if (!isSameActive) {
                 activeCallId = callId;
+                activeCallStartedAtMs = startedAtMs;
                 ringingActive = true;
                 startSystemRingtoneAndVibration();
-                showIncomingCallNotification(callId, callerName, resolvedMode);
-                launchIncomingCallScreen(callId, callerName, resolvedMode);
+                showIncomingCallNotification(callId, startedAtMs, callerName, resolvedMode);
+                launchIncomingCallScreen(callId, startedAtMs, callerName, resolvedMode);
             } else {
                 ensureRingtonePlaying();
             }
         } else {
-            if ("idle".equals(status) || "ended".equals(status)) {
-                lastAnsweredCallId = "";
+            if ("idle".equals(status) || "ended".equals(status) || "missed".equals(status) || "declined".equals(status)) {
+                lastAnsweredCallKey = "";
                 lastAnsweredAtMs = 0L;
-                lastDeclinedCallId = "";
+                lastDeclinedCallKey = "";
                 lastDeclinedAtMs = 0L;
+                lastSuppressedCallKey = "";
+                lastSuppressedAtMs = 0L;
             }
             if (ringingActive || !activeCallId.isEmpty()) {
                 String endedId = activeCallId;
@@ -294,16 +350,18 @@ public class CallForegroundService extends Service {
     }
 
     private void startSystemRingtoneAndVibration() {
-        try {
-            stopRingtoneAndVibOnly();
-            Uri ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
-            if (ringUri == null) {
-                ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
-            }
-            Ringtone r = RingtoneManager.getRingtone(this, ringUri);
-            if (r != null) {
+        stopRingtoneAndVibOnly();
+        Uri ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+        if (ringUri == null) {
+            ringUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+        }
+
+        boolean mediaStarted = false;
+        if (ringUri != null) {
+            try {
+                MediaPlayer mp = new MediaPlayer();
                 if (Build.VERSION.SDK_INT >= 21) {
-                    r.setAudioAttributes(
+                    mp.setAudioAttributes(
                         new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -312,15 +370,42 @@ public class CallForegroundService extends Service {
                 } else {
                     @SuppressWarnings("deprecation")
                     int st = AudioManager.STREAM_RING;
-                    r.setStreamType(st);
+                    mp.setAudioStreamType(st);
                 }
-                if (Build.VERSION.SDK_INT >= 28) {
-                    r.setLooping(true);
-                }
-                r.play();
-                activeRingtone = r;
+                mp.setDataSource(this, ringUri);
+                mp.setLooping(true);
+                mp.prepare();
+                mp.start();
+                activeMediaPlayer = mp;
+                mediaStarted = true;
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
+        }
+
+        if (!mediaStarted && ringUri != null) {
+            try {
+                Ringtone r = RingtoneManager.getRingtone(this, ringUri);
+                if (r != null) {
+                    if (Build.VERSION.SDK_INT >= 21) {
+                        r.setAudioAttributes(
+                            new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                .build()
+                        );
+                    } else {
+                        @SuppressWarnings("deprecation")
+                        int st = AudioManager.STREAM_RING;
+                        r.setStreamType(st);
+                    }
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        r.setLooping(true);
+                    }
+                    r.play();
+                    activeRingtone = r;
+                }
+            } catch (Throwable ignored) {
+            }
         }
 
         try {
@@ -342,6 +427,13 @@ public class CallForegroundService extends Service {
 
     private void ensureRingtonePlaying() {
         try {
+            MediaPlayer mp = activeMediaPlayer;
+            if (mp != null) {
+                if (!mp.isPlaying()) {
+                    mp.start();
+                }
+                return;
+            }
             Ringtone r = activeRingtone;
             if (r != null && !r.isPlaying()) {
                 r.play();
@@ -350,7 +442,19 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void stopRingtoneAndVibOnly() {
+    private static void stopRingtoneAndVibOnly() {
+        try {
+            MediaPlayer mp = activeMediaPlayer;
+            activeMediaPlayer = null;
+            if (mp != null) {
+                try {
+                    if (mp.isPlaying()) mp.stop();
+                } catch (Throwable ignored) {
+                }
+                mp.release();
+            }
+        } catch (Throwable ignored) {
+        }
         try {
             Ringtone r = activeRingtone;
             activeRingtone = null;
@@ -372,6 +476,7 @@ public class CallForegroundService extends Service {
     private void stopRingingInternal() {
         ringingActive = false;
         activeCallId = "";
+        activeCallStartedAtMs = 0L;
         activeCallMode = "audio";
         stopRingtoneAndVibOnly();
         try {
@@ -384,8 +489,11 @@ public class CallForegroundService extends Service {
     }
 
     public static void stopRingingStatic(Context ctx) {
+        markSuppressed(buildCallKey(activeCallId, activeCallStartedAtMs));
         CallForegroundService inst = instance;
         if (inst != null) {
+            stopRingtoneAndVibOnly();
+            ringingActive = false;
             inst.mainHandler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -394,22 +502,10 @@ public class CallForegroundService extends Service {
             });
             return;
         }
-        try {
-            if (activeRingtone != null) {
-                activeRingtone.stop();
-                activeRingtone = null;
-            }
-        } catch (Throwable ignored) {
-        }
-        try {
-            if (activeVibrator != null) {
-                activeVibrator.cancel();
-                activeVibrator = null;
-            }
-        } catch (Throwable ignored) {
-        }
+        stopRingtoneAndVibOnly();
         ringingActive = false;
         activeCallId = "";
+        activeCallStartedAtMs = 0L;
         activeCallMode = "audio";
         if (ctx != null) {
             try {
@@ -420,7 +516,12 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void showIncomingCallNotification(String callId, String callerName, String callMode) {
+    private void showIncomingCallNotification(
+        String callId,
+        long startedAtMs,
+        String callerName,
+        String callMode
+    ) {
         try {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return;
@@ -435,6 +536,7 @@ public class CallForegroundService extends Service {
             Intent fsIntent = new Intent(this, IncomingCallActivity.class);
             fsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             fsIntent.putExtra("callId", callId);
+            fsIntent.putExtra("startedAtMs", startedAtMs);
             fsIntent.putExtra("callerName", callerName);
             fsIntent.putExtra("callMode", resolvedMode);
             PendingIntent fsPi = PendingIntent.getActivity(this, 21, fsIntent, piFlags);
@@ -442,12 +544,14 @@ public class CallForegroundService extends Service {
             Intent ansIntent = new Intent(this, CallForegroundService.class);
             ansIntent.setAction(ACTION_ANSWER_CALL);
             ansIntent.putExtra("callId", callId);
+            ansIntent.putExtra("startedAtMs", startedAtMs);
             ansIntent.putExtra("callMode", resolvedMode);
             PendingIntent ansPi = PendingIntent.getService(this, 22, ansIntent, piFlags);
 
             Intent decIntent = new Intent(this, CallForegroundService.class);
             decIntent.setAction(ACTION_DECLINE_CALL);
             decIntent.putExtra("callId", callId);
+            decIntent.putExtra("startedAtMs", startedAtMs);
             PendingIntent decPi = PendingIntent.getService(this, 23, decIntent, piFlags);
 
             Notification.Builder b = Build.VERSION.SDK_INT >= 26
@@ -478,7 +582,12 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void launchIncomingCallScreen(String callId, String callerName, String callMode) {
+    private void launchIncomingCallScreen(
+        String callId,
+        long startedAtMs,
+        String callerName,
+        String callMode
+    ) {
         try {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
@@ -499,6 +608,7 @@ public class CallForegroundService extends Service {
                     | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             );
             i.putExtra("callId", callId);
+            i.putExtra("startedAtMs", startedAtMs);
             i.putExtra("callerName", callerName);
             i.putExtra("callMode", "video".equals(callMode) ? "video" : "audio");
             startActivity(i);
@@ -528,35 +638,47 @@ public class CallForegroundService extends Service {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                HttpURLConnection conn = null;
-                try {
-                    String deviceId = CallBridgeHelper.getDeviceId(appCtx);
-                    if (deviceId.isEmpty()) return;
-                    String baseUrl = CallBridgeHelper.getApiBaseUrl(appCtx);
-                    URL url = new URL(baseUrl + "/api/owner/call");
-                    conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setConnectTimeout(3500);
-                    conn.setReadTimeout(3500);
-                    conn.setDoOutput(true);
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setRequestProperty("x-device-id", deviceId);
+                String deviceId = CallBridgeHelper.getDeviceId(appCtx);
+                if (deviceId.isEmpty()) return;
+                String baseUrl = CallBridgeHelper.getApiBaseUrl(appCtx);
 
-                    JSONObject body = new JSONObject();
-                    body.put("action", actionName);
-                    body.put("deviceId", deviceId);
-                    byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
-                    OutputStream os = conn.getOutputStream();
-                    os.write(bytes);
-                    os.close();
-                    conn.getResponseCode();
-                } catch (Throwable ignored) {
-                } finally {
-                    if (conn != null) {
-                        try {
-                            conn.disconnect();
-                        } catch (Throwable ignored) {
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    HttpURLConnection conn = null;
+                    try {
+                        URL url = new URL(baseUrl + "/api/owner/call");
+                        conn = (HttpURLConnection) url.openConnection();
+                        conn.setRequestMethod("POST");
+                        conn.setConnectTimeout(4000);
+                        conn.setReadTimeout(4000);
+                        conn.setDoOutput(true);
+                        conn.setRequestProperty("Content-Type", "application/json");
+                        conn.setRequestProperty("x-device-id", deviceId);
+
+                        JSONObject body = new JSONObject();
+                        body.put("action", actionName);
+                        body.put("deviceId", deviceId);
+                        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+                        OutputStream os = conn.getOutputStream();
+                        os.write(bytes);
+                        os.close();
+
+                        int code = conn.getResponseCode();
+                        if (code >= 200 && code < 300) {
+                            return;
                         }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (conn != null) {
+                            try {
+                                conn.disconnect();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    try {
+                        Thread.sleep(attempt == 0 ? 450L : 1000L);
+                    } catch (InterruptedException ignored) {
+                        return;
                     }
                 }
             }

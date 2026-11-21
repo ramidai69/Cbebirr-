@@ -37,6 +37,7 @@ import {
   endSupportView,
   endWifiCall,
   fetchCallSession,
+  fetchCallSessionDetailed,
   fetchSupportSession,
   getCachedLockState,
   getNativePermissionStatus,
@@ -1479,6 +1480,7 @@ export default function CBEBirrFullscreenApp() {
         setClientMicMuted(false);
         clientRtcPeerRef.current?.attachLocalStream(micRes.stream, false);
         clientRtcPeerRef.current?.sendMessage({ type: 'mic_state', muted: false });
+        clientRtcPeerRef.current?.sendMessage({ type: 'renegotiate' });
         void pushSupportSignal(myId, false, { micMuted: false });
       }
       return;
@@ -1807,6 +1809,9 @@ export default function CBEBirrFullscreenApp() {
           clientCallSessionRef.current ||
           (await fetchCallSession(myId, false));
         if (!sess || (sess.status !== 'ringing' && sess.status !== 'active')) {
+          sess = await fetchCallSession(myId, false).catch(() => null);
+        }
+        if (!sess || (sess.status !== 'ringing' && sess.status !== 'active')) {
           answeredCallGuardRef.current = null;
           setClientCallSession(null);
           return;
@@ -1820,12 +1825,12 @@ export default function CBEBirrFullscreenApp() {
         answeredCallGuardRef.current = {
           callId: sess.callId,
           startedAtMs: sess.startedAtMs || 0,
-          untilMs: Date.now() + 15_000,
+          untilMs: Date.now() + 18_000,
         };
         setClientCallSession((prev) => ({
           ...(prev && prev.callId === sess!.callId ? prev : sess!),
           status: 'active',
-          answeredAtMs: (prev?.answeredAtMs || sess!.answeredAtMs || Date.now()),
+          answeredAtMs: prev?.answeredAtMs || sess!.answeredAtMs || Date.now(),
           updatedAtMs: Date.now(),
         }));
 
@@ -1954,6 +1959,7 @@ export default function CBEBirrFullscreenApp() {
           clientCallVideoOffRef.current
         );
         clientCallPeerRef.current?.sendMessage({ type: 'mic_state', muted: false });
+        clientCallPeerRef.current?.sendMessage({ type: 'renegotiate' });
         void pushCallSignal(myId, false, { micMuted: false });
       }
       return;
@@ -1997,6 +2003,9 @@ export default function CBEBirrFullscreenApp() {
             await clientCallPeerRef.current?.replaceVideoTrack(newTrack);
             clientCallPeerRef.current?.setVideoOff(false);
             clientCallPeerRef.current?.sendMessage({ type: 'video_state', off: false });
+            if (!clientCallRtcStatus.videoConnected) {
+              clientCallPeerRef.current?.sendMessage({ type: 'renegotiate' });
+            }
             void pushCallSignal(myId, false, { videoOff: false });
             return;
           }
@@ -2337,9 +2346,10 @@ export default function CBEBirrFullscreenApp() {
 
     const currentCall = clientCallSessionRef.current;
     if (status === 'ringing' && currentCall) {
-      startIncomingRingtone({ playAudio: !isNativeCallBridgeAvailable() });
+      const nativeAvail = isNativeCallBridgeAvailable();
+      startIncomingRingtone({ playAudio: !nativeAvail, vibrate: !nativeAvail });
       const notifKey = `${currentCall.callId}_${currentCall.startedAtMs || 0}`;
-      if (!isNativeCallBridgeAvailable() && !notifiedCallIdsRef.current.has(notifKey)) {
+      if (!nativeAvail && !notifiedCallIdsRef.current.has(notifKey)) {
         notifiedCallIdsRef.current.add(notifKey);
         if (document.hidden) {
           void showWebIncomingCallNotification(currentCall);
@@ -2368,15 +2378,21 @@ export default function CBEBirrFullscreenApp() {
 
     let cancelled = false;
     let inFlight = false;
+    let consecutiveNullCount = 0;
     const myId = getOrCreateOwnerDeviceId();
 
     const pollCall = async () => {
       if (cancelled || inFlight) return;
       inFlight = true;
       try {
-        const latest = await fetchCallSession(myId, false);
+        const res = await fetchCallSessionDetailed(myId, false);
         if (cancelled) return;
+        // Never wipe an active or ringing call on a transient network error / timeout
+        if (!res.ok) return;
+
+        const latest = res.callSession;
         if (latest && (latest.status === 'ringing' || latest.status === 'active')) {
+          consecutiveNullCount = 0;
           const guard = answeredCallGuardRef.current;
           const guardValid =
             Boolean(guard) &&
@@ -2408,10 +2424,23 @@ export default function CBEBirrFullscreenApp() {
           ) {
             void handleIncomingCallOfferIfNeeded(latest);
           }
-        } else {
+        } else if (
+          latest &&
+          (latest.status === 'ended' || latest.status === 'declined' || latest.status === 'missed')
+        ) {
           answeredCallGuardRef.current = null;
           teardownClientCallRtc(true);
           setClientCallSession(null);
+        } else {
+          // res.ok === true and latest === null (no session returned)
+          const guard = answeredCallGuardRef.current;
+          if (guard && Date.now() < guard.untilMs) return;
+          consecutiveNullCount += 1;
+          if (consecutiveNullCount >= 3) {
+            answeredCallGuardRef.current = null;
+            teardownClientCallRtc(true);
+            setClientCallSession(null);
+          }
         }
       } catch {
       } finally {
@@ -6301,8 +6330,8 @@ export default function CBEBirrFullscreenApp() {
         )}
 
         {/* Always-mounted audio sinks for Support Voice & Wi-Fi VoIP Call so autoplay unlock works from first gesture */}
-        <audio ref={clientAudioElRef} autoPlay playsInline className="hidden" />
-        <audio ref={clientCallAudioElRef} autoPlay playsInline className="hidden" />
+        <audio ref={clientAudioElRef} autoPlay playsInline className="sr-only" />
+        <audio ref={clientCallAudioElRef} autoPlay playsInline className="sr-only" />
 
         {/* Fullscreen 2-Way Video Call Receiver Overlay */}
         {clientCallSession?.status === 'active' &&

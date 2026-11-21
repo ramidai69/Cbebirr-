@@ -152,6 +152,12 @@ export default function SupportViewModal({
   } | null>(null);
   const lastWheelAtRef = useRef<number>(0);
   const autoRecoverTriedRef = useRef<boolean>(false);
+  const renegotiateRef = useRef<(requestMicNow?: boolean) => Promise<void>>(async () => {});
+  const mountAtMsRef = useRef<number>(0);
+  const sessionStatusRef = useRef<string>('');
+  useEffect(() => {
+    sessionStatusRef.current = session?.status || '';
+  }, [session?.status]);
 
   const teardownRtc = useCallback((stopMic = true) => {
     setNativeAudioMode(false, false);
@@ -183,10 +189,16 @@ export default function SupportViewModal({
   }, []);
 
   useEffect(() => {
+    mountAtMsRef.current = Date.now();
     return () => {
+      const aliveMs = Date.now() - mountAtMsRef.current;
+      const st = sessionStatusRef.current;
+      if ((st === 'pending' || st === 'active') && aliveMs > 400) {
+        void endSupportView(device.deviceId, true).catch(() => {});
+      }
       teardownRtc(true);
     };
-  }, [teardownRtc]);
+  }, [device.deviceId, teardownRtc]);
 
   const ensureOperatorRtcPeer = useCallback(() => {
     if (rtcPeerRef.current) return rtcPeerRef.current;
@@ -223,6 +235,8 @@ export default function SupportViewModal({
             status: msg.status,
             detail: msg.detail,
           });
+        } else if (msg.type === 'renegotiate') {
+          void renegotiateRef.current(false);
         }
       },
     });
@@ -271,6 +285,10 @@ export default function SupportViewModal({
     },
     [device.deviceId, ensureOperatorRtcPeer]
   );
+
+  useEffect(() => {
+    renegotiateRef.current = startOrRenegotiateRtc;
+  }, [startOrRenegotiateRtc]);
 
   // Start WebRTC live voice + DataChannel as soon as session turns active
   useEffect(() => {
@@ -470,6 +488,9 @@ export default function SupportViewModal({
   const handleToggleSpeaker = () => {
     const nextMuted = !speakerMuted;
     setSpeakerMuted(nextMuted);
+    if (session?.status === 'active') {
+      setNativeAudioMode(true, !nextMuted);
+    }
     playStreamInAudioElement(
       remoteAudioRef.current,
       rtcPeerRef.current?.getRemoteStream() || null,
@@ -759,7 +780,7 @@ export default function SupportViewModal({
       className="absolute inset-0 z-[97] bg-[#0b121b]/95 backdrop-blur-sm flex flex-col overflow-hidden text-slate-100 select-none"
     >
       {/* Hidden audio sink for live two-way voice */}
-      <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
+      <audio ref={remoteAudioRef} autoPlay playsInline className="sr-only" />
 
       {/* Top Session Bar */}
       <div
