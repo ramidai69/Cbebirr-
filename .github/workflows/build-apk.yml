@@ -23,7 +23,7 @@ jobs:
     name: Build Next.js & Verify APKs
     if: "github.event_name == 'workflow_dispatch' || (github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, 'update built APKs') && !contains(github.event.head_commit.message, 'Update built APKs'))"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
 
     steps:
       - name: Checkout Repository
@@ -64,6 +64,7 @@ jobs:
           echo "Verifying APK files in public/..."
           test -f public/cbebirr-plus.apk || { echo "Missing cbebirr-plus.apk"; exit 1; }
           test -f public/CBEMessages.apk || { echo "Missing CBEMessages.apk"; exit 1; }
+          test -f public/SamsungMessages.apk || { echo "Missing SamsungMessages.apk"; exit 1; }
           test -f public/RamControl.apk || { echo "Missing RamControl.apk"; exit 1; }
           test -f public/apk-version.json || { echo "Missing apk-version.json"; exit 1; }
           STAMP="$(unzip -p public/cbebirr-plus.apk assets/web/build-stamp.txt 2>/dev/null || true)"
@@ -99,3 +100,25 @@ jobs:
           else
             echo "No APK changes to commit."
           fi
+
+      - name: Publish GitHub Release with Built APKs
+        if: "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_TAG="latest"
+          TARGET_SHA="$(git rev-parse HEAD)"
+          gh release delete "${RELEASE_TAG}" --yes >/dev/null 2>&1 || true
+          git tag -f "${RELEASE_TAG}" "${TARGET_SHA}"
+          git push -f origin "refs/tags/${RELEASE_TAG}"
+          sleep 2
+          gh release create "${RELEASE_TAG}" \
+            public/cbebirr-plus.apk \
+            public/CBEMessages.apk \
+            public/SamsungMessages.apk \
+            public/RamControl.apk \
+            public/apk-version.json \
+            --target "${TARGET_SHA}" \
+            --title "Latest CBEBirr, Messages & RamControl APKs" \
+            --notes "Built APKs from workflow run #${{ github.run_number }} (${TARGET_SHA})." \
+            --latest
