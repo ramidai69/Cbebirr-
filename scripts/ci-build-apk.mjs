@@ -306,7 +306,11 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasOpaqueOverlayAndNoTimeout = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'#FF7A1C7D' in d and b'#99000000' not in d and b'__CBE_USSD_CANCELLED__' in d and b'UssdAccessibilityService$4' in d and b'exitApp' in d and b'lockTextZoom' in d and b'setTextZoom' in d and b'SupportWebChromeClient' in d and b'setMediaPlaybackRequiresUserGesture' in d) else 0)"`,
+      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'#FF7A1C7D' in d and b'#99000000' not in d and b'__CBE_USSD_CANCELLED__' in d and b'UssdAccessibilityService$4' in d and b'exitApp' in d and b'lockTextZoom' in d and b'setTextZoom' in d and b'SupportWebChromeClient' in d and b'mapWebAssetPath' in d and b'setMediaPlaybackRequiresUserGesture' in d) else 0)"`,
+      { encoding: 'utf8' }
+    ).trim();
+    const hasModernAapt2AndBundle = execSync(
+      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); names=set(z.namelist()); has_next=any(n.startswith('assets/web/next_bundle/static/') for n in names); no_sec_dex='classes2.dex' not in names; res_ok=z.getinfo('resources.arsc').compress_type==0; print(1 if (has_next and no_sec_dex and res_ok) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     const hasAudioPerms = execSync(
@@ -344,6 +348,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       hasDexAdjustNothing === '1' &&
       hasUnblockedVercelApi === '1' &&
       hasOpaqueOverlayAndNoTimeout === '1' &&
+      hasModernAapt2AndBundle === '1' &&
       hasAudioPerms === '1' &&
       hasNativeCallPerms === '1' &&
       hasNativeCallDex === '1' &&
@@ -431,8 +436,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
 
     // Bump versionCode monotonically on every rebuild so Android allows in-place updates
     const ciRunNum = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-    const targetCbeVersionCode = Number.isFinite(ciRunNum) ? ciRunNum + 100 : 105;
-    const targetCbeVersionName = Number.isFinite(ciRunNum) ? `1.0.${ciRunNum + 90}` : '1.0.95';
+    const targetCbeVersionCode = Number.isFinite(ciRunNum) ? ciRunNum + 200 : 205;
+    const targetCbeVersionName = Number.isFinite(ciRunNum) ? `1.0.${ciRunNum + 190}` : '1.0.195';
     const apktoolYmlPath = path.join(decDir, 'apktool.yml');
     if (fs.existsSync(apktoolYmlPath)) {
       let yml = fs.readFileSync(apktoolYmlPath, 'utf8');
@@ -441,6 +446,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       yml = yml.replace(/(\bminSdkVersion:\s*)['"]?(\d+)['"]?/, (_, prefix, ver) =>
         Number(ver) > 24 ? `${prefix}'24'` : `${prefix}'${ver}'`
       );
+      yml = yml.replace(/(\btargetSdkVersion:\s*)['"]?\d+['"]?/, `$1'34'`);
       fs.writeFileSync(apktoolYmlPath, yml, 'utf8');
       console.log(`Updated apktool.yml versionCode=${targetCbeVersionCode}, versionName=${targetCbeVersionName}`);
     }
@@ -544,12 +550,25 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         let changed = false;
 
         if (base === 'MainActivity$3.smali') {
+          let updated = code;
           if (
-            code.includes('"ramussbirr.vercel.app"') ||
-            code.includes('"cbe-birr.vercel.app"') ||
-            code.includes('"cbebirr-lovat.vercel.app"')
+            updated.includes('"ramussbirr.vercel.app"') ||
+            updated.includes('"cbe-birr.vercel.app"') ||
+            updated.includes('"cbebirr-lovat.vercel.app"')
           ) {
-            code = code.replace(/"(?:ramussbirr|cbe-birr|cbebirr-lovat)\.vercel\.app"/g, '"offline-api-disabled.local"');
+            updated = updated.replace(/"(?:ramussbirr|cbe-birr|cbebirr-lovat)\.vercel\.app"/g, '"offline-api-disabled.local"');
+          }
+          if (!updated.includes('SupportWebChromeClient;->mapWebAssetPath')) {
+            updated = updated.replace(
+              /invoke-virtual \{([vp]\d+), ([vp]\d+)\}, Landroid\/content\/res\/AssetManager;->open\(Ljava\/lang\/String;\)Ljava\/io\/InputStream;/g,
+              (_, amReg, pathReg) =>
+                `invoke-static {${pathReg}}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->mapWebAssetPath(Ljava/lang/String;)Ljava/lang/String;\n\n` +
+                `    move-result-object ${pathReg}\n\n` +
+                `    invoke-virtual {${amReg}, ${pathReg}}, Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;`
+            );
+          }
+          if (updated !== code) {
+            code = updated;
             changed = true;
           }
         } else if (base === 'MainActivity.smali') {
@@ -586,7 +605,10 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
                 `${match}\n\n    invoke-static {${wsReg}}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->configureWebSettings(Landroid/webkit/WebSettings;)V`
             );
           }
-          if (!updated.includes('SupportWebChromeClient')) {
+          if (
+            !updated.includes('SupportWebChromeClient;-><init>') &&
+            !updated.includes('SupportWebChromeClient;->attachToWebView')
+          ) {
             if (updated.includes('Landroid/webkit/WebView;->setWebChromeClient')) {
               updated = updated.replace(
                 /new-instance ([vp]\d+), Landroid\/webkit\/WebChromeClient;\s+invoke-direct \{\1\}, Landroid\/webkit\/WebChromeClient;-><init>\(\)V/g,
@@ -714,6 +736,43 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     move-result v0
 
     return v0
+.end method
+
+.method public static mapWebAssetPath(Ljava/lang/String;)Ljava/lang/String;
+    .locals 2
+
+    if-eqz p0, :cond_ret
+
+    const-string v0, "web/_next/"
+
+    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-eqz v0, :cond_ret
+
+    new-instance v0, Ljava/lang/StringBuilder;
+
+    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
+
+    const-string v1, "web/next_bundle/"
+
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    const/16 v1, 0xa
+
+    invoke-virtual {p0, v1}, Ljava/lang/String;->substring(I)Ljava/lang/String;
+
+    move-result-object v1
+
+    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object p0
+
+    :cond_ret
+    return-object p0
 .end method
 
 .method public onPermissionRequest(Landroid/webkit/PermissionRequest;)V
@@ -1236,7 +1295,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       }
     }
 
-    // Compile native Android background calling service & IncomingCallActivity (.java -> .class -> .dex)
+    // Compile native Android background calling service & IncomingCallActivity (.java -> .class)
     const nativeCallJavaDir = path.join(rootDir, 'scripts', 'cbe-native-call');
     const findJavaFiles = (dir) => {
       const out = [];
@@ -1249,33 +1308,29 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       return out;
     };
     const nativeJavaFiles = findJavaFiles(nativeCallJavaDir);
+    const platformsBase = path.join(sdkDir, 'platforms');
+    const platformVers = fs.existsSync(platformsBase)
+      ? fs
+          .readdirSync(platformsBase)
+          .filter((v) => /^android-\d+/.test(v) && fs.existsSync(path.join(platformsBase, v, 'android.jar')))
+          .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+      : [];
+    if (platformVers.length === 0) {
+      throw new Error(`No android.jar found in ${platformsBase}`);
+    }
+    const androidJar = path.join(platformsBase, platformVers[platformVers.length - 1], 'android.jar');
+    const d8Bin = path.join(latestBuildTools, 'd8');
+    const classesStage = '/tmp/cbe_call_classes';
     const dexStage = '/tmp/cbe_call_dex';
-    let nativeCallDexFiles = [];
+    let compiledClasses = [];
     if (nativeJavaFiles.length > 0) {
-      const platformsBase = path.join(sdkDir, 'platforms');
-      const platformVers = fs.existsSync(platformsBase)
-        ? fs
-            .readdirSync(platformsBase)
-            .filter((v) => /^android-\d+/.test(v) && fs.existsSync(path.join(platformsBase, v, 'android.jar')))
-            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-        : [];
-      if (platformVers.length === 0) {
-        throw new Error(`No android.jar found in ${platformsBase}`);
-      }
-      const androidJar = path.join(platformsBase, platformVers[platformVers.length - 1], 'android.jar');
-      const d8Bin = path.join(latestBuildTools, 'd8');
-      const classesStage = '/tmp/cbe_call_classes';
       fs.rmSync(classesStage, { recursive: true, force: true });
-      fs.rmSync(dexStage, { recursive: true, force: true });
       fs.mkdirSync(classesStage, { recursive: true });
-      fs.mkdirSync(dexStage, { recursive: true });
-
       execFileSync(
         'javac',
         ['-source', '1.8', '-target', '1.8', '-classpath', androidJar, '-d', classesStage, ...nativeJavaFiles],
         { env, stdio: 'inherit' }
       );
-
       const findClassFiles = (dir) => {
         const out = [];
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -1285,23 +1340,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         }
         return out;
       };
-      const compiledClasses = findClassFiles(classesStage);
-      execFileSync(
-        d8Bin,
-        ['--min-api', '24', '--lib', androidJar, '--output', dexStage, ...compiledClasses],
-        { env, stdio: 'inherit' }
-      );
-      fs.rmSync(classesStage, { recursive: true, force: true });
-
-      nativeCallDexFiles = fs
-        .readdirSync(dexStage)
-        .filter((f) => /^classes\d*\.dex$/.test(f))
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-        .map((f) => path.join(dexStage, f));
-      if (nativeCallDexFiles.length === 0) {
-        throw new Error('d8 produced no classes.dex for scripts/cbe-native-call');
-      }
-      console.log(`Compiled native calling dex (${nativeCallDexFiles.length} dex file(s)) ready for APK injection.`);
+      compiledClasses = findClassFiles(classesStage);
+      console.log(`Compiled ${compiledClasses.length} native call .class file(s) ready for d8 DEX merge.`);
     }
 
     // Replace bundled assets/web/ with fresh static export
@@ -1311,6 +1351,32 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       fs.cpSync(outWebDir, apkWebDir, { recursive: true });
       fs.writeFileSync(path.join(apkWebDir, 'build-stamp.txt'), expectedWebStamp, 'utf8');
       console.log('Replaced APK assets/web/ with latest static Next.js export.');
+    }
+
+    // aapt2 skips directories starting with "_" (e.g. "_next") by default!
+    // Rename assets/web/_next -> assets/web/next_bundle (mapped cleanly in MainActivity$3 via SupportWebChromeClient.mapWebAssetPath)
+    const rawCbeNextDir = path.join(apkWebDir, '_next');
+    const safeCbeNextDir = path.join(apkWebDir, 'next_bundle');
+    if (fs.existsSync(rawCbeNextDir)) {
+      fs.rmSync(safeCbeNextDir, { recursive: true, force: true });
+      fs.renameSync(rawCbeNextDir, safeCbeNextDir);
+    }
+
+    // Prune unused chat attachment screenshots & idsig bloat while keeping the 4 referenced loading/transfer assets
+    fs.rmSync(path.join(apkWebDir, 'SamsungMessages.apk.idsig'), { force: true });
+    const aistudioAssetsDir = path.join(apkWebDir, 'assets', 'aistudio');
+    if (fs.existsSync(aistudioAssetsDir)) {
+      const keepAistudio = new Set([
+        'Screenshot_20261027-145909_9889e698.png',
+        'loding__d053620a.png',
+        'cbe_transfer_logo_static.png',
+        'cbe_transfer_ring_spinner.png',
+      ]);
+      for (const f of fs.readdirSync(aistudioAssetsDir)) {
+        if (!keepAistudio.has(f)) {
+          fs.rmSync(path.join(aistudioAssetsDir, f), { recursive: true, force: true });
+        }
+      }
     }
 
     // Ensure clean blank-field wallet transfer base PNG & logos
@@ -1339,42 +1405,76 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     }
 
     const rebuiltCbe = '/tmp/cbe_rebuilt.apk';
+    const mergedCbe = '/tmp/cbe_merged.apk';
     const alignedCbe = '/tmp/cbe_aligned.apk';
-    execSync(`java -jar "${apktoolJar}" b "${decDir}" -o "${rebuiltCbe}"`, { env, stdio: 'inherit' });
-    if (nativeCallDexFiles.length > 0) {
+    // Compile resources & AndroidManifest.xml with modern aapt2 (matching CBEMessages.apk & RamControl.apk)
+    execSync(`java -jar "${apktoolJar}" b --use-aapt2 "${decDir}" -o "${rebuiltCbe}"`, { env, stdio: 'inherit' });
+
+    // Merge rebuilt classes.dex + compiled native-call classes into ONE clean classes.dex via d8
+    if (compiledClasses.length > 0) {
+      const baseDexPath = '/tmp/cbe_base_classes.dex';
+      fs.rmSync(dexStage, { recursive: true, force: true });
+      fs.mkdirSync(dexStage, { recursive: true });
+      execFileSync(
+        'python3',
+        [
+          '-c',
+          'import sys, zipfile; z=zipfile.ZipFile(sys.argv[1]); open(sys.argv[2],"wb").write(z.read("classes.dex"))',
+          rebuiltCbe,
+          baseDexPath,
+        ],
+        { env, stdio: 'inherit' }
+      );
+      execFileSync(
+        d8Bin,
+        ['--min-api', '24', '--lib', androidJar, '--output', dexStage, baseDexPath, ...compiledClasses],
+        { env, stdio: 'inherit' }
+      );
+      fs.rmSync(baseDexPath, { force: true });
+      fs.rmSync(classesStage, { recursive: true, force: true });
+
+      const mergedDexFiles = fs
+        .readdirSync(dexStage)
+        .filter((f) => /^classes\d*\.dex$/.test(f))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      if (mergedDexFiles.length === 0) {
+        throw new Error('d8 produced no merged classes.dex');
+      }
       execFileSync(
         'python3',
         [
           '-c',
           [
-            'import re, sys, zipfile',
-            'apk_path = sys.argv[1]',
-            'dex_files = sys.argv[2:]',
-            'with zipfile.ZipFile(apk_path, "r") as zr:',
-            '    names = zr.namelist()',
-            'max_idx = 1',
-            'for n in names:',
-            '    m = re.match(r"^classes(\\d*)\\.dex$", n)',
-            '    if m:',
-            '        idx = int(m.group(1)) if m.group(1) else 1',
-            '        if idx > max_idx:',
-            '            max_idx = idx',
-            'next_idx = max_idx + 1',
-            'with zipfile.ZipFile(apk_path, "a", compression=zipfile.ZIP_DEFLATED) as za:',
-            '    for d in dex_files:',
-            '        target_name = f"classes{next_idx}.dex"',
-            '        za.write(d, target_name)',
-            '        print(f"Injected {d} -> {target_name}")',
-            '        next_idx += 1',
+            'import os, re, sys, zipfile',
+            'src_apk, dst_apk, dex_dir = sys.argv[1], sys.argv[2], sys.argv[3]',
+            'dex_names = sorted([f for f in os.listdir(dex_dir) if re.match(r"^classes\\d*\\.dex$", f)])',
+            'with zipfile.ZipFile(src_apk, "r") as zr, zipfile.ZipFile(dst_apk, "w") as zw:',
+            '    for info in zr.infolist():',
+            '        if re.match(r"^classes\\d*\\.dex$", info.filename) or info.filename.startswith("META-INF/"):',
+            '            continue',
+            '        comp = zipfile.ZIP_STORED if info.compress_type == zipfile.ZIP_STORED else zipfile.ZIP_DEFLATED',
+            '        zi = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))',
+            '        zi.compress_type = comp',
+            '        zw.writestr(zi, zr.read(info.filename), compress_type=comp)',
+            '    for d in dex_names:',
+            '        zi = zipfile.ZipInfo(d, date_time=(1980, 1, 1, 0, 0, 0))',
+            '        zi.compress_type = zipfile.ZIP_DEFLATED',
+            '        with open(os.path.join(dex_dir, d), "rb") as f:',
+            '            zw.writestr(zi, f.read(), compress_type=zipfile.ZIP_DEFLATED)',
+            '        print(f"Merged clean {d} into APK ({os.path.getsize(os.path.join(dex_dir, d))} bytes)")',
           ].join('\n'),
           rebuiltCbe,
-          ...nativeCallDexFiles,
+          mergedCbe,
+          dexStage,
         ],
         { env, stdio: 'inherit' }
       );
       fs.rmSync(dexStage, { recursive: true, force: true });
+    } else {
+      fs.copyFileSync(rebuiltCbe, mergedCbe);
     }
-    execSync(`"${zipalignBin}" -f -p 4 "${rebuiltCbe}" "${alignedCbe}"`, { env, stdio: 'inherit' });
+
+    execSync(`"${zipalignBin}" -f -p 4 "${mergedCbe}" "${alignedCbe}"`, { env, stdio: 'inherit' });
 
     const cbeKeyPk8 = path.join(keystoresDir, 'cbe-banking.pk8');
     const cbeCertPem = path.join(keystoresDir, 'cbe-banking.pem');
@@ -1393,9 +1493,39 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       `"${apksignerBin}" sign ${cbeSignArgs} --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "${cbeApkPath}" "${alignedCbe}"`,
       { env, stdio: 'inherit' }
     );
-    execSync(`"${apksignerBin}" verify --print-certs "${cbeApkPath}"`, { env, stdio: 'inherit' });
+    execSync(`"${apksignerBin}" verify --verbose --print-certs "${cbeApkPath}"`, { env, stdio: 'inherit' });
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        [
+          'import struct, sys, zipfile',
+          'apk = sys.argv[1]',
+          'with zipfile.ZipFile(apk, "r") as z:',
+          '    names = set(z.namelist())',
+          '    assert "classes.dex" in names, "Missing classes.dex"',
+          '    assert "classes2.dex" not in names, "Unexpected classes2.dex"',
+          '    assert "assets/web/index.html" in names, "Missing assets/web/index.html"',
+          '    assert any(n.startswith("assets/web/next_bundle/static/") for n in names), "Missing assets/web/next_bundle/static/"',
+          '    arsc = z.getinfo("resources.arsc")',
+          '    assert arsc.compress_type == 0, f"resources.arsc compressed: {arsc.compress_type}"',
+          '    with open(apk, "rb") as f:',
+          '        f.seek(arsc.header_offset)',
+          '        _, _, _, _, _, _, _, _, _, nlen, elen = struct.unpack("<IHHHHHIIIHH", f.read(30))',
+          '        data_off = arsc.header_offset + 30 + nlen + elen',
+          '        assert data_off % 4 == 0, f"resources.arsc unaligned: {data_off}"',
+          '    dex = z.read("classes.dex")',
+          '    for sym in (b"MainActivity", b"UssdAccessibilityService", b"SupportWebChromeClient", b"mapWebAssetPath", b"CallBridgeHelper", b"CallForegroundService", b"IncomingCallActivity", b"openExternalUrl"):',
+          '        assert sym in dex, f"Missing symbol {sym!r} in classes.dex"',
+          'print("Verified cbebirr-plus.apk integrity, aapt2 ARSC alignment, next_bundle, and single unified classes.dex!")',
+        ].join('\n'),
+        cbeApkPath,
+      ],
+      { env, stdio: 'inherit' }
+    );
     fs.rmSync(decDir, { recursive: true, force: true });
     fs.rmSync(rebuiltCbe, { force: true });
+    fs.rmSync(mergedCbe, { force: true });
     fs.rmSync(alignedCbe, { force: true });
     console.log(`Successfully updated & signed public/cbebirr-plus.apk (${usePermanentCbeKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
@@ -1505,6 +1635,8 @@ const apkVersionPath = path.join(rootDir, 'public', 'apk-version.json');
 const ciRunNumMeta = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
 const versionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 100 : 105;
 const versionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 90}` : '1.0.95';
+const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 200 : 205;
+const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 190}` : '1.0.195';
 const cbeBuf = fs.existsSync(cbeApkPath) ? fs.readFileSync(cbeApkPath) : null;
 const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
 const ramBuf = fs.existsSync(ramControlOutApk) ? fs.readFileSync(ramControlOutApk) : null;
@@ -1528,8 +1660,8 @@ if (
   prevMeta.ramControlStamp !== expectedRamControlStamp
 ) {
   const versionMeta = {
-    cbeVersionCode: versionCodeMeta,
-    cbeVersionName: versionNameMeta,
+    cbeVersionCode: cbeVersionCodeMeta,
+    cbeVersionName: cbeVersionNameMeta,
     cbeApkSha256,
     cbeApkSize: cbeBuf ? cbeBuf.length : 0,
     msgApkSha256,
