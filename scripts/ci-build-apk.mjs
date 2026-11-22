@@ -603,7 +603,6 @@ if (fs.existsSync(ramControlDir)) {
     }
     for (const unusedRel of [
       'screens',
-      'assets',
       'index.html',
       'index.txt',
       'messages.html',
@@ -622,12 +621,24 @@ if (fs.existsSync(ramControlDir)) {
     ]) {
       fs.rmSync(path.join(ramAssetsWebDir, unusedRel), { recursive: true, force: true });
     }
+    const ramAssetsPublicDir = path.join(ramAssetsWebDir, 'assets');
+    if (fs.existsSync(ramAssetsPublicDir)) {
+      const keepRamAssets = new Set(['cbe_birr_logo.png', 'cbe_birr_logo_192.png']);
+      for (const entry of fs.readdirSync(ramAssetsPublicDir)) {
+        if (!keepRamAssets.has(entry)) {
+          fs.rmSync(path.join(ramAssetsPublicDir, entry), { recursive: true, force: true });
+        }
+      }
+    }
     const ramAppChunksDir = path.join(safeNextDir, 'static', 'chunks', 'app');
     if (fs.existsSync(ramAppChunksDir)) {
       for (const entry of fs.readdirSync(ramAppChunksDir)) {
         const keepChunk =
           entry.startsWith('ram-control') ||
           entry.startsWith('layout-') ||
+          entry.startsWith('error-') ||
+          entry.startsWith('global-error-') ||
+          entry.startsWith('not-found-') ||
           entry.startsWith('_not-found');
         if (!keepChunk) {
           fs.rmSync(path.join(ramAppChunksDir, entry), { recursive: true, force: true });
@@ -649,14 +660,27 @@ if (fs.existsSync(ramControlDir)) {
       throw new Error(`Ram control release APK output not found in ${ramReleaseDir}`);
     }
 
-    const ramApkListing = execSync(`unzip -l "${ramInputApk}"`, { encoding: 'utf8' });
-    if (
-      !ramApkListing.includes('assets/web/ram-control.html') ||
-      !ramApkListing.includes('assets/web/next_bundle/static/chunks/app/ram-control/') ||
-      !ramApkListing.includes('assets/web/next_bundle/static/css/')
-    ) {
-      throw new Error('RamControl APK is missing required assets/web/next_bundle JS/CSS bundles!');
-    }
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        [
+          'import re, sys, zipfile',
+          'apk = sys.argv[1]',
+          'with zipfile.ZipFile(apk, "r") as z:',
+          '    names = set(z.namelist())',
+          '    assert "assets/web/ram-control.html" in names, "Missing assets/web/ram-control.html"',
+          '    html = z.read("assets/web/ram-control.html").decode("utf-8", "replace")',
+          '    refs = set(re.findall(r"static/(?:chunks|css)/[^\\\"\\\'\\\\\\\\]+", html))',
+          '    assert refs, "No static chunks found in ram-control.html"',
+          '    missing = [r for r in sorted(refs) if f"assets/web/next_bundle/{r}" not in names]',
+          '    assert not missing, f"RamControl APK missing referenced chunks: {missing}"',
+          'print(f"Verified RamControl APK: all {len(refs)} referenced Next.js chunks/CSS present.")',
+        ].join('\n'),
+        ramInputApk,
+      ],
+      { env, stdio: 'inherit' }
+    );
 
     const ramAlignedApk = '/tmp/ramcontrol-aligned.apk';
     execSync(`"${zipalignBin}" -f -p 4 "${ramInputApk}" "${ramAlignedApk}"`, { env, stdio: 'inherit' });

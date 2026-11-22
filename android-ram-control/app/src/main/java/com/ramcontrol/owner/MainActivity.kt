@@ -13,8 +13,10 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -25,8 +27,10 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
 
 class MainActivity : AppCompatActivity() {
 
@@ -67,6 +71,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView = WebView(this).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
             setBackgroundColor(bgColor)
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -74,9 +82,11 @@ class MainActivity : AppCompatActivity() {
             settings.allowFileAccess = true
             settings.allowContentAccess = true
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            settings.cacheMode = WebSettings.LOAD_DEFAULT
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = true
+            settings.setSupportZoom(false)
+            settings.javaScriptCanOpenWindowsAutomatically = true
             settings.textZoom = 100
             settings.mediaPlaybackRequiresUserGesture = false
         }
@@ -132,8 +142,28 @@ class MainActivity : AppCompatActivity() {
                 val url = request?.url ?: return super.shouldInterceptRequest(view, request)
                 val host = url.host ?: ""
                 if (host == "appassets.androidplatform.net" || host == "localhost" || host == "127.0.0.1") {
-                    val assetResponse = openLocalAssetResponse(url.path ?: "/")
+                    val reqPath = url.path ?: "/"
+                    if (reqPath.startsWith("/api/")) {
+                        val jsonBytes = "{\"ok\":true,\"offline\":true}".toByteArray(StandardCharsets.UTF_8)
+                        return WebResourceResponse(
+                            "application/json",
+                            "UTF-8",
+                            200,
+                            "OK",
+                            mapOf("Cache-Control" to "no-store"),
+                            ByteArrayInputStream(jsonBytes)
+                        )
+                    }
+                    val assetResponse = openLocalAssetResponse(reqPath)
                     if (assetResponse != null) return assetResponse
+                    return WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        404,
+                        "Not Found",
+                        mapOf("Cache-Control" to "no-store"),
+                        ByteArrayInputStream(ByteArray(0))
+                    )
                 }
                 return super.shouldInterceptRequest(view, request)
             }
@@ -153,6 +183,19 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Throwable) {
                     false
                 }
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView?,
+                detail: RenderProcessGoneDetail?
+            ): Boolean {
+                runOnUiThread {
+                    try {
+                        webView.loadUrl("https://appassets.androidplatform.net/ram-control")
+                    } catch (_: Throwable) {
+                    }
+                }
+                return true
             }
         }
 

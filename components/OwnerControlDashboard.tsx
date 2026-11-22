@@ -363,7 +363,12 @@ export default function OwnerControlDashboard({
 
   // Listen to Firebase Auth state and real-time Firestore devices collection when signed in on Web
   useEffect(() => {
-    if (isApkEnv) return;
+    const runningInApk =
+      isApkEnv ||
+      (typeof window !== 'undefined' &&
+        (window.location?.origin?.includes('appassets.androidplatform.net') ||
+          window.location?.protocol === 'file:'));
+    if (runningInApk) return;
     try {
       const { auth } = getFirebaseClient();
       const unsubAuth = onAuthStateChanged(auth, (user) => {
@@ -379,7 +384,12 @@ export default function OwnerControlDashboard({
   }, [isApkEnv]);
 
   useEffect(() => {
-    if (isApkEnv || !fbUser || !fbUser.emailVerified) {
+    const runningInApk =
+      isApkEnv ||
+      (typeof window !== 'undefined' &&
+        (window.location?.origin?.includes('appassets.androidplatform.net') ||
+          window.location?.protocol === 'file:'));
+    if (runningInApk || !fbUser || !fbUser.emailVerified) {
       return;
     }
     testFirestoreConnection().catch(() => {});
@@ -877,9 +887,9 @@ export default function OwnerControlDashboard({
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 16 }}
+      initial={standalone ? false : { opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 16 }}
+      exit={standalone ? undefined : { opacity: 0, y: 16 }}
       className="absolute inset-0 z-[96] bg-[#0e1621] text-slate-100 flex flex-col overflow-hidden select-none"
     >
       {selectedDevice ? (
