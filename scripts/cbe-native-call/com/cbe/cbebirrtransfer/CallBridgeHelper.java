@@ -482,6 +482,34 @@ public class CallBridgeHelper {
         });
     }
 
+    public static boolean openExternalUrl(final Activity activity, final String rawUrl) {
+        if (activity == null || rawUrl == null) return false;
+        final String cleanUrl = rawUrl.trim();
+        if (cleanUrl.isEmpty()) return false;
+        try {
+            final Uri parsed = Uri.parse(cleanUrl);
+            final String scheme = parsed.getScheme();
+            if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+                return false;
+            }
+            final Intent viewIntent = new Intent(Intent.ACTION_VIEW, parsed);
+            viewIntent.addCategory(Intent.CATEGORY_BROWSABLE);
+            viewIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        activity.startActivity(viewIntent);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static void handleWebPermissionRequest(final Activity activity, final PermissionRequest request) {
         if (request == null) return;
         try {

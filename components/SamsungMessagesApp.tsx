@@ -1150,15 +1150,33 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     };
   };
 
-  // Open Official Receipt directly in Browser tab matching user requirement
-  // Returns safe, publicly accessible URL for external browsers (never 0.0.0.0 or localhost)
-  const getPublicReceiptUrl = (msg: SmsMessage) => {
+  // Returns safe, publicly accessible QR-matched /r/<ref> URL for external browsers
+  const getPublicReceiptUrl = (msg: SmsMessage, withFallbackParams = false) => {
     const data = extractReceiptDataFromMsg(msg);
+    let origin = 'https://cbebirr-lovat.vercel.app';
+    if (typeof window !== 'undefined' && window.location?.origin) {
+      const locOrigin = window.location.origin;
+      if (
+        locOrigin.startsWith('http') &&
+        !locOrigin.includes('0.0.0.0') &&
+        !locOrigin.includes('localhost') &&
+        !locOrigin.includes('127.0.0.1') &&
+        !locOrigin.includes('appassets.androidplatform.net') &&
+        !locOrigin.includes('file:') &&
+        !locOrigin.includes('run.app') &&
+        locOrigin.length <= 50
+      ) {
+        origin = locOrigin.replace(/\/$/, '');
+      }
+    }
+    const cleanUrl = `${origin}/r/${encodeURIComponent(data.ref)}`;
+    if (!withFallbackParams) return cleanUrl;
+
     const params = new URLSearchParams({
       TID: data.ref,
-      ref: data.ref,
-      PH: data.acc || '',
+      orderId: data.ref,
     });
+    if (data.acc) params.set('acc', data.acc);
     if (data.amt) params.set('amt', data.amt);
     if (data.name) params.set('name', data.name);
     if (data.user) params.set('user', data.user);
@@ -1169,9 +1187,15 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     if (data.serviceCharge) params.set('fee', data.serviceCharge);
     if (data.vat) params.set('vat', data.vat);
     if (data.totalPaid) params.set('totalPaid', data.totalPaid);
+    return `${cleanUrl}?${params.toString()}`;
+  };
 
+  // Open Official Receipt directly in external browser matching QR-code scan flow (/r/<ref>)
+  const handleOpenReceiptInBrowser = async (msg: SmsMessage) => {
+    if (typeof window === 'undefined') return;
+    const data = extractReceiptDataFromMsg(msg);
     let origin = 'https://cbebirr-lovat.vercel.app';
-    if (typeof window !== 'undefined' && window.location?.origin) {
+    if (window.location?.origin) {
       const locOrigin = window.location.origin;
       if (
         locOrigin.startsWith('http') &&
@@ -1179,26 +1203,70 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         !locOrigin.includes('localhost') &&
         !locOrigin.includes('127.0.0.1') &&
         !locOrigin.includes('appassets.androidplatform.net') &&
-        !locOrigin.includes('file:')
+        !locOrigin.includes('file:') &&
+        !locOrigin.includes('run.app') &&
+        locOrigin.length <= 50
       ) {
-        origin = locOrigin;
+        origin = locOrigin.replace(/\/$/, '');
       }
     }
-    return `${origin}/official-receipt?${params.toString()}`;
-  };
 
-  // Open Official Receipt directly in-app modal (instant, reliable, no network/browser error)
-  const handleOpenReceiptFromMsg = (msg: SmsMessage) => {
-    const data = extractReceiptDataFromMsg(msg);
-    setActiveReceiptModalData(data);
-  };
-
-  // Open Official Receipt in external browser with verified public link
-  const handleOpenReceiptInBrowser = (msg: SmsMessage) => {
-    const publicUrl = getPublicReceiptUrl(msg);
-    if (typeof window !== 'undefined') {
-      window.open(publicUrl, '_blank');
+    let savedOk = false;
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    if (!isOffline) {
+      try {
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 1000) : null;
+        const saveRes = await fetch(`${origin}/api/receipt/save`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ref: data.ref,
+            orderId: data.ref,
+            amt: data.amt,
+            rec: data.rec,
+            name: data.name,
+            user: data.user,
+            acc: data.acc,
+            date: data.date,
+            reason: data.reason,
+            bank: data.bank,
+            serviceCharge: data.serviceCharge,
+            vat: data.vat,
+            totalPaidAmount: data.totalPaid,
+            status: 'Completed',
+          }),
+          keepalive: true,
+          mode: 'cors',
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (timer) clearTimeout(timer);
+        if (saveRes && saveRes.ok) savedOk = true;
+      } catch {}
     }
+
+    const publicUrl = getPublicReceiptUrl(msg, !savedOk);
+    try {
+      const androidBridge = (window as unknown as {
+        Android?: { openExternalUrl?: (url: string) => boolean };
+        AndroidSMSBridge?: { openExternalUrl?: (url: string) => boolean };
+      });
+      if (androidBridge.AndroidSMSBridge?.openExternalUrl?.(publicUrl)) return;
+      if (androidBridge.Android?.openExternalUrl?.(publicUrl)) return;
+    } catch {}
+    try {
+      const a = document.createElement('a');
+      a.href = publicUrl;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {}
+  };
+
+  const handleOpenReceiptFromMsg = (msg: SmsMessage) => {
+    void handleOpenReceiptInBrowser(msg);
   };
 
   // Copy working official receipt link to clipboard

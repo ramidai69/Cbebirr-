@@ -2592,9 +2592,12 @@ export default function CBEBirrFullscreenApp() {
   const [officialReceiptQrState, setOfficialReceiptQrState] = useState<{ target: string; dataUrl: string }>({ target: '', dataUrl: '' });
   const [isOpeningOfficialReceipt, setIsOpeningOfficialReceipt] = useState<boolean>(false);
   const officialReceiptLoadingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const officialReceiptRequestSeqRef = useRef<number>(0);
+  const isOpeningStep10ReceiptRef = useRef<boolean>(false);
   const lastSoundVibrateTimeRef = useRef<number>(0);
 
   const cancelOfficialReceiptLoading = useCallback(() => {
+    officialReceiptRequestSeqRef.current += 1;
     if (officialReceiptLoadingTimerRef.current) {
       clearTimeout(officialReceiptLoadingTimerRef.current);
       officialReceiptLoadingTimerRef.current = null;
@@ -4071,23 +4074,6 @@ export default function CBEBirrFullscreenApp() {
   const [deleteModalTx, setDeleteModalTx] = useState<TransactionItem | null>(null);
   const [selectedTx, setSelectedTx] = useState<TransactionItem | null>(null);
 
-  const openOfficialReceiptWithLoading = useCallback((backStep: ScreenStep = 8) => {
-    if (isOpeningOfficialReceipt) return;
-    if (!selectedTx && transactions.length > 0) {
-      setSelectedTx(transactions[0]);
-    }
-    if (officialReceiptLoadingTimerRef.current) {
-      clearTimeout(officialReceiptLoadingTimerRef.current);
-    }
-    setIsOpeningOfficialReceipt(true);
-    officialReceiptLoadingTimerRef.current = setTimeout(() => {
-      officialReceiptLoadingTimerRef.current = null;
-      setIsOpeningOfficialReceipt(false);
-      setOfficialReceiptBackStep(backStep);
-      setCurrentStep(9);
-    }, 3000);
-  }, [isOpeningOfficialReceipt, selectedTx, transactions]);
-
   useEffect(() => {
     return () => {
       if (officialReceiptLoadingTimerRef.current) {
@@ -5141,6 +5127,219 @@ export default function CBEBirrFullscreenApp() {
     };
   }, [currentStep, activeQrTargetUrl]);
 
+  const launchExternalBrowserUrl = useCallback((rawUrl: string) => {
+    if (typeof window === 'undefined') return;
+    const cleanUrl = String(rawUrl || '').trim();
+    if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return;
+    try {
+      const androidBridge = (window as unknown as { Android?: { openExternalUrl?: (url: string) => boolean } }).Android;
+      if (androidBridge && typeof androidBridge.openExternalUrl === 'function') {
+        if (androidBridge.openExternalUrl(cleanUrl)) return;
+      }
+    } catch {}
+    try {
+      const a = document.createElement('a');
+      a.href = cleanUrl;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {}
+  }, []);
+
+  const persistReceiptAndBuildUrl = useCallback(async (txOverride?: TransactionItem | null): Promise<string> => {
+    const activeTx = txOverride || selectedTx || (transactions.length > 0 ? transactions[0] : null);
+    const isPhone =
+      transferSource === 'phone_number' ||
+      Boolean(activeTx?.account && (activeTx.account.startsWith('09') || activeTx.account.startsWith('07')));
+    const currentRef = activeTx?.ref || activeTx?.orderId || transactionRef || 'FT262413JRB4';
+    const currentAcc = userAccount || phoneNumber || '';
+    const currentAmt = (parseFloat(activeTx?.amount ? String(activeTx.amount) : (isPhone ? phoneSendAmount : sendAmount)) || 0).toFixed(2);
+    const currentDate = activeTx?.date || transactionIsoDate || transactionDate || '';
+    const currentRec = activeTx?.account || (isPhone ? phoneReceiverNumber : receiverAccount) || '';
+    const currentName = activeTx?.receiverName || (isPhone ? (phoneReceiverName || '') : (displayReceiverName || '')) || '';
+    const currentUser = userName || 'CBEBirr Customer';
+    const currentBank =
+      activeTx?.bank ||
+      (transferSource === 'other_banks' && selectedBank
+        ? selectedBank.name
+        : transferSource === 'other_wallets' && selectedWallet
+          ? selectedWallet.name
+          : undefined);
+    const currentReason = activeTx?.reason
+      ? activeTx.reason
+      : currentBank
+        ? `Transfer to ${currentBank}`
+        : activeTx?.title
+          ? activeTx.title === 'Bank Transfer'
+            ? 'Transfer to Other Bank'
+            : activeTx.title === 'Wallet Transfer'
+              ? 'Wallet Transfer'
+              : 'Customer transfer to CBE account'
+          : isPhone
+            ? phoneReason || 'Wallet Transfer'
+            : sendReason || 'Customer transfer to CBE account';
+    const hasFeeCandidate =
+      Boolean(currentBank) ||
+      Boolean(activeTx?.serviceCharge && parseFloat(String(activeTx.serviceCharge)) > 0) ||
+      Boolean(activeTx?.title?.includes('Wallet'));
+    const fallbackFeeCalc = hasFeeCandidate ? calculateTransferFees(parseFloat(currentAmt) || 10) : null;
+    const currentFee = activeTx?.serviceCharge
+      ? String(activeTx.serviceCharge)
+      : fallbackFeeCalc
+        ? fallbackFeeCalc.serviceCharge.toString()
+        : undefined;
+    const currentVat = activeTx?.vat
+      ? String(activeTx.vat)
+      : fallbackFeeCalc
+        ? fallbackFeeCalc.taxAmount.toString()
+        : undefined;
+    const currentTotalPaid = activeTx?.totalPaidAmount
+      ? String(activeTx.totalPaidAmount)
+      : fallbackFeeCalc
+        ? fallbackFeeCalc.totalDeductions.toFixed(2)
+        : undefined;
+
+    const receiptSaveObj = {
+      ref: currentRef,
+      amt: currentAmt,
+      date: currentDate,
+      rec: currentRec,
+      name: currentName,
+      user: currentUser,
+      acc: currentAcc,
+      reason: currentReason,
+      status: 'Completed',
+      orderId: activeTx?.orderId || currentRef,
+      bank: currentBank,
+      creditAccountType: activeTx?.creditAccountType,
+      serviceCharge: currentFee,
+      vat: currentVat,
+      totalPaidAmount: currentTotalPaid,
+    };
+
+    const payloadJson = JSON.stringify(receiptSaveObj);
+    try {
+      const currentTid8 = generate8CharTxnId(currentRef);
+      localStorage.setItem(`cbe_receipt_${currentRef}`, payloadJson);
+      if (currentTid8 && currentTid8 !== currentRef) {
+        localStorage.setItem(`cbe_receipt_${currentTid8}`, payloadJson);
+      }
+      localStorage.setItem('cbe_receipt_latest', payloadJson);
+    } catch {}
+
+    const qrBaseOrigin = isStorageHydrated ? getShortQrBaseUrl() : 'https://cbebirr-lovat.vercel.app';
+    const cleanQrUrl = `${qrBaseOrigin}/r/${encodeURIComponent(currentRef)}`;
+    let savedOk = false;
+
+    const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    if (!isOffline && typeof window !== 'undefined') {
+      const isStaticApk =
+        window.location?.origin?.includes('appassets.androidplatform.net') ||
+        window.location?.protocol === 'file:';
+      const isSameOriginAsQrBase = window.location?.origin?.replace(/\/$/, '') === qrBaseOrigin;
+      const saveTarget =
+        !isStaticApk && isSameOriginAsQrBase
+          ? '/api/receipt/save'
+          : qrBaseOrigin && qrBaseOrigin.startsWith('http')
+            ? `${qrBaseOrigin}/api/receipt/save`
+            : '/api/receipt/save';
+
+      try {
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 1200) : null;
+        const res = await fetch(saveTarget, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payloadJson,
+          keepalive: true,
+          mode: saveTarget.startsWith('http') ? 'cors' : undefined,
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (timer) clearTimeout(timer);
+        if (res && res.ok) {
+          savedOk = true;
+        }
+      } catch {}
+    }
+
+    if (savedOk) {
+      return cleanQrUrl;
+    }
+
+    const fallbackParams = new URLSearchParams();
+    fallbackParams.set('TID', currentRef);
+    fallbackParams.set('orderId', activeTx?.orderId || currentRef);
+    if (currentAmt) fallbackParams.set('amt', currentAmt);
+    if (currentRec) fallbackParams.set('rec', currentRec);
+    if (currentName) fallbackParams.set('name', currentName);
+    if (currentUser) fallbackParams.set('user', currentUser);
+    if (currentAcc) fallbackParams.set('acc', currentAcc);
+    if (currentDate) fallbackParams.set('date', currentDate);
+    if (currentReason) fallbackParams.set('reason', currentReason);
+    if (currentBank) fallbackParams.set('bank', currentBank);
+    if (currentFee && parseFloat(currentFee) > 0) fallbackParams.set('fee', currentFee);
+    if (currentVat && parseFloat(currentVat) > 0) fallbackParams.set('vat', currentVat);
+    if (currentTotalPaid) fallbackParams.set('totalPaid', currentTotalPaid);
+    return `${cleanQrUrl}?${fallbackParams.toString()}`;
+  }, [
+    selectedTx,
+    transactions,
+    transactionRef,
+    userAccount,
+    phoneNumber,
+    sendAmount,
+    phoneSendAmount,
+    transactionDate,
+    transactionIsoDate,
+    receiverAccount,
+    phoneReceiverNumber,
+    displayReceiverName,
+    phoneReceiverName,
+    userName,
+    sendReason,
+    phoneReason,
+    transferSource,
+    selectedBank,
+    selectedWallet,
+    calculateTransferFees,
+    isStorageHydrated,
+  ]);
+
+  const openOfficialReceiptWithLoading = useCallback((_backStep: ScreenStep = 8) => {
+    if (isOpeningOfficialReceipt) return;
+    const targetTx = selectedTx || (transactions.length > 0 ? transactions[0] : null);
+    if (!selectedTx && targetTx) {
+      setSelectedTx(targetTx);
+    }
+    if (officialReceiptLoadingTimerRef.current) {
+      clearTimeout(officialReceiptLoadingTimerRef.current);
+    }
+    const seq = ++officialReceiptRequestSeqRef.current;
+    setIsOpeningOfficialReceipt(true);
+    const savePromise = persistReceiptAndBuildUrl(targetTx);
+    officialReceiptLoadingTimerRef.current = setTimeout(() => {
+      officialReceiptLoadingTimerRef.current = null;
+      void savePromise.then((browserUrl) => {
+        if (officialReceiptRequestSeqRef.current !== seq) return;
+        setIsOpeningOfficialReceipt(false);
+        launchExternalBrowserUrl(browserUrl);
+      });
+    }, 3000);
+  }, [isOpeningOfficialReceipt, selectedTx, transactions, persistReceiptAndBuildUrl, launchExternalBrowserUrl]);
+
+  const openOfficialReceiptDirectlyInBrowser = useCallback(async (txOverride?: TransactionItem | null) => {
+    if (isOpeningStep10ReceiptRef.current) return;
+    isOpeningStep10ReceiptRef.current = true;
+    try {
+      const browserUrl = await persistReceiptAndBuildUrl(txOverride);
+      launchExternalBrowserUrl(browserUrl);
+    } finally {
+      isOpeningStep10ReceiptRef.current = false;
+    }
+  }, [persistReceiptAndBuildUrl, launchExternalBrowserUrl]);
+
   const handleStartAddReceiver = () => {
     setEditingReceiverId(null);
     setModalAccNum('');
@@ -5731,10 +5930,11 @@ export default function CBEBirrFullscreenApp() {
 
     if (typeof navigator !== 'undefined' && navigator.share) {
       try {
+        const shareReceiptUrl = `${getShortQrBaseUrl()}/r/${encodeURIComponent(currentRef)}`;
         await navigator.share({
           title: 'CBEBirr Official Receipt',
           text: `CBEBirr VAT Invoice / Customer Receipt for ETB ${currentAmt} - Ref: ${currentRef}`,
-          url: window.location.href,
+          url: shareReceiptUrl,
         });
         setReceiptToast('ደረሰኝ ተጋርቷል (Receipt shared)');
       } catch {
@@ -11030,7 +11230,7 @@ export default function CBEBirrFullscreenApp() {
                   }
 
                   setOfficialReceiptBackStep(10);
-                  setCurrentStep(9); // Opens Official Receipt (Step 9) per user request
+                  void openOfficialReceiptDirectlyInBrowser(targetTx);
                 }}
                 className="absolute bottom-[4.5cqw] right-[4.5cqw] w-[22cqw] h-[22cqw] bg-[#7a1c7d] hover:bg-[#68146a] active:scale-95 text-white rounded-[4cqw] shadow-2xl flex flex-col items-center justify-center space-y-[1cqw] cursor-pointer z-40 transition-all border border-purple-300/30"
                 aria-label="Get Receipt"

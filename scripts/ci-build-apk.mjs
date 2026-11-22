@@ -330,7 +330,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       { encoding: 'utf8' }
     ).trim();
     const hasNativeCallDex = execSync(
-      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); d=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')); print(1 if (b'CallForegroundService' in d and b'IncomingCallActivity' in d and b'registerCallDevice' in d and b'consumePendingCallAction' in d and b'getPermissionStatusJson' in d and b'openPermissionSetting' in d) else 0)"`,
+      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); d=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')); print(1 if (b'CallForegroundService' in d and b'IncomingCallActivity' in d and b'registerCallDevice' in d and b'consumePendingCallAction' in d and b'getPermissionStatusJson' in d and b'openPermissionSetting' in d and b'openExternalUrl' in d) else 0)"`,
       { encoding: 'utf8' }
     ).trim();
     const hasNativeCallPerms = execSync(
@@ -758,6 +758,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             .replace(/\.method\s+[^\r\n]*\bopenPermissionSetting\(Ljava\/lang\/String;\)V[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bconsumePendingCallAction\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
             .replace(/\.method\s+[^\r\n]*\bsetAudioCallMode\(ZZ\)V[\s\S]*?\.end method\s*/g, '')
+            .replace(/\.method\s+[^\r\n]*\bopenExternalUrl\(Ljava\/lang\/String;\)Z[\s\S]*?\.end method\s*/g, '')
             .trimEnd();
           updated +=
             `\n\n.method public hideLoadingOverlay()V\n` +
@@ -870,6 +871,19 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
             `    invoke-static {v0, p1, p2}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->setAudioCallMode(Landroid/content/Context;ZZ)V\n\n` +
             `    :cond_done_audio_mode\n` +
             `    return-void\n` +
+            `.end method\n\n` +
+            `.method public openExternalUrl(Ljava/lang/String;)Z\n` +
+            `    .locals 1\n` +
+            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
+            `    .end annotation\n\n` +
+            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
+            `    if-nez v0, :cond_open_ext_url\n\n` +
+            `    const/4 v0, 0x0\n\n` +
+            `    return v0\n\n` +
+            `    :cond_open_ext_url\n` +
+            `    invoke-static {v0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->openExternalUrl(Landroid/app/Activity;Ljava/lang/String;)Z\n\n` +
+            `    move-result v0\n\n` +
+            `    return v0\n` +
             `.end method\n`;
           if (updated !== code) {
             code = updated;

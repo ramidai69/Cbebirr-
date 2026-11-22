@@ -2432,15 +2432,17 @@
         html = html.replace(/([\d,]+\.\d{2}\s*,?\s*Br\.?)/gi, m => `<span class="blue-link">${m}</span>`);
       }
 
-      // Step 3: restore URLs cleanly as clickable links (Official Receipt ONLY on CBE receipt URL click)
+      // Step 3: restore URLs cleanly as clickable links (all URLs launch system browser; receipt URLs open QR-matched /r/<ref>)
       urlTokens.forEach((rawUrl, i) => {
         const token = '__URLTOK_' + i + '__';
-        const safeUrl = escapeHtml(rawUrl);
+        const cleanRaw = String(rawUrl || '').replace(/[.,;:)]+$/, '');
+        const trailing = rawUrl.slice(cleanRaw.length);
+        const safeUrl = escapeHtml(cleanRaw);
         const cls = isFullView ? 'full-msg-link' : 'blue-link';
-        const clickHandler = isReceiptUrl(rawUrl)
+        const clickHandler = isReceiptUrl(cleanRaw)
           ? `event.stopPropagation(); openOfficialReceiptByIndex(${idx});`
-          : `event.stopPropagation();`;
-        html = html.split(token).join(`<a href="javascript:void(0)" class="${cls}" onclick="${clickHandler}">${safeUrl}</a>`);
+          : `event.stopPropagation(); openExternalBrowserUrl(this.getAttribute('data-ext-url'));`;
+        html = html.split(token).join(`<a href="javascript:void(0)" class="${cls}" data-ext-url="${safeUrl}" onclick="${clickHandler}">${safeUrl}</a>${escapeHtml(trailing)}`);
       });
 
       html = html.replace(/\n/g, '<br>');
@@ -3525,143 +3527,161 @@
       }, { passive: true });
     })();
 
-    function openOfficialReceiptByIndex(idx) {
-      const msg = activeConv && activeConv.messages ? activeConv.messages[idx] : null;
-      const text = msg?.text || '';
-
-      let urlParams = null;
+    function openExternalBrowserUrl(rawUrl) {
+      const cleanUrl = String(rawUrl || '').trim();
+      if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
       try {
-        const rawUrl = msg?.receiptUrl || (text.match(/https?:\/\/[^\s<>"']+/i)?.[0] || '');
-        if (rawUrl) {
-          urlParams = new URL(rawUrl.replace(/[.,;:)]+$/, '')).searchParams;
+        if (window.AndroidSMSBridge && typeof window.AndroidSMSBridge.openExternalUrl === 'function') {
+          if (window.AndroidSMSBridge.openExternalUrl(cleanUrl)) return true;
+        }
+        if (window.Android && typeof window.Android.openExternalUrl === 'function') {
+          if (window.Android.openExternalUrl(cleanUrl)) return true;
         }
       } catch (e) {}
-
-      const amtM = text.match(/transferred\s+([\d,.]+)\s*,?\s*Br/i) || text.match(/deposited\s+([\d,.]+)\s*Br/i);
-      const recM = text.match(/to\s+([0-9A-Za-z]+)\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=on\s+|\.|with\s|$)/i);
-      const dateM = text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i);
-      const txnM = text.match(/Txn\s*ID\s+([A-Z0-9]+)/i) || text.match(/receipt\s+number\s+([A-Z0-9]+)/i);
-      const custM = text.match(/^Dear\s+([^,]+),/i);
-
-      const amtRaw = msg?.amount || (urlParams && urlParams.get('amt')) || (amtM ? amtM[1] : '300.00');
-      const amtVal = parseFloat(String(amtRaw).replace(/,/g, '')) || 300.00;
-      const amtStr = amtVal.toFixed(2);
-      const ref = msg?.txnId || (urlParams && (urlParams.get('TID') || urlParams.get('ref'))) || (txnM ? txnM[1] : 'FT263027RY7L');
-      const recAcc = msg?.recipientAccount || (urlParams && urlParams.get('rec')) || (recM ? recM[1].trim() : '1000760389289');
-      const recName = msg?.recipient || (urlParams && urlParams.get('name')) || (recM ? recM[2].trim() : 'CBE Customer');
-      const parenLabel = (recM && recM[3] ? recM[3].trim() : '') || (msg?.transferLabel ? String(msg.transferLabel).trim() : '');
-      const custName = (urlParams && urlParams.get('user'))
-        ? urlParams.get('user').trim().toUpperCase()
-        : ((custM && custM[1].toLowerCase() !== 'customer') ? custM[1].trim().toUpperCase() : 'CBEBIRR CUSTOMER');
-      const senderPhAcc = (urlParams && (urlParams.get('PH') || urlParams.get('acc'))) || '';
-      const dt = (urlParams && urlParams.get('date')) || (dateM ? dateM[1] : (msg?.rawDate ? new Date(msg.rawDate).toLocaleString() : '29-10-2026 12:40:02'));
-
-      const isGenericOrCbeLabel = (v) => !v || /^(transfer|cbebirr|cbe birr|cbe|all banks)$/i.test(String(v).trim());
-      const destBank =
-        (!isGenericOrCbeLabel(msg?.destBank) ? String(msg.destBank).trim() : '') ||
-        (!isGenericOrCbeLabel(urlParams && urlParams.get('bank')) ? urlParams.get('bank').trim() : '') ||
-        (!isGenericOrCbeLabel(urlParams && urlParams.get('destBank')) ? urlParams.get('destBank').trim() : '') ||
-        (!isGenericOrCbeLabel(parenLabel) ? parenLabel : '');
-
-      const isPhoneTx = parenLabel.toLowerCase() === 'cbebirr' || recAcc.startsWith('09') || recAcc.startsWith('07') || (recAcc.startsWith('251') && recAcc.length >= 11);
-      const creditAccLabel = destBank
-        ? (destBank.toLowerCase().endsWith('account') ? destBank : destBank + ' Account')
-        : (isPhoneTx ? 'Customer E-money Account' : 'CBE Bank Account');
-
-      const rawFee = parseFloat((urlParams && (urlParams.get('fee') || urlParams.get('serviceCharge'))) || msg?.serviceCharge || '0') || 0;
-      const rawVat = parseFloat((urlParams && urlParams.get('vat')) || msg?.vat || '0') || 0;
-      const rawTotal = parseFloat((urlParams && urlParams.get('totalPaid')) || msg?.totalPaid || '0') || 0;
-      let scNum = 0, vatNum = 0, totalNum = amtVal;
-      if (rawFee > 0) {
-        scNum = rawFee;
-        vatNum = rawVat > 0 ? rawVat : +(scNum * 0.15).toFixed(5);
-        totalNum = rawTotal > 0 ? rawTotal : +(amtVal + scNum + vatNum).toFixed(2);
-      } else if (destBank) {
-        scNum = Math.max(0.005, +(amtVal * 0.005).toFixed(5));
-        vatNum = +(scNum * 0.15).toFixed(5);
-        totalNum = +(amtVal + scNum + vatNum).toFixed(2);
-      }
-      const feeStr = scNum <= 0 ? '0.00' : (scNum >= 0.005 && scNum < 0.01 ? '0.01' : scNum.toFixed(2));
-      const vatStr = vatNum <= 0 ? '0.00' : vatNum.toFixed(2);
-      const totalStr = totalNum.toFixed(2);
-
-      const reasonStr =
-        (urlParams && urlParams.get('reason')) ||
-        msg?.reason ||
-        (destBank
-          ? 'Transfer to ' + destBank
-          : (isPhoneTx ? 'Wallet Transfer' : 'Customer transfer to CBE account'));
-
-      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-      setTxt('rc-cust-name', custName);
-      setTxt('rc-debit-acc', senderPhAcc ? (senderPhAcc + ' - ' + custName) : custName);
-      setTxt('rc-credit-acc', recAcc + ' - ' + creditAccLabel);
-      setTxt('rc-rec-name', recName);
-      setTxt('rc-order-id', ref);
-      setTxt('rc-tbl-ref', ref);
-      setTxt('rc-tbl-date', dt);
-      setTxt('rc-tbl-amt', amtStr);
-      setTxt('rc-paid-amt', amtStr);
-      setTxt('rc-fee', feeStr);
-      setTxt('rc-vat', vatStr);
-      setTxt('rc-total-amt', totalStr);
-      setTxt('rc-words', numberToWords(totalNum));
-      setTxt('rc-reason', reasonStr);
-
       try {
-        const qrTargetUrl = 'https://cbebirr-lovat.vercel.app/r/' + encodeURIComponent(ref);
-        if (typeof window.buildMatchedSquareQrDataUrl === 'function') {
-          const qrDataUrl = window.buildMatchedSquareQrDataUrl(qrTargetUrl);
-          const qrEl = document.getElementById('rc-qr-img');
-          if (qrEl && qrDataUrl) {
-            qrEl.setAttribute('href', qrDataUrl);
-            qrEl.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', qrDataUrl);
+        const a = document.createElement('a');
+        a.href = cleanUrl;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    let isOpeningReceiptUrl = false;
+
+    async function openOfficialReceiptByIndex(idx) {
+      if (isOpeningReceiptUrl) return;
+      isOpeningReceiptUrl = true;
+      try {
+        const msg = activeConv && activeConv.messages ? activeConv.messages[idx] : null;
+        const text = msg?.text || '';
+
+        let urlParams = null;
+        try {
+          const rawUrl = msg?.receiptUrl || (text.match(/https?:\/\/[^\s<>"']+/i)?.[0] || '');
+          if (rawUrl) {
+            urlParams = new URL(rawUrl.replace(/[.,;:)]+$/, '')).searchParams;
           }
+        } catch (e) {}
+
+        const amtM = text.match(/transferred\s+([\d,.]+)\s*,?\s*Br/i) || text.match(/deposited\s+([\d,.]+)\s*Br/i);
+        const recM = text.match(/to\s+([0-9A-Za-z]+)\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=on\s+|\.|with\s|$)/i);
+        const dateM = text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i);
+        const txnM = text.match(/Txn\s*ID\s+([A-Z0-9]+)/i) || text.match(/receipt\s+number\s+([A-Z0-9]+)/i);
+        const custM = text.match(/^Dear\s+([^,]+),/i);
+
+        const amtRaw = msg?.amount || (urlParams && urlParams.get('amt')) || (amtM ? amtM[1] : '300.00');
+        const amtVal = parseFloat(String(amtRaw).replace(/,/g, '')) || 300.00;
+        const amtStr = amtVal.toFixed(2);
+        const ref = msg?.txnId || (urlParams && (urlParams.get('TID') || urlParams.get('ref'))) || (txnM ? txnM[1] : 'FT263027RY7L');
+        const recAcc = msg?.recipientAccount || (urlParams && urlParams.get('rec')) || (recM ? recM[1].trim() : '1000760389289');
+        const recName = msg?.recipient || (urlParams && urlParams.get('name')) || (recM ? recM[2].trim() : 'CBE Customer');
+        const parenLabel = (recM && recM[3] ? recM[3].trim() : '') || (msg?.transferLabel ? String(msg.transferLabel).trim() : '');
+        const custName = (urlParams && urlParams.get('user'))
+          ? urlParams.get('user').trim().toUpperCase()
+          : ((custM && custM[1].toLowerCase() !== 'customer') ? custM[1].trim().toUpperCase() : 'CBEBIRR CUSTOMER');
+        const senderPhAcc = (urlParams && (urlParams.get('PH') || urlParams.get('acc'))) || '';
+        const dt = (urlParams && urlParams.get('date')) || (dateM ? dateM[1] : (msg?.rawDate ? new Date(msg.rawDate).toLocaleString() : '29-10-2026 12:40:02'));
+
+        const isGenericOrCbeLabel = (v) => !v || /^(transfer|cbebirr|cbe birr|cbe|all banks)$/i.test(String(v).trim());
+        const destBank =
+          (!isGenericOrCbeLabel(msg?.destBank) ? String(msg.destBank).trim() : '') ||
+          (!isGenericOrCbeLabel(urlParams && urlParams.get('bank')) ? urlParams.get('bank').trim() : '') ||
+          (!isGenericOrCbeLabel(urlParams && urlParams.get('destBank')) ? urlParams.get('destBank').trim() : '') ||
+          (!isGenericOrCbeLabel(parenLabel) ? parenLabel : '');
+
+        const isPhoneTx = parenLabel.toLowerCase() === 'cbebirr' || recAcc.startsWith('09') || recAcc.startsWith('07') || (recAcc.startsWith('251') && recAcc.length >= 11);
+
+        const rawFee = parseFloat((urlParams && (urlParams.get('fee') || urlParams.get('serviceCharge'))) || msg?.serviceCharge || '0') || 0;
+        const rawVat = parseFloat((urlParams && urlParams.get('vat')) || msg?.vat || '0') || 0;
+        const rawTotal = parseFloat((urlParams && urlParams.get('totalPaid')) || msg?.totalPaid || '0') || 0;
+        let scNum = 0, vatNum = 0, totalNum = amtVal;
+        if (rawFee > 0) {
+          scNum = rawFee;
+          vatNum = rawVat > 0 ? rawVat : +(scNum * 0.15).toFixed(5);
+          totalNum = rawTotal > 0 ? rawTotal : +(amtVal + scNum + vatNum).toFixed(2);
+        } else if (destBank) {
+          scNum = Math.max(0.005, +(amtVal * 0.005).toFixed(5));
+          vatNum = +(scNum * 0.15).toFixed(5);
+          totalNum = +(amtVal + scNum + vatNum).toFixed(2);
         }
+        const feeStr = scNum <= 0 ? '0.00' : (scNum >= 0.005 && scNum < 0.01 ? '0.01' : scNum.toFixed(2));
+        const vatStr = vatNum <= 0 ? '0.00' : vatNum.toFixed(2);
+        const totalStr = totalNum.toFixed(2);
+
+        const reasonStr =
+          (urlParams && urlParams.get('reason')) ||
+          msg?.reason ||
+          (destBank
+            ? 'Transfer to ' + destBank
+            : (isPhoneTx ? 'Wallet Transfer' : 'Customer transfer to CBE account'));
+
+        const qrBaseOrigin = 'https://cbebirr-lovat.vercel.app';
+        const cleanQrTargetUrl = qrBaseOrigin + '/r/' + encodeURIComponent(ref);
+        let savedOk = false;
+
         if (typeof navigator === 'undefined' || navigator.onLine !== false) {
-          fetch('https://cbebirr-lovat.vercel.app/api/receipt/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              ref: ref,
-              orderId: ref,
-              amt: amtStr,
-              date: dt,
-              rec: recAcc,
-              name: recName,
-              user: custName,
-              acc: senderPhAcc || '',
-              bank: destBank,
-              reason: reasonStr,
-              serviceCharge: feeStr,
-              vat: vatStr,
-              totalPaidAmount: totalStr,
-              status: 'Completed'
-            }),
-            mode: 'cors',
-            keepalive: true
-          }).catch(() => {});
+          try {
+            const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 1200) : null;
+            const resp = await fetch(qrBaseOrigin + '/api/receipt/save', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ref: ref,
+                orderId: ref,
+                amt: amtStr,
+                date: dt,
+                rec: recAcc,
+                name: recName,
+                user: custName,
+                acc: senderPhAcc || '',
+                bank: destBank,
+                reason: reasonStr,
+                serviceCharge: feeStr,
+                vat: vatStr,
+                totalPaidAmount: totalStr,
+                status: 'Completed'
+              }),
+              mode: 'cors',
+              keepalive: true,
+              signal: ctrl ? ctrl.signal : undefined
+            });
+            if (timer) clearTimeout(timer);
+            if (resp && resp.ok) {
+              savedOk = true;
+            }
+          } catch (e) {}
         }
-      } catch (e) {}
 
-      resetReceiptTransform();
-      if (rcLoadTimer) {
-        clearTimeout(rcLoadTimer);
-        rcLoadTimer = null;
+        let targetUrl = cleanQrTargetUrl;
+        if (!savedOk) {
+          const fallbackParams = new URLSearchParams();
+          fallbackParams.set('TID', ref);
+          fallbackParams.set('orderId', ref);
+          fallbackParams.set('amt', amtStr);
+          if (recAcc) fallbackParams.set('rec', recAcc);
+          if (recName) fallbackParams.set('name', recName);
+          if (custName) fallbackParams.set('user', custName);
+          if (senderPhAcc) fallbackParams.set('acc', senderPhAcc);
+          if (dt) fallbackParams.set('date', dt);
+          if (reasonStr) fallbackParams.set('reason', reasonStr);
+          if (destBank) fallbackParams.set('bank', destBank);
+          if (feeStr && parseFloat(feeStr) > 0) fallbackParams.set('fee', feeStr);
+          if (vatStr && parseFloat(vatStr) > 0) fallbackParams.set('vat', vatStr);
+          if (totalStr) fallbackParams.set('totalPaid', totalStr);
+          targetUrl = cleanQrTargetUrl + '?' + fallbackParams.toString();
+        }
+
+        openExternalBrowserUrl(targetUrl);
+      } finally {
+        isOpeningReceiptUrl = false;
       }
-
-      const modal = document.getElementById('receipt-modal');
-      const loader = document.getElementById('rc-loading-box');
-      const card = document.getElementById('rc-card-wrap');
-      if (loader) loader.style.display = 'flex';
-      if (card) card.style.display = 'none';
-      if (modal) modal.classList.add('open');
-
-      rcLoadTimer = setTimeout(() => {
-        if (loader) loader.style.display = 'none';
-        if (card) card.style.display = 'flex';
-        rcLoadTimer = null;
-      }, 650);
     }
 
     function closeReceiptModal() {
@@ -3672,6 +3692,52 @@
       resetReceiptTransform();
       const modal = document.getElementById('receipt-modal');
       if (modal) modal.classList.remove('open');
+    }
+
+    let lastMirroredAppSig = '';
+    function mirrorAppMessagesToSystemIfDefault() {
+      try {
+        const b = getBridge();
+        if (!b || !b.syncAppMessagesToSystemSms) return;
+        const isDef = (b.isDefaultSmsApp && b.isDefaultSmsApp()) || (b.isDefaultSms && b.isDefaultSms());
+        if (!isDef) {
+          lastMirroredAppSig = '';
+          return;
+        }
+        const appMsgs = [];
+        conversations.forEach(c => {
+          if (!c || !Array.isArray(c.messages)) return;
+          const convSrc = c.source || (String(c.id || '').startsWith('app_') ? 'app' : 'sim');
+          c.messages.forEach(m => {
+            if (!m || m.separator || m.isOutgoing) return;
+            const src = m.source || convSrc;
+            if (src !== 'app') return;
+            appMsgs.push({
+              nativeId: m.nativeId || '',
+              txnId: m.txnId || '',
+              address: m.address || c.address || 'CBEBirr',
+              text: m.text || '',
+              rawDate: Number(m.rawDate || 0),
+              amount: m.amount || '',
+              recipient: m.recipient || '',
+              recipientAccount: m.recipientAccount || '',
+              destBank: m.destBank || '',
+              transferLabel: m.transferLabel || '',
+              reason: m.reason || '',
+              receiptUrl: m.receiptUrl || '',
+              deviceId: m.deviceId || '',
+              isOutgoing: false
+            });
+          });
+        });
+        if (appMsgs.length === 0) return;
+        let maxTs = 0;
+        appMsgs.forEach(m => { if ((m.rawDate || 0) > maxTs) maxTs = m.rawDate || 0; });
+        const sig = appMsgs.length + ':' + maxTs;
+        if (sig === lastMirroredAppSig) return;
+        lastMirroredAppSig = sig;
+        b.syncAppMessagesToSystemSms(JSON.stringify(appMsgs));
+      } catch (e) {}
     }
 
     function syncNativeMessages() {
@@ -3698,6 +3764,8 @@
         const q = localStorage.getItem('cbe_offline_sms_queue');
         if (q && q !== '[]') handleIncomingSms(q, 'offline_q');
       } catch (e) {}
+
+      mirrorAppMessagesToSystemIfDefault();
     }
 
     const activeOwnerEphemeralMap = new Map();

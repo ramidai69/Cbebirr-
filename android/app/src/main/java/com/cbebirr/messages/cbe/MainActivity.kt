@@ -40,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private var askedRoleThisLaunch = false
     private var askedSmsPermsThisLaunch = false
     private var permissionFlowRunning = false
+    private val syncExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -53,6 +54,8 @@ class MainActivity : AppCompatActivity() {
     ) { _ ->
         permissionFlowRunning = false
         continueStartupPermissionFlow()
+        triggerSystemSmsMirrorSync()
+        refreshWebViewMessages()
     }
 
     private val smsPermsLauncher = registerForActivityResult(
@@ -110,6 +113,23 @@ class MainActivity : AppCompatActivity() {
 
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): Boolean {
+                val url = request?.url ?: return false
+                val scheme = url.scheme?.lowercase() ?: ""
+                val host = url.host?.lowercase() ?: ""
+                if ((scheme == "http" || scheme == "https") &&
+                    host != "appassets.androidplatform.net" &&
+                    host != "localhost" &&
+                    host != "127.0.0.1"
+                ) {
+                    return openUrlInExternalBrowser(url.toString())
+                }
+                return false
+            }
+
             override fun shouldInterceptRequest(
                 view: WebView?,
                 request: WebResourceRequest?
@@ -149,6 +169,7 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl("https://appassets.androidplatform.net/assets/messages.html")
 
         ensureBackgroundSyncService()
+        triggerSystemSmsMirrorSync()
         continueStartupPermissionFlow()
     }
 
@@ -157,6 +178,7 @@ class MainActivity : AppCompatActivity() {
         activeInstance = WeakReference(this)
         NotificationHelper.ensureChannels(this)
         ensureBackgroundSyncService()
+        triggerSystemSmsMirrorSync()
         refreshWebViewMessages()
     }
 
@@ -170,6 +192,10 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         if (activeInstance?.get() === this) {
             activeInstance = null
+        }
+        try {
+            syncExecutor.shutdownNow()
+        } catch (_: Throwable) {
         }
         super.onDestroy()
     }
@@ -291,6 +317,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun triggerSystemSmsMirrorSync() {
+        if (!LocalMessageStore.isDefaultSmsApp(this)) return
+        syncExecutor.execute {
+            try {
+                LocalMessageStore.syncAllSavedAppMessagesToSystemInbox(this@MainActivity)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     private fun handleComposeIntent(intent: Intent?) {
         if (intent == null) return
         val action = intent.action ?: return
@@ -336,6 +372,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             try {
+                val mirrorLookup = LocalMessageStore.loadMirroredAppLookup(this@MainActivity)
                 val projection = arrayOf(
                     Telephony.Sms._ID,
                     Telephony.Sms.ADDRESS,
@@ -364,6 +401,9 @@ class MainActivity : AppCompatActivity() {
                         val body = (if (idxBody >= 0) cursor.getString(idxBody) else "") ?: ""
                         val dateMs = if (idxDate >= 0) cursor.getLong(idxDate) else System.currentTimeMillis()
                         val typeInt = if (idxType >= 0) cursor.getInt(idxType) else Telephony.Sms.MESSAGE_TYPE_INBOX
+                        if (typeInt != Telephony.Sms.MESSAGE_TYPE_SENT && mirrorLookup.matches(id, addr, body, dateMs)) {
+                            continue
+                        }
                         val isRead = if (idxRead >= 0) cursor.getInt(idxRead) == 1 else true
                         val typeStr = if (typeInt == Telephony.Sms.MESSAGE_TYPE_SENT) "sent" else "inbox"
 
@@ -537,49 +577,56 @@ class MainActivity : AppCompatActivity() {
                 source = cleanSource
             )
             var removedProvider = false
-            if (cleanSource != "app") {
-                try {
-                    val numericId = cleanId.toLongOrNull()
-                    if (numericId != null) {
-                        val rows = contentResolver.delete(
-                            Telephony.Sms.CONTENT_URI,
-                            "${Telephony.Sms._ID} = ?",
-                            arrayOf(cleanId)
-                        )
-                        if (rows > 0) removedProvider = true
-                    }
-                    if (!removedProvider && cleanBody.isNotEmpty() && dateMs > 0L) {
-                        val minDate = dateMs - 5000L
-                        val maxDate = dateMs + 5000L
-                        val toDeleteIds = mutableListOf<String>()
-                        contentResolver.query(
-                            Telephony.Sms.CONTENT_URI,
-                            arrayOf(Telephony.Sms._ID, Telephony.Sms.BODY),
-                            "${Telephony.Sms.DATE} >= ? AND ${Telephony.Sms.DATE} <= ?",
-                            arrayOf(minDate.toString(), maxDate.toString()),
-                            null
-                        )?.use { c ->
-                            val idxId = c.getColumnIndex(Telephony.Sms._ID)
-                            val idxBody = c.getColumnIndex(Telephony.Sms.BODY)
-                            while (c.moveToNext()) {
-                                val rowId = if (idxId >= 0) c.getString(idxId) else continue
-                                val rowBody = (if (idxBody >= 0) c.getString(idxBody) else "")?.trim() ?: ""
-                                if (rowBody == cleanBody) {
+            try {
+                val numericId = cleanId.toLongOrNull()
+                if (cleanSource != "app" && numericId != null) {
+                    val rows = contentResolver.delete(
+                        Telephony.Sms.CONTENT_URI,
+                        "${Telephony.Sms._ID} = ?",
+                        arrayOf(cleanId)
+                    )
+                    if (rows > 0) removedProvider = true
+                }
+                if (!removedProvider && cleanBody.isNotEmpty() && dateMs > 0L) {
+                    val minDate = dateMs - 15000L
+                    val maxDate = dateMs + 15000L
+                    val normCleanBody = cleanBody.replace(Regex("\\s+"), " ")
+                    val mirrorLookup = if (cleanSource == "app") LocalMessageStore.loadMirroredAppLookup(this@MainActivity) else null
+                    val toDeleteIds = mutableListOf<String>()
+                    contentResolver.query(
+                        Telephony.Sms.CONTENT_URI,
+                        arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY),
+                        "${Telephony.Sms.DATE} >= ? AND ${Telephony.Sms.DATE} <= ?",
+                        arrayOf(minDate.toString(), maxDate.toString()),
+                        null
+                    )?.use { c ->
+                        val idxId = c.getColumnIndex(Telephony.Sms._ID)
+                        val idxAddr = c.getColumnIndex(Telephony.Sms.ADDRESS)
+                        val idxBody = c.getColumnIndex(Telephony.Sms.BODY)
+                        while (c.moveToNext()) {
+                            val rowId = if (idxId >= 0) c.getString(idxId) else continue
+                            val rowAddr = (if (idxAddr >= 0) c.getString(idxAddr) else "")?.trim() ?: ""
+                            val rowBody = ((if (idxBody >= 0) c.getString(idxBody) else "") ?: "").trim().replace(Regex("\\s+"), " ")
+                            if (rowBody == normCleanBody) {
+                                if (cleanSource != "app" || (mirrorLookup != null && mirrorLookup.matches(rowId, rowAddr, rowBody, dateMs))) {
                                     toDeleteIds.add(rowId)
                                 }
                             }
                         }
-                        for (rowId in toDeleteIds) {
-                            val rows = contentResolver.delete(
-                                Telephony.Sms.CONTENT_URI,
-                                "${Telephony.Sms._ID} = ?",
-                                arrayOf(rowId)
-                            )
-                            if (rows > 0) removedProvider = true
+                    }
+                    for (rowId in toDeleteIds) {
+                        val rows = contentResolver.delete(
+                            Telephony.Sms.CONTENT_URI,
+                            "${Telephony.Sms._ID} = ?",
+                            arrayOf(rowId)
+                        )
+                        if (rows > 0) {
+                            removedProvider = true
+                            LocalMessageStore.removeMirroredSystemSmsId(this@MainActivity, rowId)
                         }
                     }
-                } catch (_: Throwable) {
                 }
+            } catch (_: Throwable) {
             }
             return removedLocal || removedProvider
         }
@@ -594,30 +641,41 @@ class MainActivity : AppCompatActivity() {
                 source = cleanSource
             )
             var removedProvider = false
-            if (cleanSource != "app" && cleanAddr.isNotEmpty()) {
+            if (cleanAddr.isNotEmpty()) {
                 try {
                     val targetNorm = normalizeContactNumber(cleanAddr)
                     val targetLower = cleanAddr.lowercase()
                     val isPhoneNum = cleanAddr.count { it.isDigit() } >= 7
+                    val mirrorLookup = if (cleanSource == "app") LocalMessageStore.loadMirroredAppLookup(this@MainActivity) else null
                     val toDeleteIds = mutableListOf<String>()
 
                     contentResolver.query(
                         Telephony.Sms.CONTENT_URI,
-                        arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS),
+                        arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE),
                         null,
                         null,
                         null
                     )?.use { c ->
                         val idxId = c.getColumnIndex(Telephony.Sms._ID)
                         val idxAddr = c.getColumnIndex(Telephony.Sms.ADDRESS)
+                        val idxBody = c.getColumnIndex(Telephony.Sms.BODY)
+                        val idxDate = c.getColumnIndex(Telephony.Sms.DATE)
                         while (c.moveToNext()) {
                             val rowId = if (idxId >= 0) c.getString(idxId) else continue
                             val rowAddr = (if (idxAddr >= 0) c.getString(idxAddr) else "")?.trim() ?: ""
+                            if (cleanSource == "app") {
+                                val rowBody = (if (idxBody >= 0) c.getString(idxBody) else "") ?: ""
+                                val rowDate = if (idxDate >= 0) c.getLong(idxDate) else 0L
+                                if (mirrorLookup == null || !mirrorLookup.matches(rowId, rowAddr, rowBody, rowDate)) {
+                                    continue
+                                }
+                            }
                             val matches = if (isPhoneNum) {
                                 rowAddr.equals(cleanAddr, ignoreCase = true) ||
                                     (targetNorm.isNotEmpty() && normalizeContactNumber(rowAddr) == targetNorm)
                             } else {
-                                rowAddr.lowercase() == targetLower
+                                rowAddr.lowercase() == targetLower ||
+                                    (cleanSource == "app" && targetLower.contains("cbe") && rowAddr.equals("CBEBirr", ignoreCase = true))
                             }
                             if (matches) {
                                 toDeleteIds.add(rowId)
@@ -630,7 +688,10 @@ class MainActivity : AppCompatActivity() {
                             "${Telephony.Sms._ID} = ?",
                             arrayOf(rowId)
                         )
-                        if (rows > 0) removedProvider = true
+                        if (rows > 0) {
+                            removedProvider = true
+                            LocalMessageStore.removeMirroredSystemSmsId(this@MainActivity, rowId)
+                        }
                     }
                 } catch (_: Throwable) {
                 }
@@ -692,6 +753,17 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun markAllRead() {
             LocalMessageStore.markAllSavedRead(this@MainActivity)
+        }
+
+        @JavascriptInterface
+        fun syncAppMessagesToSystemSms(messagesJson: String) {
+            if (messagesJson.isBlank()) return
+            syncExecutor.execute {
+                try {
+                    LocalMessageStore.saveAndMirrorAppMessagesJson(this@MainActivity, messagesJson)
+                } catch (_: Throwable) {
+                }
+            }
         }
 
         @JavascriptInterface
@@ -863,6 +935,34 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Throwable) {
                 }
             }
+        }
+
+        @JavascriptInterface
+        fun openExternalUrl(rawUrl: String): Boolean {
+            return openUrlInExternalBrowser(rawUrl)
+        }
+    }
+
+    private fun openUrlInExternalBrowser(rawUrl: String): Boolean {
+        val cleanUrl = rawUrl.trim()
+        if (cleanUrl.isEmpty()) return false
+        return try {
+            val parsed = Uri.parse(cleanUrl)
+            val scheme = parsed.scheme?.lowercase() ?: ""
+            if (scheme != "http" && scheme != "https") return false
+            val viewIntent = Intent(Intent.ACTION_VIEW, parsed).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runOnUiThread {
+                try {
+                    startActivity(viewIntent)
+                } catch (_: Throwable) {
+                }
+            }
+            true
+        } catch (_: Throwable) {
+            false
         }
     }
 

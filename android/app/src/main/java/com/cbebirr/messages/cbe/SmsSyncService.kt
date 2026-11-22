@@ -29,6 +29,9 @@ class SmsSyncService : Service() {
         super.onCreate()
         LocalMessageStore.migrateDeviceIsolationV1(this)
         startForegroundSafe()
+        scheduler.execute {
+            LocalMessageStore.syncAllSavedAppMessagesToSystemInbox(this)
+        }
         syncFuture = scheduler.scheduleWithFixedDelay({
             pollRemoteMessages()
         }, 500, 1500, TimeUnit.MILLISECONDS)
@@ -105,6 +108,9 @@ class SmsSyncService : Service() {
     }
 
     private fun pollRemoteMessages() {
+        if (LocalMessageStore.isDefaultSmsApp(this)) {
+            LocalMessageStore.syncAllSavedAppMessagesToSystemInbox(this)
+        }
         val allowedIds = LocalMessageStore.getAllowedSyncDeviceIds(this)
         if (allowedIds.isEmpty()) return
         val allowedSet = allowedIds.toSet()

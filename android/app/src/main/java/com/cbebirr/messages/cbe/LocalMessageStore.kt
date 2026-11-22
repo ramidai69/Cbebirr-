@@ -17,10 +17,15 @@ object LocalMessageStore {
     private const val KEY_PAIRED_DEVICE_IDS = "paired_banking_device_ids"
     private const val KEY_ISOLATION_MIGRATED = "isolation_v1_migrated"
     private const val KEY_SEEN_OWNER_NOTIFS = "seen_owner_notif_ids"
+    private const val KEY_SYS_SYNCED_KEYS = "sys_sms_synced_keys"
+    private const val KEY_MIRRORED_SYS_IDS = "sys_sms_mirrored_ids"
+    private const val KEY_APP_MIRRORED_SIGS = "sys_sms_app_mirrored_sigs"
     private const val MAX_SAVED_MESSAGES = 400
     private const val MAX_SEEN_IDS = 800
     private const val MAX_DELETED_KEYS = 800
     private const val MAX_SEEN_OWNER_NOTIFS = 400
+    private const val MAX_SYS_SYNCED_KEYS = 800
+    private const val MAX_MIRRORED_SYS_IDS = 800
 
     private val RESERVED_SHARED_IDS = setOf(
         "all",
@@ -33,6 +38,21 @@ object LocalMessageStore {
     )
 
     private val lock = Any()
+    private val sysSyncLock = Any()
+
+    data class MirroredAppLookup(
+        val mirroredIds: Set<String>,
+        val appSigs: Set<String>
+    ) {
+        fun matches(systemSmsId: String, address: String, body: String, dateMs: Long): Boolean {
+            if (systemSmsId.isNotBlank() && mirroredIds.contains(systemSmsId.trim())) {
+                return true
+            }
+            if (appSigs.isEmpty() || body.isBlank()) return false
+            val sig = buildSystemMirrorSig(address, body, dateMs)
+            return appSigs.contains(sig)
+        }
+    }
 
     fun isValidScopedDeviceId(id: String?): Boolean {
         val clean = id?.trim() ?: return false
@@ -177,6 +197,17 @@ object LocalMessageStore {
     private fun normalizePhoneKey(raw: String): String {
         val digits = raw.filter { it.isDigit() }
         return if (digits.length >= 9) digits.takeLast(9) else raw.trim().lowercase()
+    }
+
+    private fun normalizeBodyForSig(body: String): String {
+        return body.trim().replace(Regex("\\s+"), " ")
+    }
+
+    fun buildSystemMirrorSig(address: String, body: String, dateMs: Long): String {
+        val normAddr = address.trim().lowercase().ifBlank { "cbebirr" }
+        val normBody = normalizeBodyForSig(body)
+        val bucket = (if (dateMs > 0L) dateMs else 0L) / 10000L
+        return "$normAddr|${normBody.hashCode()}|$bucket"
     }
 
     private fun buildCandidateDeleteKeys(
@@ -420,9 +451,19 @@ object LocalMessageStore {
                 .putString(KEY_SAVED_MESSAGES, trimmedSaved.toString())
                 .putString(KEY_SEEN_IDS, trimmedSeen.toString())
                 .apply()
-
-            return true
         }
+
+        if (source == "app" && type != "sent") {
+            tryInsertInboxSms(
+                context = context,
+                address = address.ifBlank { "CBEBirr" },
+                body = repairedBody,
+                dateMs = dateMs,
+                isRead = false,
+                isAppMirror = true
+            )
+        }
+        return true
     }
 
     fun deleteMessage(
@@ -627,24 +668,275 @@ object LocalMessageStore {
         }
     }
 
-    /**
-     * Safely inserts an incoming SIM SMS into Android's Telephony.Sms.Inbox content provider
-     * ONLY inside an isolated try/catch. Never throws even if app is not Default SMS App.
-     */
-    fun tryInsertInboxSms(context: Context, address: String, body: String, dateMs: Long) {
-        try {
-            val values = ContentValues().apply {
-                put(Telephony.Sms.ADDRESS, address.ifBlank { "Messages" })
-                put(Telephony.Sms.BODY, body)
-                put(Telephony.Sms.DATE, dateMs)
-                put(Telephony.Sms.DATE_SENT, dateMs)
-                put(Telephony.Sms.READ, 0)
-                put(Telephony.Sms.SEEN, 0)
-                put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_INBOX)
-            }
-            context.contentResolver.insert(Telephony.Sms.Inbox.CONTENT_URI, values)
+    private fun appendBoundedPrefKey(prefs: android.content.SharedPreferences, prefKey: String, value: String, maxSize: Int) {
+        if (value.isBlank()) return
+        val arr = try {
+            JSONArray(prefs.getString(prefKey, "[]") ?: "[]")
         } catch (_: Throwable) {
-            // Expected on Android if app isn't currently Default SMS App; local store still works.
+            JSONArray()
         }
+        for (i in 0 until arr.length()) {
+            if (arr.optString(i) == value) return
+        }
+        arr.put(value)
+        val trimmed = JSONArray()
+        val start = maxOf(0, arr.length() - maxSize)
+        for (i in start until arr.length()) {
+            trimmed.put(arr.get(i))
+        }
+        prefs.edit().putString(prefKey, trimmed.toString()).apply()
+    }
+
+    private fun prefJsonArrayContains(prefs: android.content.SharedPreferences, prefKey: String, value: String): Boolean {
+        if (value.isBlank()) return false
+        val arr = try {
+            JSONArray(prefs.getString(prefKey, "[]") ?: "[]")
+        } catch (_: Throwable) {
+            return false
+        }
+        for (i in 0 until arr.length()) {
+            if (arr.optString(i) == value) return true
+        }
+        return false
+    }
+
+    fun loadMirroredAppLookup(context: Context): MirroredAppLookup {
+        synchronized(sysSyncLock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val idSet = hashSetOf<String>()
+            val sigSet = hashSetOf<String>()
+            try {
+                val idArr = JSONArray(prefs.getString(KEY_MIRRORED_SYS_IDS, "[]") ?: "[]")
+                for (i in 0 until idArr.length()) {
+                    val v = idArr.optString(i).trim()
+                    if (v.isNotEmpty()) idSet.add(v)
+                }
+            } catch (_: Throwable) {
+            }
+            try {
+                val sigArr = JSONArray(prefs.getString(KEY_APP_MIRRORED_SIGS, "[]") ?: "[]")
+                for (i in 0 until sigArr.length()) {
+                    val v = sigArr.optString(i).trim()
+                    if (v.isNotEmpty()) sigSet.add(v)
+                }
+            } catch (_: Throwable) {
+            }
+            return MirroredAppLookup(idSet, sigSet)
+        }
+    }
+
+    fun removeMirroredSystemSmsId(context: Context, systemSmsId: String) {
+        val clean = systemSmsId.trim()
+        if (clean.isEmpty()) return
+        synchronized(sysSyncLock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val idArr = try {
+                JSONArray(prefs.getString(KEY_MIRRORED_SYS_IDS, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                return
+            }
+            val next = JSONArray()
+            var changed = false
+            for (i in 0 until idArr.length()) {
+                val v = idArr.optString(i).trim()
+                if (v == clean) {
+                    changed = true
+                } else if (v.isNotEmpty()) {
+                    next.put(v)
+                }
+            }
+            if (changed) {
+                prefs.edit().putString(KEY_MIRRORED_SYS_IDS, next.toString()).apply()
+            }
+        }
+    }
+
+    /**
+     * Safely inserts an incoming message into Android's Telephony.Sms.Inbox content provider
+     * when this app is the Default SMS App, deduplicating against existing rows.
+     */
+    fun tryInsertInboxSms(
+        context: Context,
+        address: String,
+        body: String,
+        dateMs: Long,
+        isRead: Boolean = false,
+        isAppMirror: Boolean = false
+    ): Boolean {
+        if (!isDefaultSmsApp(context)) return false
+        val cleanAddr = address.trim().ifBlank { "CBEBirr" }
+        val cleanBody = body.trim()
+        if (cleanBody.isEmpty()) return false
+        val cleanDate = if (dateMs > 0L) dateMs else System.currentTimeMillis()
+        val sig = buildSystemMirrorSig(cleanAddr, cleanBody, cleanDate)
+        val normTargetBody = normalizeBodyForSig(cleanBody)
+
+        synchronized(sysSyncLock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefJsonArrayContains(prefs, KEY_SYS_SYNCED_KEYS, sig)) {
+                return false
+            }
+
+            try {
+                val minDate = cleanDate - 15000L
+                val maxDate = cleanDate + 15000L
+                var existingRowId = ""
+                context.contentResolver.query(
+                    Telephony.Sms.CONTENT_URI,
+                    arrayOf(Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY),
+                    "${Telephony.Sms.DATE} >= ? AND ${Telephony.Sms.DATE} <= ?",
+                    arrayOf(minDate.toString(), maxDate.toString()),
+                    null
+                )?.use { cursor ->
+                    val idxId = cursor.getColumnIndex(Telephony.Sms._ID)
+                    val idxAddr = cursor.getColumnIndex(Telephony.Sms.ADDRESS)
+                    val idxBody = cursor.getColumnIndex(Telephony.Sms.BODY)
+                    while (cursor.moveToNext()) {
+                        val rowBody = normalizeBodyForSig((if (idxBody >= 0) cursor.getString(idxBody) else "") ?: "")
+                        if (rowBody != normTargetBody) continue
+                        val rowAddr = (if (idxAddr >= 0) cursor.getString(idxAddr) else "")?.trim() ?: ""
+                        if (rowAddr.equals(cleanAddr, ignoreCase = true) ||
+                            (cleanAddr.equals("CBEBirr", ignoreCase = true) && rowAddr.equals("CBEBirr", ignoreCase = true))
+                        ) {
+                            existingRowId = if (idxId >= 0) cursor.getString(idxId) ?: "" else ""
+                            break
+                        }
+                    }
+                }
+                if (existingRowId.isNotEmpty()) {
+                    appendBoundedPrefKey(prefs, KEY_SYS_SYNCED_KEYS, sig, MAX_SYS_SYNCED_KEYS)
+                    if (isAppMirror) {
+                        appendBoundedPrefKey(prefs, KEY_MIRRORED_SYS_IDS, existingRowId, MAX_MIRRORED_SYS_IDS)
+                        appendBoundedPrefKey(prefs, KEY_APP_MIRRORED_SIGS, sig, MAX_SYS_SYNCED_KEYS)
+                    }
+                    return false
+                }
+            } catch (_: Throwable) {
+            }
+
+            return try {
+                val values = ContentValues().apply {
+                    put(Telephony.Sms.ADDRESS, cleanAddr)
+                    put(Telephony.Sms.BODY, cleanBody)
+                    put(Telephony.Sms.DATE, cleanDate)
+                    put(Telephony.Sms.DATE_SENT, cleanDate)
+                    put(Telephony.Sms.READ, if (isRead) 1 else 0)
+                    put(Telephony.Sms.SEEN, if (isRead) 1 else 0)
+                    put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_INBOX)
+                }
+                val insertedUri = context.contentResolver.insert(Telephony.Sms.Inbox.CONTENT_URI, values)
+                if (insertedUri != null) {
+                    appendBoundedPrefKey(prefs, KEY_SYS_SYNCED_KEYS, sig, MAX_SYS_SYNCED_KEYS)
+                    if (isAppMirror) {
+                        val insertedId = insertedUri.lastPathSegment?.trim() ?: ""
+                        if (insertedId.isNotEmpty()) {
+                            appendBoundedPrefKey(prefs, KEY_MIRRORED_SYS_IDS, insertedId, MAX_MIRRORED_SYS_IDS)
+                        }
+                        appendBoundedPrefKey(prefs, KEY_APP_MIRRORED_SIGS, sig, MAX_SYS_SYNCED_KEYS)
+                    }
+                    true
+                } else {
+                    false
+                }
+            } catch (_: Throwable) {
+                false
+            }
+        }
+    }
+
+    /**
+     * Backfills all previously saved banking/app messages into Android's System SMS Inbox
+     * once this app is set as Default SMS App.
+     */
+    fun syncAllSavedAppMessagesToSystemInbox(context: Context): Int {
+        if (!isDefaultSmsApp(context)) return 0
+        val toMirror = mutableListOf<JSONObject>()
+        synchronized(lock) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val savedArr = try {
+                JSONArray(prefs.getString(KEY_SAVED_MESSAGES, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                return 0
+            }
+            val deletedArr = try {
+                JSONArray(prefs.getString(KEY_DELETED_KEYS, "[]") ?: "[]")
+            } catch (_: Throwable) {
+                JSONArray()
+            }
+            for (i in 0 until savedArr.length()) {
+                val obj = savedArr.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "")
+                val source = obj.optString("source", if (id.startsWith("cbe") || id.startsWith("remote_")) "app" else "sim")
+                if (source != "app") continue
+                val type = obj.optString("type", "inbox")
+                if (type == "sent") continue
+                val address = obj.optString("address", obj.optString("sender", "CBEBirr")).ifBlank { "CBEBirr" }
+                val body = obj.optString("body", obj.optString("text", "")).trim()
+                if (body.isEmpty()) continue
+                val dateMs = obj.optLong("date", 0L)
+                val txnId = obj.optString("txnId", "")
+                if (isDeletedLocked(deletedArr, id, address, body, dateMs, txnId, source)) continue
+                toMirror.add(obj)
+            }
+        }
+
+        if (toMirror.isEmpty()) return 0
+        toMirror.sortBy { it.optLong("date", 0L) }
+        var insertedCount = 0
+        for (obj in toMirror) {
+            val address = obj.optString("address", obj.optString("sender", "CBEBirr")).ifBlank { "CBEBirr" }
+            val body = obj.optString("body", obj.optString("text", "")).trim()
+            val dateMs = obj.optLong("date", System.currentTimeMillis()).let {
+                if (it > 0L) it else System.currentTimeMillis()
+            }
+            val isRead = obj.optBoolean("read", false) || obj.optString("status", "") == "read"
+            if (tryInsertInboxSms(context, address, body, dateMs, isRead = isRead, isAppMirror = true)) {
+                insertedCount++
+            }
+        }
+        return insertedCount
+    }
+
+    fun saveAndMirrorAppMessagesJson(context: Context, jsonArrayStr: String): Int {
+        if (jsonArrayStr.isBlank()) return 0
+        val arr = try {
+            JSONArray(jsonArrayStr)
+        } catch (_: Throwable) {
+            return 0
+        }
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val body = obj.optString("text", obj.optString("body", "")).trim()
+            if (body.isEmpty()) continue
+            val address = obj.optString("address", obj.optString("sender", "CBEBirr")).ifBlank { "CBEBirr" }
+            val dateMs = obj.optLong("rawDate", obj.optLong("date", System.currentTimeMillis())).let {
+                if (it > 0L) it else System.currentTimeMillis()
+            }
+            val txnId = obj.optString("txnId", obj.optString("reference", ""))
+            val id = obj.optString("nativeId", obj.optString("id", "")).ifBlank {
+                "cbe_${dateMs}_${txnId.ifBlank { body.hashCode().toString() }}"
+            }
+            val isOutgoing = obj.optBoolean("isOutgoing", false)
+            saveIncomingMessage(
+                context = context,
+                id = id,
+                address = address,
+                body = body,
+                dateMs = dateMs,
+                type = if (isOutgoing) "sent" else "inbox",
+                isBank = true,
+                source = "app",
+                txnId = txnId,
+                amount = obj.optString("amount", ""),
+                recipient = obj.optString("recipient", ""),
+                recipientAccount = obj.optString("recipientAccount", ""),
+                receiptUrl = obj.optString("receiptUrl", ""),
+                destBank = obj.optString("destBank", ""),
+                transferLabel = obj.optString("transferLabel", ""),
+                reason = obj.optString("reason", ""),
+                deviceId = obj.optString("deviceId", "")
+            )
+        }
+        return syncAllSavedAppMessagesToSystemInbox(context)
     }
 }
