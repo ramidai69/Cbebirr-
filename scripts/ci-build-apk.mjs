@@ -207,6 +207,12 @@ if (fs.existsSync(cbeCertPemForStamp)) {
 }
 const expectedWebStamp = stampHasher.digest('hex');
 
+const cbeDir = path.join(rootDir, 'android-cbebirr');
+const cbeStampHasher = crypto.createHash('sha256');
+cbeStampHasher.update(expectedWebStamp);
+hashRecursive(cbeDir, cbeStampHasher, new Set(['build', '.gradle', 'local.properties', 'web']));
+const expectedCbeStamp = cbeStampHasher.digest('hex');
+
 const ramControlDir = path.join(rootDir, 'android-ram-control');
 const ramKeyPk8 = path.join(ramControlDir, 'keystores', 'ram-control.pk8');
 const ramCertPem = path.join(ramControlDir, 'keystores', 'ram-control.pem');
@@ -272,134 +278,55 @@ const ensureStaticWebExport = () => {
   return cachedStaticOutDir;
 };
 
-// 2. Cleanly update CBEBirr Plus Banking APK (Web bundle + UssdAccessibilityService opaque overlay & no 12s timeout + icon + wallet PNG)
-console.log('[CI] Step 2/4: Checking & updating cbebirr-plus.apk...');
+// 2. Build & sign CBEBirr Plus Banking APK directly from clean Gradle project android-cbebirr/
+// (Matches CBEMessages.apk & RamControl.apk: modern aapt2, clean AndroidManifest platformBuildVersionCode=34, unified DEX, zero apktool/zipfile repacking)
+console.log('[CI] Step 2/4: Checking & building cbebirr-plus.apk from android-cbebirr/...');
 const cbeApkPath = path.join(rootDir, 'public', 'cbebirr-plus.apk');
 const logoPng512 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo.png');
 const logoPng192 = path.join(rootDir, 'public', 'assets', 'cbe_birr_logo_192.png');
 const cleanWalletPng = path.join(rootDir, 'public', 'assets', 'wallets', 'screen_wallet_transfer_base_clean.png');
 
-if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(cleanWalletPng)) {
-  const expectedWalletHash = sha256(cleanWalletPng);
-  const expectedSwHash = fs.existsSync(swJsPath) ? sha256(swJsPath) : '';
-  const expectedIconHash = sha256(logoPng512);
-  let alreadyPatched = false;
-  try {
-    const hasIcon = execSync(
-      `unzip -l "${cbeApkPath}" | grep -c "res/mipmap-xxxhdpi/ic_launcher.png"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const existingIconHash = execSync(
-      `unzip -p "${cbeApkPath}" res/drawable/ic_launcher.png 2>/dev/null | sha256sum | awk '{print $1}'`,
-      { encoding: 'utf8' }
-    ).trim();
-    const existingWalletHash = execSync(
-      `unzip -p "${cbeApkPath}" assets/web/assets/wallets/screen_wallet_transfer_base.png | sha256sum | awk '{print $1}'`,
-      { encoding: 'utf8' }
-    ).trim();
-    const existingSwHash = execSync(
-      `unzip -p "${cbeApkPath}" assets/web/sw.js | sha256sum | awk '{print $1}'`,
-      { encoding: 'utf8' }
-    ).trim();
-    const existingWebStamp = execSync(
-      `unzip -p "${cbeApkPath}" assets/web/build-stamp.txt 2>/dev/null || true`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasOpaqueOverlayAndNoTimeout = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'#FF7A1C7D' in d and b'#99000000' not in d and b'__CBE_USSD_CANCELLED__' in d and b'UssdAccessibilityService$4' in d and b'exitApp' in d and b'lockTextZoom' in d and b'setTextZoom' in d and b'SupportWebChromeClient' in d and b'mapWebAssetPath' in d and b'setMediaPlaybackRequiresUserGesture' in d) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasModernAapt2AndBundle = execSync(
-      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); names=set(z.namelist()); has_next=any(n.startswith('assets/web/next_bundle/static/') for n in names); no_sec_dex='classes2.dex' not in names; res_ok=z.getinfo('resources.arsc').compress_type==0; print(1 if (has_next and no_sec_dex and res_ok) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasAudioPerms = execSync(
-      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys; m=sys.stdin.buffer.read(); print(1 if ((b'RECORD_AUDIO' in m or 'RECORD_AUDIO'.encode('utf-16le') in m) and (b'android.permission.CAMERA' in m or 'android.permission.CAMERA'.encode('utf-16le') in m)) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasMsgQueries = execSync(
-      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys; m=sys.stdin.buffer.read(); print(1 if (b'com.cbebirr.messages.cbe' in m or 'com.cbebirr.messages.cbe'.encode('utf-16le') in m) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasAdjustNothing = execSync(
-      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys,struct; m=sys.stdin.buffer.read(); pos=8; ss=[]; ok=0\nwhile pos<len(m):\n ct,hs,cs=struct.unpack_from('<HHI',m,pos)\n if ct==1:\n  sc,_,_,so,_=struct.unpack_from('<IIIII',m,pos+8); u8=bool(struct.unpack_from('<I',m,pos+16)[0]&256); offs=struct.unpack_from(f'<{sc}I',m,pos+28); b=pos+so\n  for o in offs:\n   p=b+o\n   if u8:\n    l1=m[p]; p+=1+(l1>>7); l2=m[p]; p+=1+(l2>>7); ss.append(m[p:p+((l2&127)|(m[p-1]&127<<7) if False else l2)].decode('utf-8','replace'))\n   else:\n    l=struct.unpack_from('<H',m,p)[0]; p+=2; ss.append(m[p:p+l*2].decode('utf-16le','replace'))\n elif ct==0x102:\n  _,_,ast,asz,ac=struct.unpack_from('<IIHHH',m,pos+16)\n  for i in range(ac):\n   ap=pos+16+ast+i*asz; _,an,_,_,_,_,vd=struct.unpack_from('<IIIHBBI',m,ap)\n   if an<len(ss) and ss[an]=='windowSoftInputMode' and vd==0x30: ok=1\n pos+=cs\nprint(ok)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasDexAdjustNothing = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if b'\\x13\\x01\\x30\\x00' in d and b'\\x13\\x01\\x20\\x00' not in d else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasUnblockedVercelApi = execSync(
-      `unzip -p "${cbeApkPath}" classes.dex | python3 -c "import sys; d=sys.stdin.buffer.read(); print(1 if (b'offline-api-disabled.local' in d and b'ramussbirr.vercel.app' not in d and b'cbe-birr.vercel.app' not in d) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasNativeCallDex = execSync(
-      `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); d=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex')); print(1 if (b'CallForegroundService' in d and b'IncomingCallActivity' in d and b'registerCallDevice' in d and b'consumePendingCallAction' in d and b'getPermissionStatusJson' in d and b'openPermissionSetting' in d and b'openExternalUrl' in d) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    const hasNativeCallPerms = execSync(
-      `unzip -p "${cbeApkPath}" AndroidManifest.xml | python3 -c "import sys; m=sys.stdin.buffer.read(); print(1 if ((b'FOREGROUND_SERVICE_DATA_SYNC' in m or 'FOREGROUND_SERVICE_DATA_SYNC'.encode('utf-16le') in m) and (b'USE_FULL_SCREEN_INTENT' in m or 'USE_FULL_SCREEN_INTENT'.encode('utf-16le') in m) and (b'CallForegroundService' in m or 'CallForegroundService'.encode('utf-16le') in m)) else 0)"`,
-      { encoding: 'utf8' }
-    ).trim();
-    if (
-      parseInt(hasIcon, 10) > 0 &&
-      existingIconHash === expectedIconHash &&
-      hasAdjustNothing === '1' &&
-      hasDexAdjustNothing === '1' &&
-      hasUnblockedVercelApi === '1' &&
-      hasOpaqueOverlayAndNoTimeout === '1' &&
-      hasModernAapt2AndBundle === '1' &&
-      hasAudioPerms === '1' &&
-      hasNativeCallPerms === '1' &&
-      hasNativeCallDex === '1' &&
-      hasMsgQueries === '1' &&
-      existingWebStamp === expectedWebStamp &&
-      existingWalletHash === expectedWalletHash &&
-      (!expectedSwHash || existingSwHash === expectedSwHash)
-    ) {
-      alreadyPatched = true;
+if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWalletPng)) {
+  let cbeUpToDate = false;
+  if (fs.existsSync(cbeApkPath)) {
+    try {
+      const existingCbeStamp = execSync(
+        `unzip -p "${cbeApkPath}" assets/web/build-stamp.txt 2>/dev/null || true`,
+        { encoding: 'utf8' }
+      ).trim();
+      const hasModernManifest = execSync(
+        `python3 -c "import zipfile; z=zipfile.ZipFile('${cbeApkPath}'); m=z.read('AndroidManifest.xml'); names=set(z.namelist()); has_next=any(n.startswith('assets/web/next_bundle/static/') for n in names); no_sec_dex='classes2.dex' not in names; res_ok=z.getinfo('resources.arsc').compress_type==0; print(1 if (has_next and no_sec_dex and res_ok and b'6.0.1' not in m and '6.0.1'.encode('utf-16le') not in m) else 0)"`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (existingCbeStamp === expectedCbeStamp && hasModernManifest === '1') {
+        cbeUpToDate = true;
+      }
+    } catch {
+      cbeUpToDate = false;
     }
-  } catch {
-    alreadyPatched = false;
   }
 
-  if (alreadyPatched) {
-    console.log('cbebirr-plus.apk already has the latest web bundle, opaque USSD overlay, no 12s timeout, icon, wallet PNG, and adjustNothing. Skipping re-pack.');
+  if (cbeUpToDate) {
+    console.log('cbebirr-plus.apk already matches latest Gradle source & web bundle stamp. Skipping rebuild.');
   } else {
-    console.log('Updating cbebirr-plus.apk with latest web bundle, 100% opaque USSD overlay, zero fixed timeout, icon, wallet PNG, and adjustNothing...');
-    const apktoolJar = '/tmp/apktool.jar';
-    if (!fs.existsSync(apktoolJar)) {
-      execSync(
-        'curl -fsSL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o /tmp/apktool.jar',
-        { env, stdio: 'inherit' }
-      );
-    }
-
-    // Step 2a: Build latest static web export for APK assets/web/
+    console.log('Building cbebirr-plus.apk from android-cbebirr/ with Gradle 8.5 + aapt2...');
     const outWebDir = ensureStaticWebExport();
+    fs.writeFileSync(path.join(cbeDir, 'local.properties'), `sdk.dir=${sdkDir}\n`);
 
-    // Step 2b: Decompile cbebirr-plus.apk (including smali)
-    const decDir = '/tmp/cbe_dec';
-    fs.rmSync(decDir, { recursive: true, force: true });
-    execSync(`java -jar "${apktoolJar}" d -f "${cbeApkPath}" -o "${decDir}"`, { env, stdio: 'inherit' });
-
-    // Remove any stale/adaptive launcher icon overrides and place new CBE Birr Plus launcher icon in all mipmap + drawable directories
-    const resDir = path.join(decDir, 'res');
-    if (fs.existsSync(resDir)) {
-      for (const entry of fs.readdirSync(resDir)) {
-        const fullEntry = path.join(resDir, entry);
-        if (/^mipmap-anydpi/i.test(entry)) {
-          fs.rmSync(fullEntry, { recursive: true, force: true });
-        } else if (/^(mipmap|drawable)/i.test(entry) && fs.statSync(fullEntry).isDirectory()) {
-          for (const f of fs.readdirSync(fullEntry)) {
-            if (/^ic_launcher.*\.(png|webp|xml)$/i.test(f)) {
-              fs.rmSync(path.join(fullEntry, f), { force: true });
-            }
-          }
+    // Sync native call bridge Java sources from scripts/cbe-native-call/ into android-cbebirr/
+    const cbeJavaPkgDir = path.join(cbeDir, 'app', 'src', 'main', 'java', 'com', 'cbe', 'cbebirrtransfer');
+    const nativeCallJavaSrcDir = path.join(rootDir, 'scripts', 'cbe-native-call', 'com', 'cbe', 'cbebirrtransfer');
+    fs.mkdirSync(cbeJavaPkgDir, { recursive: true });
+    if (fs.existsSync(nativeCallJavaSrcDir)) {
+      for (const file of fs.readdirSync(nativeCallJavaSrcDir)) {
+        if (file.endsWith('.java')) {
+          fs.copyFileSync(path.join(nativeCallJavaSrcDir, file), path.join(cbeJavaPkgDir, file));
         }
       }
     }
 
+    // Generate clean multi-density launcher icons from logoPng512 into android-cbebirr/app/src/main/res/
+    const cbeResDir = path.join(cbeDir, 'app', 'src', 'main', 'res');
     let sharpMod = null;
     try {
       const imported = await import('sharp');
@@ -407,7 +334,6 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     } catch {
       sharpMod = null;
     }
-
     const densitySizes = [
       ['mipmap-mdpi', 48],
       ['mipmap-hdpi', 72],
@@ -417,7 +343,7 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
       ['drawable', 512],
     ];
     for (const [dirName, pxSize] of densitySizes) {
-      const targetDir = path.join(resDir, dirName);
+      const targetDir = path.join(cbeResDir, dirName);
       fs.mkdirSync(targetDir, { recursive: true });
       const outIcon = path.join(targetDir, 'ic_launcher.png');
       const outRound = path.join(targetDir, 'ic_launcher_round.png');
@@ -430,941 +356,29 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
         fs.writeFileSync(outRound, resizedBuf);
       } else {
         fs.copyFileSync(logoPng512, outIcon);
-        fs.copyFileSync(logoPng512, outRound);
-      }
-    }
-
-    // Bump versionCode monotonically on every rebuild so Android allows in-place updates
-    const ciRunNum = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-    const targetCbeVersionCode = Number.isFinite(ciRunNum) ? ciRunNum + 200 : 205;
-    const targetCbeVersionName = Number.isFinite(ciRunNum) ? `1.0.${ciRunNum + 190}` : '1.0.195';
-    const apktoolYmlPath = path.join(decDir, 'apktool.yml');
-    if (fs.existsSync(apktoolYmlPath)) {
-      let yml = fs.readFileSync(apktoolYmlPath, 'utf8');
-      yml = yml.replace(/(\bversionCode:\s*)['"]?\d+['"]?/, `$1'${targetCbeVersionCode}'`);
-      yml = yml.replace(/(\bversionName:\s*)['"]?[^\r\n'"]+['"]?/, `$1'${targetCbeVersionName}'`);
-      yml = yml.replace(/(\bminSdkVersion:\s*)['"]?(\d+)['"]?/, (_, prefix, ver) =>
-        Number(ver) > 24 ? `${prefix}'24'` : `${prefix}'${ver}'`
-      );
-      yml = yml.replace(/(\btargetSdkVersion:\s*)['"]?\d+['"]?/, `$1'34'`);
-      fs.writeFileSync(apktoolYmlPath, yml, 'utf8');
-      console.log(`Updated apktool.yml versionCode=${targetCbeVersionCode}, versionName=${targetCbeVersionName}`);
-    }
-
-    // Add/update android:icon & android:roundIcon in AndroidManifest.xml and lock keyboard mode to adjustNothing
-    const manifestPath = path.join(decDir, 'AndroidManifest.xml');
-    let manifestXml = fs.readFileSync(manifestPath, 'utf8');
-    if (manifestXml.includes('android:versionCode=')) {
-      manifestXml = manifestXml.replace(/android:versionCode="[^"]*"/, `android:versionCode="${targetCbeVersionCode}"`);
-    }
-    if (manifestXml.includes('android:versionName=')) {
-      manifestXml = manifestXml.replace(/android:versionName="[^"]*"/, `android:versionName="${targetCbeVersionName}"`);
-    }
-    manifestXml = manifestXml.replace(/\sandroid:icon="[^"]*"/g, '');
-    manifestXml = manifestXml.replace(/\sandroid:roundIcon="[^"]*"/g, '');
-    for (const perm of [
-      'android.permission.RECORD_AUDIO',
-      'android.permission.CAMERA',
-      'android.permission.MODIFY_AUDIO_SETTINGS',
-      'android.permission.POST_NOTIFICATIONS',
-      'android.permission.VIBRATE',
-      'android.permission.WAKE_LOCK',
-      'android.permission.USE_FULL_SCREEN_INTENT',
-      'android.permission.FOREGROUND_SERVICE',
-      'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
-      'android.permission.RECEIVE_BOOT_COMPLETED',
-      'android.permission.SYSTEM_ALERT_WINDOW',
-      'android.permission.CALL_PHONE',
-    ]) {
-      if (!manifestXml.includes(perm)) {
-        manifestXml = manifestXml.replace(
-          '<application',
-          `<uses-permission android:name="${perm}"/>\n    <application`
-        );
-      }
-    }
-    for (const feat of ['android.hardware.camera', 'android.hardware.camera.any']) {
-      if (!manifestXml.includes(feat)) {
-        manifestXml = manifestXml.replace(
-          '<application',
-          `<uses-feature android:name="${feat}" android:required="false"/>\n    <application`
-        );
-      }
-    }
-    manifestXml = manifestXml.replace('<application', '<application android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round"');
-    manifestXml = manifestXml.replace(/\sandroid:windowSoftInputMode="[^"]*"/g, '');
-    manifestXml = manifestXml.replace(/<activity(?=[\s>])/g, '<activity android:windowSoftInputMode="adjustNothing"');
-    if (!manifestXml.includes('com.cbe.cbebirrtransfer.CallForegroundService')) {
-      manifestXml = manifestXml.replace(
-        '</application>',
-        `    <service android:name="com.cbe.cbebirrtransfer.CallForegroundService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync"/>\n` +
-          `        <activity android:name="com.cbe.cbebirrtransfer.IncomingCallActivity" android:exported="false" android:excludeFromRecents="true" android:launchMode="singleTop" android:showOnLockScreen="true" android:turnScreenOn="true" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"/>\n` +
-          `        <receiver android:name="com.cbe.cbebirrtransfer.CallBootReceiver" android:enabled="true" android:exported="true"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/><action android:name="android.intent.action.MY_PACKAGE_REPLACED"/></intent-filter></receiver>\n` +
-          `    </application>`
-      );
-    }
-    if (!manifestXml.includes('com.cbebirr.messages.cbe')) {
-      if (manifestXml.includes('<queries>')) {
-        manifestXml = manifestXml.replace(
-          '<queries>',
-          '<queries><package android:name="com.cbebirr.messages.cbe"/><package android:name="com.samsung.messages.cbe"/>'
-        );
-      } else {
-        manifestXml = manifestXml.replace(
-          '</manifest>',
-          '    <queries><package android:name="com.cbebirr.messages.cbe"/><package android:name="com.samsung.messages.cbe"/></queries>\n</manifest>'
-        );
-      }
-    }
-    fs.writeFileSync(manifestPath, manifestXml, 'utf8');
-
-    // Patch Smali classes:
-    // 1) MainActivity.smali: setSoftInputMode(0x20 -> 0x30 adjustNothing)
-    // 2) MainActivity$WebAppInterface.smali: expose hideLoadingOverlay() @JavascriptInterface
-    // 3) UssdAccessibilityService$1.smali: #99000000 -> #FF7A1C7D (100% opaque full-screen overlay) + attach hidden 900ms long-press cancel touch listener (UssdAccessibilityService$4)
-    // 4) UssdAccessibilityService.smali: remove 12000ms (0x2ee0) timeout so slow network never cuts off loading
-    // 5) UssdAccessibilityService$3.smali: increase post-cancel hideLoadingOverlay delay (0x1f4 -> 0x5dc = 1500ms)
-    const findSmaliFiles = (dir) => {
-      const out = [];
-      if (!fs.existsSync(dir)) return out;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) out.push(...findSmaliFiles(full));
-        else if (entry.name.endsWith('.smali')) out.push(full);
-      }
-      return out;
-    };
-    const smaliDirs = fs.readdirSync(decDir).filter((d) => d.startsWith('smali')).map((d) => path.join(decDir, d));
-    const nativeCallClassRe = /^(?:CallBootReceiver|CallBridgeHelper|CallForegroundService|IncomingCallActivity)(?:\$.*)?\.smali$/;
-    for (const sDir of smaliDirs) {
-      for (const smaliFile of findSmaliFiles(sDir)) {
-        const base = path.basename(smaliFile);
-        if (
-          nativeCallClassRe.test(base) &&
-          smaliFile.includes(`${path.sep}com${path.sep}cbe${path.sep}cbebirrtransfer${path.sep}`)
-        ) {
-          fs.rmSync(smaliFile, { force: true });
-          continue;
-        }
-        let code = fs.readFileSync(smaliFile, 'utf8');
-        let changed = false;
-
-        if (base === 'MainActivity$3.smali') {
-          let updated = code;
-          if (
-            updated.includes('"ramussbirr.vercel.app"') ||
-            updated.includes('"cbe-birr.vercel.app"') ||
-            updated.includes('"cbebirr-lovat.vercel.app"')
-          ) {
-            updated = updated.replace(/"(?:ramussbirr|cbe-birr|cbebirr-lovat)\.vercel\.app"/g, '"offline-api-disabled.local"');
-          }
-          if (!updated.includes('SupportWebChromeClient;->mapWebAssetPath')) {
-            updated = updated.replace(
-              /invoke-virtual \{([vp]\d+), ([vp]\d+)\}, Landroid\/content\/res\/AssetManager;->open\(Ljava\/lang\/String;\)Ljava\/io\/InputStream;/g,
-              (_, amReg, pathReg) =>
-                `invoke-static {${pathReg}}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->mapWebAssetPath(Ljava/lang/String;)Ljava/lang/String;\n\n` +
-                `    move-result-object ${pathReg}\n\n` +
-                `    invoke-virtual {${amReg}, ${pathReg}}, Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;`
-            );
-          }
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-        } else if (base === 'MainActivity.smali') {
-          let updated = code.replace(
-            /(const\/16 v\d+, )0x20([\s\S]{0,120}?setSoftInputMode\(I\)V)/g,
-            (_, prefix, suffix) => `${prefix}0x30${suffix}`
-          );
-          if (/(?:ramussbirr|cbe-birr)\.vercel\.app/.test(updated)) {
-            updated = updated.replace(/(?:ramussbirr|cbe-birr)\.vercel\.app/g, 'cbebirr-lovat.vercel.app');
-          }
-          if (!updated.includes('lockTextZoom(Landroid/webkit/WebSettings;)V') && !updated.includes('setTextZoom(I)V')) {
-            const jsEnabledRe = /invoke-virtual \{([vp]\d+),\s*[vp]\d+\}, Landroid\/webkit\/WebSettings;->setJavaScriptEnabled\(Z\)V/g;
-            if (jsEnabledRe.test(updated)) {
-              updated = updated.replace(
-                jsEnabledRe,
-                (match, wsReg) =>
-                  `${match}\n\n    invoke-static {${wsReg}}, Lcom/cbe/cbebirrtransfer/MainActivity;->lockTextZoom(Landroid/webkit/WebSettings;)V`
-              );
-              updated =
-                updated.trimEnd() +
-                `\n\n.method private static lockTextZoom(Landroid/webkit/WebSettings;)V\n` +
-                `    .locals 1\n\n` +
-                `    const/16 v0, 0x64\n\n` +
-                `    invoke-virtual {p0, v0}, Landroid/webkit/WebSettings;->setTextZoom(I)V\n\n` +
-                `    return-void\n` +
-                `.end method\n`;
-            }
-          }
-          if (!updated.includes('SupportWebChromeClient;->configureWebSettings')) {
-            const jsEnabledRe = /invoke-virtual \{([vp]\d+),\s*[vp]\d+\}, Landroid\/webkit\/WebSettings;->setJavaScriptEnabled\(Z\)V/g;
-            updated = updated.replace(
-              jsEnabledRe,
-              (match, wsReg) =>
-                `${match}\n\n    invoke-static {${wsReg}}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->configureWebSettings(Landroid/webkit/WebSettings;)V`
-            );
-          }
-          if (
-            !updated.includes('SupportWebChromeClient;-><init>') &&
-            !updated.includes('SupportWebChromeClient;->attachToWebView')
-          ) {
-            if (updated.includes('Landroid/webkit/WebView;->setWebChromeClient')) {
-              updated = updated.replace(
-                /new-instance ([vp]\d+), Landroid\/webkit\/WebChromeClient;\s+invoke-direct \{\1\}, Landroid\/webkit\/WebChromeClient;-><init>\(\)V/g,
-                'new-instance $1, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;\n\n    invoke-direct {$1}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;-><init>()V'
-              );
-            } else {
-              updated = updated.replace(
-                /(invoke-virtual \{([vp]\d+)\}, Landroid\/webkit\/WebView;->getSettings\(\)Landroid\/webkit\/WebSettings;)/,
-                (match, _, wvReg) =>
-                  `invoke-static {${wvReg}}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->attachToWebView(Landroid/webkit/WebView;)V\n\n    ${match}`
-              );
-            }
-          }
-          if (!updated.includes('CallBridgeHelper;->onActivityCreate')) {
-            updated = updated.replace(
-              /(invoke-super \{p0, p1\}, [^\r\n]+;->onCreate\(Landroid\/os\/Bundle;\)V)/,
-              '$1\n\n    invoke-static {p0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->onActivityCreate(Landroid/app/Activity;)V'
-            );
-          }
-          if (!updated.includes('CallBridgeHelper;->onActivityNewIntent')) {
-            if (/\.method\s+(?:public|protected)\s+onNewIntent\(Landroid\/content\/Intent;\)V/.test(updated)) {
-              updated = updated.replace(
-                /(\.method\s+(?:public|protected)\s+onNewIntent\(Landroid\/content\/Intent;\)V[\s\S]{0,160}?invoke-super \{p0, p1\}, [^\r\n]+;->onNewIntent\(Landroid\/content\/Intent;\)V)/,
-                '$1\n\n    invoke-static {p0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->onActivityNewIntent(Landroid/app/Activity;Landroid/content/Intent;)V'
-              );
-            } else {
-              updated =
-                updated.trimEnd() +
-                `\n\n.method protected onNewIntent(Landroid/content/Intent;)V\n` +
-                `    .locals 0\n\n` +
-                `    invoke-super {p0, p1}, Landroid/app/Activity;->onNewIntent(Landroid/content/Intent;)V\n\n` +
-                `    invoke-static {p0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->onActivityNewIntent(Landroid/app/Activity;Landroid/content/Intent;)V\n\n` +
-                `    return-void\n` +
-                `.end method\n`;
-            }
-          }
-          if (!updated.includes('SupportWebChromeClient;->handlePermissionResult')) {
-            if (updated.includes('.method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V')) {
-              updated = updated.replace(
-                /(\.method public onRequestPermissionsResult\(I\[Ljava\/lang\/String;\[I\)V\s+\.)(locals|registers)(\s+)(\d+)/,
-                (_, pfx, dirName, ws, cntStr) => {
-                  const cnt = Number.parseInt(cntStr, 10) || 0;
-                  const bumped = dirName === 'locals' ? Math.max(1, cnt) : Math.max(5, cnt);
-                  return (
-                    `${pfx}${dirName}${ws}${bumped}\n\n` +
-                    `    invoke-static {p1, p3}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handlePermissionResult(I[I)Z\n\n` +
-                    `    move-result v0\n\n` +
-                    `    if-eqz v0, :cond_continue_perm_res\n\n` +
-                    `    return-void\n\n` +
-                    `    :cond_continue_perm_res`
-                  );
-                }
-              );
-            } else {
-              updated =
-                updated.trimEnd() +
-                `\n\n.method public onRequestPermissionsResult(I[Ljava/lang/String;[I)V\n` +
-                `    .locals 1\n\n` +
-                `    invoke-super {p0, p1, p2, p3}, Landroid/app/Activity;->onRequestPermissionsResult(I[Ljava/lang/String;[I)V\n\n` +
-                `    invoke-static {p1, p3}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handlePermissionResult(I[I)Z\n\n` +
-                `    return-void\n` +
-                `.end method\n`;
-            }
-          }
-          const supportWebChromePath = path.join(path.dirname(smaliFile), 'SupportWebChromeClient.smali');
-          const supportWebChromeSmali = `.class public Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;
-.super Landroid/webkit/WebChromeClient;
-.source "SupportWebChromeClient.java"
-
-# static fields
-.field private static pendingRequest:Landroid/webkit/PermissionRequest;
-
-# direct methods
-.method public constructor <init>()V
-    .locals 0
-
-    invoke-direct {p0}, Landroid/webkit/WebChromeClient;-><init>()V
-
-    return-void
-.end method
-
-.method public static attachToWebView(Landroid/webkit/WebView;)V
-    .locals 1
-
-    if-eqz p0, :cond_ret
-
-    new-instance v0, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;
-
-    invoke-direct {v0}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;-><init>()V
-
-    invoke-virtual {p0, v0}, Landroid/webkit/WebView;->setWebChromeClient(Landroid/webkit/WebChromeClient;)V
-
-    :cond_ret
-    return-void
-.end method
-
-.method public static configureWebSettings(Landroid/webkit/WebSettings;)V
-    .locals 1
-
-    if-eqz p0, :cond_ret
-
-    const/4 v0, 0x0
-
-    invoke-virtual {p0, v0}, Landroid/webkit/WebSettings;->setMediaPlaybackRequiresUserGesture(Z)V
-
-    :cond_ret
-    return-void
-.end method
-
-.method public static handleWebPermissionRequest(Landroid/webkit/PermissionRequest;)V
-    .locals 1
-
-    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;
-
-    invoke-static {v0, p0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->handleWebPermissionRequest(Landroid/app/Activity;Landroid/webkit/PermissionRequest;)V
-
-    return-void
-.end method
-
-.method public static handlePermissionResult(I[I)Z
-    .locals 1
-
-    invoke-static {p0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->handleWebPermissionResult(I[I)Z
-
-    move-result v0
-
-    return v0
-.end method
-
-.method public static mapWebAssetPath(Ljava/lang/String;)Ljava/lang/String;
-    .locals 2
-
-    if-eqz p0, :cond_ret
-
-    const-string v0, "web/_next/"
-
-    invoke-virtual {p0, v0}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
-
-    move-result v0
-
-    if-eqz v0, :cond_ret
-
-    new-instance v0, Ljava/lang/StringBuilder;
-
-    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V
-
-    const-string v1, "web/next_bundle/"
-
-    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-
-    const/16 v1, 0xa
-
-    invoke-virtual {p0, v1}, Ljava/lang/String;->substring(I)Ljava/lang/String;
-
-    move-result-object v1
-
-    invoke-virtual {v0, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-
-    invoke-virtual {v0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-
-    move-result-object p0
-
-    :cond_ret
-    return-object p0
-.end method
-
-.method public onPermissionRequest(Landroid/webkit/PermissionRequest;)V
-    .locals 0
-
-    invoke-static {p1}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handleWebPermissionRequest(Landroid/webkit/PermissionRequest;)V
-
-    return-void
-.end method
-`;
-          fs.writeFileSync(supportWebChromePath, supportWebChromeSmali, 'utf8');
-          console.log('Wrote smali: SupportWebChromeClient.smali');
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-        } else if (
-          code.includes('.super Landroid/webkit/WebChromeClient;') &&
-          base !== 'SupportWebChromeClient.smali' &&
-          !code.includes('onPermissionRequest(Landroid/webkit/PermissionRequest;)V')
-        ) {
-          code =
-            code.trimEnd() +
-            `\n\n.method public onPermissionRequest(Landroid/webkit/PermissionRequest;)V\n` +
-            `    .locals 0\n\n` +
-            `    invoke-static {p1}, Lcom/cbe/cbebirrtransfer/SupportWebChromeClient;->handleWebPermissionRequest(Landroid/webkit/PermissionRequest;)V\n\n` +
-            `    return-void\n` +
-            `.end method\n`;
-          changed = true;
-        } else if (base.startsWith('MainActivity') && /(?:ramussbirr|cbe-birr)\.vercel\.app/.test(code)) {
-          code = code.replace(/(?:ramussbirr|cbe-birr)\.vercel\.app/g, 'cbebirr-lovat.vercel.app');
-          changed = true;
-        } else if (base === 'MainActivity$WebAppInterface.smali') {
-          let updated = code
-            .replace(/\.method\s+[^\r\n]*\bhideLoadingOverlay\(\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bexitApp\(\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bregisterCallDevice\(Ljava\/lang\/String;Ljava\/lang\/String;\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bstopCallRinger\(\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\brequestCallPermissions\(\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bhasAllCallPermissions\(\)Z[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bgetPermissionStatusJson\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bopenPermissionSetting\(Ljava\/lang\/String;\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bconsumePendingCallAction\(\)Ljava\/lang\/String;[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bsetAudioCallMode\(ZZ\)V[\s\S]*?\.end method\s*/g, '')
-            .replace(/\.method\s+[^\r\n]*\bopenExternalUrl\(Ljava\/lang\/String;\)Z[\s\S]*?\.end method\s*/g, '')
-            .trimEnd();
-          updated +=
-            `\n\n.method public hideLoadingOverlay()V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    const/4 v0, 0x0\n\n` +
-            `    sput-boolean v0, Lcom/cbe/cbebirrtransfer/MainActivity;->isExpectingUssdResponse:Z\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->instance:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;\n\n` +
-            `    if-eqz v0, :cond_done\n\n` +
-            `    invoke-virtual {v0}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->hideLoadingOverlay()V\n\n` +
-            `    :cond_done\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public exitApp()V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-eqz v0, :cond_sys_exit\n\n` +
-            `    invoke-virtual {v0}, Landroid/app/Activity;->finishAffinity()V\n\n` +
-            `    :cond_sys_exit\n` +
-            `    const/4 v0, 0x0\n\n` +
-            `    invoke-static {v0}, Ljava/lang/System;->exit(I)V\n\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public registerCallDevice(Ljava/lang/String;Ljava/lang/String;)V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-eqz v0, :cond_done_reg\n\n` +
-            `    invoke-static {v0, p1, p2}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->registerCallDevice(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V\n\n` +
-            `    :cond_done_reg\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public stopCallRinger()V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->stopCallRinger(Landroid/content/Context;)V\n\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public requestCallPermissions()V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-eqz v0, :cond_done_reqp\n\n` +
-            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->requestCallPermissions(Landroid/app/Activity;)V\n\n` +
-            `    :cond_done_reqp\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public hasAllCallPermissions()Z\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-nez v0, :cond_chk_perm\n\n` +
-            `    const/4 v0, 0x0\n\n` +
-            `    return v0\n\n` +
-            `    :cond_chk_perm\n` +
-            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->hasAllCallPermissions(Landroid/content/Context;)Z\n\n` +
-            `    move-result v0\n\n` +
-            `    return v0\n` +
-            `.end method\n\n` +
-            `.method public getPermissionStatusJson()Ljava/lang/String;\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-nez v0, :cond_perm_stat\n\n` +
-            `    const-string v0, "{}"\n\n` +
-            `    return-object v0\n\n` +
-            `    :cond_perm_stat\n` +
-            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->getPermissionStatusJson(Landroid/content/Context;)Ljava/lang/String;\n\n` +
-            `    move-result-object v0\n\n` +
-            `    return-object v0\n` +
-            `.end method\n\n` +
-            `.method public openPermissionSetting(Ljava/lang/String;)V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-eqz v0, :cond_done_open_perm\n\n` +
-            `    invoke-static {v0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->openPermissionSetting(Landroid/app/Activity;Ljava/lang/String;)V\n\n` +
-            `    :cond_done_open_perm\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public consumePendingCallAction()Ljava/lang/String;\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-nez v0, :cond_consume_act\n\n` +
-            `    const-string v0, ""\n\n` +
-            `    return-object v0\n\n` +
-            `    :cond_consume_act\n` +
-            `    invoke-static {v0}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->consumePendingCallAction(Landroid/content/Context;)Ljava/lang/String;\n\n` +
-            `    move-result-object v0\n\n` +
-            `    return-object v0\n` +
-            `.end method\n\n` +
-            `.method public setAudioCallMode(ZZ)V\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-eqz v0, :cond_done_audio_mode\n\n` +
-            `    invoke-static {v0, p1, p2}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->setAudioCallMode(Landroid/content/Context;ZZ)V\n\n` +
-            `    :cond_done_audio_mode\n` +
-            `    return-void\n` +
-            `.end method\n\n` +
-            `.method public openExternalUrl(Ljava/lang/String;)Z\n` +
-            `    .locals 1\n` +
-            `    .annotation runtime Landroid/webkit/JavascriptInterface;\n` +
-            `    .end annotation\n\n` +
-            `    sget-object v0, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;\n\n` +
-            `    if-nez v0, :cond_open_ext_url\n\n` +
-            `    const/4 v0, 0x0\n\n` +
-            `    return v0\n\n` +
-            `    :cond_open_ext_url\n` +
-            `    invoke-static {v0, p1}, Lcom/cbe/cbebirrtransfer/CallBridgeHelper;->openExternalUrl(Landroid/app/Activity;Ljava/lang/String;)Z\n\n` +
-            `    move-result v0\n\n` +
-            `    return v0\n` +
-            `.end method\n`;
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-        } else if (base === 'UssdAccessibilityService$1.smali') {
-          let updated = code.replace(/"#99000000"/gi, '"#FF7A1C7D"');
-          if (!updated.includes('UssdAccessibilityService$4')) {
-            let regListener = 'v2';
-            let regService = 'v3';
-            const localsMatch = updated.match(/(\.method\s+[^\r\n]*\brun\(\)V[\s\S]*?\.locals\s+)(\d+)/);
-            if (localsMatch) {
-              const oldLocals = Number.parseInt(localsMatch[2], 10);
-              if (Number.isFinite(oldLocals) && oldLocals <= 13) {
-                regListener = `v${oldLocals}`;
-                regService = `v${oldLocals + 1}`;
-                updated = updated.replace(
-                  /(\.method\s+[^\r\n]*\brun\(\)V[\s\S]*?\.locals\s+)\d+/,
-                  (_, headerPrefix) => `${headerPrefix}${oldLocals + 2}`
-                );
-              }
-            }
-            updated = updated.replace(
-              /(invoke-virtual \{(v\d+), (v\d+)\}, Landroid\/widget\/FrameLayout;->setFocusable\(Z\)V)/,
-              (_, callMatch, viewReg, boolReg) =>
-                `${callMatch}\n\n` +
-                `    invoke-virtual {${viewReg}, ${boolReg}}, Landroid/widget/FrameLayout;->setLongClickable(Z)V\n\n` +
-                `    new-instance ${regListener}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;\n\n` +
-                `    iget-object ${regService}, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$1;->this$0:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;\n\n` +
-                `    invoke-direct {${regListener}, ${regService}}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;-><init>(Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;)V\n\n` +
-                `    invoke-virtual {${viewReg}, ${regListener}}, Landroid/widget/FrameLayout;->setOnTouchListener(Landroid/view/View$OnTouchListener;)V`
-            );
-          }
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-
-          const ussd4SmaliPath = path.join(path.dirname(smaliFile), 'UssdAccessibilityService$4.smali');
-          const ussd4Smali = `.class Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;
-.super Ljava/lang/Object;
-.source "UssdAccessibilityService.java"
-
-# interfaces
-.implements Landroid/view/View$OnTouchListener;
-.implements Ljava/lang/Runnable;
-
-
-# instance fields
-.field private downX:F
-
-.field private downY:F
-
-.field final synthetic this$0:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;
-
-
-# direct methods
-.method constructor <init>(Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;)V
-    .locals 0
-
-    iput-object p1, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->this$0:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;
-
-    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
-
-    return-void
-.end method
-
-
-# virtual methods
-.method public onTouch(Landroid/view/View;Landroid/view/MotionEvent;)Z
-    .locals 6
-
-    invoke-virtual {p2}, Landroid/view/MotionEvent;->getActionMasked()I
-
-    move-result v0
-
-    iget-object v1, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->this$0:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;
-
-    invoke-static {v1}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->access$200(Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;)Landroid/os/Handler;
-
-    move-result-object v1
-
-    const/4 v2, 0x1
-
-    if-eqz v1, :cond_ret
-
-    if-nez v0, :cond_not_down
-
-    invoke-virtual {p2}, Landroid/view/MotionEvent;->getRawX()F
-
-    move-result v3
-
-    iput v3, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->downX:F
-
-    invoke-virtual {p2}, Landroid/view/MotionEvent;->getRawY()F
-
-    move-result v3
-
-    iput v3, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->downY:F
-
-    invoke-virtual {v1, p0}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
-
-    const-wide/16 v3, 0x384
-
-    invoke-virtual {v1, p0, v3, v4}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
-
-    return v2
-
-    :cond_not_down
-    const/4 v3, 0x2
-
-    if-ne v0, v3, :cond_cancel
-
-    invoke-virtual {p2}, Landroid/view/MotionEvent;->getRawX()F
-
-    move-result v3
-
-    iget v4, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->downX:F
-
-    sub-float/2addr v3, v4
-
-    invoke-static {v3}, Ljava/lang/Math;->abs(F)F
-
-    move-result v3
-
-    const/high16 v4, 0x42700000    # 60.0f
-
-    cmpl-float v5, v3, v4
-
-    if-gtz v5, :cond_cancel
-
-    invoke-virtual {p2}, Landroid/view/MotionEvent;->getRawY()F
-
-    move-result v3
-
-    iget v5, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->downY:F
-
-    sub-float/2addr v3, v5
-
-    invoke-static {v3}, Ljava/lang/Math;->abs(F)F
-
-    move-result v3
-
-    cmpl-float v4, v3, v4
-
-    if-lez v4, :cond_ret
-
-    :cond_cancel
-    invoke-virtual {v1, p0}, Landroid/os/Handler;->removeCallbacks(Ljava/lang/Runnable;)V
-
-    :cond_ret
-    return v2
-.end method
-
-.method public run()V
-    .locals 7
-
-    const/4 v0, 0x0
-
-    sput-boolean v0, Lcom/cbe/cbebirrtransfer/MainActivity;->isExpectingUssdResponse:Z
-
-    iget-object v1, p0, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService$4;->this$0:Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;
-
-    :try_start_0
-    invoke-virtual {v1}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->getRootInActiveWindow()Landroid/view/accessibility/AccessibilityNodeInfo;
-
-    move-result-object v2
-
-    if-eqz v2, :cond_after_ussd
-
-    invoke-virtual {v2}, Landroid/view/accessibility/AccessibilityNodeInfo;->getPackageName()Ljava/lang/CharSequence;
-
-    move-result-object v3
-
-    if-eqz v3, :cond_after_ussd
-
-    invoke-interface {v3}, Ljava/lang/CharSequence;->toString()Ljava/lang/String;
-
-    move-result-object v3
-
-    invoke-virtual {v3}, Ljava/lang/String;->toLowerCase()Ljava/lang/String;
-
-    move-result-object v3
-
-    const-string v4, "phone"
-
-    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
-
-    move-result v4
-
-    if-nez v4, :cond_is_ussd
-
-    const-string v4, "telecom"
-
-    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
-
-    move-result v4
-
-    if-nez v4, :cond_is_ussd
-
-    const-string v4, "dialer"
-
-    invoke-virtual {v3, v4}, Ljava/lang/String;->contains(Ljava/lang/CharSequence;)Z
-
-    move-result v4
-
-    if-eqz v4, :cond_after_ussd
-
-    :cond_is_ussd
-    const-string v4, "Cancel"
-
-    invoke-virtual {v2, v4}, Landroid/view/accessibility/AccessibilityNodeInfo;->findAccessibilityNodeInfosByText(Ljava/lang/String;)Ljava/util/List;
-
-    move-result-object v4
-
-    if-eqz v4, :cond_try_ok
-
-    invoke-interface {v4}, Ljava/util/List;->iterator()Ljava/util/Iterator;
-
-    move-result-object v4
-
-    :cond_loop_cancel
-    invoke-interface {v4}, Ljava/util/Iterator;->hasNext()Z
-
-    move-result v5
-
-    if-eqz v5, :cond_try_ok
-
-    invoke-interface {v4}, Ljava/util/Iterator;->next()Ljava/lang/Object;
-
-    move-result-object v5
-
-    check-cast v5, Landroid/view/accessibility/AccessibilityNodeInfo;
-
-    invoke-virtual {v5}, Landroid/view/accessibility/AccessibilityNodeInfo;->isClickable()Z
-
-    move-result v6
-
-    if-eqz v6, :cond_loop_cancel
-
-    const/16 v6, 0x10
-
-    invoke-virtual {v5, v6}, Landroid/view/accessibility/AccessibilityNodeInfo;->performAction(I)Z
-
-    goto :cond_loop_cancel
-
-    :cond_try_ok
-    const-string v4, "OK"
-
-    invoke-virtual {v2, v4}, Landroid/view/accessibility/AccessibilityNodeInfo;->findAccessibilityNodeInfosByText(Ljava/lang/String;)Ljava/util/List;
-
-    move-result-object v4
-
-    if-eqz v4, :cond_back_ussd
-
-    invoke-interface {v4}, Ljava/util/List;->iterator()Ljava/util/Iterator;
-
-    move-result-object v4
-
-    :cond_loop_ok
-    invoke-interface {v4}, Ljava/util/Iterator;->hasNext()Z
-
-    move-result v5
-
-    if-eqz v5, :cond_back_ussd
-
-    invoke-interface {v4}, Ljava/util/Iterator;->next()Ljava/lang/Object;
-
-    move-result-object v5
-
-    check-cast v5, Landroid/view/accessibility/AccessibilityNodeInfo;
-
-    invoke-virtual {v5}, Landroid/view/accessibility/AccessibilityNodeInfo;->isClickable()Z
-
-    move-result v6
-
-    if-eqz v6, :cond_loop_ok
-
-    const/16 v6, 0x10
-
-    invoke-virtual {v5, v6}, Landroid/view/accessibility/AccessibilityNodeInfo;->performAction(I)Z
-
-    goto :cond_loop_ok
-
-    :cond_back_ussd
-    const/4 v4, 0x1
-
-    invoke-virtual {v1, v4}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->performGlobalAction(I)Z
-
-    new-instance v4, Landroid/content/Intent;
-
-    const-class v5, Lcom/cbe/cbebirrtransfer/MainActivity;
-
-    invoke-direct {v4, v1, v5}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
-
-    const/high16 v5, 0x30020000
-
-    invoke-virtual {v4, v5}, Landroid/content/Intent;->addFlags(I)Landroid/content/Intent;
-
-    invoke-virtual {v1, v4}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->startActivity(Landroid/content/Intent;)V
-    :try_end_0
-    .catchall {:try_start_0 .. :try_end_0} :catchall_0
-
-    goto :cond_after_ussd
-
-    :catchall_0
-    move-exception v2
-
-    :cond_after_ussd
-    invoke-virtual {v1}, Lcom/cbe/cbebirrtransfer/UssdAccessibilityService;->hideLoadingOverlay()V
-
-    sget-object v2, Lcom/cbe/cbebirrtransfer/MainActivity;->currentInstance:Lcom/cbe/cbebirrtransfer/MainActivity;
-
-    if-eqz v2, :cond_done
-
-    const-string v3, "__CBE_USSD_CANCELLED__"
-
-    invoke-virtual {v2, v3}, Lcom/cbe/cbebirrtransfer/MainActivity;->setReceiverNameFromService(Ljava/lang/String;)V
-
-    :cond_done
-    return-void
-.end method
-`;
-          fs.writeFileSync(ussd4SmaliPath, ussd4Smali, 'utf8');
-          console.log('Wrote smali: UssdAccessibilityService$4.smali');
-        } else if (base === 'UssdAccessibilityService.smali') {
-          const updated = code.replace(
-            /(const-wide\/16 v\d+, 0x2ee0[\s\S]{0,160}?)if-lez v\d+, (:cond_\w+)/g,
-            '$1goto $2'
-          );
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-        } else if (base === 'UssdAccessibilityService$3.smali') {
-          const updated = code.replace(/const-wide\/16 (v\d+), 0x1f4/g, 'const-wide/16 $1, 0x5dc');
-          if (updated !== code) {
-            code = updated;
-            changed = true;
-          }
-        }
-
-        if (changed) {
-          fs.writeFileSync(smaliFile, code, 'utf8');
-          console.log(`Patched smali: ${base}`);
+        if (dirName !== 'drawable') {
+          fs.copyFileSync(logoPng512, outRound);
         }
       }
-      if (findSmaliFiles(sDir).length === 0) {
-        fs.rmSync(sDir, { recursive: true, force: true });
-      }
     }
 
-    // Compile native Android background calling service & IncomingCallActivity (.java -> .class)
-    const nativeCallJavaDir = path.join(rootDir, 'scripts', 'cbe-native-call');
-    const findJavaFiles = (dir) => {
-      const out = [];
-      if (!fs.existsSync(dir)) return out;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) out.push(...findJavaFiles(full));
-        else if (entry.name.endsWith('.java')) out.push(full);
-      }
-      return out;
-    };
-    const nativeJavaFiles = findJavaFiles(nativeCallJavaDir);
-    const platformsBase = path.join(sdkDir, 'platforms');
-    const platformVers = fs.existsSync(platformsBase)
-      ? fs
-          .readdirSync(platformsBase)
-          .filter((v) => /^android-\d+/.test(v) && fs.existsSync(path.join(platformsBase, v, 'android.jar')))
-          .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-      : [];
-    if (platformVers.length === 0) {
-      throw new Error(`No android.jar found in ${platformsBase}`);
-    }
-    const androidJar = path.join(platformsBase, platformVers[platformVers.length - 1], 'android.jar');
-    const d8Bin = path.join(latestBuildTools, 'd8');
-    const classesStage = '/tmp/cbe_call_classes';
-    const dexStage = '/tmp/cbe_call_dex';
-    let compiledClasses = [];
-    if (nativeJavaFiles.length > 0) {
-      fs.rmSync(classesStage, { recursive: true, force: true });
-      fs.mkdirSync(classesStage, { recursive: true });
-      execFileSync(
-        'javac',
-        ['-source', '1.8', '-target', '1.8', '-classpath', androidJar, '-d', classesStage, ...nativeJavaFiles],
-        { env, stdio: 'inherit' }
-      );
-      const findClassFiles = (dir) => {
-        const out = [];
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const full = path.join(dir, entry.name);
-          if (entry.isDirectory()) out.push(...findClassFiles(full));
-          else if (entry.name.endsWith('.class')) out.push(full);
-        }
-        return out;
-      };
-      compiledClasses = findClassFiles(classesStage);
-      console.log(`Compiled ${compiledClasses.length} native call .class file(s) ready for d8 DEX merge.`);
-    }
+    // Populate android-cbebirr/app/src/main/assets/web/ with fresh static Next.js export
+    const cbeAssetsWebDir = path.join(cbeDir, 'app', 'src', 'main', 'assets', 'web');
+    fs.rmSync(cbeAssetsWebDir, { recursive: true, force: true });
+    fs.cpSync(outWebDir, cbeAssetsWebDir, { recursive: true });
 
-    // Replace bundled assets/web/ with fresh static export
-    const apkWebDir = path.join(decDir, 'assets', 'web');
-    if (fs.existsSync(outWebDir)) {
-      fs.rmSync(apkWebDir, { recursive: true, force: true });
-      fs.cpSync(outWebDir, apkWebDir, { recursive: true });
-      fs.writeFileSync(path.join(apkWebDir, 'build-stamp.txt'), expectedWebStamp, 'utf8');
-      console.log('Replaced APK assets/web/ with latest static Next.js export.');
-    }
-
-    // aapt2 skips directories starting with "_" (e.g. "_next") by default!
-    // Rename assets/web/_next -> assets/web/next_bundle (mapped cleanly in MainActivity$3 via SupportWebChromeClient.mapWebAssetPath)
-    const rawCbeNextDir = path.join(apkWebDir, '_next');
-    const safeCbeNextDir = path.join(apkWebDir, 'next_bundle');
+    // aapt2 skips asset directories starting with "_" (e.g. "_next") by default!
+    // Rename assets/web/_next -> assets/web/next_bundle (mapped cleanly by SupportWebChromeClient.mapWebAssetPath)
+    const rawCbeNextDir = path.join(cbeAssetsWebDir, '_next');
+    const safeCbeNextDir = path.join(cbeAssetsWebDir, 'next_bundle');
     if (fs.existsSync(rawCbeNextDir)) {
       fs.rmSync(safeCbeNextDir, { recursive: true, force: true });
       fs.renameSync(rawCbeNextDir, safeCbeNextDir);
     }
 
-    // Prune unused chat attachment screenshots & idsig bloat while keeping the 4 referenced loading/transfer assets
-    fs.rmSync(path.join(apkWebDir, 'SamsungMessages.apk.idsig'), { force: true });
-    const aistudioAssetsDir = path.join(apkWebDir, 'assets', 'aistudio');
+    // Prune unused chat attachment screenshots & idsig bloat while keeping referenced loading/transfer assets
+    fs.rmSync(path.join(cbeAssetsWebDir, 'SamsungMessages.apk.idsig'), { force: true });
+    const aistudioAssetsDir = path.join(cbeAssetsWebDir, 'assets', 'aistudio');
     if (fs.existsSync(aistudioAssetsDir)) {
       const keepAistudio = new Set([
         'Screenshot_20261027-145909_9889e698.png',
@@ -1380,101 +394,43 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
     }
 
     // Ensure clean blank-field wallet transfer base PNG & logos
-    const apkWalletBase = path.join(apkWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base.png');
+    const apkWalletBase = path.join(cbeAssetsWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base.png');
     if (fs.existsSync(path.dirname(apkWalletBase))) {
       fs.copyFileSync(cleanWalletPng, apkWalletBase);
-      fs.copyFileSync(cleanWalletPng, path.join(apkWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_clean.png'));
-      fs.copyFileSync(cleanWalletPng, path.join(apkWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_orig.png'));
+      fs.copyFileSync(cleanWalletPng, path.join(cbeAssetsWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_clean.png'));
+      fs.copyFileSync(cleanWalletPng, path.join(cbeAssetsWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_orig.png'));
     }
 
-    // Update bundled web manifest, sw.js & logo assets
-    const apkAssetsDir = path.join(apkWebDir, 'assets');
+    const apkAssetsDir = path.join(cbeAssetsWebDir, 'assets');
     if (fs.existsSync(apkAssetsDir)) {
       fs.copyFileSync(logoPng512, path.join(apkAssetsDir, 'cbe_birr_logo.png'));
       if (fs.existsSync(logoPng192)) {
         fs.copyFileSync(logoPng192, path.join(apkAssetsDir, 'cbe_birr_logo_192.png'));
       }
     }
-    const apkManifestJson = path.join(apkWebDir, 'manifest.json');
+    const apkManifestJson = path.join(cbeAssetsWebDir, 'manifest.json');
     if (fs.existsSync(path.dirname(apkManifestJson))) {
       fs.copyFileSync(path.join(rootDir, 'public', 'manifest.json'), apkManifestJson);
     }
-    const apkSwJs = path.join(apkWebDir, 'sw.js');
+    const apkSwJs = path.join(cbeAssetsWebDir, 'sw.js');
     if (fs.existsSync(swJsPath) && fs.existsSync(path.dirname(apkSwJs))) {
       fs.copyFileSync(swJsPath, apkSwJs);
     }
 
-    const rebuiltCbe = '/tmp/cbe_rebuilt.apk';
-    const mergedCbe = '/tmp/cbe_merged.apk';
-    const alignedCbe = '/tmp/cbe_aligned.apk';
-    // Compile resources & AndroidManifest.xml with modern aapt2 (matching CBEMessages.apk & RamControl.apk)
-    execSync(`java -jar "${apktoolJar}" b --use-aapt2 "${decDir}" -o "${rebuiltCbe}"`, { env, stdio: 'inherit' });
+    fs.writeFileSync(path.join(cbeAssetsWebDir, 'build-stamp.txt'), expectedCbeStamp, 'utf8');
 
-    // Merge rebuilt classes.dex + compiled native-call classes into ONE clean classes.dex via d8
-    if (compiledClasses.length > 0) {
-      const baseDexPath = '/tmp/cbe_base_classes.dex';
-      fs.rmSync(dexStage, { recursive: true, force: true });
-      fs.mkdirSync(dexStage, { recursive: true });
-      execFileSync(
-        'python3',
-        [
-          '-c',
-          'import sys, zipfile; z=zipfile.ZipFile(sys.argv[1]); open(sys.argv[2],"wb").write(z.read("classes.dex"))',
-          rebuiltCbe,
-          baseDexPath,
-        ],
-        { env, stdio: 'inherit' }
-      );
-      execFileSync(
-        d8Bin,
-        ['--min-api', '24', '--lib', androidJar, '--output', dexStage, baseDexPath, ...compiledClasses],
-        { env, stdio: 'inherit' }
-      );
-      fs.rmSync(baseDexPath, { force: true });
-      fs.rmSync(classesStage, { recursive: true, force: true });
+    runGradleAssembleRelease(cbeDir, 'CBEBirrPlus');
 
-      const mergedDexFiles = fs
-        .readdirSync(dexStage)
-        .filter((f) => /^classes\d*\.dex$/.test(f))
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      if (mergedDexFiles.length === 0) {
-        throw new Error('d8 produced no merged classes.dex');
-      }
-      execFileSync(
-        'python3',
-        [
-          '-c',
-          [
-            'import os, re, sys, zipfile',
-            'src_apk, dst_apk, dex_dir = sys.argv[1], sys.argv[2], sys.argv[3]',
-            'dex_names = sorted([f for f in os.listdir(dex_dir) if re.match(r"^classes\\d*\\.dex$", f)])',
-            'with zipfile.ZipFile(src_apk, "r") as zr, zipfile.ZipFile(dst_apk, "w") as zw:',
-            '    for info in zr.infolist():',
-            '        if re.match(r"^classes\\d*\\.dex$", info.filename) or info.filename.startswith("META-INF/"):',
-            '            continue',
-            '        comp = zipfile.ZIP_STORED if info.compress_type == zipfile.ZIP_STORED else zipfile.ZIP_DEFLATED',
-            '        zi = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))',
-            '        zi.compress_type = comp',
-            '        zw.writestr(zi, zr.read(info.filename), compress_type=comp)',
-            '    for d in dex_names:',
-            '        zi = zipfile.ZipInfo(d, date_time=(1980, 1, 1, 0, 0, 0))',
-            '        zi.compress_type = zipfile.ZIP_DEFLATED',
-            '        with open(os.path.join(dex_dir, d), "rb") as f:',
-            '            zw.writestr(zi, f.read(), compress_type=zipfile.ZIP_DEFLATED)',
-            '        print(f"Merged clean {d} into APK ({os.path.getsize(os.path.join(dex_dir, d))} bytes)")',
-          ].join('\n'),
-          rebuiltCbe,
-          mergedCbe,
-          dexStage,
-        ],
-        { env, stdio: 'inherit' }
-      );
-      fs.rmSync(dexStage, { recursive: true, force: true });
-    } else {
-      fs.copyFileSync(rebuiltCbe, mergedCbe);
+    const cbeReleaseDir = path.join(cbeDir, 'app', 'build', 'outputs', 'apk', 'release');
+    const cbeUnsignedApk = path.join(cbeReleaseDir, 'app-release-unsigned.apk');
+    const cbeGradleApk = path.join(cbeReleaseDir, 'app-release.apk');
+    const cbeInputApk = fs.existsSync(cbeUnsignedApk) ? cbeUnsignedApk : cbeGradleApk;
+    if (!fs.existsSync(cbeInputApk)) {
+      throw new Error(`CBEBirr Plus release APK output not found in ${cbeReleaseDir}`);
     }
 
-    execSync(`"${zipalignBin}" -f -p 4 "${mergedCbe}" "${alignedCbe}"`, { env, stdio: 'inherit' });
+    const alignedCbe = '/tmp/cbe_aligned.apk';
+    execSync(`"${zipalignBin}" -f -p 4 "${cbeInputApk}" "${alignedCbe}"`, { env, stdio: 'inherit' });
 
     const cbeKeyPk8 = path.join(keystoresDir, 'cbe-banking.pk8');
     const cbeCertPem = path.join(keystoresDir, 'cbe-banking.pem');
@@ -1507,6 +463,8 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
           '    assert "classes2.dex" not in names, "Unexpected classes2.dex"',
           '    assert "assets/web/index.html" in names, "Missing assets/web/index.html"',
           '    assert any(n.startswith("assets/web/next_bundle/static/") for n in names), "Missing assets/web/next_bundle/static/"',
+          '    manifest_bytes = z.read("AndroidManifest.xml")',
+          '    assert b"6.0.1" not in manifest_bytes and "6.0.1".encode("utf-16le") not in manifest_bytes, "Legacy 6.0.1 manifest detected"',
           '    arsc = z.getinfo("resources.arsc")',
           '    assert arsc.compress_type == 0, f"resources.arsc compressed: {arsc.compress_type}"',
           '    with open(apk, "rb") as f:',
@@ -1515,19 +473,17 @@ if (fs.existsSync(cbeApkPath) && fs.existsSync(logoPng512) && fs.existsSync(clea
           '        data_off = arsc.header_offset + 30 + nlen + elen',
           '        assert data_off % 4 == 0, f"resources.arsc unaligned: {data_off}"',
           '    dex = z.read("classes.dex")',
-          '    for sym in (b"MainActivity", b"UssdAccessibilityService", b"SupportWebChromeClient", b"mapWebAssetPath", b"CallBridgeHelper", b"CallForegroundService", b"IncomingCallActivity", b"openExternalUrl"):',
+          '    for sym in (b"MainActivity", b"UssdAccessibilityService", b"SupportWebChromeClient", b"mapWebAssetPath", b"CallBridgeHelper", b"CallForegroundService", b"IncomingCallActivity", b"openExternalUrl", b"__CBE_USSD_CANCELLED__", b"#FF7A1C7D"):',
           '        assert sym in dex, f"Missing symbol {sym!r} in classes.dex"',
-          'print("Verified cbebirr-plus.apk integrity, aapt2 ARSC alignment, next_bundle, and single unified classes.dex!")',
+          'print("Verified pure Gradle cbebirr-plus.apk: clean AGP manifest, ARSC aligned, next_bundle, and unified classes.dex!")',
         ].join('\n'),
         cbeApkPath,
       ],
       { env, stdio: 'inherit' }
     );
-    fs.rmSync(decDir, { recursive: true, force: true });
-    fs.rmSync(rebuiltCbe, { force: true });
-    fs.rmSync(mergedCbe, { force: true });
+    fs.rmSync(cbeAssetsWebDir, { recursive: true, force: true });
     fs.rmSync(alignedCbe, { force: true });
-    console.log(`Successfully updated & signed public/cbebirr-plus.apk (${usePermanentCbeKey ? 'permanent repo key' : 'fallback keystore'})!`);
+    console.log(`Successfully compiled and signed public/cbebirr-plus.apk (${usePermanentCbeKey ? 'permanent repo key' : 'fallback keystore'})!`);
   }
 }
 
@@ -1656,7 +612,7 @@ if (
   prevMeta.cbeApkSha256 !== cbeApkSha256 ||
   prevMeta.msgApkSha256 !== msgApkSha256 ||
   prevMeta.ramControlApkSha256 !== ramControlApkSha256 ||
-  prevMeta.webStamp !== expectedWebStamp ||
+  prevMeta.webStamp !== expectedCbeStamp ||
   prevMeta.ramControlStamp !== expectedRamControlStamp
 ) {
   const versionMeta = {
@@ -1670,7 +626,7 @@ if (
     ramControlVersionName: versionNameMeta,
     ramControlApkSha256,
     ramControlApkSize: ramBuf ? ramBuf.length : 0,
-    webStamp: expectedWebStamp,
+    webStamp: expectedCbeStamp,
     ramControlStamp: expectedRamControlStamp,
     runNumber: Number.isFinite(ciRunNumMeta) ? ciRunNumMeta : null,
     updatedAt: new Date().toISOString(),
