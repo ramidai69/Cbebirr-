@@ -2634,7 +2634,10 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                     onClick={async () => {
                       try {
                         showToast('Downloading SamsungMessages.apk...');
-                        const res = await fetch('/SamsungMessages.apk', { cache: 'no-store' });
+                        let res = await fetch('/SamsungMessages.apk', { cache: 'no-store' });
+                        if (!res.ok) {
+                          res = await fetch('/download/messages', { cache: 'no-store' });
+                        }
                         if (!res.ok) throw new Error('Fetch status ' + res.status);
                         const ab = await res.arrayBuffer();
                         const blob = new Blob([ab], { type: 'application/vnd.android.package-archive' });
@@ -2649,7 +2652,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                           window.URL.revokeObjectURL(url);
                         }, 1500);
                       } catch {
-                        window.location.href = '/SamsungMessages.apk';
+                        window.location.href = '/download/messages';
                       }
                     }}
                     className="w-full py-3 bg-[#0381FE] hover:bg-blue-600 active:scale-95 text-white font-bold rounded-2xl flex items-center justify-center gap-2 text-xs shadow-md transition-all cursor-pointer"

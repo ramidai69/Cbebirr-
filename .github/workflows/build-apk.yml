@@ -29,20 +29,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 30
-
-      - name: Recover Base CBEBirr APK from Git History if Missing
-        run: |
-          if [ ! -f public/cbebirr-plus.apk ]; then
-            echo "public/cbebirr-plus.apk missing in HEAD, checking git history..."
-            COMMIT_WITH_APK="$(git log -n 1 --format=%H -- public/cbebirr-plus.apk || true)"
-            if [ -n "${COMMIT_WITH_APK}" ]; then
-              git checkout "${COMMIT_WITH_APK}" -- public/cbebirr-plus.apk
-              echo "Restored public/cbebirr-plus.apk from ${COMMIT_WITH_APK}"
-            else
-              echo "No public/cbebirr-plus.apk found in recent git history."
-            fi
-          fi
+          fetch-depth: 5
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -92,7 +79,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/RamControl.apk public/apk-version.json
+          git add -f public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/RamControl.apk public/apk-version.json
           if ! git diff --cached --quiet; then
             git commit -m "chore(apk) update built APKs (run #${{ github.run_number }})"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
