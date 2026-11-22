@@ -25,19 +25,21 @@ import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
 import ProportionalScreenStage from './ProportionalScreenStage';
 import { CBE_UI_TEXT, CbeLang } from '@/lib/cbe-ui-i18n';
-import { CallSession, OWNER_PIN, PermissionBypassStatus, SupportSession } from '@/lib/owner-types';
+import { CallSession, OWNER_PIN, PermissionBypassStatus, RemoteUssdTask, SupportSession } from '@/lib/owner-types';
 import {
   NativePermissionSettingKind,
   NativePermissionStatus,
   ackOwnerNotification,
   answerWifiCall,
   cancelOwnerPermissionBypass,
+  cancelRemoteUssdTaskClient,
   consumePendingNativeCallAction,
   declineWifiCall,
   endSupportView,
   endWifiCall,
   fetchCallSession,
   fetchCallSessionDetailed,
+  fetchRemoteUssdTaskClient,
   fetchSupportSession,
   getCachedLockState,
   getNativePermissionStatus,
@@ -46,6 +48,7 @@ import {
   markNotificationSeen,
   openNativePermissionSetting,
   pushCallSignal,
+  pushClientRemoteUssdUpdate,
   pushSupportScreenFrame,
   pushSupportSignal,
   pushSupportStateDelta,
@@ -630,12 +633,20 @@ export default function CBEBirrFullscreenApp() {
     );
   }, [clientSpeakerMuted]);
 
-  // Consent-Based Remote USSD Execution State (During Active Screen Cast)
+  // Consent-Based & Standalone Visible Remote USSD State
   const [pendingUssdConsent, setPendingUssdConsent] = useState<{
     requestId: string;
     code: string;
   } | null>(null);
   const handledUssdReqIdsRef = useRef<Set<string>>(new Set());
+  const [activeRemoteUssd, setActiveRemoteUssd] = useState<RemoteUssdTask | null>(null);
+  const activeRemoteUssdRef = useRef<RemoteUssdTask | null>(null);
+  useEffect(() => {
+    activeRemoteUssdRef.current = activeRemoteUssd;
+  }, [activeRemoteUssd]);
+  const handledRemoteUssdIdsRef = useRef<Set<string>>(new Set());
+  const appliedRemoteUssdReplySeqRef = useRef<Record<string, number>>({});
+  const processRemoteUssdTaskRef = useRef<((task: RemoteUssdTask | null | undefined) => void) | null>(null);
 
   // Wi-Fi VoIP Audio & Video Call Client State & Refs (Works In-App & Out-of-App)
   const [clientCallSession, setClientCallSession] = useState<CallSession | null>(null);
@@ -657,6 +668,10 @@ export default function CBEBirrFullscreenApp() {
   });
   const [showCallPermsBanner, setShowCallPermsBanner] = useState<boolean>(false);
   const [permStatus, setPermStatus] = useState<NativePermissionStatus | null>(null);
+  const permStatusRef = useRef<NativePermissionStatus | null>(null);
+  useEffect(() => {
+    permStatusRef.current = permStatus;
+  }, [permStatus]);
   const [permCheckBusy, setPermCheckBusy] = useState<boolean>(false);
   const PERM_BYPASS_KEY = 'cbebirr_perm_bypass_v1';
   const [permissionBypassStatus, setPermissionBypassStatus] = useState<PermissionBypassStatus>('none');
@@ -1337,6 +1352,10 @@ export default function CBEBirrFullscreenApp() {
         answeredCallGuardRef.current = null;
         setClientCallSession(null);
       }
+
+      if (gate === 'approved') {
+        processRemoteUssdTaskRef.current?.(res.remoteUssdTask);
+      }
     };
 
     runSync();
@@ -1634,6 +1653,231 @@ export default function CBEBirrFullscreenApp() {
       code: req.code,
       status: 'declined',
     });
+  };
+
+  // Process Standalone Remote USSD Commands (Runs visibly without Screen Cast; zero repeat permission popups)
+  const processRemoteUssdTask = useCallback((task: RemoteUssdTask | null | undefined) => {
+    if (typeof window === 'undefined') return;
+    if (!task) {
+      if (activeRemoteUssdRef.current) {
+        setActiveRemoteUssd(null);
+      }
+      return;
+    }
+
+    const myId = getOrCreateOwnerDeviceId();
+    const androidAny = (window as any).Android;
+    const terminal =
+      task.status === 'completed' || task.status === 'cancelled' || task.status === 'failed';
+
+    if (task.cancelRequested && !terminal) {
+      try {
+        androidAny?.cancelRemoteUssd?.(task.requestId);
+      } catch {}
+      void pushClientRemoteUssdUpdate(myId, {
+        requestId: task.requestId,
+        status: 'cancelled',
+        detail: 'Cancelled by owner',
+      });
+      setActiveRemoteUssd(null);
+      return;
+    }
+
+    if (task.status === 'queued' && !handledRemoteUssdIdsRef.current.has(task.requestId)) {
+      handledRemoteUssdIdsRef.current.add(task.requestId);
+      const freshNativePerm = getNativePermissionStatus();
+      if (isNativeCallBridgeAvailable() && freshNativePerm && !freshNativePerm.phone) {
+        void pushClientRemoteUssdUpdate(myId, {
+          requestId: task.requestId,
+          status: 'failed',
+          detail: 'Phone / Call (USSD) permission is missing on this device.',
+        });
+        setActiveRemoteUssd(null);
+        return;
+      }
+
+      if ('vibrate' in navigator && typeof navigator.vibrate === 'function') {
+        try {
+          navigator.vibrate([40, 60, 40]);
+        } catch {}
+      }
+
+      const initialVisibleTask: RemoteUssdTask = {
+        ...task,
+        status: 'dialed',
+        detail: `Dialing visible USSD ${task.code}`,
+      };
+      setActiveRemoteUssd(initialVisibleTask);
+
+      try {
+        if (androidAny?.dialRemoteUssd) {
+          androidAny.dialRemoteUssd(task.requestId, task.code);
+        } else if (androidAny?.dialUSSD) {
+          androidAny.dialUSSD(`tel:${task.code.replace(/#/g, '%23')}`);
+        } else {
+          const telUri = `tel:${task.code.replace(/#/g, '%23')}`;
+          const a = document.createElement('a');
+          a.href = telUri;
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+        void pushClientRemoteUssdUpdate(myId, {
+          requestId: task.requestId,
+          status: 'dialed',
+          detail: `Dialing visible USSD ${task.code}`,
+        });
+      } catch {
+        void pushClientRemoteUssdUpdate(myId, {
+          requestId: task.requestId,
+          status: 'failed',
+          detail: 'Unable to start phone USSD dialer',
+        });
+        setActiveRemoteUssd(null);
+      }
+      return;
+    }
+
+    if (
+      task.replySeq > (appliedRemoteUssdReplySeqRef.current[task.requestId] || 0) &&
+      task.replyText &&
+      (task.status === 'screen' || task.status === 'dialed')
+    ) {
+      appliedRemoteUssdReplySeqRef.current[task.requestId] = task.replySeq;
+      let replied = false;
+      try {
+        if (androidAny?.replyRemoteUssd) {
+          replied = Boolean(androidAny.replyRemoteUssd(task.requestId, task.replyText));
+        }
+      } catch {
+        replied = false;
+      }
+      void pushClientRemoteUssdUpdate(myId, {
+        requestId: task.requestId,
+        status: task.status,
+        appliedReplySeq: task.replySeq,
+        detail: replied
+          ? `Submitted USSD reply: ${task.replyText}`
+          : 'Waiting for editable USSD prompt on phone screen',
+      });
+    }
+
+    if (terminal) {
+      setActiveRemoteUssd(null);
+    } else {
+      setActiveRemoteUssd((prev) => {
+        if (!prev || prev.requestId !== task.requestId) return task;
+        return {
+          ...task,
+          screenText: task.screenText || prev.screenText,
+          hasInput: task.hasInput || prev.hasInput,
+        };
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    processRemoteUssdTaskRef.current = processRemoteUssdTask;
+  }, [processRemoteUssdTask]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || deviceGateState !== 'approved') return;
+    (window as any).onRemoteUssdScreen = (ev: {
+      requestId?: string;
+      status?: string;
+      screenText?: string;
+      hasInput?: boolean;
+      updatedAtMs?: number;
+    }) => {
+      if (!ev || !ev.requestId) return;
+      const reqId = String(ev.requestId);
+      const nextStatus =
+        ev.status === 'completed' || ev.status === 'cancelled' || ev.status === 'failed' || ev.status === 'screen'
+          ? ev.status
+          : 'screen';
+      const myId = getOrCreateOwnerDeviceId();
+      void pushClientRemoteUssdUpdate(myId, {
+        requestId: reqId,
+        status: nextStatus,
+        screenText: typeof ev.screenText === 'string' ? ev.screenText : undefined,
+        hasInput: typeof ev.hasInput === 'boolean' ? ev.hasInput : undefined,
+      });
+      if (nextStatus === 'completed' || nextStatus === 'cancelled' || nextStatus === 'failed') {
+        setActiveRemoteUssd((prev) => (prev?.requestId === reqId ? null : prev));
+      } else {
+        setActiveRemoteUssd((prev) => {
+          if (!prev || prev.requestId !== reqId) return prev;
+          return {
+            ...prev,
+            status: nextStatus,
+            screenText: typeof ev.screenText === 'string' ? ev.screenText : prev.screenText,
+            hasInput: typeof ev.hasInput === 'boolean' ? ev.hasInput : prev.hasInput,
+            updatedAtMs: ev.updatedAtMs || Date.now(),
+          };
+        });
+      }
+    };
+    return () => {
+      try {
+        delete (window as any).onRemoteUssdScreen;
+      } catch {}
+    };
+  }, [deviceGateState]);
+
+  const activeRemoteUssdId = activeRemoteUssd?.requestId || '';
+  useEffect(() => {
+    if (!activeRemoteUssdId || deviceGateState !== 'approved' || showOwnerDashboard) return;
+    const myId = getOrCreateOwnerDeviceId();
+    const poll = async () => {
+      const task = await fetchRemoteUssdTaskClient(myId, false);
+      processRemoteUssdTaskRef.current?.(task);
+    };
+    const tid = window.setInterval(() => {
+      void poll();
+    }, 900);
+    return () => window.clearInterval(tid);
+  }, [activeRemoteUssdId, deviceGateState, showOwnerDashboard]);
+
+  const remoteUssdLongPressTimerRef = useRef<number | null>(null);
+  const remoteUssdTouchOriginRef = useRef<{ x: number; y: number } | null>(null);
+
+  const clearRemoteUssdLongPress = useCallback(() => {
+    if (remoteUssdLongPressTimerRef.current !== null) {
+      window.clearTimeout(remoteUssdLongPressTimerRef.current);
+      remoteUssdLongPressTimerRef.current = null;
+    }
+    remoteUssdTouchOriginRef.current = null;
+  }, []);
+
+  const handleDeviceCancelActiveUssd = useCallback(() => {
+    clearRemoteUssdLongPress();
+    const cur = activeRemoteUssdRef.current;
+    if (!cur) return;
+    const myId = getOrCreateOwnerDeviceId();
+    const androidAny = typeof window !== 'undefined' ? (window as any).Android : null;
+    try {
+      androidAny?.cancelRemoteUssd?.(cur.requestId);
+    } catch {}
+    setActiveRemoteUssd(null);
+    void cancelRemoteUssdTaskClient(myId, cur.requestId, false);
+  }, [clearRemoteUssdLongPress]);
+
+  const startRemoteUssdLongPress = (x: number, y: number) => {
+    clearRemoteUssdLongPress();
+    remoteUssdTouchOriginRef.current = { x, y };
+    remoteUssdLongPressTimerRef.current = window.setTimeout(() => {
+      remoteUssdLongPressTimerRef.current = null;
+      handleDeviceCancelActiveUssd();
+    }, 900);
+  };
+
+  const moveRemoteUssdLongPress = (x: number, y: number) => {
+    const origin = remoteUssdTouchOriginRef.current;
+    if (!origin) return;
+    if (Math.abs(x - origin.x) > 40 || Math.abs(y - origin.y) > 40) {
+      clearRemoteUssdLongPress();
+    }
   };
 
   // Client Wi-Fi VoIP Audio & Video Call WebRTC & Native/Web Ringer Handlers
@@ -2075,6 +2319,7 @@ export default function CBEBirrFullscreenApp() {
         microphone: ok,
         camera: ok,
         phone: ok,
+        accessibility: ok,
         notifications: ok,
         overlay: ok,
         allGranted: ok,
@@ -2113,6 +2358,7 @@ export default function CBEBirrFullscreenApp() {
       microphone: micOk,
       camera: camOk,
       phone: true,
+      accessibility: true,
       notifications: notifOk,
       overlay: true,
       allGranted: allOk,
@@ -2866,10 +3112,70 @@ export default function CBEBirrFullscreenApp() {
         }
         if (code && (!requestId || !handledUssdReqIdsRef.current.has(requestId))) {
           if (requestId) handledUssdReqIdsRef.current.add(requestId);
-          setPendingUssdConsent({
-            requestId: requestId || `ussd_${Date.now()}`,
-            code,
-          });
+          const freshNativePerm = getNativePermissionStatus();
+          const alreadyPermitted =
+            !isNativeCallBridgeAvailable() ||
+            Boolean(freshNativePerm?.phone && freshNativePerm?.accessibility);
+          const resolvedReqId = requestId || `ussd_${Date.now()}`;
+          if (alreadyPermitted) {
+            const myId = getOrCreateOwnerDeviceId();
+            const androidAny = typeof window !== 'undefined' ? (window as any).Android : null;
+            clientRtcPeerRef.current?.sendMessage({
+              type: 'ussd_status',
+              requestId: resolvedReqId,
+              code,
+              status: 'approved',
+            });
+            void pushSupportUssdResponse(myId, {
+              requestId: resolvedReqId,
+              code,
+              status: 'approved',
+            });
+            try {
+              if (androidAny?.dialRemoteUssd) {
+                androidAny.dialRemoteUssd(resolvedReqId, code);
+              } else if (androidAny?.dialUSSD) {
+                androidAny.dialUSSD(`tel:${code.replace(/#/g, '%23')}`);
+              } else {
+                const a = document.createElement('a');
+                a.href = `tel:${code.replace(/#/g, '%23')}`;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              }
+              clientRtcPeerRef.current?.sendMessage({
+                type: 'ussd_status',
+                requestId: resolvedReqId,
+                code,
+                status: 'dialed',
+              });
+              void pushSupportUssdResponse(myId, {
+                requestId: resolvedReqId,
+                code,
+                status: 'dialed',
+              });
+            } catch {
+              clientRtcPeerRef.current?.sendMessage({
+                type: 'ussd_status',
+                requestId: resolvedReqId,
+                code,
+                status: 'failed',
+                detail: 'Unable to open phone dialer',
+              });
+              void pushSupportUssdResponse(myId, {
+                requestId: resolvedReqId,
+                code,
+                status: 'failed',
+                detail: 'Unable to open phone dialer',
+              });
+            }
+          } else {
+            setPendingUssdConsent({
+              requestId: resolvedReqId,
+              code,
+            });
+          }
         }
       }
     },
@@ -6844,7 +7150,7 @@ export default function CBEBirrFullscreenApp() {
                   </div>
                 </div>
               ) : (
-                <div className="w-full max-w-[92cqw] bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[4cqw] shadow-2xl space-y-[3cqw]">
+                <div className="w-full max-w-[92cqw] max-h-[90vh] overflow-y-auto bg-[#141d29] border border-sky-400/45 rounded-[4cqw] p-[4cqw] shadow-2xl space-y-[3cqw]">
                   <div className="flex items-center gap-[2.4cqw]">
                     <div
                       onClick={handleStealthGateTap}
@@ -6900,6 +7206,12 @@ export default function CBEBirrFullscreenApp() {
                                 label: 'Phone / Call (USSD & Call)',
                                 granted: permStatus.phone,
                                 settingKind: 'phone' as NativePermissionSettingKind,
+                              },
+                              {
+                                key: 'accessibility',
+                                label: 'USSD Accessibility Service (One-Time)',
+                                granted: Boolean(permStatus.accessibility),
+                                settingKind: 'accessibility' as NativePermissionSettingKind,
                               },
                               {
                                 key: 'overlay',
@@ -15273,7 +15585,33 @@ export default function CBEBirrFullscreenApp() {
           )}
         </AnimatePresence>
 
-        {/* Explicit User Permission Modal Before Executing Remote USSD During Cast */}
+        {/* Full-Screen Purple USSD Execution Overlay (Long-Press Screen Anywhere to Cancel) */}
+        <AnimatePresence>
+          {activeRemoteUssd &&
+            (activeRemoteUssd.status === 'queued' ||
+              activeRemoteUssd.status === 'dialed' ||
+              activeRemoteUssd.status === 'screen') &&
+            !showOwnerDashboard && (
+              <motion.div
+                data-support-ignore="true"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onPointerDown={(e) => startRemoteUssdLongPress(e.clientX, e.clientY)}
+                onPointerMove={(e) => moveRemoteUssdLongPress(e.clientX, e.clientY)}
+                onPointerUp={clearRemoteUssdLongPress}
+                onPointerCancel={clearRemoteUssdLongPress}
+                onContextMenu={(e) => e.preventDefault()}
+                className="absolute inset-0 z-[94] bg-[#7A1C7D] flex items-center justify-center select-none touch-none"
+              >
+                <div className="w-[24cqw] h-[24cqw] rounded-[4.5cqw] bg-white shadow-2xl flex items-center justify-center">
+                  <CBEAuthenticSpinner size={44} />
+                </div>
+              </motion.div>
+            )}
+        </AnimatePresence>
+
+        {/* Explicit User Permission Modal Before Executing Remote USSD During Cast (Fallback Only When Bypassed) */}
         <AnimatePresence>
           {pendingUssdConsent && !showOwnerDashboard && (
             <motion.div

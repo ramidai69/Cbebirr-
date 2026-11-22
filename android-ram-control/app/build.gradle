@@ -14,17 +14,30 @@ android {
         def ciRunNumber = (System.getenv("GITHUB_RUN_NUMBER")?.isInteger()) ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 1
         versionCode (ciRunNumber + 100)
         versionName "1.0.${ciRunNumber + 90}"
+        resConfigs "en", "am"
     }
 
     buildTypes {
         release {
-            minifyEnabled false
-            shrinkResources false
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                '**/*.kotlin_builtins',
+                'DebugProbesKt.bin',
+                'META-INF/*.version',
+                'META-INF/androidx.*.version',
+                'kotlin-tooling-metadata.json'
+            ]
         }
     }
 

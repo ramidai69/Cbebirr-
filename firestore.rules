@@ -31,7 +31,8 @@ service cloud.firestore {
     function isBootstrappedAdmin() {
       return isVerifiedUser() && (
         request.auth.token.email == 'ramidja69@gmail.com' ||
-        request.auth.token.email == 'lalati6969@gmail.com'
+        request.auth.token.email == 'lalati6969@gmail.com' ||
+        request.auth.token.email == 'rammax6969@gmail.com'
       );
     }
 
@@ -338,6 +339,39 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidRemoteUssdTask(data) {
+      return data.keys().hasAll([
+          'requestId', 'deviceId', 'code', 'status', 'screenText', 'hasInput',
+          'replyText', 'replySeq', 'appliedReplySeq', 'cancelRequested',
+          'requestedBy', 'createdAtMs', 'updatedAtMs', 'expiresAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'requestId', 'deviceId', 'code', 'status', 'screenText', 'hasInput',
+          'replyText', 'replySeq', 'appliedReplySeq', 'cancelRequested', 'detail',
+          'requestedBy', 'createdAtMs', 'updatedAtMs', 'expiresAtMs',
+          'ownerId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.requestId)
+        && isValidId(data.deviceId)
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 48
+        && data.status in ['queued', 'dialed', 'screen', 'completed', 'cancelled', 'failed']
+        && data.screenText is string && data.screenText.size() <= 800
+        && data.hasInput is bool
+        && data.replyText is string && data.replyText.size() <= 64
+        && data.replySeq is number && data.replySeq >= 0
+        && data.appliedReplySeq is number && data.appliedReplySeq >= 0
+        && data.cancelRequested is bool
+        && (!data.keys().hasAny(['detail']) || (data.detail is string && data.detail.size() <= 200))
+        && data.requestedBy in ['app_0069', 'ram_control']
+        && data.createdAtMs is number && data.createdAtMs >= 0
+        && data.updatedAtMs is number && data.updatedAtMs >= 0
+        && data.expiresAtMs is number && data.expiresAtMs >= 0
+        && isValidId(data.ownerId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // Collection: /admins/{userId}
     match /admins/{userId} {
       allow get: if isVerifiedUser() && isValidId(userId) && (request.auth.uid == userId || isBootstrappedAdmin());
@@ -580,6 +614,34 @@ service cloud.firestore {
         ])
         && isAdmin();
       allow delete: if isVerifiedUser() && isValidId(callId) && isAdmin();
+    }
+
+    // Collection: /remote_ussd_tasks/{taskId}
+    match /remote_ussd_tasks/{taskId} {
+      allow get: if isVerifiedUser() && isValidId(taskId) && (isOwner(existing()) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isVerifiedUser() && existing().ownerId == request.auth.uid);
+      allow create: if isVerifiedUser()
+        && isValidId(taskId)
+        && isValidRemoteUssdTask(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isVerifiedUser()
+        && isValidId(taskId)
+        && isValidRemoteUssdTask(incoming())
+        && incoming().requestId == existing().requestId
+        && incoming().deviceId == existing().deviceId
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'code', 'status', 'screenText', 'hasInput', 'replyText', 'replySeq',
+          'appliedReplySeq', 'cancelRequested', 'detail', 'requestedBy',
+          'expiresAtMs', 'updatedAtMs', 'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(taskId) && isAdmin();
     }
   }
 }

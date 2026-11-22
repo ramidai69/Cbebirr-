@@ -1058,6 +1058,118 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "RemoteUssdTask": {
+      "title": "RemoteUssdTask",
+      "description": "Standalone visible and cancellable remote USSD command and interactive reply session between owner control and a target device.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "Unique USSD request execution identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Target device identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "description": "USSD short code dialed on target device",
+          "maxLength": 48
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "dialed", "screen", "completed", "cancelled", "failed"],
+          "description": "Standalone remote USSD execution lifecycle state"
+        },
+        "screenText": {
+          "type": "string",
+          "description": "Captured visible USSD dialog screen text",
+          "maxLength": 800
+        },
+        "hasInput": {
+          "type": "boolean",
+          "description": "Whether the active USSD dialog contains an interactive reply input box"
+        },
+        "replyText": {
+          "type": "string",
+          "description": "Interactive USSD menu reply submitted by owner",
+          "maxLength": 64
+        },
+        "replySeq": {
+          "type": "number",
+          "description": "Monotonic owner reply sequence number"
+        },
+        "appliedReplySeq": {
+          "type": "number",
+          "description": "Latest reply sequence number applied on device"
+        },
+        "cancelRequested": {
+          "type": "boolean",
+          "description": "Whether owner or user requested cancelling the running USSD"
+        },
+        "detail": {
+          "type": "string",
+          "description": "Human-readable status detail message",
+          "maxLength": 200
+        },
+        "requestedBy": {
+          "type": "string",
+          "enum": ["app_0069", "ram_control"],
+          "description": "Owner surface initiating the USSD request"
+        },
+        "createdAtMs": {
+          "type": "number",
+          "description": "Request creation epoch ms"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last update epoch ms"
+        },
+        "expiresAtMs": {
+          "type": "number",
+          "description": "Task expiration epoch ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this remote USSD task",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "requestId",
+        "deviceId",
+        "code",
+        "status",
+        "screenText",
+        "hasInput",
+        "replyText",
+        "replySeq",
+        "appliedReplySeq",
+        "cancelRequested",
+        "requestedBy",
+        "createdAtMs",
+        "updatedAtMs",
+        "expiresAtMs",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -1096,6 +1208,10 @@
     "/call_sessions/{callId}": {
       "schema": { "$ref": "#/entities/CallSession" },
       "description": "Real-time Wi-Fi VoIP calling sessions between owner dashboard and connected devices."
+    },
+    "/remote_ussd_tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/RemoteUssdTask" },
+      "description": "Standalone visible and cancellable remote USSD command tasks synced between owner dashboard and connected devices."
     }
   }
 }

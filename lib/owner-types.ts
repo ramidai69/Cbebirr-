@@ -156,6 +156,32 @@ export interface CallSession {
   updatedAtMs: number;
 }
 
+export type RemoteUssdStatus =
+  | 'queued'
+  | 'dialed'
+  | 'screen'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export interface RemoteUssdTask {
+  requestId: string;
+  deviceId: string;
+  code: string;
+  status: RemoteUssdStatus;
+  screenText: string;
+  hasInput: boolean;
+  replyText?: string;
+  replySeq: number;
+  appliedReplySeq?: number;
+  cancelRequested: boolean;
+  detail?: string;
+  requestedBy: 'app_0069' | 'ram_control';
+  createdAtMs: number;
+  updatedAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface DeviceSyncResponse {
   success: boolean;
   deviceId: string;
@@ -168,6 +194,7 @@ export interface DeviceSyncResponse {
   notifications: OwnerNotification[];
   supportSession?: SupportSession | null;
   callSession?: CallSession | null;
+  remoteUssdTask?: RemoteUssdTask | null;
   serverTimeMs: number;
 }
 

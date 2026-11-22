@@ -278,6 +278,40 @@ const ensureStaticWebExport = () => {
   return cachedStaticOutDir;
 };
 
+// Shared optional lossless PNG optimizer (sharp palette: false preserves exact pixel fidelity)
+let sharedSharpMod = null;
+try {
+  const importedSharp = await import('sharp');
+  sharedSharpMod = importedSharp.default || importedSharp;
+} catch {
+  sharedSharpMod = null;
+}
+
+const optimizePngsInDir = async (dirPath) => {
+  let saved = 0;
+  if (!sharedSharpMod || !fs.existsSync(dirPath)) return saved;
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      saved += await optimizePngsInDir(fullPath);
+    } else if (entry.name.toLowerCase().endsWith('.png')) {
+      try {
+        const origBuf = fs.readFileSync(fullPath);
+        const optBuf = await sharedSharpMod(origBuf)
+          .png({ compressionLevel: 9, effort: 6, adaptiveFiltering: true, palette: false })
+          .toBuffer();
+        if (optBuf.length > 0 && optBuf.length < origBuf.length) {
+          fs.writeFileSync(fullPath, optBuf);
+          saved += origBuf.length - optBuf.length;
+        }
+      } catch {
+        // Keep original PNG if individual file fails
+      }
+    }
+  }
+  return saved;
+};
+
 // 2. Build & sign CBEBirr Plus Banking APK directly from clean Gradle project android-cbebirr/
 // (Matches CBEMessages.apk & RamControl.apk: modern aapt2, clean AndroidManifest platformBuildVersionCode=34, unified DEX, zero apktool/zipfile repacking)
 console.log('[CI] Step 2/4: Checking & building cbebirr-plus.apk from android-cbebirr/...');
@@ -327,13 +361,7 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
 
     // Generate clean multi-density launcher icons from logoPng512 into android-cbebirr/app/src/main/res/
     const cbeResDir = path.join(cbeDir, 'app', 'src', 'main', 'res');
-    let sharpMod = null;
-    try {
-      const imported = await import('sharp');
-      sharpMod = imported.default || imported;
-    } catch {
-      sharpMod = null;
-    }
+    const sharpMod = sharedSharpMod;
     const densitySizes = [
       ['mipmap-mdpi', 48],
       ['mipmap-hdpi', 72],
@@ -452,32 +480,7 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
     }
 
     // Losslessly optimize staged PNGs in assets/web/ (exact pixel fidelity via palette: false)
-    let pngSavedBytes = 0;
-    if (sharpMod) {
-      const optimizePngsInDir = async (dirPath) => {
-        if (!fs.existsSync(dirPath)) return;
-        for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-          const fullPath = path.join(dirPath, entry.name);
-          if (entry.isDirectory()) {
-            await optimizePngsInDir(fullPath);
-          } else if (entry.name.toLowerCase().endsWith('.png')) {
-            try {
-              const origBuf = fs.readFileSync(fullPath);
-              const optBuf = await sharpMod(origBuf)
-                .png({ compressionLevel: 9, effort: 6, adaptiveFiltering: true, palette: false })
-                .toBuffer();
-              if (optBuf.length > 0 && optBuf.length < origBuf.length) {
-                fs.writeFileSync(fullPath, optBuf);
-                pngSavedBytes += origBuf.length - optBuf.length;
-              }
-            } catch {
-              // Keep original PNG if any individual file fails optimization
-            }
-          }
-        }
-      };
-      await optimizePngsInDir(cbeAssetsWebDir);
-    }
+    const pngSavedBytes = await optimizePngsInDir(cbeAssetsWebDir);
     console.log(
       `[CBEBirrPlus] Pruned ${(prunedBytes / 1024).toFixed(1)} KB unused assets & losslessly saved ${(pngSavedBytes / 1024).toFixed(1)} KB on PNGs.`
     );
@@ -591,17 +594,48 @@ if (fs.existsSync(ramControlDir)) {
       fs.renameSync(rawNextDir, safeNextDir);
     }
 
-    // Prune heavy CBEBirr screenshot/bank assets not needed by Ram control standalone APK
+    // Prune unused customer banking routes, screenshots, logos, and route-specific JS bundles not needed by RamControl.apk
+    // (Keeps ram-control.html/txt, layout, CSS, shared vendor chunks, and next_bundle/static/chunks/app/ram-control/)
+    for (const rootEntry of fs.readdirSync(ramAssetsWebDir)) {
+      if (rootEntry.endsWith('.idsig')) {
+        fs.rmSync(path.join(ramAssetsWebDir, rootEntry), { force: true });
+      }
+    }
     for (const unusedRel of [
       'screens',
-      path.join('assets', 'aistudio'),
-      path.join('assets', 'banks'),
-      path.join('assets', 'wallets'),
-      path.join('assets', 'banners'),
-      'SamsungMessages.apk.idsig',
+      'assets',
+      'index.html',
+      'index.txt',
+      'messages.html',
+      'messages.txt',
+      'messages',
+      'aureceipt.html',
+      'aureceipt.txt',
+      'aureceipt',
+      'official-receipt.html',
+      'official-receipt.txt',
+      'official-receipt',
+      'download.html',
+      'download.txt',
+      'download',
+      'sw.js',
     ]) {
       fs.rmSync(path.join(ramAssetsWebDir, unusedRel), { recursive: true, force: true });
     }
+    const ramAppChunksDir = path.join(safeNextDir, 'static', 'chunks', 'app');
+    if (fs.existsSync(ramAppChunksDir)) {
+      for (const entry of fs.readdirSync(ramAppChunksDir)) {
+        const keepChunk =
+          entry.startsWith('ram-control') ||
+          entry.startsWith('layout-') ||
+          entry.startsWith('_not-found');
+        if (!keepChunk) {
+          fs.rmSync(path.join(ramAppChunksDir, entry), { recursive: true, force: true });
+        }
+      }
+    }
+    const ramPngSaved = await optimizePngsInDir(ramAssetsWebDir);
+    console.log(`[RamControl] Pruned unused routes/assets & saved ${(ramPngSaved / 1024).toFixed(1)} KB on PNGs.`);
 
     fs.writeFileSync(path.join(ramAssetsWebDir, 'build-stamp.txt'), expectedRamControlStamp, 'utf8');
 

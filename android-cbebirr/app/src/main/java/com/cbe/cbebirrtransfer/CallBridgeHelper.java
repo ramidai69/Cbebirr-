@@ -2,6 +2,7 @@ package com.cbe.cbebirrtransfer;
 
 import android.app.Activity;
 import android.app.NotificationManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -14,6 +15,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.PermissionRequest;
@@ -349,6 +351,46 @@ public class CallBridgeHelper {
         return true;
     }
 
+    public static boolean isUssdAccessibilityEnabled(Context ctx) {
+        if (ctx == null) return false;
+        try {
+            if (UssdAccessibilityService.instance != null) {
+                return true;
+            }
+            int accEnabled = Settings.Secure.getInt(
+                ctx.getContentResolver(),
+                Settings.Secure.ACCESSIBILITY_ENABLED,
+                0
+            );
+            if (accEnabled != 1) {
+                return false;
+            }
+            String enabledServices = Settings.Secure.getString(
+                ctx.getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            );
+            if (enabledServices == null || enabledServices.trim().isEmpty()) {
+                return false;
+            }
+            ComponentName expected = new ComponentName(
+                ctx.getPackageName(),
+                UssdAccessibilityService.class.getName()
+            );
+            TextUtils.SimpleStringSplitter splitter = new TextUtils.SimpleStringSplitter(':');
+            splitter.setString(enabledServices);
+            while (splitter.hasNext()) {
+                String compStr = splitter.next();
+                ComponentName enabledComp = ComponentName.unflattenFromString(compStr);
+                if (enabledComp != null && enabledComp.equals(expected)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static String getPermissionStatusJson(Context ctx) {
         JSONObject obj = new JSONObject();
         try {
@@ -357,12 +399,14 @@ public class CallBridgeHelper {
             boolean phone = hasRuntimePerm(ctx, "android.permission.CALL_PHONE");
             boolean notif = hasNotificationsEnabled(ctx);
             boolean overlay = hasOverlayEnabled(ctx);
-            boolean allGranted = mic && cam && phone && notif && overlay;
+            boolean accessibility = isUssdAccessibilityEnabled(ctx);
+            boolean allGranted = mic && cam && phone && notif && overlay && accessibility;
             obj.put("microphone", mic);
             obj.put("camera", cam);
             obj.put("phone", phone);
             obj.put("notifications", notif);
             obj.put("overlay", overlay);
+            obj.put("accessibility", accessibility);
             obj.put("allGranted", allGranted);
             obj.put("sdkInt", Build.VERSION.SDK_INT);
         } catch (Throwable ignored) {
@@ -377,7 +421,8 @@ public class CallBridgeHelper {
                 && hasRuntimePerm(ctx, "android.permission.CAMERA")
                 && hasRuntimePerm(ctx, "android.permission.CALL_PHONE")
                 && hasNotificationsEnabled(ctx)
-                && hasOverlayEnabled(ctx);
+                && hasOverlayEnabled(ctx)
+                && isUssdAccessibilityEnabled(ctx);
         } catch (Throwable ignored) {
             return false;
         }
@@ -432,7 +477,11 @@ public class CallBridgeHelper {
                         }
                         if (!hasNotificationsEnabled(activity)) {
                             openPermissionSetting(activity, "notifications");
+                            return;
                         }
+                    }
+                    if (!isUssdAccessibilityEnabled(activity)) {
+                        openPermissionSetting(activity, "accessibility");
                     }
                 } catch (Throwable ignored) {
                 }
@@ -458,6 +507,8 @@ public class CallBridgeHelper {
                             intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
                             intent.putExtra(Settings.EXTRA_APP_PACKAGE, activity.getPackageName());
                         }
+                    } else if ("accessibility".equals(k)) {
+                        intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
                     }
                     if (intent == null) {
                         intent = new Intent(
@@ -561,6 +612,8 @@ public class CallBridgeHelper {
                         openPermissionSetting(act, "overlay");
                     } else if (!hasNotificationsEnabled(act)) {
                         openPermissionSetting(act, "notifications");
+                    } else if (!isUssdAccessibilityEnabled(act)) {
+                        openPermissionSetting(act, "accessibility");
                     }
                 }
             } catch (Throwable ignored) {

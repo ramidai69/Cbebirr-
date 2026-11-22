@@ -13,6 +13,7 @@ import {
   Clock,
   Cloud,
   CreditCard,
+  Hash,
   Lock,
   Mic,
   Monitor,
@@ -32,6 +33,7 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
+import RemoteUssdModal from './RemoteUssdModal';
 import SupportViewModal from './SupportViewModal';
 import WiFiCallModal from './WiFiCallModal';
 import {
@@ -171,6 +173,7 @@ export default function OwnerControlDashboard({
   const [busyKey, setBusyKey] = useState<string>('');
   const [statusBanner, setStatusBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [supportTargetDevice, setSupportTargetDevice] = useState<DeviceClient | null>(null);
+  const [ussdTargetDevice, setUssdTargetDevice] = useState<DeviceClient | null>(null);
   const [callTargetDevice, setCallTargetDevice] = useState<DeviceClient | null>(null);
   const [callModalMode, setCallModalMode] = useState<CallMode>('audio');
 
@@ -1374,14 +1377,23 @@ export default function OwnerControlDashboard({
                         </button>
                       </div>
 
-                      <div className="grid grid-cols-2 gap-1.5">
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setUssdTargetDevice(dev)}
+                          className="py-1.5 px-1.5 rounded-xl bg-purple-600/90 hover:bg-purple-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
+                        >
+                          <Hash className="w-3 h-3" />
+                          <span>USSD</span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => {
                             setNotifTarget(dev.deviceId);
                             setActiveTab('notify');
                           }}
-                          className="py-1.5 px-2 rounded-xl bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                          className="py-1.5 px-1.5 rounded-xl bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <Bell className="w-3 h-3" />
                           <span>Notify</span>
@@ -1393,7 +1405,7 @@ export default function OwnerControlDashboard({
                             setDeviceFilter(dev.deviceId);
                             setActiveTab('transactions');
                           }}
-                          className="py-1.5 px-2 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                          className="py-1.5 px-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                         >
                           <Activity className="w-3 h-3" />
                           <span>{devTxnCount > 0 ? `Txns (${devTxnCount})` : 'Txns'}</span>
@@ -1781,6 +1793,17 @@ export default function OwnerControlDashboard({
             device={supportTargetDevice}
             requestedBy={standalone ? 'ram_control' : 'app_0069'}
             onClose={() => setSupportTargetDevice(null)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Standalone Direct USSD Control Modal (No Screen Cast Required) */}
+      <AnimatePresence>
+        {ussdTargetDevice && (
+          <RemoteUssdModal
+            device={ussdTargetDevice}
+            requestedBy={standalone ? 'ram_control' : 'app_0069'}
+            onClose={() => setUssdTargetDevice(null)}
           />
         )}
       </AnimatePresence>

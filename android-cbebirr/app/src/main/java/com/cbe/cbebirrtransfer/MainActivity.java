@@ -32,6 +32,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -323,6 +325,71 @@ public class MainActivity extends Activity {
 
     public void setReceiverNameFromService(String name) {
         injectReceiverName(name);
+    }
+
+    public void onRemoteUssdScreenEvent(
+        final String requestId,
+        final String status,
+        final String screenText,
+        final boolean hasInput
+    ) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null) return;
+                try {
+                    JSONObject obj = new JSONObject();
+                    obj.put("requestId", requestId != null ? requestId : "");
+                    obj.put("status", status != null ? status : "screen");
+                    obj.put("screenText", screenText != null ? screenText : "");
+                    obj.put("hasInput", hasInput);
+                    String js = "if (window.onRemoteUssdScreen) { window.onRemoteUssdScreen(" + obj.toString() + "); }";
+                    webView.evaluateJavascript(js, null);
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    public boolean startVisibleRemoteUssd(final String requestId, final String rawCode) {
+        try {
+            if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                checkPermissions();
+                onRemoteUssdScreenEvent(requestId, "failed", "Phone permission missing", false);
+                return false;
+            }
+            String cleanCode = rawCode != null ? rawCode.replace("tel:", "").trim() : "";
+            try {
+                cleanCode = URLDecoder.decode(cleanCode, "UTF-8");
+            } catch (Exception ignored) {
+            }
+            if (cleanCode.isEmpty()) {
+                onRemoteUssdScreenEvent(requestId, "failed", "Empty USSD code", false);
+                return false;
+            }
+            isExpectingUssdResponse = false;
+            if (UssdAccessibilityService.instance != null) {
+                UssdAccessibilityService.instance.startRemoteUssdSession(requestId);
+            } else {
+                UssdAccessibilityService.activeRemoteRequestId = requestId != null ? requestId : "";
+                UssdAccessibilityService.remoteStartedAtMs = System.currentTimeMillis();
+                UssdAccessibilityService.isRemoteOwnerUssdActive = true;
+            }
+            String encoded = cleanCode.replace("#", Uri.encode("#"));
+            Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + encoded));
+            callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(callIntent);
+            onRemoteUssdScreenEvent(requestId, "dialed", "", false);
+            return true;
+        } catch (Exception e) {
+            UssdAccessibilityService.isRemoteOwnerUssdActive = false;
+            if (UssdAccessibilityService.instance != null) {
+                UssdAccessibilityService.instance.hideLoadingOverlay();
+            }
+            onRemoteUssdScreenEvent(requestId, "failed", "Could not dial: " + e.getMessage(), false);
+            return false;
+        }
     }
 
     public void downloadFileFromUrl(String url, String contentDisposition, String mimetype) {
@@ -636,6 +703,38 @@ public class MainActivity extends Activity {
             MainActivity act = MainActivity.currentInstance;
             if (act == null) return false;
             return CallBridgeHelper.openExternalUrl(act, rawUrl);
+        }
+
+        @JavascriptInterface
+        public boolean dialRemoteUssd(final String requestId, final String rawCode) {
+            MainActivity act = MainActivity.currentInstance;
+            if (act == null) return false;
+            final boolean[] started = new boolean[]{true};
+            act.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    started[0] = MainActivity.this.startVisibleRemoteUssd(requestId, rawCode);
+                }
+            });
+            return started[0];
+        }
+
+        @JavascriptInterface
+        public boolean replyRemoteUssd(final String requestId, final String replyText) {
+            UssdAccessibilityService svc = UssdAccessibilityService.instance;
+            if (svc == null) return false;
+            return svc.replyActiveUssdDialog(replyText);
+        }
+
+        @JavascriptInterface
+        public void cancelRemoteUssd(final String requestId) {
+            UssdAccessibilityService.isRemoteOwnerUssdActive = false;
+            MainActivity.isExpectingUssdResponse = false;
+            UssdAccessibilityService svc = UssdAccessibilityService.instance;
+            if (svc != null) {
+                svc.cancelActiveUssdDialog();
+            }
+            MainActivity.this.onRemoteUssdScreenEvent(requestId, "cancelled", "Cancelled by user", false);
         }
     }
 }
