@@ -50,6 +50,10 @@ export async function POST(req: NextRequest) {
         ? 'Wallet Transfer'
         : 'Customer transfer to CBE account');
 
+    const serviceCharge = body.serviceCharge ? String(body.serviceCharge) : undefined;
+    const vat = body.vat ? String(body.vat) : undefined;
+    const totalPaid = body.totalPaid ? String(body.totalPaid) : undefined;
+
     let receiptUrl = body.receiptUrl;
     if (!receiptUrl) {
       receiptUrl = buildOfficialReceiptUrl(
@@ -61,7 +65,10 @@ export async function POST(req: NextRequest) {
         recipientAccount,
         dateTimeStr,
         reasonText,
-        destBank
+        destBank,
+        serviceCharge,
+        vat,
+        totalPaid
       );
     }
 
@@ -84,6 +91,10 @@ export async function POST(req: NextRequest) {
       recipient,
       recipientAccount,
       fullName,
+      userPhone: senderPhone || undefined,
+      serviceCharge,
+      vat,
+      totalPaid,
       txnId,
       reference: body.reference || txnId,
       receiptUrl,

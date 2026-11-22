@@ -89,7 +89,7 @@ export function OfficialReceiptCore({
   const rawRef = data.ref || ORIGINAL_QR_TID;
   const isStaticOriginalQr = !data.ref || data.ref.trim().toUpperCase() === ORIGINAL_QR_TID;
 
-  const shouldResolveRemote = isStaticOriginalQr || !(data.amt && data.rec && data.name && data.bank);
+  const shouldResolveRemote = isStaticOriginalQr || !(data.amt && data.rec && data.name);
 
   const [fetchedData, setFetchedData] = useState<Partial<OfficialReceiptData> | null>(null);
   const [isLoadingLive, setIsLoadingLive] = useState<boolean>(isStaticOriginalQr || !(data.amt && data.rec));
@@ -300,7 +300,7 @@ export function OfficialReceiptCore({
   const activeRec = (isStaticOriginalQr ? fetchedData?.rec : data.rec) || fetchedData?.rec || data.rec || '-';
   const activeName = (isStaticOriginalQr ? fetchedData?.name : data.name) || fetchedData?.name || data.name || '';
   const activeUser = (isStaticOriginalQr ? fetchedData?.user : data.user) || fetchedData?.user || data.user || 'CBEBIRR CUSTOMER';
-  const activeAcc = (isStaticOriginalQr ? fetchedData?.acc : undefined) || fetchedData?.acc || data.acc || '';
+  const activeAcc = (isStaticOriginalQr ? fetchedData?.acc : data.acc) || data.acc || fetchedData?.acc || '';
   const activeDate = (isStaticOriginalQr ? fetchedData?.date : data.date) || fetchedData?.date || data.date || '-';
   const activeReason = (isStaticOriginalQr ? fetchedData?.reason : data.reason) || fetchedData?.reason || data.reason || 'Customer transfer to CBE account';
   const cleanRawBank = (isStaticOriginalQr ? fetchedData?.bank : (data.bank || fetchedData?.bank)) || fetchedData?.bank || data.bank || '';

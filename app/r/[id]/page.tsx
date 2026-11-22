@@ -31,7 +31,7 @@ export default async function ShortReceiptPage({
   const paramAmt = pickParam(sp, 'amt');
 
   const initialData: OfficialReceiptData = {
-    ref: stored?.ref || rawRef,
+    ref: pickParam(sp, 'TID', 'ref', 'tid') || stored?.ref || rawRef,
     orderId: pickParam(sp, 'orderId') || stored?.orderId || stored?.ref || rawRef,
     amt: paramAmt || (hasRichStoredAmt ? stored.amt : ''),
     rec: pickParam(sp, 'rec', 'receiverAccount') || stored?.rec || '',

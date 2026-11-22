@@ -5259,7 +5259,10 @@ export default function CBEBirrFullscreenApp() {
         });
         if (timer) clearTimeout(timer);
         if (res && res.ok) {
-          savedOk = true;
+          const saveJson = await res.json().catch(() => ({}));
+          if (saveJson && saveJson.durable === true) {
+            savedOk = true;
+          }
         }
       } catch {}
     }
@@ -5776,6 +5779,9 @@ export default function CBEBirrFullscreenApp() {
             bank: activeDestBank,
             transferLabel: smsTransferLabel,
             creditAccountType: activeCreditAccountType,
+            serviceCharge: feeInfo ? feeInfo.serviceCharge.toFixed(2) : undefined,
+            vat: feeInfo ? feeInfo.taxAmount.toFixed(2) : undefined,
+            totalPaid: totalDeducted.toFixed(2),
           }).catch(() => {});
 
           reportDeviceTransaction({

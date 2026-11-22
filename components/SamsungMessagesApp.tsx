@@ -528,6 +528,11 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
               txnId: m.txnId,
               recipient: m.recipient,
               recipientAccount: m.recipientAccount,
+              fullName: m.fullName,
+              userPhone: m.userPhone,
+              serviceCharge: m.serviceCharge,
+              vat: m.vat,
+              totalPaid: m.totalPaid,
             });
           });
         }
@@ -977,25 +982,30 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   const extractReceiptDataFromMsg = (msg: SmsMessage): OfficialReceiptData => {
     const text = msg.text || '';
 
-    // 1. Try URL parameters first
+    // 1. Try URL parameters from both msg.receiptUrl and inline SMS URL
     let urlParams: URLSearchParams | null = null;
-    const urlMatch = text.match(/https?:\/\/[^\s]+/i) || (msg.receiptUrl ? [msg.receiptUrl] : null);
-    if (urlMatch) {
+    let textUrlParams: URLSearchParams | null = null;
+    if (msg.receiptUrl) {
       try {
-        const cleanUrl = urlMatch[0].replace(/[.,;:)]+$/, '');
-        const u = new URL(cleanUrl);
-        urlParams = u.searchParams;
+        urlParams = new URL(msg.receiptUrl.replace(/[.,;:)]+$/, '')).searchParams;
       } catch {}
     }
+    const textUrlMatch = text.match(/https?:\/\/[^\s]+/i);
+    if (textUrlMatch) {
+      try {
+        textUrlParams = new URL(textUrlMatch[0].replace(/[.,;:)]+$/, '')).searchParams;
+      } catch {}
+    }
+    const pickUrlParam = (key: string) => urlParams?.get(key) || textUrlParams?.get(key) || '';
 
     // Reference / TID
-    let ref = msg.reference || msg.txnId || (urlParams?.get('TID') || urlParams?.get('ref') || '');
+    let ref = msg.reference || msg.txnId || pickUrlParam('TID') || pickUrlParam('ref');
     if (!ref) {
       const tidMatch =
         text.match(/Txn\s*ID\s*[:\s]*([A-Za-z0-9,]+)/i) ||
         text.match(/receipt\s*number\s*([A-Za-z0-9]+)/i) ||
         text.match(/በደረሰኝ\s*ቁጥር\s*([A-Za-z0-9]+)/) ||
-        text.match(/\b(FT[0-9A-Z]{10,14})\b/i) ||
+        text.match(/\b(FT[0-9A-Z]{8,14})\b/i) ||
         text.match(/\b(DJ[0-9A-Z]{8,12})\b/i) ||
         text.match(/\b(DCWD[0-9A-Z]{4,8})\b/i);
       if (tidMatch) {
@@ -1003,29 +1013,33 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
       }
     }
     if (!ref) {
-      ref = 'FT262413JRB4';
+      const idRef = String(msg.id || '').replace(/[^A-Z0-9]/gi, '').slice(-8).toUpperCase();
+      ref = idRef || 'RECEIPT';
     }
+    const orderId = pickUrlParam('orderId') || ref;
 
     // Amount
-    let amt = msg.amount || urlParams?.get('amt') || '';
+    let amt = msg.amount || pickUrlParam('amt') || '';
     if (!amt) {
       const amtMatch =
-        text.match(/transferred\s*\(?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*\)?\s*,?\s*Br/i) ||
-        text.match(/deposited\s*\[?([0-9]+(?:\.[0-9]{1,2})?)\]?\s*Br/i) ||
-        text.match(/made\s*([0-9]+(?:\.[0-9]{1,2})?)\s*Br/i) ||
-        text.match(/([0-9]+(?:\.[0-9]{1,2})?)\s*Br/i);
+        text.match(/transferred\s*\(?\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*\)?\s*,?\s*Br/i) ||
+        text.match(/deposited\s*\[?([0-9,]+(?:\.[0-9]{1,2})?)\]?\s*,?\s*Br/i) ||
+        text.match(/made\s*([0-9,]+(?:\.[0-9]{1,2})?)\s*Br/i) ||
+        text.match(/([0-9,]+(?:\.[0-9]{1,2})?)\s*,?\s*Br/i);
       if (amtMatch) {
-        amt = amtMatch[1];
+        amt = amtMatch[1].replace(/,/g, '');
       }
     }
-    if (!amt || isNaN(parseFloat(amt))) amt = '10.00';
+    const parsedAmt = parseFloat(String(amt).replace(/,/g, ''));
+    const amtNum = !isNaN(parsedAmt) ? parsedAmt : 0;
+    amt = amtNum.toFixed(2);
 
     // Recipient Account, Recipient Name, & Destination Label inside parentheses (...)
-    let rec = msg.recipientAccount || urlParams?.get('rec') || '';
-    let name = msg.recipient || urlParams?.get('name') || '';
+    let rec = msg.recipientAccount || pickUrlParam('rec') || '';
+    let name = msg.recipient || pickUrlParam('name') || '';
     let parenLabel = '';
 
-    const toMatch = text.match(/to\s+([0-9A-Za-z]{6,20})\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=on\s+|\.|with\s|$)/i);
+    const toMatch = text.match(/to\s+([0-9A-Za-z]{5,20})\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=\s+on\s+\d{2}[-\/]|\.(?=\s*(?:Txn|Your|Thank|on|$))|\s+with\s|$)/i);
     if (toMatch) {
       if (!rec) rec = toMatch[1].trim();
       if (!name) name = toMatch[2].trim();
@@ -1036,7 +1050,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     }
 
     if (!rec || !name) {
-      const accMatch = text.match(/Account\s*Number\s*([0-9]{9,16})\s*[-–]\s*([^(.]+?)(?:\s+on\s+|\.|\s+with)/i);
+      const accMatch = text.match(/Account\s*Number\s*([0-9A-Za-z]{6,20})\s*[-–]\s*(.+?)(?=\s+on\s+\d{2}[-\/]|\.(?=\s*(?:Txn|Your|Thank|on|$))|\s+with\s|$)/i);
       if (accMatch) {
         if (!rec) rec = accMatch[1].trim();
         if (!name) name = accMatch[2].trim();
@@ -1044,18 +1058,19 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     }
 
     if (!rec || !name) {
-      const amhMatch = text.match(/ከ\s+([0-9]{9,16})\s*[-–]\s*([^(.]+?)(?:\s+በቀን|\.|\s+በደረሰኝ)/);
+      const amhMatch = text.match(/ከ\s+([0-9A-Za-z]{6,20})\s*[-–]\s*(.+?)(?=\s+በቀን|\.(?=\s|$)|\s+በደረሰኝ|$)/);
       if (amhMatch) {
         if (!rec) rec = amhMatch[1].trim();
         if (!name) name = amhMatch[2].trim();
       }
     }
 
-    if (!rec) rec = '-';
-    if (!name) name = 'CBE Customer';
+    const isDepositMsg = Boolean(msg.isDeposit || /\bdeposited\b|\bdeposit\b/i.test(text));
+    if (!rec) rec = isDepositMsg ? 'CBE Birr Account' : '-';
+    if (!name) name = isDepositMsg ? 'CBE Birr Deposit' : 'CBE Customer';
 
     // Customer / Payer Name
-    let user = msg.fullName || urlParams?.get('user') || '';
+    let user = (msg.fullName && msg.fullName.toLowerCase() !== 'customer' ? msg.fullName : '') || pickUrlParam('user') || '';
     if (!user) {
       const dearMatch = text.match(/Dear\s+([A-Za-z\s]+?),/i);
       if (dearMatch && !dearMatch[1].toLowerCase().includes('customer')) {
@@ -1067,10 +1082,14 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         user = localStorage.getItem('cbebirr_user_name') || '';
       } catch {}
     }
-    if (!user) user = 'CBEBirr Customer';
+    user = (user || 'CBEBirr Customer').trim().toUpperCase();
 
     // Payer Phone / Account
-    let acc = urlParams?.get('PH') || urlParams?.get('acc') || '';
+    let acc =
+      (msg.userPhone && /\d/.test(msg.userPhone) ? msg.userPhone : '') ||
+      pickUrlParam('PH') ||
+      pickUrlParam('acc') ||
+      '';
     if (!acc) {
       const phMatch = text.match(/PH=([+0-9]+)/i);
       if (phMatch) acc = phMatch[1];
@@ -1081,35 +1100,41 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
       } catch {}
     }
 
-    // Date
-    let date = msg.date || urlParams?.get('date') || '';
-    if (!date) {
-      const onMatch =
-        text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i) ||
-        text.match(/በቀን\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/);
-      if (onMatch) {
-        date = onMatch[1].trim();
-      }
-    }
-    if (!date) date = '2026-10-29 12:40:02';
+    // Date formatted cleanly as DD-MM-YYYY HH:mm:ss
+    const formatReceiptDate = (raw?: string | number) => {
+      const d = raw ? new Date(raw) : new Date();
+      if (isNaN(d.getTime())) return '';
+      const p = (n: number) => String(n).padStart(2, '0');
+      return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    };
+
+    const onMatch =
+      text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i) ||
+      text.match(/በቀን\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/);
+    const urlDate = pickUrlParam('date');
+    let date =
+      (onMatch ? onMatch[1].trim() : '') ||
+      (urlDate ? (/^\d{2}[-/]\d{2}[-/]\d{2,4}/.test(urlDate) ? urlDate : formatReceiptDate(urlDate)) : '') ||
+      (msg.date ? (/^\d{2}[-/]\d{2}[-/]\d{2,4}/.test(msg.date) ? msg.date : formatReceiptDate(msg.date)) : '');
+    if (!date && msg.createdAt) date = formatReceiptDate(msg.createdAt);
 
     // Destination Bank / Wallet (strictly distinguish sender "CBEBirr" from destination bank/wallet)
     const isGenericOrCbe = (val?: string) => !val || /^(transfer|cbebirr|cbe birr|cbe|all banks)$/i.test(val.trim());
     let bank =
       (!isGenericOrCbe(msg.destBank) ? msg.destBank!.trim() : '') ||
-      (!isGenericOrCbe(urlParams?.get('bank') || undefined) ? urlParams!.get('bank')!.trim() : '') ||
-      (!isGenericOrCbe(urlParams?.get('destBank') || undefined) ? urlParams!.get('destBank')!.trim() : '') ||
+      (!isGenericOrCbe(pickUrlParam('bank')) ? pickUrlParam('bank').trim() : '') ||
+      (!isGenericOrCbe(pickUrlParam('destBank')) ? pickUrlParam('destBank').trim() : '') ||
       (!isGenericOrCbe(parenLabel) ? parenLabel : '') ||
       (!isGenericOrCbe(msg.bankName) ? msg.bankName!.trim() : '');
     if (!bank) {
-      if (text.includes('MPESA') || text.includes('M-PESA')) bank = 'MPESA';
-      else if (text.includes('telebirr') || text.includes('TELEBIRR')) bank = 'TELEBIRR';
+      if (/M-?PESA/i.test(text)) bank = 'MPESA';
+      else if (/TELEBIRR/i.test(text)) bank = 'TELEBIRR';
     }
 
     // Reason
-    let reason = urlParams?.get('reason') || msg.reason || '';
+    let reason = pickUrlParam('reason') || msg.reason || '';
     if (!reason) {
-      if (msg.isDeposit || text.toLowerCase().includes('deposit') || text.toLowerCase().includes('deposited')) {
+      if (isDepositMsg) {
         reason = 'Deposit to CBE Birr account';
       } else if (bank) {
         reason = `Transfer to ${bank}`;
@@ -1121,21 +1146,28 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     }
 
     // Fees & VAT
-    let serviceCharge = urlParams?.get('fee') || urlParams?.get('serviceCharge') || '';
-    let vat = urlParams?.get('vat') || '';
-    let totalPaid = urlParams?.get('totalPaid') || '';
-
-    if (text.includes('Services Charge') || text.includes('Service Charge')) {
-      const feeMatch = text.match(/(?:Services|Service)\s*Charge\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
-      if (feeMatch) serviceCharge = feeMatch[1];
+    const rawFee = parseFloat(pickUrlParam('fee') || pickUrlParam('serviceCharge') || msg.serviceCharge || '0') || 0;
+    const rawVat = parseFloat(pickUrlParam('vat') || msg.vat || '0') || 0;
+    const rawTotal = parseFloat(pickUrlParam('totalPaid') || msg.totalPaid || '0') || 0;
+    let scNum = 0;
+    let vatNum = 0;
+    let totalNum = amtNum;
+    if (rawFee > 0) {
+      scNum = rawFee;
+      vatNum = rawVat > 0 ? rawVat : +(scNum * 0.15).toFixed(5);
+      totalNum = rawTotal > 0 ? rawTotal : +(amtNum + scNum + vatNum).toFixed(2);
+    } else if (bank && !isDepositMsg) {
+      scNum = Math.max(0.005, +(amtNum * 0.005).toFixed(5));
+      vatNum = +(scNum * 0.15).toFixed(5);
+      totalNum = +(amtNum + scNum + vatNum).toFixed(2);
     }
-    if (text.includes('Tax') || text.includes('VAT')) {
-      const vatMatch = text.match(/(?:Tax|VAT)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
-      if (vatMatch && !vatMatch[1].includes('15')) vat = vatMatch[1];
-    }
+    const serviceCharge = scNum <= 0 ? '0.00' : (scNum >= 0.005 && scNum < 0.01 ? '0.01' : scNum.toFixed(2));
+    const vat = vatNum <= 0 ? '0.00' : vatNum.toFixed(2);
+    const totalPaid = totalNum.toFixed(2);
 
     return {
       ref,
+      orderId,
       amt,
       rec,
       name,
@@ -1144,9 +1176,9 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
       date,
       reason,
       bank,
-      serviceCharge: serviceCharge || '0.00',
-      vat: vat || '0.00',
-      totalPaid: totalPaid || amt,
+      serviceCharge,
+      vat,
+      totalPaid,
     };
   };
 
@@ -1174,7 +1206,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
 
     const params = new URLSearchParams({
       TID: data.ref,
-      orderId: data.ref,
+      orderId: data.orderId || data.ref,
     });
     if (data.acc) params.set('acc', data.acc);
     if (data.amt) params.set('amt', data.amt);
@@ -1184,8 +1216,8 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
     if (data.date) params.set('date', data.date);
     if (data.reason) params.set('reason', data.reason);
     if (data.bank) params.set('bank', data.bank);
-    if (data.serviceCharge) params.set('fee', data.serviceCharge);
-    if (data.vat) params.set('vat', data.vat);
+    if (data.serviceCharge && parseFloat(data.serviceCharge) > 0) params.set('fee', data.serviceCharge);
+    if (data.vat && parseFloat(data.vat) > 0) params.set('vat', data.vat);
     if (data.totalPaid) params.set('totalPaid', data.totalPaid);
     return `${cleanUrl}?${params.toString()}`;
   };
@@ -1211,18 +1243,17 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
       }
     }
 
-    let savedOk = false;
     const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
     if (!isOffline) {
       try {
         const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
         const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, 1000) : null;
-        const saveRes = await fetch(`${origin}/api/receipt/save`, {
+        await fetch(`${origin}/api/receipt/save`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             ref: data.ref,
-            orderId: data.ref,
+            orderId: data.orderId || data.ref,
             amt: data.amt,
             rec: data.rec,
             name: data.name,
@@ -1241,11 +1272,10 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
           signal: ctrl ? ctrl.signal : undefined,
         });
         if (timer) clearTimeout(timer);
-        if (saveRes && saveRes.ok) savedOk = true;
       } catch {}
     }
 
-    const publicUrl = getPublicReceiptUrl(msg, !savedOk);
+    const publicUrl = getPublicReceiptUrl(msg, true);
     try {
       const androidBridge = (window as unknown as {
         Android?: { openExternalUrl?: (url: string) => boolean };
@@ -1271,7 +1301,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
 
   // Copy working official receipt link to clipboard
   const handleCopyReceiptLink = (msg: SmsMessage) => {
-    const fullUrl = getPublicReceiptUrl(msg);
+    const fullUrl = getPublicReceiptUrl(msg, true);
     if (typeof navigator !== 'undefined' && navigator.clipboard) {
       navigator.clipboard.writeText(fullUrl).then(() => {
         showToast('Official receipt link copied to clipboard!');

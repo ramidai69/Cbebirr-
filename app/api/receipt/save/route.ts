@@ -19,8 +19,8 @@ export async function POST(req: NextRequest) {
     if (!body || !body.ref) {
       return NextResponse.json({ error: 'Missing ref' }, { status: 400, headers: CORS_HEADERS });
     }
-    await saveReceiptAsync(body);
-    return NextResponse.json({ success: true, ref: body.ref }, { headers: CORS_HEADERS });
+    const durable = await saveReceiptAsync(body);
+    return NextResponse.json({ success: true, durable, ref: body.ref }, { headers: CORS_HEADERS });
   } catch {
     return NextResponse.json({ error: 'Failed to save receipt' }, { status: 500, headers: CORS_HEADERS });
   }

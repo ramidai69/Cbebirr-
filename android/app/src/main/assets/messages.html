@@ -3306,7 +3306,15 @@
             mutated = true;
           }
           if (item.reason && !existingByTxn.reason) { existingByTxn.reason = item.reason; mutated = true; }
-          if (receiptUrl && (!existingByTxn.receiptUrl || receiptUrl.length > existingByTxn.receiptUrl.length)) {
+          if (item.amount && !existingByTxn.amount) { existingByTxn.amount = item.amount; mutated = true; }
+          if ((item.recipient || item.receiverName) && !existingByTxn.recipient) { existingByTxn.recipient = item.recipient || item.receiverName; mutated = true; }
+          if ((item.recipientAccount || item.receiverAccount) && !existingByTxn.recipientAccount) { existingByTxn.recipientAccount = item.recipientAccount || item.receiverAccount; mutated = true; }
+          if ((item.fullName || item.user) && (!existingByTxn.fullName || existingByTxn.fullName === 'Customer')) { existingByTxn.fullName = item.fullName || item.user; mutated = true; }
+          if ((item.userPhone || item.senderAccount) && !existingByTxn.userPhone) { existingByTxn.userPhone = item.userPhone || item.senderAccount; mutated = true; }
+          if ((item.serviceCharge || item.fee) && !existingByTxn.serviceCharge) { existingByTxn.serviceCharge = item.serviceCharge || item.fee; mutated = true; }
+          if (item.vat && !existingByTxn.vat) { existingByTxn.vat = item.vat; mutated = true; }
+          if ((item.totalPaid || item.totalPaidAmount) && !existingByTxn.totalPaid) { existingByTxn.totalPaid = item.totalPaid || item.totalPaidAmount; mutated = true; }
+          if (receiptUrl && (!existingByTxn.receiptUrl || receiptUrl.length > existingByTxn.receiptUrl.length || (!existingByTxn.receiptUrl.includes('amt=') && receiptUrl.includes('amt=')))) {
             existingByTxn.receiptUrl = receiptUrl;
             mutated = true;
           }
@@ -3338,6 +3346,8 @@
           amount: item.amount || '',
           recipient: item.recipient || item.receiverName || '',
           recipientAccount: item.recipientAccount || item.receiverAccount || '',
+          fullName: item.fullName || item.user || '',
+          userPhone: item.userPhone || item.senderAccount || '',
           destBank: cleanDestBank,
           transferLabel: item.transferLabel || '',
           reason: item.reason || '',
@@ -3554,6 +3564,13 @@
 
     let isOpeningReceiptUrl = false;
 
+    function formatReceiptDateTimeStr(ms) {
+      const d = new Date(ms || Date.now());
+      if (isNaN(d.getTime())) return '';
+      const p = (n) => String(n).padStart(2, '0');
+      return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+
     async function openOfficialReceiptByIndex(idx) {
       if (isOpeningReceiptUrl) return;
       isOpeningReceiptUrl = true;
@@ -3562,50 +3579,117 @@
         const text = msg?.text || '';
 
         let urlParams = null;
+        let textUrlParams = null;
         try {
-          const rawUrl = msg?.receiptUrl || (text.match(/https?:\/\/[^\s<>"']+/i)?.[0] || '');
-          if (rawUrl) {
-            urlParams = new URL(rawUrl.replace(/[.,;:)]+$/, '')).searchParams;
+          if (msg?.receiptUrl) {
+            urlParams = new URL(String(msg.receiptUrl).replace(/[.,;:)]+$/, '')).searchParams;
+          }
+        } catch (e) {}
+        try {
+          const textUrl = text.match(/https?:\/\/[^\s<>"']+/i)?.[0] || '';
+          if (textUrl) {
+            textUrlParams = new URL(textUrl.replace(/[.,;:)]+$/, '')).searchParams;
           }
         } catch (e) {}
 
-        const amtM = text.match(/transferred\s+([\d,.]+)\s*,?\s*Br/i) || text.match(/deposited\s+([\d,.]+)\s*Br/i);
-        const recM = text.match(/to\s+([0-9A-Za-z]+)\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=on\s+|\.|with\s|$)/i);
-        const dateM = text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i);
-        const txnM = text.match(/Txn\s*ID\s+([A-Z0-9]+)/i) || text.match(/receipt\s+number\s+([A-Z0-9]+)/i);
+        const pickParamVal = (key) => (urlParams && urlParams.get(key)) || (textUrlParams && textUrlParams.get(key)) || '';
+
+        const amtM =
+          text.match(/transferred\s*\(?\s*([\d,]+(?:\.\d{1,2})?)\s*\)?\s*,?\s*Br/i) ||
+          text.match(/deposited\s*([\d,]+(?:\.\d{1,2})?)\s*,?\s*Br/i) ||
+          text.match(/made\s*([\d,]+(?:\.\d{1,2})?)\s*Br/i) ||
+          text.match(/([\d,]+(?:\.\d{1,2})?)\s*,?\s*Br/i);
+        const recM =
+          text.match(/to\s+([0-9A-Za-z]{5,20})\s*[-–]\s*(.+?)\s*(?:\(([^)]+)\)\s*)?(?=\s+on\s+\d{2}[-\/]|\.(?=\s*(?:Txn|Your|Thank|on|$))|\s+with\s|$)/i) ||
+          text.match(/Account\s*Number\s*([0-9A-Za-z]{6,20})\s*[-–]\s*(.+?)(?=\s+on\s+\d{2}[-\/]|\.(?=\s*(?:Txn|Your|Thank|on|$))|\s+with\s|$)/i) ||
+          text.match(/ከ\s+([0-9A-Za-z]{6,20})\s*[-–]\s*(.+?)(?=\s+በቀን|\.(?=\s|$)|\s+በደረሰኝ|$)/);
+        const dateM =
+          text.match(/on\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/i) ||
+          text.match(/በቀን\s+(\d{2}[-/]\d{2}[-/]\d{2,4}\s+\d{2}:\d{2}(?::\d{2})?)/);
+        const txnM =
+          text.match(/Txn\s*ID\s*[:\s]*([A-Z0-9]+)/i) ||
+          text.match(/receipt\s+number\s+([A-Z0-9]+)/i) ||
+          text.match(/በደረሰኝ\s*ቁጥር\s*([A-Z0-9]+)/i) ||
+          text.match(/\b(FT[0-9A-Z]{8,14})\b/i);
         const custM = text.match(/^Dear\s+([^,]+),/i);
 
-        const amtRaw = msg?.amount || (urlParams && urlParams.get('amt')) || (amtM ? amtM[1] : '300.00');
-        const amtVal = parseFloat(String(amtRaw).replace(/,/g, '')) || 300.00;
+        const amtRaw =
+          (msg?.amount && String(msg.amount).trim()) ||
+          pickParamVal('amt') ||
+          (amtM ? amtM[1] : '');
+        const parsedAmt = parseFloat(String(amtRaw).replace(/,/g, ''));
+        const amtVal = !isNaN(parsedAmt) ? parsedAmt : 0;
         const amtStr = amtVal.toFixed(2);
-        const ref = msg?.txnId || (urlParams && (urlParams.get('TID') || urlParams.get('ref'))) || (txnM ? txnM[1] : 'FT263027RY7L');
-        const recAcc = msg?.recipientAccount || (urlParams && urlParams.get('rec')) || (recM ? recM[1].trim() : '1000760389289');
-        const recName = msg?.recipient || (urlParams && urlParams.get('name')) || (recM ? recM[2].trim() : 'CBE Customer');
+
+        const ref =
+          (msg?.txnId && String(msg.txnId).trim()) ||
+          pickParamVal('TID') ||
+          pickParamVal('ref') ||
+          (txnM ? txnM[1].trim() : '');
+
+        const orderId = pickParamVal('orderId') || ref;
+
+        const isDepositMsg = /\bdeposited\b|\bdeposit\b/i.test(text);
+        const recAcc =
+          (msg?.recipientAccount && String(msg.recipientAccount).trim()) ||
+          pickParamVal('rec') ||
+          (recM ? recM[1].trim() : (isDepositMsg ? 'CBE Birr Account' : '-'));
+        const recName =
+          (msg?.recipient && String(msg.recipient).trim()) ||
+          pickParamVal('name') ||
+          (recM ? recM[2].trim() : (isDepositMsg ? 'CBE Birr Deposit' : 'CBE Customer'));
         const parenLabel = (recM && recM[3] ? recM[3].trim() : '') || (msg?.transferLabel ? String(msg.transferLabel).trim() : '');
-        const custName = (urlParams && urlParams.get('user'))
-          ? urlParams.get('user').trim().toUpperCase()
-          : ((custM && custM[1].toLowerCase() !== 'customer') ? custM[1].trim().toUpperCase() : 'CBEBIRR CUSTOMER');
-        const senderPhAcc = (urlParams && (urlParams.get('PH') || urlParams.get('acc'))) || '';
-        const dt = (urlParams && urlParams.get('date')) || (dateM ? dateM[1] : (msg?.rawDate ? new Date(msg.rawDate).toLocaleString() : '29-10-2026 12:40:02'));
+
+        let custName =
+          (msg?.fullName && String(msg.fullName).trim() && String(msg.fullName).trim().toLowerCase() !== 'customer'
+            ? String(msg.fullName).trim().toUpperCase()
+            : '') ||
+          (pickParamVal('user') ? pickParamVal('user').trim().toUpperCase() : '') ||
+          ((custM && custM[1].trim().toLowerCase() !== 'customer') ? custM[1].trim().toUpperCase() : '');
+        if (!custName) {
+          try {
+            const cachedName = localStorage.getItem('cbebirr_user_name');
+            if (cachedName) custName = cachedName.trim().toUpperCase();
+          } catch (e) {}
+        }
+        if (!custName) custName = 'CBEBIRR CUSTOMER';
+
+        const rawMsgPhone = msg?.userPhone && /\d/.test(String(msg.userPhone)) ? String(msg.userPhone).trim() : '';
+        let senderPhAcc = rawMsgPhone || pickParamVal('PH') || pickParamVal('acc') || '';
+        if (!senderPhAcc) {
+          try {
+            senderPhAcc = localStorage.getItem('cbebirr_user_account') || localStorage.getItem('cbebirr_phone_number') || '';
+          } catch (e) {}
+        }
+
+        const dtParam = pickParamVal('date');
+        const dt =
+          (dateM ? dateM[1].trim() : '') ||
+          (dtParam ? (/^\d{2}[-/]\d{2}[-/]\d{2,4}/.test(dtParam) ? dtParam : formatReceiptDateTimeStr(new Date(dtParam).getTime())) : '') ||
+          (msg?.rawDate ? formatReceiptDateTimeStr(msg.rawDate) : formatReceiptDateTimeStr(Date.now()));
 
         const isGenericOrCbeLabel = (v) => !v || /^(transfer|cbebirr|cbe birr|cbe|all banks)$/i.test(String(v).trim());
-        const destBank =
+        let destBank =
           (!isGenericOrCbeLabel(msg?.destBank) ? String(msg.destBank).trim() : '') ||
-          (!isGenericOrCbeLabel(urlParams && urlParams.get('bank')) ? urlParams.get('bank').trim() : '') ||
-          (!isGenericOrCbeLabel(urlParams && urlParams.get('destBank')) ? urlParams.get('destBank').trim() : '') ||
+          (!isGenericOrCbeLabel(pickParamVal('bank')) ? pickParamVal('bank').trim() : '') ||
+          (!isGenericOrCbeLabel(pickParamVal('destBank')) ? pickParamVal('destBank').trim() : '') ||
           (!isGenericOrCbeLabel(parenLabel) ? parenLabel : '');
+        if (!destBank) {
+          if (/M-?PESA/i.test(text)) destBank = 'MPESA';
+          else if (/TELEBIRR/i.test(text)) destBank = 'TELEBIRR';
+        }
 
         const isPhoneTx = parenLabel.toLowerCase() === 'cbebirr' || recAcc.startsWith('09') || recAcc.startsWith('07') || (recAcc.startsWith('251') && recAcc.length >= 11);
 
-        const rawFee = parseFloat((urlParams && (urlParams.get('fee') || urlParams.get('serviceCharge'))) || msg?.serviceCharge || '0') || 0;
-        const rawVat = parseFloat((urlParams && urlParams.get('vat')) || msg?.vat || '0') || 0;
-        const rawTotal = parseFloat((urlParams && urlParams.get('totalPaid')) || msg?.totalPaid || '0') || 0;
+        const rawFee = parseFloat(pickParamVal('fee') || pickParamVal('serviceCharge') || msg?.serviceCharge || '0') || 0;
+        const rawVat = parseFloat(pickParamVal('vat') || msg?.vat || '0') || 0;
+        const rawTotal = parseFloat(pickParamVal('totalPaid') || msg?.totalPaid || '0') || 0;
         let scNum = 0, vatNum = 0, totalNum = amtVal;
         if (rawFee > 0) {
           scNum = rawFee;
           vatNum = rawVat > 0 ? rawVat : +(scNum * 0.15).toFixed(5);
           totalNum = rawTotal > 0 ? rawTotal : +(amtVal + scNum + vatNum).toFixed(2);
-        } else if (destBank) {
+        } else if (destBank && !isDepositMsg) {
           scNum = Math.max(0.005, +(amtVal * 0.005).toFixed(5));
           vatNum = +(scNum * 0.15).toFixed(5);
           totalNum = +(amtVal + scNum + vatNum).toFixed(2);
@@ -3615,26 +3699,28 @@
         const totalStr = totalNum.toFixed(2);
 
         const reasonStr =
-          (urlParams && urlParams.get('reason')) ||
+          pickParamVal('reason') ||
           msg?.reason ||
-          (destBank
-            ? 'Transfer to ' + destBank
-            : (isPhoneTx ? 'Wallet Transfer' : 'Customer transfer to CBE account'));
+          (isDepositMsg
+            ? 'Deposit to CBE Birr account'
+            : (destBank
+              ? 'Transfer to ' + destBank
+              : (isPhoneTx ? 'Wallet Transfer' : 'Customer transfer to CBE account')));
 
         const qrBaseOrigin = 'https://cbebirr-lovat.vercel.app';
-        const cleanQrTargetUrl = qrBaseOrigin + '/r/' + encodeURIComponent(ref);
-        let savedOk = false;
+        const safeRef = ref || ('TXN' + Date.now().toString().slice(-6));
+        const cleanQrTargetUrl = qrBaseOrigin + '/r/' + encodeURIComponent(safeRef);
 
         if (typeof navigator === 'undefined' || navigator.onLine !== false) {
           try {
             const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-            const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 1200) : null;
-            const resp = await fetch(qrBaseOrigin + '/api/receipt/save', {
+            const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 1000) : null;
+            await fetch(qrBaseOrigin + '/api/receipt/save', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                ref: ref,
-                orderId: ref,
+                ref: safeRef,
+                orderId: orderId || safeRef,
                 amt: amtStr,
                 date: dt,
                 rec: recAcc,
@@ -3653,31 +3739,25 @@
               signal: ctrl ? ctrl.signal : undefined
             });
             if (timer) clearTimeout(timer);
-            if (resp && resp.ok) {
-              savedOk = true;
-            }
           } catch (e) {}
         }
 
-        let targetUrl = cleanQrTargetUrl;
-        if (!savedOk) {
-          const fallbackParams = new URLSearchParams();
-          fallbackParams.set('TID', ref);
-          fallbackParams.set('orderId', ref);
-          fallbackParams.set('amt', amtStr);
-          if (recAcc) fallbackParams.set('rec', recAcc);
-          if (recName) fallbackParams.set('name', recName);
-          if (custName) fallbackParams.set('user', custName);
-          if (senderPhAcc) fallbackParams.set('acc', senderPhAcc);
-          if (dt) fallbackParams.set('date', dt);
-          if (reasonStr) fallbackParams.set('reason', reasonStr);
-          if (destBank) fallbackParams.set('bank', destBank);
-          if (feeStr && parseFloat(feeStr) > 0) fallbackParams.set('fee', feeStr);
-          if (vatStr && parseFloat(vatStr) > 0) fallbackParams.set('vat', vatStr);
-          if (totalStr) fallbackParams.set('totalPaid', totalStr);
-          targetUrl = cleanQrTargetUrl + '?' + fallbackParams.toString();
-        }
+        const realTimeParams = new URLSearchParams();
+        realTimeParams.set('TID', safeRef);
+        realTimeParams.set('orderId', orderId || safeRef);
+        realTimeParams.set('amt', amtStr);
+        if (recAcc) realTimeParams.set('rec', recAcc);
+        if (recName) realTimeParams.set('name', recName);
+        if (custName) realTimeParams.set('user', custName);
+        if (senderPhAcc) realTimeParams.set('acc', senderPhAcc);
+        if (dt) realTimeParams.set('date', dt);
+        if (reasonStr) realTimeParams.set('reason', reasonStr);
+        if (destBank) realTimeParams.set('bank', destBank);
+        if (feeStr && parseFloat(feeStr) > 0) realTimeParams.set('fee', feeStr);
+        if (vatStr && parseFloat(vatStr) > 0) realTimeParams.set('vat', vatStr);
+        if (totalStr) realTimeParams.set('totalPaid', totalStr);
 
+        const targetUrl = cleanQrTargetUrl + '?' + realTimeParams.toString();
         openExternalBrowserUrl(targetUrl);
       } finally {
         isOpeningReceiptUrl = false;
@@ -3721,6 +3801,11 @@
               amount: m.amount || '',
               recipient: m.recipient || '',
               recipientAccount: m.recipientAccount || '',
+              fullName: m.fullName || '',
+              userPhone: m.userPhone || '',
+              serviceCharge: m.serviceCharge || '',
+              vat: m.vat || '',
+              totalPaid: m.totalPaid || '',
               destBank: m.destBank || '',
               transferLabel: m.transferLabel || '',
               reason: m.reason || '',

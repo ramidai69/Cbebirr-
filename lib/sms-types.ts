@@ -19,6 +19,10 @@ export interface SmsMessage {
   recipient?: string;
   recipientAccount?: string;
   fullName?: string;
+  userPhone?: string;
+  serviceCharge?: string;
+  vat?: string;
+  totalPaid?: string;
   reference?: string;
   txnId?: string;
   receiptUrl?: string;

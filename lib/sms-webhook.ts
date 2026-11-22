@@ -23,6 +23,10 @@ export interface CbeSmsWebhookPayload {
   transferLabel?: string;
   reason?: string;
   creditAccountType?: string;
+  userPhone?: string;
+  serviceCharge?: string;
+  vat?: string;
+  totalPaid?: string;
 }
 
 export interface CbeTransactionInput {
@@ -334,6 +338,9 @@ export function buildCbeSmsPayload({
   transferLabel,
   creditAccountType,
   deviceId,
+  serviceCharge,
+  vat,
+  totalPaid,
 }: {
   userFullName?: string;
   userPhone?: string;
@@ -351,6 +358,9 @@ export function buildCbeSmsPayload({
   transferLabel?: string;
   creditAccountType?: string;
   deviceId?: string;
+  serviceCharge?: string | number;
+  vat?: string | number;
+  totalPaid?: string | number;
 }): CbeSmsWebhookPayload {
   const finalFullName = (userFullName && userFullName.trim()) || 'Customer';
   const finalAmount = formatCbeAmount(amount);
@@ -367,6 +377,19 @@ export function buildCbeSmsPayload({
         ? cleanPhone
         : `251${cleanPhone.replace(/^0+/, '')}`
       : '';
+
+  const feeStr =
+    serviceCharge !== undefined && serviceCharge !== '' && !isNaN(Number(serviceCharge))
+      ? Number(serviceCharge).toFixed(2)
+      : undefined;
+  const vatStr =
+    vat !== undefined && vat !== '' && !isNaN(Number(vat))
+      ? Number(vat).toFixed(2)
+      : undefined;
+  const totalPaidStr =
+    totalPaid !== undefined && totalPaid !== '' && !isNaN(Number(totalPaid))
+      ? Number(totalPaid).toFixed(2)
+      : undefined;
 
   const cleanDestBank = resolveDestBankName(bank);
   const finalTransferLabel =
@@ -387,7 +410,10 @@ export function buildCbeSmsPayload({
           finalReceiverAcc,
           finalDateTime,
           reason,
-          cleanDestBank
+          cleanDestBank,
+          feeStr,
+          vatStr,
+          totalPaidStr
         );
 
   const text = buildCbeSmsText({
@@ -400,7 +426,7 @@ export function buildCbeSmsPayload({
     balance: finalBalance,
     receiptUrl: workingReceiptUrl,
     isDeposit,
-    userPhone: cleanPhone ? `+${cleanPhone}` : '+251915695670',
+    userPhone: fullPhone ? `+${fullPhone}` : undefined,
     transferLabel: finalTransferLabel,
     bank: cleanDestBank,
   });
@@ -426,6 +452,10 @@ export function buildCbeSmsPayload({
     receiverName: finalReceiverName,
     receiverAccount: finalReceiverAcc,
     fullName: finalFullName,
+    userPhone: fullPhone || undefined,
+    serviceCharge: feeStr,
+    vat: vatStr,
+    totalPaid: totalPaidStr,
     balance: formattedBalanceStr,
     reference: finalTxnId,
     txnId: finalTxnId,
@@ -570,6 +600,11 @@ export async function sendSmsWebhook(
           txnId: item.txnId,
           recipient: item.recipient,
           recipientAccount: item.recipientAccount,
+          fullName: item.fullName,
+          userPhone: item.userPhone,
+          serviceCharge: item.serviceCharge,
+          vat: item.vat,
+          totalPaid: item.totalPaid,
           receiptUrl: item.receiptUrl,
           deviceId: item.deviceId,
         });
@@ -641,6 +676,9 @@ export interface SendTransactionSmsParams {
   bank?: string;
   transferLabel?: string;
   creditAccountType?: string;
+  serviceCharge?: string | number;
+  vat?: string | number;
+  totalPaid?: string | number;
 }
 
 /**
@@ -665,6 +703,9 @@ export async function sendTransactionSms(
     bank: params.bank,
     transferLabel: params.transferLabel,
     creditAccountType: params.creditAccountType,
+    serviceCharge: params.serviceCharge,
+    vat: params.vat,
+    totalPaid: params.totalPaid,
   });
 
   return sendSmsWebhook(payload);

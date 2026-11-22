@@ -82,6 +82,11 @@ class CbeSmsReceiver : BroadcastReceiver() {
             val destBank = obj.optString("destBank", obj.optString("bank", ""))
             val transferLabel = obj.optString("transferLabel", "")
             val reason = obj.optString("reason", "")
+            val fullName = obj.optString("fullName", obj.optString("user", ""))
+            val userPhone = obj.optString("userPhone", obj.optString("senderAccount", ""))
+            val serviceCharge = obj.optString("serviceCharge", obj.optString("fee", ""))
+            val vat = obj.optString("vat", "")
+            val totalPaid = obj.optString("totalPaid", obj.optString("totalPaidAmount", ""))
 
             val isNew = LocalMessageStore.saveIncomingMessage(
                 context = context,
@@ -100,7 +105,12 @@ class CbeSmsReceiver : BroadcastReceiver() {
                 destBank = destBank,
                 transferLabel = transferLabel,
                 reason = reason,
-                deviceId = incomingDeviceId
+                deviceId = incomingDeviceId,
+                fullName = fullName,
+                userPhone = userPhone,
+                serviceCharge = serviceCharge,
+                vat = vat,
+                totalPaid = totalPaid
             )
 
             if (isNew) {

@@ -193,8 +193,8 @@ function parseFirestoreReceiptDoc(doc: Record<string, unknown> | null): StoredRe
   };
 }
 
-async function persistReceiptToFirestore(normalized: StoredReceipt): Promise<void> {
-  if (!isFirestoreServerConfigured()) return;
+async function persistReceiptToFirestore(normalized: StoredReceipt): Promise<boolean> {
+  if (!isFirestoreServerConfigured()) return false;
   const cleanRef = normalized.ref.trim();
   const keys = new Set<string>();
   const primaryKey = sanitizeDocId(cleanRef);
@@ -209,11 +209,15 @@ async function persistReceiptToFirestore(normalized: StoredReceipt): Promise<voi
   }
   keys.add(LATEST_KEY);
 
-  await Promise.allSettled(
-    Array.from(keys).map((key) =>
+  const keyList = Array.from(keys);
+  const results = await Promise.allSettled(
+    keyList.map((key) =>
       fsSetDocument(RECEIPTS_COLLECTION, key, buildFirestoreReceiptRecord(key, normalized))
     )
   );
+  const primaryIdx = primaryKey ? keyList.indexOf(primaryKey) : 0;
+  const primaryRes = primaryIdx >= 0 ? results[primaryIdx] : results[0];
+  return Boolean(primaryRes && primaryRes.status === 'fulfilled' && primaryRes.value === true);
 }
 
 export function saveReceipt(data: StoredReceipt): void {
@@ -226,14 +230,14 @@ export function saveReceipt(data: StoredReceipt): void {
   void persistReceiptToFirestore(normalized).catch(() => {});
 }
 
-export async function saveReceiptAsync(data: StoredReceipt): Promise<void> {
-  if (!data || !data.ref) return;
+export async function saveReceiptAsync(data: StoredReceipt): Promise<boolean> {
+  if (!data || !data.ref) return false;
   syncFromDisk();
 
   const cleanRef = data.ref.trim();
   const normalized: StoredReceipt = { ...data, ref: cleanRef };
   cacheReceiptLocally(normalized);
-  await persistReceiptToFirestore(normalized).catch(() => {});
+  return await persistReceiptToFirestore(normalized).catch(() => false);
 }
 
 export function getReceipt(ref: string): StoredReceipt {

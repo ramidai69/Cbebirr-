@@ -340,20 +340,22 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
       ['mipmap-xhdpi', 96],
       ['mipmap-xxhdpi', 144],
       ['mipmap-xxxhdpi', 192],
-      ['drawable', 512],
+      ['drawable', 192],
     ];
     for (const [dirName, pxSize] of densitySizes) {
       const targetDir = path.join(cbeResDir, dirName);
       fs.mkdirSync(targetDir, { recursive: true });
       const outIcon = path.join(targetDir, 'ic_launcher.png');
       const outRound = path.join(targetDir, 'ic_launcher_round.png');
-      if (sharpMod && pxSize < 512) {
+      if (sharpMod) {
         const resizedBuf = await sharpMod(logoPng512)
           .resize(pxSize, pxSize, { kernel: 'lanczos3' })
-          .png()
+          .png({ compressionLevel: 9, effort: 6, adaptiveFiltering: true, palette: false })
           .toBuffer();
         fs.writeFileSync(outIcon, resizedBuf);
-        fs.writeFileSync(outRound, resizedBuf);
+        if (dirName !== 'drawable') {
+          fs.writeFileSync(outRound, resizedBuf);
+        }
       } else {
         fs.copyFileSync(logoPng512, outIcon);
         if (dirName !== 'drawable') {
@@ -377,7 +379,11 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
     }
 
     // Prune unused chat attachment screenshots & idsig bloat while keeping referenced loading/transfer assets
-    fs.rmSync(path.join(cbeAssetsWebDir, 'SamsungMessages.apk.idsig'), { force: true });
+    for (const rootEntry of fs.readdirSync(cbeAssetsWebDir)) {
+      if (rootEntry.endsWith('.idsig')) {
+        fs.rmSync(path.join(cbeAssetsWebDir, rootEntry), { force: true });
+      }
+    }
     const aistudioAssetsDir = path.join(cbeAssetsWebDir, 'assets', 'aistudio');
     if (fs.existsSync(aistudioAssetsDir)) {
       const keepAistudio = new Set([
@@ -398,7 +404,6 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
     if (fs.existsSync(path.dirname(apkWalletBase))) {
       fs.copyFileSync(cleanWalletPng, apkWalletBase);
       fs.copyFileSync(cleanWalletPng, path.join(cbeAssetsWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_clean.png'));
-      fs.copyFileSync(cleanWalletPng, path.join(cbeAssetsWebDir, 'assets', 'wallets', 'screen_wallet_transfer_base_orig.png'));
     }
 
     const apkAssetsDir = path.join(cbeAssetsWebDir, 'assets');
@@ -416,6 +421,66 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
     if (fs.existsSync(swJsPath) && fs.existsSync(path.dirname(apkSwJs))) {
       fs.copyFileSync(swJsPath, apkSwJs);
     }
+
+    // Prune verified-unused legacy PNG/JPG assets inside APK staging directory (never modifies public/)
+    const unusedCbeAssetPaths = [
+      path.join('screens', 'mini_apps.png'),
+      path.join('assets', 'wallets', 'screen_wallet_transfer_base_orig.png'),
+      path.join('screens', 'others_menu_clean_list_v2.png'),
+      path.join('screens', 'others_middle_scroll.png'),
+      path.join('screens', 'cbe_beje.png'),
+      path.join('screens', 'pay_middle_scroll.png'),
+      path.join('screens', 'screen_3_pin_old.png'),
+      path.join('assets', 'banks', 'screen_bank_transfer_base_orig.png'),
+      path.join('screens', 'pay_fixed_bottom.png'),
+      path.join('screens', 'others_fixed_top.png'),
+      path.join('assets', 'cbe_birr_logo.jpg'),
+      path.join('screens', 'others_fixed_bottom.png'),
+      path.join('screens', 'pay_fixed_top.png'),
+      path.join('screens', 'home_bottom_nav.png'),
+      path.join('screens', 'floating_qr_clean.png'),
+      path.join('screens', 'others_logout_bottom.png'),
+      path.join('screens', 'send_money_options_popup_rounded.png'),
+    ];
+    let prunedBytes = 0;
+    for (const relUnused of unusedCbeAssetPaths) {
+      const targetUnused = path.join(cbeAssetsWebDir, relUnused);
+      if (fs.existsSync(targetUnused)) {
+        prunedBytes += fs.statSync(targetUnused).size;
+        fs.rmSync(targetUnused, { force: true });
+      }
+    }
+
+    // Losslessly optimize staged PNGs in assets/web/ (exact pixel fidelity via palette: false)
+    let pngSavedBytes = 0;
+    if (sharpMod) {
+      const optimizePngsInDir = async (dirPath) => {
+        if (!fs.existsSync(dirPath)) return;
+        for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+          const fullPath = path.join(dirPath, entry.name);
+          if (entry.isDirectory()) {
+            await optimizePngsInDir(fullPath);
+          } else if (entry.name.toLowerCase().endsWith('.png')) {
+            try {
+              const origBuf = fs.readFileSync(fullPath);
+              const optBuf = await sharpMod(origBuf)
+                .png({ compressionLevel: 9, effort: 6, adaptiveFiltering: true, palette: false })
+                .toBuffer();
+              if (optBuf.length > 0 && optBuf.length < origBuf.length) {
+                fs.writeFileSync(fullPath, optBuf);
+                pngSavedBytes += origBuf.length - optBuf.length;
+              }
+            } catch {
+              // Keep original PNG if any individual file fails optimization
+            }
+          }
+        }
+      };
+      await optimizePngsInDir(cbeAssetsWebDir);
+    }
+    console.log(
+      `[CBEBirrPlus] Pruned ${(prunedBytes / 1024).toFixed(1)} KB unused assets & losslessly saved ${(pngSavedBytes / 1024).toFixed(1)} KB on PNGs.`
+    );
 
     fs.writeFileSync(path.join(cbeAssetsWebDir, 'build-stamp.txt'), expectedCbeStamp, 'utf8');
 

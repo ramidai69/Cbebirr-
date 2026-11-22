@@ -101,6 +101,9 @@ export async function POST(req: NextRequest) {
       const recipientAccount = item.recipientAccount || item.receiverAccount || item.rec;
       const fullName = item.fullName || item.user || 'Customer';
       const senderPhone = item.userPhone || item.phone || '';
+      const serviceCharge = item.serviceCharge !== undefined ? String(item.serviceCharge) : (item.fee !== undefined ? String(item.fee) : undefined);
+      const vat = item.vat !== undefined ? String(item.vat) : undefined;
+      const totalPaid = item.totalPaid !== undefined ? String(item.totalPaid) : (item.totalPaidAmount !== undefined ? String(item.totalPaidAmount) : undefined);
       const rawDestBank = item.destBank || item.bank || '';
       const destBank =
         rawDestBank && !/^(all banks|cbebirr|cbe birr|cbe)$/i.test(String(rawDestBank).trim())
@@ -123,7 +126,10 @@ export async function POST(req: NextRequest) {
           recipientAccount,
           item.date,
           item.reason || (destBank ? `Transfer to ${destBank}` : undefined),
-          destBank
+          destBank,
+          serviceCharge,
+          vat,
+          totalPaid
         );
       }
 
@@ -145,6 +151,10 @@ export async function POST(req: NextRequest) {
         recipient,
         recipientAccount,
         fullName,
+        userPhone: senderPhone || undefined,
+        serviceCharge,
+        vat,
+        totalPaid,
         txnId,
         reference: item.reference || txnId,
         receiptUrl,

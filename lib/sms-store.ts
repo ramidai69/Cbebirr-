@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { getReceipt, saveReceipt, StoredReceipt } from './receipt-store';
-import { repairTransferLabelInSmsText, resolveDestBankName } from './sms-webhook';
+import { formatCbeDateTime, repairTransferLabelInSmsText, resolveDestBankName } from './sms-webhook';
 import {
   fsDeleteDocument,
   fsListCollection,
@@ -146,6 +146,10 @@ class SmsStore {
       recipient: clampStr(raw.recipient, 120),
       recipientAccount: clampStr(raw.recipientAccount, 64),
       fullName: clampStr(raw.fullName, 120),
+      userPhone: clampStr(raw.userPhone, 40),
+      serviceCharge: clampStr(raw.serviceCharge, 32),
+      vat: clampStr(raw.vat, 32),
+      totalPaid: clampStr(raw.totalPaid, 32),
       reference: clampStr(raw.reference, 64),
       txnId: clampStr(raw.txnId, 64),
       receiptUrl: clampStr(raw.receiptUrl, 1000),
@@ -233,6 +237,10 @@ class SmsStore {
       ['recipient', clampStr(msg.recipient, 120)],
       ['recipientAccount', clampStr(msg.recipientAccount, 64)],
       ['fullName', clampStr(msg.fullName, 120)],
+      ['userPhone', clampStr(msg.userPhone, 40)],
+      ['serviceCharge', clampStr(msg.serviceCharge, 32)],
+      ['vat', clampStr(msg.vat, 32)],
+      ['totalPaid', clampStr(msg.totalPaid, 32)],
       ['reference', clampStr(msg.reference, 64)],
       ['txnId', clampStr(msg.txnId, 64)],
       ['receiptUrl', clampStr(msg.receiptUrl, 1000)],
@@ -463,6 +471,38 @@ class SmsStore {
           existing.reason = msgInput.reason;
           changed = true;
         }
+        if (msgInput.fullName && (!existing.fullName || existing.fullName === 'Customer')) {
+          existing.fullName = msgInput.fullName;
+          changed = true;
+        }
+        if (msgInput.userPhone && !existing.userPhone) {
+          existing.userPhone = msgInput.userPhone;
+          changed = true;
+        }
+        if (msgInput.serviceCharge && !existing.serviceCharge) {
+          existing.serviceCharge = msgInput.serviceCharge;
+          changed = true;
+        }
+        if (msgInput.vat && !existing.vat) {
+          existing.vat = msgInput.vat;
+          changed = true;
+        }
+        if (msgInput.totalPaid && !existing.totalPaid) {
+          existing.totalPaid = msgInput.totalPaid;
+          changed = true;
+        }
+        if (msgInput.amount && !existing.amount) {
+          existing.amount = msgInput.amount;
+          changed = true;
+        }
+        if (msgInput.recipient && !existing.recipient) {
+          existing.recipient = msgInput.recipient;
+          changed = true;
+        }
+        if (msgInput.recipientAccount && !existing.recipientAccount) {
+          existing.recipientAccount = msgInput.recipientAccount;
+          changed = true;
+        }
         if (
           msgInput.receiptUrl &&
           (!existing.receiptUrl || msgInput.receiptUrl.length > existing.receiptUrl.length)
@@ -499,6 +539,10 @@ class SmsStore {
       recipient: clampStr(msgInput.recipient, 120),
       recipientAccount: clampStr(msgInput.recipientAccount, 64),
       fullName: clampStr(msgInput.fullName, 120),
+      userPhone: clampStr(msgInput.userPhone, 40),
+      serviceCharge: clampStr(msgInput.serviceCharge, 32),
+      vat: clampStr(msgInput.vat, 32),
+      totalPaid: clampStr(msgInput.totalPaid, 32),
       reference: clampStr(msgInput.reference, 64),
       txnId: clampStr(msgInput.txnId, 64),
       receiptUrl: clampStr(msgInput.receiptUrl, 1000),
@@ -518,6 +562,17 @@ class SmsStore {
             (existingReceipt.ref?.toUpperCase().startsWith('FT') &&
               existingReceipt.ref.slice(2, 10).toUpperCase() === newMsg.txnId.toUpperCase()));
 
+        let parsedAcc = newMsg.userPhone || '';
+        if (!parsedAcc && newMsg.receiptUrl) {
+          try {
+            const u = new URL(newMsg.receiptUrl);
+            parsedAcc = u.searchParams.get('PH') || u.searchParams.get('acc') || '';
+          } catch {}
+        }
+        const formattedReceiptDate = /^\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}/.test(newMsg.date)
+          ? newMsg.date
+          : formatCbeDateTime(newMsg.date);
+
         if (!hasExactSavedReceipt) {
           const isPhoneRec =
             (newMsg.recipientAccount || '').startsWith('09') ||
@@ -525,11 +580,11 @@ class SmsStore {
           const storedRec: StoredReceipt = {
             ref: newMsg.reference || newMsg.txnId,
             amt: newMsg.amount || '0.00',
-            date: newMsg.date,
+            date: formattedReceiptDate,
             rec: newMsg.recipientAccount || '',
             name: newMsg.recipient || 'CBE Customer',
             user: newMsg.fullName || 'CBEBirr Customer',
-            acc: '',
+            acc: parsedAcc,
             bank: extractedDestBank,
             reason: newMsg.isDeposit
               ? 'Deposit to CBE Birr'
@@ -539,15 +594,29 @@ class SmsStore {
                   : isPhoneRec
                   ? 'Wallet Transfer'
                   : 'Customer transfer to CBE account'),
+            serviceCharge: newMsg.serviceCharge,
+            vat: newMsg.vat,
+            totalPaidAmount: newMsg.totalPaid,
             status: 'Completed',
             orderId: newMsg.txnId,
           };
           saveReceipt(storedRec);
-        } else if (extractedDestBank && !existingReceipt.bank) {
+        } else if (
+          (extractedDestBank && !existingReceipt.bank) ||
+          (parsedAcc && !existingReceipt.acc) ||
+          (newMsg.serviceCharge && !existingReceipt.serviceCharge)
+        ) {
           saveReceipt({
             ...existingReceipt,
-            bank: extractedDestBank,
-            reason: newMsg.reason || existingReceipt.reason || `Transfer to ${extractedDestBank}`,
+            bank: extractedDestBank || existingReceipt.bank,
+            acc: parsedAcc || existingReceipt.acc,
+            serviceCharge: newMsg.serviceCharge || existingReceipt.serviceCharge,
+            vat: newMsg.vat || existingReceipt.vat,
+            totalPaidAmount: newMsg.totalPaid || existingReceipt.totalPaidAmount,
+            reason:
+              newMsg.reason ||
+              existingReceipt.reason ||
+              (extractedDestBank ? `Transfer to ${extractedDestBank}` : 'Wallet Transfer'),
           });
         }
       } catch {}

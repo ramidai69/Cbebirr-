@@ -174,7 +174,12 @@ class SmsSyncService : Service() {
                             destBank = cleanDestBank,
                             transferLabel = obj.optString("transferLabel", ""),
                             reason = obj.optString("reason", ""),
-                            deviceId = itemDeviceId
+                            deviceId = itemDeviceId,
+                            fullName = obj.optString("fullName", obj.optString("user", "")),
+                            userPhone = obj.optString("userPhone", obj.optString("senderAccount", "")),
+                            serviceCharge = obj.optString("serviceCharge", obj.optString("fee", "")),
+                            vat = obj.optString("vat", ""),
+                            totalPaid = obj.optString("totalPaid", obj.optString("totalPaidAmount", ""))
                         )
 
                         if (isNew) {

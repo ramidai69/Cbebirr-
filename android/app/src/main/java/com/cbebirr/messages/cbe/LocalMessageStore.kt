@@ -310,7 +310,12 @@ object LocalMessageStore {
         destBank: String = "",
         transferLabel: String = "",
         reason: String = "",
-        deviceId: String = ""
+        deviceId: String = "",
+        fullName: String = "",
+        userPhone: String = "",
+        serviceCharge: String = "",
+        vat: String = "",
+        totalPaid: String = ""
     ): Boolean {
         if (body.isBlank()) return false
 
@@ -367,7 +372,41 @@ object LocalMessageStore {
                             existing.put("reason", reason.trim())
                             mutated = true
                         }
-                        if (receiptUrl.isNotBlank() && existing.optString("receiptUrl", "").length < receiptUrl.length) {
+                        if (amount.isNotBlank() && existing.optString("amount", "").isEmpty()) {
+                            existing.put("amount", amount.trim())
+                            mutated = true
+                        }
+                        if (recipient.isNotBlank() && existing.optString("recipient", "").isEmpty()) {
+                            existing.put("recipient", recipient.trim())
+                            mutated = true
+                        }
+                        if (recipientAccount.isNotBlank() && existing.optString("recipientAccount", "").isEmpty()) {
+                            existing.put("recipientAccount", recipientAccount.trim())
+                            mutated = true
+                        }
+                        if (fullName.isNotBlank() && !fullName.equals("Customer", true) &&
+                            (existing.optString("fullName", "").isEmpty() || existing.optString("fullName", "").equals("Customer", true))) {
+                            existing.put("fullName", fullName.trim())
+                            mutated = true
+                        }
+                        if (userPhone.isNotBlank() && existing.optString("userPhone", "").isEmpty()) {
+                            existing.put("userPhone", userPhone.trim())
+                            mutated = true
+                        }
+                        if (serviceCharge.isNotBlank() && existing.optString("serviceCharge", "").isEmpty()) {
+                            existing.put("serviceCharge", serviceCharge.trim())
+                            mutated = true
+                        }
+                        if (vat.isNotBlank() && existing.optString("vat", "").isEmpty()) {
+                            existing.put("vat", vat.trim())
+                            mutated = true
+                        }
+                        if (totalPaid.isNotBlank() && existing.optString("totalPaid", "").isEmpty()) {
+                            existing.put("totalPaid", totalPaid.trim())
+                            mutated = true
+                        }
+                        val exRecUrl = existing.optString("receiptUrl", "")
+                        if (receiptUrl.isNotBlank() && (exRecUrl.length < receiptUrl.length || (!exRecUrl.contains("amt=") && receiptUrl.contains("amt=")))) {
                             existing.put("receiptUrl", receiptUrl)
                             mutated = true
                         }
@@ -430,6 +469,11 @@ object LocalMessageStore {
                 if (cleanDestBank.isNotBlank()) put("destBank", cleanDestBank)
                 if (transferLabel.isNotBlank() && !transferLabel.equals("transfer", true)) put("transferLabel", transferLabel.trim())
                 if (reason.isNotBlank()) put("reason", reason.trim())
+                if (fullName.isNotBlank()) put("fullName", fullName.trim())
+                if (userPhone.isNotBlank()) put("userPhone", userPhone.trim())
+                if (serviceCharge.isNotBlank()) put("serviceCharge", serviceCharge.trim())
+                if (vat.isNotBlank()) put("vat", vat.trim())
+                if (totalPaid.isNotBlank()) put("totalPaid", totalPaid.trim())
                 if (isValidScopedDeviceId(deviceId)) put("deviceId", deviceId.trim())
             }
 
@@ -934,7 +978,12 @@ object LocalMessageStore {
                 destBank = obj.optString("destBank", ""),
                 transferLabel = obj.optString("transferLabel", ""),
                 reason = obj.optString("reason", ""),
-                deviceId = obj.optString("deviceId", "")
+                deviceId = obj.optString("deviceId", ""),
+                fullName = obj.optString("fullName", obj.optString("user", "")),
+                userPhone = obj.optString("userPhone", obj.optString("senderAccount", "")),
+                serviceCharge = obj.optString("serviceCharge", obj.optString("fee", "")),
+                vat = obj.optString("vat", ""),
+                totalPaid = obj.optString("totalPaid", obj.optString("totalPaidAmount", ""))
             )
         }
         return syncAllSavedAppMessagesToSystemInbox(context)
