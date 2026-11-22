@@ -10,6 +10,7 @@ import {
   Check,
   CheckCheck,
   CheckCircle2,
+  ChevronRight,
   Clock,
   Cloud,
   CreditCard,
@@ -33,6 +34,7 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
+import DeviceFullControlView from './DeviceFullControlView';
 import RemoteUssdModal from './RemoteUssdModal';
 import SupportViewModal from './SupportViewModal';
 import WiFiCallModal from './WiFiCallModal';
@@ -140,7 +142,7 @@ function mergeSnapshotsPreservingLocal(
   }
   const mergedTxns = Array.from(txMap.values())
     .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
-    .slice(0, 200);
+    .slice(0, 2500);
 
   const notifMap = new Map<string, (typeof incoming.notifications)[number]>();
   for (const n of prev?.notifications || []) {
@@ -151,7 +153,7 @@ function mergeSnapshotsPreservingLocal(
   }
   const mergedNotifs = Array.from(notifMap.values())
     .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
-    .slice(0, 50);
+    .slice(0, 100);
 
   return {
     ...incoming,
@@ -176,6 +178,7 @@ export default function OwnerControlDashboard({
   const [ussdTargetDevice, setUssdTargetDevice] = useState<DeviceClient | null>(null);
   const [callTargetDevice, setCallTargetDevice] = useState<DeviceClient | null>(null);
   const [callModalMode, setCallModalMode] = useState<CallMode>('audio');
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
 
   // Filters
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
@@ -553,17 +556,18 @@ export default function OwnerControlDashboard({
     }
   };
 
-  const handleDeviceLockToggle = async (dev: DeviceClient) => {
+  const handleDeviceLockToggle = async (dev: DeviceClient, customReason?: string) => {
     setBusyKey(`lock_${dev.deviceId}`);
     try {
       const action = dev.isLocked ? 'unlock_device' : 'lock_device';
       await postOwnerAction({
         action,
         deviceId: dev.deviceId,
+        ...(customReason ? { reason: customReason } : {}),
       });
       await loadSnapshot(true);
       if (dev.deviceId === myDeviceId) {
-        onRemoteLockChange?.(!dev.isLocked, dev.lockReason || '');
+        onRemoteLockChange?.(!dev.isLocked, customReason || dev.lockReason || '');
       }
       flashBanner(
         'ok',
@@ -866,6 +870,10 @@ export default function OwnerControlDashboard({
 
   const serverNow = snapshot?.serverTimeMs || 0;
   const globalLocked = Boolean(snapshot?.globalConfig?.globalLocked);
+  const selectedDevice = useMemo(
+    () => (selectedDeviceId ? devicesList.find((d) => d.deviceId === selectedDeviceId) || null : null),
+    [selectedDeviceId, devicesList]
+  );
 
   return (
     <motion.div
@@ -874,6 +882,52 @@ export default function OwnerControlDashboard({
       exit={{ opacity: 0, y: 16 }}
       className="absolute inset-0 z-[96] bg-[#0e1621] text-slate-100 flex flex-col overflow-hidden select-none"
     >
+      {selectedDevice ? (
+        <div className="relative flex-1 flex flex-col overflow-hidden">
+          {statusBanner && (
+            <div
+              className={`mx-3 mt-2 rounded-lg px-2.5 py-1.5 text-[11px] font-medium flex items-center justify-between gap-2 shrink-0 ${
+                statusBanner.type === 'ok'
+                  ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/30'
+                  : 'bg-rose-500/20 text-rose-200 border border-rose-400/30'
+              }`}
+            >
+              <span className="truncate">{statusBanner.text}</span>
+              <button
+                type="button"
+                onClick={() => setStatusBanner(null)}
+                className="text-current opacity-70 hover:opacity-100 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+          <div className="flex-1 overflow-hidden">
+            <DeviceFullControlView
+              key={selectedDevice.deviceId}
+              device={selectedDevice}
+              transactions={snapshot?.transactions || []}
+              serverNow={serverNow}
+              isMe={selectedDevice.deviceId === myDeviceId}
+              busyKey={busyKey}
+              onBack={() => setSelectedDeviceId(null)}
+              onRefresh={() => loadSnapshot(true)}
+              onFlashBanner={flashBanner}
+              onApproveDevice={handleDeviceApproval}
+              onPermissionBypass={handlePermissionBypass}
+              onToggleLock={handleDeviceLockToggle}
+              onDeleteDevice={handleDeleteDevice}
+              onOpenCall={(dev, mode) => {
+                setCallModalMode(mode);
+                setCallTargetDevice(dev);
+              }}
+              onOpenScreenCast={(dev) => setSupportTargetDevice(dev)}
+              onOpenRemoteUssd={(dev) => setUssdTargetDevice(dev)}
+            />
+          </div>
+        </div>
+      ) : (
+        <>
       {/* Telegram-style Header */}
       <div className="bg-[#17212b] border-b border-white/10 px-3.5 pt-3 pb-2.5 shrink-0">
         <div className="flex items-center justify-between gap-2">
@@ -1134,7 +1188,16 @@ export default function OwnerControlDashboard({
                 return (
                   <div
                     key={dev.deviceId}
-                    className={`border rounded-2xl p-3 space-y-2.5 ${
+                    onClick={() => setSelectedDeviceId(dev.deviceId)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedDeviceId(dev.deviceId);
+                      }
+                    }}
+                    className={`border rounded-2xl p-3 space-y-2.5 cursor-pointer transition-colors hover:border-[#5eb5f7]/60 ${
                       isPending || isPermBypassPending
                         ? 'bg-amber-950/25 border-amber-400/60 shadow-[0_0_20px_rgba(251,191,36,0.12)]'
                         : isJustApproved
@@ -1176,7 +1239,10 @@ export default function OwnerControlDashboard({
                               NO-PERM ALLOWED
                               <button
                                 type="button"
-                                onClick={() => handlePermissionBypass(dev, 'reset_permission_bypass')}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handlePermissionBypass(dev, 'reset_permission_bypass');
+                                }}
                                 disabled={busyKey === `pb_${dev.deviceId}`}
                                 className="underline text-[9px] text-amber-200 hover:text-white cursor-pointer ml-1"
                               >
@@ -1226,7 +1292,10 @@ export default function OwnerControlDashboard({
                       {!isMe && (!dev.isOnline || isPending || isRejected || isPermBypassPending) && (
                         <button
                           type="button"
-                          onClick={() => handleDeleteDevice(dev)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void handleDeleteDevice(dev);
+                          }}
                           disabled={busyKey === `del_${dev.deviceId}`}
                           className="p-1.5 rounded-lg bg-white/5 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 cursor-pointer shrink-0"
                           title="Remove device"
@@ -1269,7 +1338,10 @@ export default function OwnerControlDashboard({
 
                     {/* Prominent Allow / Deny Prompt for Devices Requesting Permission-Free Entry */}
                     {isPermBypassPending && (
-                      <div className="bg-sky-950/50 border border-sky-400/50 rounded-xl p-2.5 space-y-2">
+                      <div
+                        className="bg-sky-950/50 border border-sky-400/50 rounded-xl p-2.5 space-y-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         <p className="text-[11px] font-semibold text-sky-100 leading-snug">
                           This device cannot grant permissions and wants to enter the app without permissions. Do you allow it?
                         </p>
@@ -1298,7 +1370,10 @@ export default function OwnerControlDashboard({
 
                     {/* Prominent Approve / Reject Prompt for New Device Permission Requests */}
                     {(isPending || isRejected) && (
-                      <div className="grid grid-cols-2 gap-2">
+                      <div
+                        className="grid grid-cols-2 gap-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         <button
                           type="button"
                           onClick={() => handleDeviceApproval(dev, true)}
@@ -1322,95 +1397,15 @@ export default function OwnerControlDashboard({
                       </div>
                     )}
 
-                    {/* Per-Device Actions */}
-                    <div className="space-y-1.5">
-                      <div className="grid grid-cols-4 gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCallModalMode('audio');
-                            setCallTargetDevice(dev);
-                          }}
-                          className="py-1.5 px-1.5 rounded-xl bg-sky-600/90 hover:bg-sky-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <PhoneCall className="w-3 h-3" />
-                          <span>Call</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCallModalMode('video');
-                            setCallTargetDevice(dev);
-                          }}
-                          className="py-1.5 px-1.5 rounded-xl bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <Video className="w-3 h-3" />
-                          <span>Video</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => setSupportTargetDevice(dev)}
-                          className="py-1.5 px-1.5 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <Monitor className="w-3 h-3" />
-                          <span>Screen</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => handleDeviceLockToggle(dev)}
-                          disabled={busyKey === `lock_${dev.deviceId}`}
-                          className={`py-1.5 px-1.5 rounded-xl text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
-                            dev.isLocked
-                              ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                              : 'bg-rose-600/85 hover:bg-rose-600 text-white'
-                          }`}
-                        >
-                          {dev.isLocked ? (
-                            <Unlock className="w-3 h-3" />
-                          ) : (
-                            <Lock className="w-3 h-3" />
-                          )}
-                          <span>{dev.isLocked ? 'Unlock' : 'Lock'}</span>
-                        </button>
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => setUssdTargetDevice(dev)}
-                          className="py-1.5 px-1.5 rounded-xl bg-purple-600/90 hover:bg-purple-500 text-white text-[10.5px] font-bold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <Hash className="w-3 h-3" />
-                          <span>USSD</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setNotifTarget(dev.deviceId);
-                            setActiveTab('notify');
-                          }}
-                          className="py-1.5 px-1.5 rounded-xl bg-[#2b5278] hover:bg-[#356696] text-white text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <Bell className="w-3 h-3" />
-                          <span>Notify</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setDeviceFilter(dev.deviceId);
-                            setActiveTab('transactions');
-                          }}
-                          className="py-1.5 px-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-slate-200 text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
-                        >
-                          <Activity className="w-3 h-3" />
-                          <span>{devTxnCount > 0 ? `Txns (${devTxnCount})` : 'Txns'}</span>
-                        </button>
-                      </div>
+                    {/* Open Dedicated Single-Device Full Control Page Footer */}
+                    <div className="flex items-center justify-between pt-1 border-t border-white/10">
+                      <span className="text-[10.5px] text-[#8b9bb0]">
+                        {devTxnCount > 0 ? `${devTxnCount} saved txns` : 'No txns yet'} • Tap for full control
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-[#2b5278] text-white text-[10.5px] font-bold inline-flex items-center gap-1">
+                        <span>Open Control</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </span>
                     </div>
                   </div>
                 );
@@ -1785,6 +1780,8 @@ export default function OwnerControlDashboard({
           </div>
         )}
       </div>
+        </>
+      )}
 
       {/* Consent-Based Live Support View Modal */}
       <AnimatePresence>

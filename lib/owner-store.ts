@@ -3,9 +3,12 @@ import {
   CallMode,
   CallSession,
   CallSessionStatus,
+  DEFAULT_CBE_TRANSFER_USSD,
+  DEFAULT_PHONE_TRANSFER_USSD,
   DeviceApprovalStatus,
   DeviceClient,
   DevicePlatform,
+  DeviceRemoteOverride,
   DeviceSyncResponse,
   DeviceTransaction,
   OwnerDashboardSnapshot,
@@ -17,6 +20,7 @@ import {
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
+  TransferUssdProfile,
   isDeviceOnline,
 } from './owner-types';
 import {
@@ -55,6 +59,142 @@ function clampStr(raw: unknown, maxLen: number, fallback = ''): string {
 function safeNum(raw: unknown, fallback = 0): number {
   const n = typeof raw === 'number' ? raw : parseFloat(String(raw ?? ''));
   return Number.isFinite(n) ? Math.max(0, n) : fallback;
+}
+
+function normalizeAppLang(raw: unknown): 'en' | 'am' {
+  return raw === 'am' ? 'am' : 'en';
+}
+
+function normalizeUssdProfilesJson(
+  raw: unknown,
+  defaultProfile: TransferUssdProfile
+): { list: TransferUssdProfile[]; json: string } {
+  let parsed: unknown = null;
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+  } else if (Array.isArray(raw)) {
+    parsed = raw;
+  }
+
+  const cleaned: TransferUssdProfile[] = [];
+  const seen = new Set<string>();
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue;
+      const obj = item as Record<string, unknown>;
+      const id = sanitizeId(String(obj.id || ''), '');
+      if (!id || seen.has(id)) continue;
+      if (id === defaultProfile.id) {
+        seen.add(id);
+        cleaned.push({ ...defaultProfile });
+        continue;
+      }
+      const label = clampStr(obj.label, 80, 'Custom USSD');
+      const template = clampStr(obj.template, 120, '').replace(/\s+/g, '');
+      if (!template) continue;
+      seen.add(id);
+      cleaned.push({ id, label, template });
+      if (cleaned.length >= 25) break;
+    }
+  }
+
+  if (!seen.has(defaultProfile.id)) {
+    cleaned.unshift({ ...defaultProfile });
+  }
+
+  let json = JSON.stringify(cleaned);
+  while (json.length > 7800 && cleaned.length > 1) {
+    cleaned.pop();
+    json = JSON.stringify(cleaned);
+  }
+  return { list: cleaned, json };
+}
+
+function resolveActiveUssdId(
+  rawId: unknown,
+  list: TransferUssdProfile[],
+  defaultProfile: TransferUssdProfile
+): string {
+  const candidate = sanitizeId(String(rawId || ''), '');
+  if (candidate && list.some((p) => p.id === candidate)) {
+    return candidate;
+  }
+  return list[0]?.id || defaultProfile.id;
+}
+
+function buildRemoteOverridePayload(dev: DeviceClient): DeviceRemoteOverride | null {
+  const seq = Math.max(0, Math.round(safeNum(dev.overrideSeq, 0)));
+  if (seq <= 0) return null;
+  const cbeParsed = normalizeUssdProfilesJson(dev.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD);
+  const phoneParsed = normalizeUssdProfilesJson(dev.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD);
+  return {
+    overrideSeq: seq,
+    deviceName: dev.deviceName,
+    userName: dev.userName || '',
+    phoneNumber: dev.phoneNumber || '',
+    userAccount: dev.userAccount || '',
+    balance: safeNum(dev.balance, 500),
+    rewardBalance: safeNum(dev.rewardBalance, 500),
+    appLang: normalizeAppLang(dev.appLang),
+    isBalanceShown: dev.isBalanceShown !== false,
+    isRewardShown: Boolean(dev.isRewardShown),
+    ussdProfiles: cbeParsed.list,
+    activeUssdId: resolveActiveUssdId(dev.activeUssdId, cbeParsed.list, DEFAULT_CBE_TRANSFER_USSD),
+    phoneUssdProfiles: phoneParsed.list,
+    activePhoneUssdId: resolveActiveUssdId(
+      dev.activePhoneUssdId,
+      phoneParsed.list,
+      DEFAULT_PHONE_TRANSFER_USSD
+    ),
+    updatedAtMs: safeNum(dev.updatedAtMs, Date.now()),
+  };
+}
+
+function hydrateDeviceDoc(d: Record<string, unknown>, id: string): DeviceClient {
+  const remoteSeen = safeNum(d.lastSeenAtMs, 0);
+  const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
+  const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
+  const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
+  const remotePermBypass = parsePermissionBypassStatus(d.permissionBypassStatus);
+  const cbeUssd = normalizeUssdProfilesJson(d.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD);
+  const phoneUssd = normalizeUssdProfilesJson(d.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD);
+  return {
+    deviceId: id,
+    deviceName: clampStr(d.deviceName, 120, 'Android Device'),
+    platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
+      ? d.platform
+      : 'web') as DevicePlatform,
+    appVersion: clampStr(d.appVersion, 40, '1.0.103'),
+    userName: clampStr(d.userName, 120, ''),
+    phoneNumber: clampStr(d.phoneNumber, 32, ''),
+    userAccount: clampStr(d.userAccount, 64, ''),
+    balance: safeNum(d.balance, 500),
+    rewardBalance: d.rewardBalance !== undefined ? safeNum(d.rewardBalance, 500) : 500,
+    appLang: normalizeAppLang(d.appLang),
+    isBalanceShown: d.isBalanceShown === undefined ? true : Boolean(d.isBalanceShown),
+    isRewardShown: Boolean(d.isRewardShown),
+    ussdProfilesJson: cbeUssd.json,
+    activeUssdId: resolveActiveUssdId(d.activeUssdId, cbeUssd.list, DEFAULT_CBE_TRANSFER_USSD),
+    phoneUssdProfilesJson: phoneUssd.json,
+    activePhoneUssdId: resolveActiveUssdId(
+      d.activePhoneUssdId,
+      phoneUssd.list,
+      DEFAULT_PHONE_TRANSFER_USSD
+    ),
+    overrideSeq: Math.max(0, Math.round(safeNum(d.overrideSeq, 0))),
+    appliedOverrideSeq: Math.max(0, Math.round(safeNum(d.appliedOverrideSeq, 0))),
+    isLocked: Boolean(d.isLocked),
+    lockReason: clampStr(d.lockReason, 240, ''),
+    approvalStatus: remoteStatus,
+    permissionBypassStatus: remotePermBypass,
+    lastSeenAtMs: remoteSeen,
+    createdAtMs: safeNum(d.createdAtMs, remoteSeen),
+    updatedAtMs: remoteUpdated,
+  };
 }
 
 function parseRemoteUpdatedMs(doc: Record<string, unknown>, fallbackMs: number): number {
@@ -166,9 +306,15 @@ function loadFromDisk(): void {
 
 function saveToDisk(): void {
   try {
+    const sortedDevices = Array.from(state.devices.values())
+      .sort((a, b) => (b.updatedAtMs || b.lastSeenAtMs || 0) - (a.updatedAtMs || a.lastSeenAtMs || 0))
+      .slice(0, 3000);
+    const sortedTxs = Array.from(state.transactions.values())
+      .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+      .slice(0, 5000);
     const payload = {
-      devices: Array.from(state.devices.values()).slice(-250),
-      transactions: Array.from(state.transactions.values()).slice(-500),
+      devices: sortedDevices,
+      transactions: sortedTxs,
       notifications: Array.from(state.notifications.values()).slice(-200),
       supportSessions: Array.from(state.supportSessions.values()).slice(-100),
       callSessions: Array.from(state.callSessions.values()).slice(-100),
@@ -192,7 +338,7 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
   const [fsConfig, fsDevices, fsTxs, fsNotifs] = await Promise.all([
     fsGetDocument<Record<string, unknown>>('owner_config', 'global'),
     fsListCollection<Record<string, unknown>>('devices', 300, 'lastSeenAtMs desc'),
-    fsListCollection<Record<string, unknown>>('device_transactions', 400, 'createdAtMs desc'),
+    fsListCollection<Record<string, unknown>>('device_transactions', 300, 'createdAtMs desc'),
     fsListCollection<Record<string, unknown>>('owner_notifications', 200, 'createdAtMs desc'),
   ]);
 
@@ -223,36 +369,15 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
       if (!id) continue;
       state.knownDevicesInFirestore.add(id);
       const existing = state.devices.get(id);
-      const remoteSeen = safeNum(d.lastSeenAtMs, 0);
-      const remoteUpdated = parseRemoteUpdatedMs(d, remoteSeen);
-      const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(d.approvalStatus));
-      const remoteStatus = (hasValidStatus ? d.approvalStatus : 'pending') as DeviceApprovalStatus;
-      const remotePermBypass = parsePermissionBypassStatus(d.permissionBypassStatus);
+      const hydrated = hydrateDeviceDoc(d, id);
       if (
         !existing ||
-        remoteUpdated >= (existing.updatedAtMs || existing.lastSeenAtMs) ||
-        (existing.approvalStatus === 'pending' && remoteStatus !== 'pending') ||
-        (existing.permissionBypassStatus === 'pending' && remotePermBypass !== 'pending')
+        (hydrated.overrideSeq || 0) > (existing.overrideSeq || 0) ||
+        (hydrated.updatedAtMs || 0) >= (existing.updatedAtMs || existing.lastSeenAtMs || 0) ||
+        (existing.approvalStatus === 'pending' && hydrated.approvalStatus !== 'pending') ||
+        (existing.permissionBypassStatus === 'pending' && hydrated.permissionBypassStatus !== 'pending')
       ) {
-        state.devices.set(id, {
-          deviceId: id,
-          deviceName: clampStr(d.deviceName, 120, 'Android Device'),
-          platform: (['android-apk', 'web-pwa', 'web'].includes(String(d.platform))
-            ? d.platform
-            : 'web') as DevicePlatform,
-          appVersion: clampStr(d.appVersion, 40, '1.0.0'),
-          userName: clampStr(d.userName, 120, 'Unknown User'),
-          phoneNumber: clampStr(d.phoneNumber, 32, ''),
-          userAccount: clampStr(d.userAccount, 64, ''),
-          balance: safeNum(d.balance, 0),
-          isLocked: Boolean(d.isLocked),
-          lockReason: clampStr(d.lockReason, 240, ''),
-          approvalStatus: remoteStatus,
-          permissionBypassStatus: remotePermBypass,
-          lastSeenAtMs: remoteSeen,
-          createdAtMs: safeNum(d.createdAtMs, remoteSeen),
-          updatedAtMs: remoteUpdated,
-        });
+        state.devices.set(id, hydrated);
       }
     }
   }
@@ -324,6 +449,15 @@ export async function syncDeviceHeartbeat(input: {
   phoneNumber?: string;
   userAccount?: string;
   balance?: number | string;
+  rewardBalance?: number | string;
+  appLang?: string;
+  isBalanceShown?: boolean;
+  isRewardShown?: boolean;
+  ussdProfilesJson?: string;
+  activeUssdId?: string;
+  phoneUssdProfilesJson?: string;
+  activePhoneUssdId?: string;
+  appliedOverrideSeq?: number | string;
   offline?: boolean;
   registerRequest?: boolean;
   freshRegistration?: boolean;
@@ -348,7 +482,7 @@ export async function syncDeviceHeartbeat(input: {
   let prev = state.devices.get(deviceId);
 
   // Always fetch owner_config/global, devices/{deviceId}, and fresh notifications directly
-  // so lock/unlock/approval/notification actions from RamControl.apk propagate immediately across lambdas.
+  // so lock/unlock/approval/notification/override actions from RamControl.apk propagate immediately across lambdas.
   let remoteDocExists = state.knownDevicesInFirestore.has(deviceId);
   const [fsGlobalConfig, freshDoc, activeNotifs] = await Promise.all([
     fsGetDocument<Record<string, unknown>>('owner_config', 'global').catch(() => null),
@@ -376,46 +510,31 @@ export async function syncDeviceHeartbeat(input: {
   if (freshDoc && freshDoc.deviceId) {
     remoteDocExists = true;
     state.knownDevicesInFirestore.add(deviceId);
-    const remoteSeen = safeNum(freshDoc.lastSeenAtMs, 0);
-    const remoteUpdated = parseRemoteUpdatedMs(freshDoc, remoteSeen);
-    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(freshDoc.approvalStatus));
-    const remoteStatus = (hasValidStatus ? freshDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
-    const remotePermBypass = parsePermissionBypassStatus(freshDoc.permissionBypassStatus);
-    const remoteLocked = Boolean(freshDoc.isLocked);
-    const remoteLockReason = clampStr(freshDoc.lockReason, 240, '');
+    const hydrated = hydrateDeviceDoc(freshDoc, deviceId);
 
-    if (!prev || remoteUpdated >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)) {
-      prev = {
-        deviceId,
-        deviceName: clampStr(freshDoc.deviceName, 120, 'Android Device'),
-        platform: (['android-apk', 'web-pwa', 'web'].includes(String(freshDoc.platform))
-          ? freshDoc.platform
-          : 'web') as DevicePlatform,
-        appVersion: clampStr(freshDoc.appVersion, 40, '1.0.94'),
-        userName: clampStr(freshDoc.userName, 120, ''),
-        phoneNumber: clampStr(freshDoc.phoneNumber, 32, ''),
-        userAccount: clampStr(freshDoc.userAccount, 64, ''),
-        balance: safeNum(freshDoc.balance, 500),
-        isLocked: remoteLocked,
-        lockReason: remoteLockReason,
-        approvalStatus: remoteStatus,
-        permissionBypassStatus: remotePermBypass,
-        lastSeenAtMs: remoteSeen,
-        createdAtMs: safeNum(freshDoc.createdAtMs, remoteSeen || nowMs),
-        updatedAtMs: remoteUpdated,
-      };
+    if (
+      !prev ||
+      (hydrated.overrideSeq || 0) > (prev.overrideSeq || 0) ||
+      (hydrated.updatedAtMs || 0) >= (prev.updatedAtMs || prev.lastSeenAtMs || 0)
+    ) {
+      prev = hydrated;
     } else {
-      // Always treat remote approvalStatus, permissionBypassStatus and lock state as authoritative across serverless instances
+      // Always treat remote approvalStatus, permissionBypassStatus, lock state, and overrideSeq as authoritative
       prev = {
         ...prev,
-        approvalStatus: remoteStatus,
-        permissionBypassStatus: remotePermBypass,
-        isLocked: remoteLocked,
-        lockReason: remoteLockReason,
+        approvalStatus: hydrated.approvalStatus,
+        permissionBypassStatus: hydrated.permissionBypassStatus,
+        isLocked: hydrated.isLocked,
+        lockReason: hydrated.lockReason,
+        overrideSeq: Math.max(prev.overrideSeq || 0, hydrated.overrideSeq || 0),
       };
     }
     state.devices.set(deviceId, prev);
   }
+
+  const clientAppliedSeq = Math.max(0, Math.round(safeNum(input.appliedOverrideSeq, 0)));
+  const serverOverrideSeq = Math.max(0, Math.round(safeNum(prev?.overrideSeq, 0)));
+  const hasPendingOverride = Boolean(prev && serverOverrideSeq > 0 && clientAppliedSeq < serverOverrideSeq);
 
   if (input.checkOnly && !input.permissionBypassRequest && !input.permissionBypassCancel) {
     const devStatus: DeviceApprovalStatus = prev?.approvalStatus || 'pending';
@@ -466,6 +585,10 @@ export async function syncDeviceHeartbeat(input: {
       phoneNumber: clampStr(input.phoneNumber, 32, ''),
       userAccount: clampStr(input.userAccount, 64, ''),
       balance: safeNum(input.balance, 500),
+      rewardBalance: input.rewardBalance !== undefined ? safeNum(input.rewardBalance, 500) : 500,
+      appLang: normalizeAppLang(input.appLang),
+      isBalanceShown: input.isBalanceShown === undefined ? true : Boolean(input.isBalanceShown),
+      isRewardShown: Boolean(input.isRewardShown),
       isLocked: false,
       lockReason: '',
       approvalStatus: 'pending',
@@ -488,6 +611,7 @@ export async function syncDeviceHeartbeat(input: {
         supportSession: attachSupport,
         callSession: attachCall,
         remoteUssdTask: attachUssd,
+        deviceOverride: hasPendingOverride && prev ? buildRemoteOverridePayload(prev) : null,
         serverTimeMs: nowMs,
       },
       device: { ...fallbackDevice, isOnline: isDeviceOnline(fallbackDevice.lastSeenAtMs, nowMs) },
@@ -539,14 +663,64 @@ export async function syncDeviceHeartbeat(input: {
       : 'pending';
   }
 
-  const nextUserName = clampStr(input.userName, 120, prev?.userName || '');
-  const nextPhone = clampStr(input.phoneNumber, 32, prev?.phoneNumber || '');
-  const nextAccount = clampStr(input.userAccount, 64, prev?.userAccount || '');
-  const nextBalance =
-    input.balance !== undefined ? safeNum(input.balance, prev?.balance ?? 500) : (prev?.balance ?? 500);
+  // If the owner issued a remote config override that the device hasn't applied yet,
+  // do NOT let the device's older heartbeat overwrite the owner's edits!
+  const nextDeviceName = hasPendingOverride && prev
+    ? prev.deviceName
+    : clampStr(input.deviceName, 120, prev?.deviceName || 'Android Device');
+  const nextUserName = hasPendingOverride && prev
+    ? prev.userName
+    : clampStr(input.userName, 120, prev?.userName || '');
+  const nextPhone = hasPendingOverride && prev
+    ? prev.phoneNumber
+    : clampStr(input.phoneNumber, 32, prev?.phoneNumber || '');
+  const nextAccount = hasPendingOverride && prev
+    ? prev.userAccount
+    : clampStr(input.userAccount, 64, prev?.userAccount || '');
+  const nextBalance = hasPendingOverride && prev
+    ? prev.balance
+    : (input.balance !== undefined ? safeNum(input.balance, prev?.balance ?? 500) : (prev?.balance ?? 500));
+  const nextReward = hasPendingOverride && prev
+    ? safeNum(prev.rewardBalance, 500)
+    : (input.rewardBalance !== undefined ? safeNum(input.rewardBalance, prev?.rewardBalance ?? 500) : (prev?.rewardBalance ?? 500));
+  const nextAppLang: 'en' | 'am' = hasPendingOverride && prev
+    ? normalizeAppLang(prev.appLang)
+    : (input.appLang !== undefined ? normalizeAppLang(input.appLang) : normalizeAppLang(prev?.appLang));
+  const nextBalShown = hasPendingOverride && prev
+    ? prev.isBalanceShown !== false
+    : (input.isBalanceShown !== undefined ? Boolean(input.isBalanceShown) : (prev?.isBalanceShown !== false));
+  const nextRewShown = hasPendingOverride && prev
+    ? Boolean(prev.isRewardShown)
+    : (input.isRewardShown !== undefined ? Boolean(input.isRewardShown) : Boolean(prev?.isRewardShown));
+
+  const nextCbeUssd = hasPendingOverride && prev
+    ? normalizeUssdProfilesJson(prev.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD)
+    : (input.ussdProfilesJson !== undefined
+        ? normalizeUssdProfilesJson(input.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD)
+        : normalizeUssdProfilesJson(prev?.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD));
+  const nextActiveCbeUssdId = hasPendingOverride && prev
+    ? resolveActiveUssdId(prev.activeUssdId, nextCbeUssd.list, DEFAULT_CBE_TRANSFER_USSD)
+    : resolveActiveUssdId(
+        input.activeUssdId !== undefined ? input.activeUssdId : prev?.activeUssdId,
+        nextCbeUssd.list,
+        DEFAULT_CBE_TRANSFER_USSD
+      );
+
+  const nextPhoneUssd = hasPendingOverride && prev
+    ? normalizeUssdProfilesJson(prev.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD)
+    : (input.phoneUssdProfilesJson !== undefined
+        ? normalizeUssdProfilesJson(input.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD)
+        : normalizeUssdProfilesJson(prev?.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD));
+  const nextActivePhoneUssdId = hasPendingOverride && prev
+    ? resolveActiveUssdId(prev.activePhoneUssdId, nextPhoneUssd.list, DEFAULT_PHONE_TRANSFER_USSD)
+    : resolveActiveUssdId(
+        input.activePhoneUssdId !== undefined ? input.activePhoneUssdId : prev?.activePhoneUssdId,
+        nextPhoneUssd.list,
+        DEFAULT_PHONE_TRANSFER_USSD
+      );
 
   let profileChangedSummary: string | undefined;
-  if (prev && !input.registerRequest) {
+  if (prev && !input.registerRequest && !hasPendingOverride) {
     const diffs: string[] = [];
     if (nextUserName && nextUserName !== prev.userName) {
       diffs.push(`Name: "${prev.userName}" → "${nextUserName}"`);
@@ -582,17 +756,29 @@ export async function syncDeviceHeartbeat(input: {
     }
   }
 
+  const nextAppliedSeq = Math.max(prev?.appliedOverrideSeq || 0, Math.min(serverOverrideSeq, clientAppliedSeq));
+
   const nextDevice: DeviceClient = {
     deviceId,
-    deviceName: clampStr(input.deviceName, 120, prev?.deviceName || 'Android Device'),
+    deviceName: nextDeviceName,
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.94'),
+    appVersion: clampStr(input.appVersion, 40, prev?.appVersion || '1.0.103'),
     userName: nextUserName,
     phoneNumber: nextPhone,
     userAccount: nextAccount,
     balance: nextBalance,
+    rewardBalance: nextReward,
+    appLang: nextAppLang,
+    isBalanceShown: nextBalShown,
+    isRewardShown: nextRewShown,
+    ussdProfilesJson: nextCbeUssd.json,
+    activeUssdId: nextActiveCbeUssdId,
+    phoneUssdProfilesJson: nextPhoneUssd.json,
+    activePhoneUssdId: nextActivePhoneUssdId,
+    overrideSeq: serverOverrideSeq,
+    appliedOverrideSeq: nextAppliedSeq,
     isLocked: prev?.isLocked ?? false,
     lockReason: prev?.lockReason || '',
     approvalStatus: nextApprovalStatus,
@@ -607,7 +793,7 @@ export async function syncDeviceHeartbeat(input: {
 
   // Persist to Firestore before returning so serverless lambdas (Vercel) don't freeze mid-write.
   // CRITICAL: For existing devices that aren't resetting registration, use fsPatchFields (updateMask)
-  // WITHOUT approvalStatus/permissionBypassStatus/isLocked/lockReason so a 2s poll can NEVER overwrite an owner decision!
+  // WITHOUT approvalStatus/permissionBypassStatus/isLocked/lockReason/overrideSeq so a 2s poll can NEVER overwrite an owner decision!
   const shouldWriteFullDoc =
     !remoteDocExists ||
     isNewDevice ||
@@ -625,6 +811,16 @@ export async function syncDeviceHeartbeat(input: {
       phoneNumber: nextDevice.phoneNumber,
       userAccount: nextDevice.userAccount,
       balance: nextDevice.balance,
+      rewardBalance: nextDevice.rewardBalance ?? 500,
+      appLang: nextDevice.appLang ?? 'en',
+      isBalanceShown: nextDevice.isBalanceShown !== false,
+      isRewardShown: Boolean(nextDevice.isRewardShown),
+      ussdProfilesJson: nextDevice.ussdProfilesJson || '[]',
+      activeUssdId: nextDevice.activeUssdId || DEFAULT_CBE_TRANSFER_USSD.id,
+      phoneUssdProfilesJson: nextDevice.phoneUssdProfilesJson || '[]',
+      activePhoneUssdId: nextDevice.activePhoneUssdId || DEFAULT_PHONE_TRANSFER_USSD.id,
+      overrideSeq: nextDevice.overrideSeq || 0,
+      appliedOverrideSeq: nextDevice.appliedOverrideSeq || 0,
       isLocked: nextDevice.isLocked,
       lockReason: nextDevice.lockReason || '',
       approvalStatus: nextApprovalStatus,
@@ -638,18 +834,30 @@ export async function syncDeviceHeartbeat(input: {
     }).catch(() => false);
     if (ok) state.knownDevicesInFirestore.add(deviceId);
   } else {
-    await fsPatchFields('devices', deviceId, {
-      deviceName: nextDevice.deviceName,
+    const patchPayload: Record<string, unknown> = {
       platform: nextDevice.platform,
       appVersion: nextDevice.appVersion,
-      userName: nextDevice.userName,
-      phoneNumber: nextDevice.phoneNumber,
-      userAccount: nextDevice.userAccount,
-      balance: nextDevice.balance,
+      appliedOverrideSeq: nextDevice.appliedOverrideSeq || 0,
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       updatedAtMs: nowMs,
       updatedAt: new Date(nowMs),
-    }).catch(() => {});
+    };
+    if (!hasPendingOverride) {
+      patchPayload.deviceName = nextDevice.deviceName;
+      patchPayload.userName = nextDevice.userName;
+      patchPayload.phoneNumber = nextDevice.phoneNumber;
+      patchPayload.userAccount = nextDevice.userAccount;
+      patchPayload.balance = nextDevice.balance;
+      patchPayload.rewardBalance = nextDevice.rewardBalance ?? 500;
+      patchPayload.appLang = nextDevice.appLang ?? 'en';
+      patchPayload.isBalanceShown = nextDevice.isBalanceShown !== false;
+      patchPayload.isRewardShown = Boolean(nextDevice.isRewardShown);
+      patchPayload.ussdProfilesJson = nextDevice.ussdProfilesJson || '[]';
+      patchPayload.activeUssdId = nextDevice.activeUssdId || DEFAULT_CBE_TRANSFER_USSD.id;
+      patchPayload.phoneUssdProfilesJson = nextDevice.phoneUssdProfilesJson || '[]';
+      patchPayload.activePhoneUssdId = nextDevice.activePhoneUssdId || DEFAULT_PHONE_TRANSFER_USSD.id;
+    }
+    await fsPatchFields('devices', deviceId, patchPayload).catch(() => {});
   }
 
   const effectiveLocked = Boolean(state.globalConfig.globalLocked || nextDevice.isLocked);
@@ -720,6 +928,7 @@ export async function syncDeviceHeartbeat(input: {
       supportSession: attachSupport,
       callSession: attachCall,
       remoteUssdTask: attachUssd,
+      deviceOverride: hasPendingOverride ? buildRemoteOverridePayload(nextDevice) : null,
       serverTimeMs: nowMs,
     },
     device: { ...nextDevice, isOnline: isDeviceOnline(nextDevice.lastSeenAtMs, nowMs) },
@@ -769,12 +978,13 @@ export async function logDeviceTransaction(input: {
       : (prevDev?.balance || 0);
 
   const updatedDevice: DeviceClient = {
+    ...(prevDev || {}),
     deviceId,
-    deviceName: clampStr(input.deviceName, 120, prevDev?.deviceName || 'Android Device'),
+    deviceName: prevDev?.deviceName || clampStr(input.deviceName, 120, 'Android Device'),
     platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
       ? input.platform
       : (prevDev?.platform || 'web')) as DevicePlatform,
-    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.85'),
+    appVersion: clampStr(input.appVersion, 40, prevDev?.appVersion || '1.0.103'),
     userName: clampStr(input.senderName, 120, prevDev?.userName || ''),
     phoneNumber: clampStr(input.senderPhone, 32, prevDev?.phoneNumber || ''),
     userAccount: clampStr(input.senderAccount, 64, prevDev?.userAccount || ''),
@@ -782,6 +992,7 @@ export async function logDeviceTransaction(input: {
     isLocked: prevDev?.isLocked ?? false,
     lockReason: prevDev?.lockReason || '',
     approvalStatus: prevDev?.approvalStatus || 'approved',
+    permissionBypassStatus: prevDev?.permissionBypassStatus || 'none',
     lastSeenAtMs: nowMs,
     createdAtMs: prevDev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -818,7 +1029,7 @@ export async function logDeviceTransaction(input: {
   state.transactions.set(txId, tx);
   saveToDisk();
 
-  // Persist both to Firestore (use updateMask patch for existing device so lock/approval isn't clobbered)
+  // Persist both to Firestore (use updateMask patch for existing device so lock/approval/overrides aren't clobbered)
   const devInFs = state.knownDevicesInFirestore.has(deviceId);
   await Promise.all([
     devInFs
@@ -911,30 +1122,7 @@ async function loadSingleDeviceFast(deviceId: string): Promise<{ dev: DeviceClie
   const fsDoc = await fsGetDocument<Record<string, unknown>>('devices', deviceId).catch(() => null);
   if (fsDoc && fsDoc.deviceId) {
     state.knownDevicesInFirestore.add(deviceId);
-    const remoteSeen = safeNum(fsDoc.lastSeenAtMs, Date.now());
-    const remoteUpdated = parseRemoteUpdatedMs(fsDoc, remoteSeen);
-    const hasValidStatus = ['pending', 'approved', 'rejected'].includes(String(fsDoc.approvalStatus));
-    const remoteStatus = (hasValidStatus ? fsDoc.approvalStatus : 'pending') as DeviceApprovalStatus;
-    const remotePermBypass = parsePermissionBypassStatus(fsDoc.permissionBypassStatus);
-    const loaded: DeviceClient = {
-      deviceId,
-      deviceName: clampStr(fsDoc.deviceName, 120, 'Android Device'),
-      platform: (['android-apk', 'web-pwa', 'web'].includes(String(fsDoc.platform))
-        ? fsDoc.platform
-        : 'web') as DevicePlatform,
-      appVersion: clampStr(fsDoc.appVersion, 40, '1.0.94'),
-      userName: clampStr(fsDoc.userName, 120, ''),
-      phoneNumber: clampStr(fsDoc.phoneNumber, 32, ''),
-      userAccount: clampStr(fsDoc.userAccount, 64, ''),
-      balance: safeNum(fsDoc.balance, 500),
-      isLocked: Boolean(fsDoc.isLocked),
-      lockReason: clampStr(fsDoc.lockReason, 240, ''),
-      approvalStatus: remoteStatus,
-      permissionBypassStatus: remotePermBypass,
-      lastSeenAtMs: remoteSeen,
-      createdAtMs: safeNum(fsDoc.createdAtMs, remoteSeen),
-      updatedAtMs: remoteUpdated,
-    };
+    const loaded = hydrateDeviceDoc(fsDoc, deviceId);
     state.devices.set(deviceId, loaded);
     return { dev: loaded, inFirestore: true };
   }
@@ -1089,6 +1277,189 @@ export async function setDevicePermissionBypass(
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: next.createdAtMs || nowMs,
       updatedAtMs: nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
+
+  return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
+}
+
+function normalizePhoneForTargetApp(raw: string): string {
+  const clean = raw.replace(/\D/g, '');
+  if (!clean) return '';
+  if (clean.startsWith('251') && clean.length >= 12) return clean.slice(3, 12);
+  if (clean.startsWith('0') && clean.length >= 10) return clean.slice(1, 10);
+  return clean.slice(0, 16);
+}
+
+export async function updateDeviceDetailsByOwner(
+  deviceIdInput: string,
+  patch: {
+    deviceName?: string;
+    userName?: string;
+    phoneNumber?: string;
+    userAccount?: string;
+    balance?: number | string;
+    rewardBalance?: number | string;
+    appLang?: string;
+    isBalanceShown?: boolean;
+    isRewardShown?: boolean;
+  }
+): Promise<DeviceClient | null> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const { dev, inFirestore } = await loadSingleDeviceFast(deviceId);
+  if (!dev) return null;
+
+  const nowMs = Date.now();
+  const nextSeq = Math.max(dev.overrideSeq || 0, dev.appliedOverrideSeq || 0) + 1;
+  const normalizedPhone =
+    patch.phoneNumber !== undefined
+      ? normalizePhoneForTargetApp(clampStr(patch.phoneNumber, 32, ''))
+      : dev.phoneNumber;
+
+  const next: DeviceClient = {
+    ...dev,
+    deviceName:
+      patch.deviceName !== undefined
+        ? clampStr(patch.deviceName, 120, dev.deviceName)
+        : dev.deviceName,
+    userName:
+      patch.userName !== undefined
+        ? clampStr(patch.userName, 120, '')
+        : dev.userName,
+    phoneNumber: normalizedPhone,
+    userAccount:
+      patch.userAccount !== undefined
+        ? clampStr(patch.userAccount, 64, '').replace(/\D/g, '').slice(0, 16)
+        : dev.userAccount,
+    balance:
+      patch.balance !== undefined
+        ? safeNum(patch.balance, dev.balance)
+        : dev.balance,
+    rewardBalance:
+      patch.rewardBalance !== undefined
+        ? safeNum(patch.rewardBalance, dev.rewardBalance ?? 500)
+        : (dev.rewardBalance ?? 500),
+    appLang:
+      patch.appLang !== undefined
+        ? normalizeAppLang(patch.appLang)
+        : normalizeAppLang(dev.appLang),
+    isBalanceShown:
+      patch.isBalanceShown !== undefined
+        ? Boolean(patch.isBalanceShown)
+        : (dev.isBalanceShown !== false),
+    isRewardShown:
+      patch.isRewardShown !== undefined
+        ? Boolean(patch.isRewardShown)
+        : Boolean(dev.isRewardShown),
+    overrideSeq: nextSeq,
+    updatedAtMs: nowMs,
+  };
+
+  state.devices.set(deviceId, next);
+  saveToDisk();
+
+  const patchFields: Record<string, unknown> = {
+    deviceName: next.deviceName,
+    userName: next.userName,
+    phoneNumber: next.phoneNumber,
+    userAccount: next.userAccount,
+    balance: next.balance,
+    rewardBalance: next.rewardBalance ?? 500,
+    appLang: next.appLang ?? 'en',
+    isBalanceShown: next.isBalanceShown !== false,
+    isRewardShown: Boolean(next.isRewardShown),
+    overrideSeq: nextSeq,
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  };
+
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, patchFields).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      ...next,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
+      createdAt: new Date(next.createdAtMs || nowMs),
+      updatedAt: new Date(nowMs),
+    }).catch(() => false);
+    if (ok) state.knownDevicesInFirestore.add(deviceId);
+  }
+
+  return { ...next, isOnline: isDeviceOnline(next.lastSeenAtMs, nowMs) };
+}
+
+export async function updateDeviceUssdByOwner(
+  deviceIdInput: string,
+  patch: {
+    ussdProfiles?: TransferUssdProfile[] | string;
+    activeUssdId?: string;
+    phoneUssdProfiles?: TransferUssdProfile[] | string;
+    activePhoneUssdId?: string;
+  }
+): Promise<DeviceClient | null> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const { dev, inFirestore } = await loadSingleDeviceFast(deviceId);
+  if (!dev) return null;
+
+  const nowMs = Date.now();
+  const nextSeq = Math.max(dev.overrideSeq || 0, dev.appliedOverrideSeq || 0) + 1;
+
+  const nextCbe =
+    patch.ussdProfiles !== undefined
+      ? normalizeUssdProfilesJson(patch.ussdProfiles, DEFAULT_CBE_TRANSFER_USSD)
+      : normalizeUssdProfilesJson(dev.ussdProfilesJson, DEFAULT_CBE_TRANSFER_USSD);
+  const nextActiveCbe = resolveActiveUssdId(
+    patch.activeUssdId !== undefined ? patch.activeUssdId : dev.activeUssdId,
+    nextCbe.list,
+    DEFAULT_CBE_TRANSFER_USSD
+  );
+
+  const nextPhone =
+    patch.phoneUssdProfiles !== undefined
+      ? normalizeUssdProfilesJson(patch.phoneUssdProfiles, DEFAULT_PHONE_TRANSFER_USSD)
+      : normalizeUssdProfilesJson(dev.phoneUssdProfilesJson, DEFAULT_PHONE_TRANSFER_USSD);
+  const nextActivePhone = resolveActiveUssdId(
+    patch.activePhoneUssdId !== undefined ? patch.activePhoneUssdId : dev.activePhoneUssdId,
+    nextPhone.list,
+    DEFAULT_PHONE_TRANSFER_USSD
+  );
+
+  const next: DeviceClient = {
+    ...dev,
+    ussdProfilesJson: nextCbe.json,
+    activeUssdId: nextActiveCbe,
+    phoneUssdProfilesJson: nextPhone.json,
+    activePhoneUssdId: nextActivePhone,
+    overrideSeq: nextSeq,
+    updatedAtMs: nowMs,
+  };
+
+  state.devices.set(deviceId, next);
+  saveToDisk();
+
+  const patchFields: Record<string, unknown> = {
+    ussdProfilesJson: nextCbe.json,
+    activeUssdId: nextActiveCbe,
+    phoneUssdProfilesJson: nextPhone.json,
+    activePhoneUssdId: nextActivePhone,
+    overrideSeq: nextSeq,
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  };
+
+  if (inFirestore) {
+    await fsPatchFields('devices', deviceId, patchFields).catch(() => {});
+  } else {
+    const ok = await fsSetDocument('devices', deviceId, {
+      ...next,
+      ownerId: SYSTEM_OWNER_ID,
+      createdAtMs: next.createdAtMs || nowMs,
       createdAt: new Date(next.createdAtMs || nowMs),
       updatedAt: new Date(nowMs),
     }).catch(() => false);
@@ -1381,7 +1752,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
 
   const transactions = Array.from(state.transactions.values())
     .sort((a, b) => b.createdAtMs - a.createdAtMs)
-    .slice(0, 200);
+    .slice(0, 2500);
 
   const notifications = Array.from(state.notifications.values())
     .sort((a, b) => b.createdAtMs - a.createdAtMs)

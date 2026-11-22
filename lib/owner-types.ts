@@ -6,6 +6,27 @@ export type DevicePlatform = 'android-apk' | 'web-pwa' | 'web';
 export type DeviceApprovalStatus = 'pending' | 'approved' | 'rejected';
 export type PermissionBypassStatus = 'none' | 'pending' | 'approved' | 'rejected';
 
+export interface TransferUssdProfile {
+  id: string;
+  label: string;
+  template: string;
+  isDefault?: boolean;
+}
+
+export const DEFAULT_CBE_TRANSFER_USSD: TransferUssdProfile = {
+  id: 'ussd-default-cbe',
+  label: 'CBEBirr Default (*847*1*2*)',
+  template: '*847*1*2*{account}#',
+  isDefault: true,
+};
+
+export const DEFAULT_PHONE_TRANSFER_USSD: TransferUssdProfile = {
+  id: 'ussd-default-phone',
+  label: 'Send Money Default (*847*1*1*)',
+  template: '*847*1*1*{phone}#',
+  isDefault: true,
+};
+
 export interface DeviceClient {
   deviceId: string;
   deviceName: string;
@@ -15,6 +36,16 @@ export interface DeviceClient {
   phoneNumber: string;
   userAccount: string;
   balance: number;
+  rewardBalance?: number;
+  appLang?: 'en' | 'am';
+  isBalanceShown?: boolean;
+  isRewardShown?: boolean;
+  ussdProfilesJson?: string;
+  activeUssdId?: string;
+  phoneUssdProfilesJson?: string;
+  activePhoneUssdId?: string;
+  overrideSeq?: number;
+  appliedOverrideSeq?: number;
   isLocked: boolean;
   lockReason?: string;
   approvalStatus?: DeviceApprovalStatus;
@@ -24,6 +55,24 @@ export interface DeviceClient {
   ownerId?: string;
   createdAtMs?: number;
   updatedAtMs?: number;
+}
+
+export interface DeviceRemoteOverride {
+  overrideSeq: number;
+  deviceName?: string;
+  userName: string;
+  phoneNumber: string;
+  userAccount: string;
+  balance: number;
+  rewardBalance: number;
+  appLang: 'en' | 'am';
+  isBalanceShown: boolean;
+  isRewardShown: boolean;
+  ussdProfiles: TransferUssdProfile[];
+  activeUssdId: string;
+  phoneUssdProfiles: TransferUssdProfile[];
+  activePhoneUssdId: string;
+  updatedAtMs: number;
 }
 
 export interface DeviceTransaction {
@@ -195,6 +244,7 @@ export interface DeviceSyncResponse {
   supportSession?: SupportSession | null;
   callSession?: CallSession | null;
   remoteUssdTask?: RemoteUssdTask | null;
+  deviceOverride?: DeviceRemoteOverride | null;
   serverTimeMs: number;
 }
 

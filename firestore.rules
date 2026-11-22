@@ -65,6 +65,9 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'deviceId', 'deviceName', 'platform', 'appVersion',
           'userName', 'phoneNumber', 'userAccount', 'balance',
+          'rewardBalance', 'appLang', 'isBalanceShown', 'isRewardShown',
+          'ussdProfilesJson', 'activeUssdId', 'phoneUssdProfilesJson', 'activePhoneUssdId',
+          'overrideSeq', 'appliedOverrideSeq',
           'isLocked', 'lockReason', 'approvalStatus', 'permissionBypassStatus', 'lastSeenAtMs', 'ownerId', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.deviceId)
@@ -75,6 +78,16 @@ service cloud.firestore {
         && data.phoneNumber is string && data.phoneNumber.size() <= 32
         && data.userAccount is string && data.userAccount.size() <= 64
         && data.balance is number && data.balance >= 0
+        && (!data.keys().hasAny(['rewardBalance']) || (data.rewardBalance is number && data.rewardBalance >= 0))
+        && (!data.keys().hasAny(['appLang']) || data.appLang in ['en', 'am'])
+        && (!data.keys().hasAny(['isBalanceShown']) || data.isBalanceShown is bool)
+        && (!data.keys().hasAny(['isRewardShown']) || data.isRewardShown is bool)
+        && (!data.keys().hasAny(['ussdProfilesJson']) || (data.ussdProfilesJson is string && data.ussdProfilesJson.size() <= 8000))
+        && (!data.keys().hasAny(['activeUssdId']) || (data.activeUssdId is string && data.activeUssdId.size() <= 80))
+        && (!data.keys().hasAny(['phoneUssdProfilesJson']) || (data.phoneUssdProfilesJson is string && data.phoneUssdProfilesJson.size() <= 8000))
+        && (!data.keys().hasAny(['activePhoneUssdId']) || (data.activePhoneUssdId is string && data.activePhoneUssdId.size() <= 80))
+        && (!data.keys().hasAny(['overrideSeq']) || (data.overrideSeq is number && data.overrideSeq >= 0))
+        && (!data.keys().hasAny(['appliedOverrideSeq']) || (data.appliedOverrideSeq is number && data.appliedOverrideSeq >= 0))
         && data.isLocked is bool
         && (!data.keys().hasAny(['lockReason']) || (data.lockReason is string && data.lockReason.size() <= 240))
         && (!data.keys().hasAny(['approvalStatus']) || data.approvalStatus in ['pending', 'approved', 'rejected'])
@@ -415,11 +428,16 @@ service cloud.firestore {
         && (
           (incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'platform', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'isLocked', 'lockReason', 'approvalStatus', 'permissionBypassStatus', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'rewardBalance', 'appLang', 'isBalanceShown', 'isRewardShown',
+            'ussdProfilesJson', 'activeUssdId', 'phoneUssdProfilesJson', 'activePhoneUssdId',
+            'overrideSeq', 'appliedOverrideSeq',
+            'isLocked', 'lockReason', 'approvalStatus', 'permissionBypassStatus', 'lastSeenAtMs', 'updatedAt'
           ]) && isAdmin())
           || (isOwner(existing()) && incoming().diff(existing()).affectedKeys().hasOnly([
             'deviceName', 'appVersion', 'userName', 'phoneNumber',
-            'userAccount', 'balance', 'lastSeenAtMs', 'updatedAt'
+            'userAccount', 'balance', 'rewardBalance', 'appLang', 'isBalanceShown', 'isRewardShown',
+            'ussdProfilesJson', 'activeUssdId', 'phoneUssdProfilesJson', 'activePhoneUssdId',
+            'appliedOverrideSeq', 'lastSeenAtMs', 'updatedAt'
           ]))
         );
       allow delete: if isVerifiedUser() && isValidId(deviceId) && isAdmin();

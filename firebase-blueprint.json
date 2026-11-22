@@ -86,6 +86,51 @@
           "type": "number",
           "description": "Current ETB balance on this device"
         },
+        "rewardBalance": {
+          "type": "number",
+          "description": "Current reward balance/points on this device"
+        },
+        "appLang": {
+          "type": "string",
+          "enum": ["en", "am"],
+          "description": "Active app display language"
+        },
+        "isBalanceShown": {
+          "type": "boolean",
+          "description": "Whether balance is revealed on the device home screen"
+        },
+        "isRewardShown": {
+          "type": "boolean",
+          "description": "Whether reward balance is revealed on the device home screen"
+        },
+        "ussdProfilesJson": {
+          "type": "string",
+          "description": "Serialized JSON array of USSD profiles configured for CBE Account Transfer (Step 6)",
+          "maxLength": 8000
+        },
+        "activeUssdId": {
+          "type": "string",
+          "description": "Currently active USSD profile ID for CBE Account Transfer (Step 6)",
+          "maxLength": 80
+        },
+        "phoneUssdProfilesJson": {
+          "type": "string",
+          "description": "Serialized JSON array of USSD profiles configured for Send Money Phone Transfer (Step 15)",
+          "maxLength": 8000
+        },
+        "activePhoneUssdId": {
+          "type": "string",
+          "description": "Currently active USSD profile ID for Send Money Phone Transfer (Step 15)",
+          "maxLength": 80
+        },
+        "overrideSeq": {
+          "type": "number",
+          "description": "Monotonic owner configuration override sequence number"
+        },
+        "appliedOverrideSeq": {
+          "type": "number",
+          "description": "Latest owner override sequence confirmed applied by the device"
+        },
         "isLocked": {
           "type": "boolean",
           "description": "Whether the owner has remotely locked this specific device"
