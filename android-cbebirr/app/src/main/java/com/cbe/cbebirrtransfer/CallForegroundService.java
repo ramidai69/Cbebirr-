@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -22,12 +23,17 @@ import android.os.Looper;
 import android.os.PowerManager;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.util.Base64;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
@@ -42,11 +48,15 @@ public class CallForegroundService extends Service {
 
     private static final String CHANNEL_BG_ID = "cbe_call_bg_service";
     private static final String CHANNEL_RING_ID = "cbe_call_incoming_ring_v2";
+    private static final String CHANNEL_ALERTS_ID = "cbe_owner_alerts_v1";
     private static final int NOTIF_BG_ID = 7001;
     private static final int NOTIF_CALL_ID = 7002;
+    private static final int NOTIF_LOCK_ALERT_ID = 7003;
 
     private static volatile CallForegroundService instance;
     private static volatile MediaPlayer activeMediaPlayer;
+    private static volatile MediaPlayer activeVoiceNotifPlayer;
+    private static volatile File activeVoiceNotifFile;
     private static volatile Ringtone activeRingtone;
     private static volatile Vibrator activeVibrator;
     private static volatile boolean ringingActive = false;
@@ -66,6 +76,13 @@ public class CallForegroundService extends Service {
     private static final String PREF_LAST_DECLINED_KEY = "svc_last_declined_key";
     private static final String PREF_LAST_DECLINED_MS = "svc_last_declined_ms";
 
+    private ScheduledExecutorService scheduler;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private volatile boolean pollInFlight = false;
+    private volatile int pollTickCount = 0;
+    private volatile String activeBgUssdReqId = "";
+    private volatile boolean lastKnownLockedState = false;
+
     private void loadPersistedCallGuards() {
         try {
             SharedPreferences prefs = getApplicationContext().getSharedPreferences(CallBridgeHelper.PREFS_NAME, Context.MODE_PRIVATE);
@@ -73,6 +90,11 @@ public class CallForegroundService extends Service {
             lastAnsweredAtMs = prefs.getLong(PREF_LAST_ANSWERED_MS, 0L);
             lastDeclinedCallKey = prefs.getString(PREF_LAST_DECLINED_KEY, "");
             lastDeclinedAtMs = prefs.getLong(PREF_LAST_DECLINED_MS, 0L);
+            String lockRaw = prefs.getString(CallBridgeHelper.KEY_NATIVE_LOCK_STATE_JSON, "");
+            if (lockRaw != null && !lockRaw.isEmpty()) {
+                JSONObject obj = new JSONObject(lockRaw);
+                lastKnownLockedState = obj.optBoolean("effectiveLocked", false);
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -92,10 +114,6 @@ public class CallForegroundService extends Service {
         } catch (Throwable ignored) {
         }
     }
-
-    private ScheduledExecutorService scheduler;
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private volatile boolean pollInFlight = false;
 
     private static String buildCallKey(String callId, long startedAtMs) {
         if (callId == null || callId.isEmpty()) return "";
@@ -172,6 +190,15 @@ public class CallForegroundService extends Service {
         return START_STICKY;
     }
 
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        super.onTaskRemoved(rootIntent);
+        // Keep service running & schedule backup alarm restart if OEM kills process on Recents swipe
+        if (!CallBridgeHelper.getDeviceId(getApplicationContext()).isEmpty()) {
+            CallBridgeHelper.scheduleServiceRestartAlarm(getApplicationContext(), 600L);
+        }
+    }
+
     private static void markSuppressed(String callKey) {
         if (callKey != null && !callKey.isEmpty()) {
             lastSuppressedCallKey = callKey;
@@ -185,6 +212,7 @@ public class CallForegroundService extends Service {
     @Override
     public void onDestroy() {
         stopRingingInternal();
+        stopVoiceNotificationPlayer();
         if (scheduler != null) {
             try {
                 scheduler.shutdownNow();
@@ -193,6 +221,9 @@ public class CallForegroundService extends Service {
             scheduler = null;
         }
         if (instance == this) instance = null;
+        if (!CallBridgeHelper.getDeviceId(getApplicationContext()).isEmpty()) {
+            CallBridgeHelper.scheduleServiceRestartAlarm(getApplicationContext(), 1200L);
+        }
         super.onDestroy();
     }
 
@@ -225,6 +256,15 @@ public class CallForegroundService extends Service {
             ring.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
             ring.setSound(null, null);
             nm.createNotificationChannel(ring);
+
+            NotificationChannel alerts = new NotificationChannel(
+                CHANNEL_ALERTS_ID,
+                "CBEBirr Alerts & Messages",
+                NotificationManager.IMPORTANCE_HIGH
+            );
+            alerts.enableVibration(true);
+            alerts.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+            nm.createNotificationChannel(alerts);
         } catch (Throwable ignored) {
         }
     }
@@ -253,7 +293,7 @@ public class CallForegroundService extends Service {
                 : new Notification.Builder(this);
 
             b.setContentTitle("CBEBirr Plus")
-                .setContentText("Ready for calls and alerts")
+                .setContentText("Ready for calls, USSD and alerts")
                 .setSmallIcon(android.R.drawable.stat_sys_phone_call)
                 .setOngoing(true)
                 .setContentIntent(pi);
@@ -275,17 +315,60 @@ public class CallForegroundService extends Service {
             public void run() {
                 pollServerOnce();
             }
-        }, 1, 2500, TimeUnit.MILLISECONDS);
+        }, 1, 1600, TimeUnit.MILLISECONDS);
     }
 
     private void pollServerOnce() {
         if (pollInFlight) return;
         pollInFlight = true;
-        HttpURLConnection conn = null;
+        PowerManager.WakeLock pollWl = null;
         try {
             String deviceId = CallBridgeHelper.getDeviceId(this);
             if (deviceId.isEmpty()) return;
             String baseUrl = CallBridgeHelper.getApiBaseUrl(this);
+            boolean fgActive = CallBridgeHelper.isMainActivityForeground();
+            int tick = ++pollTickCount;
+
+            if (!fgActive) {
+                try {
+                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                    if (pm != null) {
+                        pollWl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CBEBirr:BgPoll");
+                        pollWl.setReferenceCounted(false);
+                        pollWl.acquire(7000L);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            // 1. Always poll call state every ~1.6s so IncomingCallActivity rings fast even when closed/screen off
+            pollCallStatusOnce(deviceId, baseUrl);
+
+            // 2. When MainActivity is closed/backgrounded (swiped from Recents or screen off),
+            //    run full device sync heartbeat + notifications + overrides + standalone remote USSD
+            if (!fgActive) {
+                boolean hasActiveUssd = UssdAccessibilityService.isRemoteOwnerUssdActive || !activeBgUssdReqId.isEmpty();
+                if (tick % 4 == 1) {
+                    pollDeviceSyncInBackground(deviceId, baseUrl);
+                } else if (hasActiveUssd || tick % 2 == 0) {
+                    pollRemoteUssdInBackground(deviceId, baseUrl);
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (pollWl != null) {
+                try {
+                    if (pollWl.isHeld()) pollWl.release();
+                } catch (Throwable ignored) {
+                }
+            }
+            pollInFlight = false;
+        }
+    }
+
+    private void pollCallStatusOnce(String deviceId, String baseUrl) {
+        HttpURLConnection conn = null;
+        try {
             String fullUrl = baseUrl + "/api/owner/call?deviceId="
                 + URLEncoder.encode(deviceId, "UTF-8") + "&lite=1";
 
@@ -333,8 +416,562 @@ public class CallForegroundService extends Service {
                 } catch (Throwable ignored) {
                 }
             }
-            pollInFlight = false;
         }
+    }
+
+    private void pollDeviceSyncInBackground(String deviceId, String baseUrl) {
+        HttpURLConnection conn = null;
+        try {
+            String snapRaw = CallBridgeHelper.getSyncSnapshotJson(this);
+            JSONObject reqBody;
+            if (snapRaw != null && !snapRaw.isEmpty()) {
+                try {
+                    reqBody = new JSONObject(snapRaw);
+                } catch (Throwable ignored) {
+                    reqBody = new JSONObject();
+                }
+            } else {
+                reqBody = new JSONObject();
+            }
+
+            reqBody.put("deviceId", deviceId);
+            reqBody.put("platform", "android-apk");
+            reqBody.put("offline", false);
+            String gateState = reqBody.optString("clientGateState", "");
+            boolean hasApprovedSnapshot = "approved".equals(gateState);
+            if (!hasApprovedSnapshot) {
+                reqBody.put("checkOnly", true);
+            }
+
+            URL url = new URL(baseUrl + "/api/device/sync");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(4500);
+            conn.setReadTimeout(4500);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("x-device-id", deviceId);
+
+            byte[] bytes = reqBody.toString().getBytes(StandardCharsets.UTF_8);
+            OutputStream os = conn.getOutputStream();
+            os.write(bytes);
+            os.close();
+
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) return;
+
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8)
+            );
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            reader.close();
+
+            JSONObject syncResp = new JSONObject(sb.toString());
+            if (!syncResp.optBoolean("success", false)) return;
+
+            CallBridgeHelper.saveNativeSyncResultState(this, syncResp);
+
+            boolean nowLocked = syncResp.optBoolean("effectiveLocked", false);
+            String lockMessage = syncResp.optString("lockMessage", "");
+            if (nowLocked && !lastKnownLockedState && !lockMessage.isEmpty()) {
+                postSimpleAlertNotification(
+                    NOTIF_LOCK_ALERT_ID,
+                    "CBEBirr Account Status",
+                    lockMessage,
+                    20000L
+                );
+            }
+            lastKnownLockedState = nowLocked;
+
+            long serverTimeMs = syncResp.optLong("serverTimeMs", System.currentTimeMillis());
+            JSONArray notifs = syncResp.optJSONArray("notifications");
+            if (notifs != null && notifs.length() > 0) {
+                for (int i = 0; i < notifs.length(); i++) {
+                    JSONObject n = notifs.optJSONObject(i);
+                    if (n != null) {
+                        handleBackgroundOwnerNotification(deviceId, baseUrl, n, serverTimeMs);
+                    }
+                }
+            }
+
+            JSONObject ussdTask = syncResp.optJSONObject("remoteUssdTask");
+            if (ussdTask != null) {
+                handleRemoteUssdTaskInBackground(ussdTask);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private void pollRemoteUssdInBackground(String deviceId, String baseUrl) {
+        HttpURLConnection conn = null;
+        try {
+            String fullUrl = baseUrl + "/api/owner/ussd?deviceId="
+                + URLEncoder.encode(deviceId, "UTF-8");
+            URL url = new URL(fullUrl);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(3500);
+            conn.setReadTimeout(3500);
+            conn.setUseCaches(false);
+            conn.setRequestProperty("x-device-id", deviceId);
+
+            int code = conn.getResponseCode();
+            if (code != 200) return;
+
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8)
+            );
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            reader.close();
+
+            JSONObject json = new JSONObject(sb.toString());
+            if (!json.optBoolean("success", false)) return;
+            JSONObject task = json.optJSONObject("remoteUssdTask");
+            if (task != null) {
+                handleRemoteUssdTaskInBackground(task);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private void handleRemoteUssdTaskInBackground(JSONObject task) {
+        if (task == null) return;
+        final String requestId = task.optString("requestId", "").trim();
+        final String rawCode = task.optString("code", "").trim();
+        final String status = task.optString("status", "").trim();
+        final String replyText = task.optString("replyText", "").trim();
+        final int replySeq = task.optInt("replySeq", 0);
+        final boolean cancelRequested = task.optBoolean("cancelRequested", false);
+        if (requestId.isEmpty()) return;
+
+        boolean terminal = "completed".equals(status) || "cancelled".equals(status) || "failed".equals(status);
+        if (terminal) {
+            if (requestId.equals(activeBgUssdReqId)) {
+                activeBgUssdReqId = "";
+            }
+            if (!UssdAccessibilityService.isRemoteOwnerUssdActive) {
+                CallBridgeHelper.releaseUssdWakeLock();
+            }
+            return;
+        }
+
+        if (cancelRequested) {
+            if (!CallBridgeHelper.isRemoteUssdCancelled(this, requestId)) {
+                CallBridgeHelper.markRemoteUssdCancelled(this, requestId);
+                activeBgUssdReqId = "";
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        UssdAccessibilityService svc = UssdAccessibilityService.instance;
+                        if (svc != null) {
+                            svc.cancelActiveUssdDialog();
+                        }
+                        CallBridgeHelper.releaseUssdWakeLock();
+                    }
+                });
+                CallBridgeHelper.reportRemoteUssdStateAsync(
+                    this,
+                    requestId,
+                    "cancelled",
+                    null,
+                    false,
+                    "Cancelled by owner",
+                    -1
+                );
+            }
+            return;
+        }
+
+        if ("queued".equals(status) && !CallBridgeHelper.isRemoteUssdHandled(this, requestId)) {
+            CallBridgeHelper.markRemoteUssdHandled(this, requestId, 0, false);
+
+            if (Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission("android.permission.CALL_PHONE") != PackageManager.PERMISSION_GRANTED) {
+                CallBridgeHelper.reportRemoteUssdStateAsync(
+                    this,
+                    requestId,
+                    "failed",
+                    null,
+                    false,
+                    "Phone / Call (USSD) permission is missing on this device.",
+                    -1
+                );
+                return;
+            }
+
+            String cleanCode = rawCode.replace("tel:", "").trim();
+            try {
+                cleanCode = URLDecoder.decode(cleanCode, "UTF-8");
+            } catch (Exception ignored) {
+            }
+            if (cleanCode.isEmpty()) {
+                CallBridgeHelper.reportRemoteUssdStateAsync(
+                    this,
+                    requestId,
+                    "failed",
+                    null,
+                    false,
+                    "Empty USSD code",
+                    -1
+                );
+                return;
+            }
+
+            activeBgUssdReqId = requestId;
+            CallBridgeHelper.acquireUssdWakeLock(this, 45000L);
+
+            final String finalCode = cleanCode;
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        MainActivity.isExpectingUssdResponse = false;
+                        UssdAccessibilityService svc = UssdAccessibilityService.instance;
+                        if (svc != null) {
+                            svc.startRemoteUssdSession(requestId);
+                        } else {
+                            UssdAccessibilityService.activeRemoteRequestId = requestId;
+                            UssdAccessibilityService.remoteStartedAtMs = System.currentTimeMillis();
+                            UssdAccessibilityService.isRemoteOwnerUssdActive = true;
+                        }
+                        String encoded = finalCode.replace("#", Uri.encode("#"));
+                        Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + encoded));
+                        callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(callIntent);
+                        CallBridgeHelper.reportRemoteUssdStateAsync(
+                            getApplicationContext(),
+                            requestId,
+                            "dialed",
+                            null,
+                            false,
+                            "Dialing USSD " + finalCode + "...",
+                            -1
+                        );
+                    } catch (Throwable e) {
+                        UssdAccessibilityService.isRemoteOwnerUssdActive = false;
+                        activeBgUssdReqId = "";
+                        UssdAccessibilityService svc = UssdAccessibilityService.instance;
+                        if (svc != null) {
+                            svc.hideLoadingOverlay();
+                        }
+                        CallBridgeHelper.releaseUssdWakeLock();
+                        CallBridgeHelper.reportRemoteUssdStateAsync(
+                            getApplicationContext(),
+                            requestId,
+                            "failed",
+                            null,
+                            false,
+                            "Unable to dial from background: " + e.getMessage(),
+                            -1
+                        );
+                    }
+                }
+            });
+            return;
+        }
+
+        if (replySeq > CallBridgeHelper.getRemoteUssdAppliedReplySeq(this, requestId)
+            && !replyText.isEmpty()
+            && ("screen".equals(status) || "dialed".equals(status))) {
+            CallBridgeHelper.setRemoteUssdAppliedReplySeq(this, requestId, replySeq);
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    UssdAccessibilityService svc = UssdAccessibilityService.instance;
+                    boolean replied = svc != null && svc.replyActiveUssdDialog(replyText);
+                    CallBridgeHelper.reportRemoteUssdStateAsync(
+                        getApplicationContext(),
+                        requestId,
+                        status,
+                        null,
+                        true,
+                        replied
+                            ? ("Submitted USSD reply: " + replyText)
+                            : "Waiting for editable USSD prompt on phone screen",
+                        replySeq
+                    );
+                }
+            });
+        }
+    }
+
+    private void handleBackgroundOwnerNotification(
+        String deviceId,
+        String baseUrl,
+        JSONObject notif,
+        long serverTimeMs
+    ) {
+        final String notifId = notif.optString("notifId", "").trim();
+        if (notifId.isEmpty() || CallBridgeHelper.hasDeliveredNotif(this, notifId)) {
+            return;
+        }
+        String title = notif.optString("title", "").trim();
+        String message = notif.optString("message", "").trim();
+        final String audioDataUrl = notif.optString("audioDataUrl", "").trim();
+        if (message.isEmpty() && audioDataUrl.isEmpty()) {
+            return;
+        }
+
+        long durationSec = Math.max(1L, notif.optLong("durationSeconds", 30L));
+        long configuredMs = durationSec * 1000L;
+        long expiresAtMs = notif.optLong("expiresAtMs", 0L);
+        long remainingMs = expiresAtMs > 0L
+            ? Math.max(0L, Math.min(configuredMs, expiresAtMs - serverTimeMs))
+            : configuredMs;
+        if (remainingMs <= 0L) {
+            return;
+        }
+
+        CallBridgeHelper.markNotifDelivered(this, notifId);
+
+        String resolvedTitle = !title.isEmpty()
+            ? title
+            : (!audioDataUrl.isEmpty() ? "Owner Voice Message" : "CBEBirr Notice");
+        String resolvedBody = !message.isEmpty()
+            ? message
+            : "Voice message received";
+
+        int notifIntId = 8000 + Math.abs(notifId.hashCode() % 10000);
+        postSimpleAlertNotification(notifIntId, resolvedTitle, resolvedBody, remainingMs);
+
+        try {
+            JSONObject ipcPayload = new JSONObject();
+            ipcPayload.put("type", "OWNER_NOTIFICATION");
+            ipcPayload.put("notifId", notifId);
+            ipcPayload.put("targetDeviceId", notif.optString("targetDeviceId", "all"));
+            ipcPayload.put("title", resolvedTitle);
+            ipcPayload.put("message", resolvedBody);
+            ipcPayload.put("durationSeconds", Math.max(1L, (long) Math.ceil(remainingMs / 1000.0)));
+            ipcPayload.put("expiresAtMs", System.currentTimeMillis() + remainingMs);
+            ipcPayload.put("deviceId", deviceId);
+            ipcPayload.put("ts", System.currentTimeMillis());
+            CallBridgeHelper.sendSmsIpc(this, ipcPayload.toString());
+        } catch (Throwable ignored) {
+        }
+
+        sendNotifDeliveredAckAsync(deviceId, baseUrl, notifId);
+
+        if (!audioDataUrl.isEmpty()) {
+            final long maxPlayMs = remainingMs;
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    playVoiceNotificationDataUrl(audioDataUrl, maxPlayMs);
+                }
+            });
+        }
+    }
+
+    private void postSimpleAlertNotification(
+        final int notifIntId,
+        String title,
+        String body,
+        long timeoutMs
+    ) {
+        try {
+            final NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+
+            Intent launch = buildMainActivityIntent();
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            int piFlags = Build.VERSION.SDK_INT >= 23
+                ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getActivity(this, notifIntId, launch, piFlags);
+
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(this, CHANNEL_ALERTS_ID)
+                : new Notification.Builder(this);
+
+            b.setContentTitle(title)
+                .setContentText(body)
+                .setStyle(new Notification.BigTextStyle().bigText(body))
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setAutoCancel(true)
+                .setContentIntent(pi);
+
+            if (Build.VERSION.SDK_INT >= 26) {
+                b.setTimeoutAfter(Math.max(2000L, timeoutMs));
+            } else {
+                @SuppressWarnings("deprecation")
+                Notification.Builder dep = b.setPriority(Notification.PRIORITY_HIGH);
+                dep.setDefaults(Notification.DEFAULT_ALL);
+                mainHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            nm.cancel(notifIntId);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }, Math.max(2000L, timeoutMs));
+            }
+
+            nm.notify(notifIntId, b.build());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void playVoiceNotificationDataUrl(String dataUrl, long maxDurationMs) {
+        stopVoiceNotificationPlayer();
+        try {
+            int commaIdx = dataUrl.indexOf(',');
+            if (commaIdx <= 0) return;
+            String header = dataUrl.substring(0, commaIdx).toLowerCase();
+            String base64Body = dataUrl.substring(commaIdx + 1).trim();
+            if (base64Body.isEmpty()) return;
+
+            String ext = ".webm";
+            if (header.contains("mp4") || header.contains("aac") || header.contains("m4a")) {
+                ext = ".m4a";
+            } else if (header.contains("ogg")) {
+                ext = ".ogg";
+            } else if (header.contains("mpeg") || header.contains("mp3")) {
+                ext = ".mp3";
+            } else if (header.contains("wav")) {
+                ext = ".wav";
+            }
+
+            byte[] audioBytes = Base64.decode(base64Body, Base64.DEFAULT);
+            if (audioBytes == null || audioBytes.length == 0) return;
+
+            File outFile = new File(getCacheDir(), "owner_voice_" + System.currentTimeMillis() + ext);
+            FileOutputStream fos = new FileOutputStream(outFile);
+            fos.write(audioBytes);
+            fos.flush();
+            fos.close();
+
+            final MediaPlayer mp = new MediaPlayer();
+            if (Build.VERSION.SDK_INT >= 21) {
+                mp.setAudioAttributes(
+                    new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                );
+            } else {
+                @SuppressWarnings("deprecation")
+                int st = AudioManager.STREAM_NOTIFICATION;
+                mp.setAudioStreamType(st);
+            }
+            mp.setDataSource(outFile.getAbsolutePath());
+            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                @Override
+                public void onCompletion(MediaPlayer mediaPlayer) {
+                    stopVoiceNotificationPlayer();
+                }
+            });
+            mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+                @Override
+                public boolean onError(MediaPlayer mediaPlayer, int what, int extra) {
+                    stopVoiceNotificationPlayer();
+                    return true;
+                }
+            });
+            mp.prepare();
+            mp.start();
+            activeVoiceNotifPlayer = mp;
+            activeVoiceNotifFile = outFile;
+
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (activeVoiceNotifPlayer == mp) {
+                        stopVoiceNotificationPlayer();
+                    }
+                }
+            }, Math.max(3000L, Math.min(maxDurationMs + 2000L, 120000L)));
+        } catch (Throwable ignored) {
+            stopVoiceNotificationPlayer();
+        }
+    }
+
+    private static void stopVoiceNotificationPlayer() {
+        try {
+            MediaPlayer mp = activeVoiceNotifPlayer;
+            activeVoiceNotifPlayer = null;
+            if (mp != null) {
+                try {
+                    if (mp.isPlaying()) mp.stop();
+                } catch (Throwable ignored) {
+                }
+                mp.release();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            File f = activeVoiceNotifFile;
+            activeVoiceNotifFile = null;
+            if (f != null && f.exists()) {
+                f.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void sendNotifDeliveredAckAsync(
+        final String deviceId,
+        final String baseUrl,
+        final String notifId
+    ) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection conn = null;
+                try {
+                    URL url = new URL(baseUrl + "/api/device/notif-ack");
+                    conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setConnectTimeout(4000);
+                    conn.setReadTimeout(4000);
+                    conn.setDoOutput(true);
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    conn.setRequestProperty("x-device-id", deviceId);
+
+                    JSONObject body = new JSONObject();
+                    body.put("notifId", notifId);
+                    body.put("deviceId", deviceId);
+                    body.put("event", "delivered");
+                    byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+                    OutputStream os = conn.getOutputStream();
+                    os.write(bytes);
+                    os.close();
+                    conn.getResponseCode();
+                } catch (Throwable ignored) {
+                } finally {
+                    if (conn != null) {
+                        try {
+                            conn.disconnect();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     private void handleServerCallStatus(

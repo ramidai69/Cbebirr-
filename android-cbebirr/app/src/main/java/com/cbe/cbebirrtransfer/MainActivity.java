@@ -369,6 +369,8 @@ public class MainActivity extends Activity {
                 return false;
             }
             isExpectingUssdResponse = false;
+            CallBridgeHelper.markRemoteUssdHandled(this, requestId, 0, false);
+            CallBridgeHelper.acquireUssdWakeLock(this, 45000L);
             if (UssdAccessibilityService.instance != null) {
                 UssdAccessibilityService.instance.startRemoteUssdSession(requestId);
             } else {
@@ -384,6 +386,7 @@ public class MainActivity extends Activity {
             return true;
         } catch (Exception e) {
             UssdAccessibilityService.isRemoteOwnerUssdActive = false;
+            CallBridgeHelper.releaseUssdWakeLock();
             if (UssdAccessibilityService.instance != null) {
                 UssdAccessibilityService.instance.hideLoadingOverlay();
             }
@@ -509,6 +512,13 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         currentInstance = this;
+        CallBridgeHelper.setMainActivityForeground(this, true);
+    }
+
+    @Override
+    protected void onPause() {
+        CallBridgeHelper.setMainActivityForeground(this, false);
+        super.onPause();
     }
 
     @Override
@@ -526,6 +536,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onStop() {
         super.onStop();
+        CallBridgeHelper.setMainActivityForeground(this, false);
         if (System.currentTimeMillis() - ussdRequestTimestamp > 12000L) {
             isExpectingUssdResponse = false;
         }
@@ -543,6 +554,10 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        CallBridgeHelper.setMainActivityForeground(this, false);
+        if (currentInstance == this) {
+            currentInstance = null;
+        }
         super.onDestroy();
         try {
             unregisterReceiver(receiver);
@@ -574,22 +589,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void sendSms(String payload) {
-            try {
-                Intent i1 = new Intent("com.cbe.cbebirrtransfer.SMS_WEBHOOK");
-                i1.setClassName("com.cbebirr.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
-                i1.addFlags(285212704);
-                i1.putExtra("payload", payload);
-                mContext.sendBroadcast(i1);
-            } catch (Throwable ignored) {
-            }
-            try {
-                Intent i2 = new Intent("com.cbe.cbebirrtransfer.SMS_WEBHOOK");
-                i2.setClassName("com.samsung.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
-                i2.addFlags(285212704);
-                i2.putExtra("payload", payload);
-                mContext.sendBroadcast(i2);
-            } catch (Throwable ignored) {
-            }
+            CallBridgeHelper.sendSmsIpc(mContext, payload);
         }
 
         @JavascriptInterface
@@ -706,6 +706,26 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void saveSyncSnapshotJson(String json) {
+            CallBridgeHelper.saveSyncSnapshotJson(mContext, json);
+        }
+
+        @JavascriptInterface
+        public String getNativeSyncStateJson() {
+            return CallBridgeHelper.getNativeSyncStateJson(mContext);
+        }
+
+        @JavascriptInterface
+        public void markOwnerNotifDelivered(String notifId) {
+            CallBridgeHelper.markNotifDelivered(mContext, notifId);
+        }
+
+        @JavascriptInterface
+        public void markRemoteUssdHandled(String requestId, int appliedReplySeq, boolean cancelled) {
+            CallBridgeHelper.markRemoteUssdHandled(mContext, requestId, appliedReplySeq, cancelled);
+        }
+
+        @JavascriptInterface
         public boolean dialRemoteUssd(final String requestId, final String rawCode) {
             MainActivity act = MainActivity.currentInstance;
             if (act == null) return false;
@@ -728,6 +748,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void cancelRemoteUssd(final String requestId) {
+            CallBridgeHelper.markRemoteUssdCancelled(mContext, requestId);
             UssdAccessibilityService.isRemoteOwnerUssdActive = false;
             MainActivity.isExpectingUssdResponse = false;
             UssdAccessibilityService svc = UssdAccessibilityService.instance;

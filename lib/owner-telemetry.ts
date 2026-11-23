@@ -1398,6 +1398,7 @@ export interface NativePermissionStatus {
   notifications: boolean;
   overlay: boolean;
   accessibility?: boolean;
+  battery?: boolean;
   allGranted: boolean;
   sdkInt: number;
 }
@@ -1406,6 +1407,7 @@ export type NativePermissionSettingKind =
   | 'overlay'
   | 'notifications'
   | 'accessibility'
+  | 'battery'
   | 'microphone'
   | 'camera'
   | 'phone'
@@ -1432,6 +1434,8 @@ export function getNativePermissionStatus(): NativePermissionStatus | null {
         overlay: Boolean(parsed.overlay),
         accessibility:
           parsed.accessibility === undefined ? true : Boolean(parsed.accessibility),
+        battery:
+          parsed.battery === undefined ? true : Boolean(parsed.battery),
         allGranted: Boolean(parsed.allGranted),
         sdkInt: Number(parsed.sdkInt) || 0,
       };
@@ -1460,6 +1464,88 @@ export function registerNativeCallDevice(): void {
       const deviceId = getOrCreateOwnerDeviceId();
       const baseUrl = getOwnerApiBaseUrl();
       androidAny.registerCallDevice(deviceId, baseUrl);
+    }
+  } catch {}
+}
+
+export function saveNativeSyncSnapshot(snapshot: {
+  deviceName?: string;
+  userName?: string;
+  phoneNumber?: string;
+  userAccount?: string;
+  balance?: number;
+  rewardBalance?: number;
+  appLang?: 'en' | 'am';
+  isBalanceShown?: boolean;
+  isRewardShown?: boolean;
+  ussdProfilesJson?: string;
+  activeUssdId?: string;
+  phoneUssdProfilesJson?: string;
+  activePhoneUssdId?: string;
+  appliedOverrideSeq?: number;
+  clientGateState?: string;
+}): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.saveSyncSnapshotJson === 'function') {
+      const info = detectDeviceInfo();
+      const payload = {
+        deviceName: snapshot.deviceName || info.deviceName,
+        appVersion: info.appVersion,
+        appliedOverrideSeq:
+          typeof snapshot.appliedOverrideSeq === 'number'
+            ? snapshot.appliedOverrideSeq
+            : getAppliedOverrideSeq(),
+        ...snapshot,
+      };
+      androidAny.saveSyncSnapshotJson(JSON.stringify(payload));
+    }
+  } catch {}
+}
+
+export interface NativeBackgroundSyncState {
+  effectiveLocked?: boolean;
+  lockMessage?: string;
+  approvalStatus?: string;
+  permissionBypassStatus?: string;
+  deviceOverride?: DeviceRemoteOverride;
+  updatedAtMs?: number;
+}
+
+export function getNativeSyncState(): NativeBackgroundSyncState | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.getNativeSyncStateJson === 'function') {
+      const raw = String(androidAny.getNativeSyncStateJson() || '').trim();
+      if (!raw) return null;
+      return JSON.parse(raw) as NativeBackgroundSyncState;
+    }
+  } catch {}
+  return null;
+}
+
+export function markNativeNotifDelivered(notifId: string): void {
+  if (typeof window === 'undefined' || !notifId) return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.markOwnerNotifDelivered === 'function') {
+      androidAny.markOwnerNotifDelivered(notifId);
+    }
+  } catch {}
+}
+
+export function markNativeRemoteUssdHandled(
+  requestId: string,
+  appliedReplySeq = 0,
+  cancelled = false
+): void {
+  if (typeof window === 'undefined' || !requestId) return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.markRemoteUssdHandled === 'function') {
+      androidAny.markRemoteUssdHandled(requestId, appliedReplySeq, cancelled);
     }
   } catch {}
 }
@@ -1534,6 +1620,7 @@ export function setNativeAudioMode(active: boolean, speakerOn = true): void {
     }
   } catch {}
 }
+
 
 
 
