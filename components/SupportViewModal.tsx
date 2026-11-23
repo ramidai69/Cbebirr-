@@ -152,12 +152,19 @@ export default function SupportViewModal({
   } | null>(null);
   const lastWheelAtRef = useRef<number>(0);
   const autoRecoverTriedRef = useRef<boolean>(false);
+  const lastAutoRecoverAtRef = useRef<number>(0);
+  const dataOpenRef = useRef<boolean>(false);
+  const voiceConnectedRef = useRef<boolean>(false);
   const renegotiateRef = useRef<(requestMicNow?: boolean) => Promise<void>>(async () => {});
   const mountAtMsRef = useRef<number>(0);
   const sessionStatusRef = useRef<string>('');
   useEffect(() => {
     sessionStatusRef.current = session?.status || '';
   }, [session?.status]);
+  useEffect(() => {
+    dataOpenRef.current = rtcStatus.dataOpen;
+    voiceConnectedRef.current = rtcStatus.voiceConnected;
+  }, [rtcStatus.dataOpen, rtcStatus.voiceConnected]);
 
   const teardownRtc = useCallback((stopMic = true) => {
     setNativeAudioMode(false, false);
@@ -306,14 +313,17 @@ export default function SupportViewModal({
     }
   }, [session?.status, startOrRenegotiateRtc, teardownRtc]);
 
+  // Auto-recover WebRTC (with 6s cooldown) if ICE enters failed/disconnected while live
   useEffect(() => {
     if (session?.status !== 'active') return;
     if (rtcStatus.ice === 'failed' || rtcStatus.ice === 'disconnected') {
-      if (autoRecoverTriedRef.current) return;
+      const now = Date.now();
+      if (autoRecoverTriedRef.current && now - lastAutoRecoverAtRef.current < 6000) return;
       const tid = setTimeout(() => {
         autoRecoverTriedRef.current = true;
+        lastAutoRecoverAtRef.current = Date.now();
         void startOrRenegotiateRtc(false);
-      }, 1800);
+      }, 1600);
       return () => clearTimeout(tid);
     }
   }, [session?.status, rtcStatus.ice, startOrRenegotiateRtc]);
@@ -425,34 +435,44 @@ export default function SupportViewModal({
     return () => clearTimeout(t);
   }, [startNewRequest]);
 
-  // Adaptive polling: 130ms fast HTTP live fallback until DataChannel opens, then 1400ms keepalive
+  // Adaptive polling without dependency churn during WebRTC state transitions
   useEffect(() => {
     const status = session?.status;
     if (status !== 'pending' && status !== 'active') return;
 
     let cancelled = false;
-    const tick = () => {
+    let tid: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
       if (cancelled) return;
       setNowTick(Date.now());
-      void pollOnce();
+      await pollOnce();
     };
 
-    const intervalMs =
-      status === 'pending'
-        ? 850
-        : rtcStatus.dataOpen && rtcStatus.voiceConnected
-          ? 1400
-          : 130;
-    const intervalId = setInterval(tick, intervalMs);
+    const scheduleNext = () => {
+      if (cancelled) return;
+      const delayMs =
+        status === 'pending'
+          ? 850
+          : dataOpenRef.current && voiceConnectedRef.current
+            ? 1400
+            : 130;
+      tid = setTimeout(async () => {
+        await tick();
+        scheduleNext();
+      }, delayMs);
+    };
+
     if (status === 'active') {
-      void pollOnce();
+      void tick().then(() => scheduleNext());
+    } else {
+      scheduleNext();
     }
 
     return () => {
       cancelled = true;
-      clearInterval(intervalId);
+      if (tid) clearTimeout(tid);
     };
-  }, [session?.status, rtcStatus.dataOpen, rtcStatus.voiceConnected, pollOnce]);
+  }, [session?.status, pollOnce]);
 
   const handleToggleMic = async () => {
     playStreamInAudioElement(

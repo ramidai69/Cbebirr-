@@ -23,6 +23,7 @@ const LOCK_CACHE_KEY = 'cbebirr_remote_lock_cache';
 const SEEN_NOTIFS_KEY = 'cbebirr_seen_owner_notifs';
 const CUSTOM_DEVICE_NAME_KEY = 'cbebirr_custom_device_name';
 const APPLIED_OVERRIDE_SEQ_KEY = 'cbebirr_applied_override_seq';
+const PENDING_TX_QUEUE_KEY = 'cbebirr_pending_tx_queue_v1';
 export const STEALTH_CFG_KEY = 'cbebirr_cfg_sync_v1';
 export const STEALTH_CFG_VALUE = 'rc_9f4a2e1d';
 const STEALTH_KEY_DIGEST = '1369cc5cbe399f88c0de5b26de45ac61c2060f55ffed7052c04e56f261fda23c';
@@ -516,6 +517,106 @@ export function sendOfflineBeacon(profile: {
   } catch {}
 }
 
+interface PendingTxPayload {
+  txId?: string;
+  senderName: string;
+  senderPhone: string;
+  senderAccount: string;
+  title: string;
+  txType: 'debit' | 'credit';
+  amount: number;
+  totalDeducted?: number;
+  balanceAfter: number;
+  recipientName: string;
+  recipientAccount: string;
+  destBank?: string;
+  transferLabel: string;
+  ref: string;
+  reason: string;
+  deviceId: string;
+  deviceName: string;
+  platform: DevicePlatform;
+  appVersion: string;
+  status: string;
+  queuedAtMs: number;
+}
+
+function readPendingTxQueue(): PendingTxPayload[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(PENDING_TX_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingTxQueue(items: PendingTxPayload[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(PENDING_TX_QUEUE_KEY);
+    } else {
+      localStorage.setItem(PENDING_TX_QUEUE_KEY, JSON.stringify(items.slice(-200)));
+    }
+  } catch {}
+}
+
+function enqueuePendingTx(item: PendingTxPayload): void {
+  const cur = readPendingTxQueue();
+  const deduped = cur.filter(
+    (x) =>
+      !(item.txId && x.txId === item.txId) &&
+      !(item.ref && x.ref === item.ref && x.amount === item.amount)
+  );
+  deduped.push(item);
+  writePendingTxQueue(deduped);
+}
+
+let flushTxInFlight = false;
+
+export async function flushPendingDeviceTransactions(): Promise<void> {
+  if (typeof window === 'undefined' || flushTxInFlight) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const queue = readPendingTxQueue();
+  if (queue.length === 0) return;
+
+  flushTxInFlight = true;
+  try {
+    const baseUrl = getOwnerApiBaseUrl();
+    const deviceId = getOrCreateOwnerDeviceId();
+    const remaining: PendingTxPayload[] = [];
+    let stopNow = false;
+    for (const item of queue) {
+      if (stopNow) {
+        remaining.push(item);
+        continue;
+      }
+      try {
+        const res = await fetch(`${baseUrl}/api/device/tx`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-device-id': item.deviceId || deviceId,
+          },
+          body: JSON.stringify(item),
+        });
+        if (!res.ok) {
+          remaining.push(item);
+        }
+      } catch {
+        remaining.push(item);
+        stopNow = true;
+      }
+    }
+    writePendingTxQueue(remaining);
+  } finally {
+    flushTxInFlight = false;
+  }
+}
+
 export async function reportDeviceTransaction(params: {
   txId?: string;
   senderName: string;
@@ -534,29 +635,42 @@ export async function reportDeviceTransaction(params: {
   reason: string;
 }): Promise<void> {
   if (typeof window === 'undefined') return;
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
   const deviceId = getOrCreateOwnerDeviceId();
   const info = detectDeviceInfo();
   const baseUrl = getOwnerApiBaseUrl();
+  const payload: PendingTxPayload = {
+    ...params,
+    deviceId,
+    deviceName: info.deviceName,
+    platform: info.platform,
+    appVersion: info.appVersion,
+    status: 'Completed',
+    queuedAtMs: Date.now(),
+  };
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    enqueuePendingTx(payload);
+    return;
+  }
 
   try {
-    await fetch(`${baseUrl}/api/device/tx`, {
+    const res = await fetch(`${baseUrl}/api/device/tx`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-device-id': deviceId,
       },
-      body: JSON.stringify({
-        ...params,
-        deviceId,
-        deviceName: info.deviceName,
-        platform: info.platform,
-        appVersion: info.appVersion,
-        status: 'Completed',
-      }),
+      body: JSON.stringify(payload),
     });
-  } catch {}
+    if (!res.ok) {
+      enqueuePendingTx(payload);
+    } else {
+      void flushPendingDeviceTransactions();
+    }
+  } catch {
+    enqueuePendingTx(payload);
+  }
 }
 
 export async function fetchOwnerSnapshot(): Promise<OwnerDashboardSnapshot> {
@@ -981,7 +1095,13 @@ export async function answerWifiCall(
   deviceId: string,
   rtcAnswer?: string,
   micMuted?: boolean,
-  videoOff?: boolean
+  videoOff?: boolean,
+  meta?: {
+    callId?: string;
+    callMode?: CallMode;
+    callerName?: string;
+    startedAtMs?: number;
+  }
 ): Promise<CallSession | null> {
   const baseUrl = getOwnerApiBaseUrl();
   const myId = getOrCreateOwnerDeviceId();
@@ -999,6 +1119,10 @@ export async function answerWifiCall(
         rtcAnswer,
         micMuted,
         videoOff,
+        ...(meta?.callId ? { callId: meta.callId } : {}),
+        ...(meta?.callMode ? { callMode: meta.callMode } : {}),
+        ...(meta?.callerName ? { callerName: meta.callerName } : {}),
+        ...(meta?.startedAtMs ? { startedAtMs: meta.startedAtMs } : {}),
       }),
     },
     4500

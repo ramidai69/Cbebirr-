@@ -1769,6 +1769,128 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   };
 }
 
+export async function importOwnerSnapshot(raw: unknown): Promise<{
+  importedDevices: number;
+  importedTransactions: number;
+  snapshot: OwnerDashboardSnapshot;
+}> {
+  loadFromDisk();
+  await syncFromFirestoreIfAvailable(true);
+  const nowMs = Date.now();
+  const data = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const rawDevices = Array.isArray(data.devices) ? data.devices : [];
+  const rawTxns = Array.isArray(data.transactions) ? data.transactions : [];
+
+  let importedDevices = 0;
+  let importedTransactions = 0;
+  const fsWrites: Promise<unknown>[] = [];
+
+  for (const item of rawDevices.slice(0, 1000)) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const deviceId = sanitizeId(String(rec.deviceId || ''));
+    if (!deviceId) continue;
+    const hydrated = hydrateDeviceDoc(rec, deviceId);
+    const existing = state.devices.get(deviceId);
+    const merged: DeviceClient = existing
+      ? {
+          ...existing,
+          ...hydrated,
+          balance:
+            (hydrated.updatedAtMs || 0) >= (existing.updatedAtMs || 0)
+              ? hydrated.balance
+              : existing.balance,
+          updatedAtMs: Math.max(hydrated.updatedAtMs || 0, existing.updatedAtMs || 0),
+          lastSeenAtMs: Math.max(hydrated.lastSeenAtMs || 0, existing.lastSeenAtMs || 0),
+        }
+      : hydrated;
+    state.devices.set(deviceId, merged);
+    importedDevices += 1;
+    fsWrites.push(
+      fsSetDocument('devices', deviceId, {
+        ...merged,
+        ownerId: SYSTEM_OWNER_ID,
+        createdAt: new Date(merged.createdAtMs || nowMs),
+        updatedAt: new Date(merged.updatedAtMs || nowMs),
+      }).catch(() => {})
+    );
+  }
+
+  for (const item of rawTxns.slice(0, 2500)) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const txId = sanitizeId(String(rec.txId || ''));
+    const deviceId = sanitizeId(String(rec.deviceId || ''));
+    if (!txId || !deviceId) continue;
+    const tx: DeviceTransaction = {
+      txId,
+      deviceId,
+      deviceName: clampStr(rec.deviceName, 120, 'Android Device'),
+      senderName: clampStr(rec.senderName, 120, ''),
+      senderPhone: clampStr(rec.senderPhone, 32, ''),
+      senderAccount: clampStr(rec.senderAccount, 64, ''),
+      title: clampStr(rec.title, 160, 'Transfer'),
+      txType: rec.txType === 'credit' ? 'credit' : 'debit',
+      amount: safeNum(rec.amount, 0),
+      totalDeducted:
+        rec.totalDeducted !== undefined
+          ? safeNum(rec.totalDeducted, safeNum(rec.amount, 0))
+          : safeNum(rec.amount, 0),
+      balanceAfter: safeNum(rec.balanceAfter, 0),
+      recipientName: clampStr(rec.recipientName, 120, ''),
+      recipientAccount: clampStr(rec.recipientAccount, 64, ''),
+      ...(rec.destBank ? { destBank: clampStr(rec.destBank, 80, '') } : {}),
+      transferLabel: clampStr(rec.transferLabel, 80, ''),
+      ref: clampStr(rec.ref, 64, ''),
+      reason: clampStr(rec.reason, 200, ''),
+      status:
+        rec.status === 'Pending' || rec.status === 'Failed' || rec.status === 'Completed'
+          ? rec.status
+          : 'Completed',
+      createdAtMs: safeNum(rec.createdAtMs, nowMs),
+    };
+    state.transactions.set(txId, tx);
+    importedTransactions += 1;
+    fsWrites.push(
+      fsSetDocument('device_transactions', txId, {
+        ...tx,
+        ownerId: SYSTEM_OWNER_ID,
+        createdAt: new Date(tx.createdAtMs || nowMs),
+      }).catch(() => {})
+    );
+  }
+
+  const rawCfg = data.globalConfig;
+  if (rawCfg && typeof rawCfg === 'object') {
+    const cfg = rawCfg as Record<string, unknown>;
+    const cfgUpdated = safeNum(cfg.updatedAtMs, 0);
+    if (cfgUpdated > state.globalConfig.updatedAtMs) {
+      state.globalConfig = {
+        configId: 'global',
+        globalLocked: Boolean(cfg.globalLocked),
+        globalLockMessage: clampStr(cfg.globalLockMessage, 240, DEFAULT_GLOBAL_CONFIG.globalLockMessage),
+        updatedBy: cfg.updatedBy === 'telegram' ? 'telegram' : 'app_0069',
+        updatedAtMs: cfgUpdated,
+      };
+      fsWrites.push(
+        fsSetDocument('owner_config', 'global', {
+          ...state.globalConfig,
+          ownerId: SYSTEM_OWNER_ID,
+          createdAt: new Date(nowMs),
+          updatedAt: new Date(nowMs),
+        }).catch(() => {})
+      );
+    }
+  }
+
+  saveToDisk();
+  if (fsWrites.length > 0) {
+    await Promise.all(fsWrites.slice(0, 80)).catch(() => {});
+  }
+  const snapshot = await getOwnerDashboardSnapshot(false);
+  return { importedDevices, importedTransactions, snapshot };
+}
+
 // ---------- Transparent Consent-Based Support View Helpers ----------
 
 function buildSupportSessionId(deviceId: string): string {
@@ -2480,6 +2602,10 @@ export async function startCallSession(
 export async function answerCallSession(
   deviceIdInput: string,
   input?: {
+    callId?: string;
+    callMode?: CallMode;
+    callerName?: string;
+    startedAtMs?: number;
     rtcAnswer?: string;
     rtcSeq?: number;
     micMuted?: boolean;
@@ -2488,12 +2614,58 @@ export async function answerCallSession(
 ): Promise<CallSession | null> {
   const deviceId = sanitizeId(deviceIdInput);
   const current = await getCallSession(deviceId, true, { includeSignal: true });
-  if (!current || (current.status !== 'ringing' && current.status !== 'active')) {
+  const nowMs = Date.now();
+  const cleanAnswer = sanitizeSdpJson(input?.rtcAnswer);
+
+  if (!current) {
+    // Reconstruct active call session across serverless container cold starts / local-cache split-brain
+    if (!input?.callId && !cleanAnswer) {
+      return null;
+    }
+    const dev = state.devices.get(deviceId) || null;
+    const resolvedMode: CallMode = input?.callMode === 'video' ? 'video' : 'audio';
+    const reconstructed: CallSession = {
+      callId: sanitizeId(input?.callId || buildCallSessionId(deviceId)),
+      deviceId,
+      deviceName: dev?.deviceName || 'Android Device',
+      callerRole: 'ram_control',
+      callerName: clampStr(
+        input?.callerName,
+        80,
+        resolvedMode === 'video' ? 'Owner Video Call' : 'Owner Wi-Fi Call'
+      ),
+      callMode: resolvedMode,
+      status: 'active',
+      rtcSeq:
+        typeof input?.rtcSeq === 'number' && Number.isFinite(input.rtcSeq) && input.rtcSeq > 0
+          ? Math.round(input.rtcSeq)
+          : cleanAnswer
+            ? 1
+            : 0,
+      rtcOffer: '',
+      rtcAnswer: cleanAnswer,
+      ownerMicMuted: false,
+      clientMicMuted: Boolean(input?.micMuted),
+      ownerVideoOff: false,
+      clientVideoOff: typeof input?.videoOff === 'boolean' ? input.videoOff : resolvedMode !== 'video',
+      startedAtMs:
+        typeof input?.startedAtMs === 'number' && Number.isFinite(input.startedAtMs) && input.startedAtMs > 0
+          ? input.startedAtMs
+          : nowMs,
+      answeredAtMs: nowMs,
+      expiresAtMs: nowMs + 30 * 60_000,
+      updatedAtMs: nowMs,
+    };
+    state.callSessions.set(deviceId, reconstructed);
+    saveToDisk();
+    await saveCallSessionToFirestore(reconstructed);
+    return reconstructed;
+  }
+
+  if (current.status !== 'ringing' && current.status !== 'active') {
     return current;
   }
 
-  const nowMs = Date.now();
-  const cleanAnswer = sanitizeSdpJson(input?.rtcAnswer);
   const next: CallSession = {
     ...current,
     status: 'active',

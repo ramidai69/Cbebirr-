@@ -4,6 +4,7 @@ import {
   clearNotificationsHistory,
   createOwnerNotification,
   getOwnerDashboardSnapshot,
+  importOwnerSnapshot,
   removeDeviceRecord,
   setDeviceApproval,
   setDeviceLock,
@@ -293,6 +294,11 @@ export async function POST(req: NextRequest) {
     if (action === 'clear_notifications') {
       await clearNotificationsHistory();
       return NextResponse.json({ success: true }, { headers: CORS_HEADERS });
+    }
+
+    if (action === 'import_snapshot') {
+      const result = await importOwnerSnapshot(body.snapshot || body);
+      return NextResponse.json({ success: true, ...result }, { headers: CORS_HEADERS });
     }
 
     return NextResponse.json(

@@ -212,8 +212,27 @@ export function playStreamInAudioElement(
       audioEl.srcObject = stream;
     }
 
+    const unlockAudioContext = () => {
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) return;
+        const winHolder = window as unknown as { __cbeSharedAudioCtx?: AudioContext };
+        if (!winHolder.__cbeSharedAudioCtx) {
+          winHolder.__cbeSharedAudioCtx = new AudioCtx();
+        }
+        if (winHolder.__cbeSharedAudioCtx.state === 'suspended') {
+          void winHolder.__cbeSharedAudioCtx.resume().catch(() => {});
+        }
+      } catch {}
+    };
+
     const tryPlay = () => {
       try {
+        if (!speakerMuted) {
+          unlockAudioContext();
+        }
         audioEl.muted = speakerMuted;
         audioEl.volume = 1.0;
         const p = audioEl.play();
@@ -225,6 +244,8 @@ export function playStreamInAudioElement(
     tryPlay();
     audioEl.onloadedmetadata = tryPlay;
     audioEl.oncanplay = tryPlay;
+    audioEl.onstalled = tryPlay;
+    audioEl.onsuspend = tryPlay;
   } else {
     const holder = audioEl as HTMLAudioElement & {
       __cbeAudioSig?: string;
@@ -471,7 +492,7 @@ export class LiveRtcPeer {
     return pc;
   }
 
-  private waitForIceGathering(pc: RTCPeerConnection, maxWaitMs = 1500): Promise<void> {
+  private waitForIceGathering(pc: RTCPeerConnection, maxWaitMs = 2200): Promise<void> {
     if (pc.iceGatheringState === 'complete') {
       return Promise.resolve();
     }
@@ -499,7 +520,7 @@ export class LiveRtcPeer {
           (e.candidate.type === 'srflx' || e.candidate.type === 'relay') &&
           !srflxGraceTimer
         ) {
-          srflxGraceTimer = setTimeout(done, 550);
+          srflxGraceTimer = setTimeout(done, 650);
         }
       };
       const hardTimeout = setTimeout(done, maxWaitMs);
@@ -549,7 +570,7 @@ export class LiveRtcPeer {
       ...(includeVideo ? { offerToReceiveVideo: true } : {}),
     });
     await pc.setLocalDescription(offer);
-    await this.waitForIceGathering(pc, 1500);
+    await this.waitForIceGathering(pc, 2200);
 
     const sdp = pc.localDescription?.sdp || offer.sdp || '';
     this.emitStatus();
@@ -611,7 +632,7 @@ export class LiveRtcPeer {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    await this.waitForIceGathering(pc, 1500);
+    await this.waitForIceGathering(pc, 2200);
 
     const sdp = pc.localDescription?.sdp || answer.sdp || '';
     this.emitStatus();

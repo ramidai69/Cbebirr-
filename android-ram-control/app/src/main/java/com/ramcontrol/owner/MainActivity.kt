@@ -13,7 +13,9 @@ import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
@@ -38,14 +40,25 @@ class MainActivity : AppCompatActivity() {
     private var pendingWebPermissionRequest: PermissionRequest? = null
 
     private val webPermissionsLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
             val pending = pendingWebPermissionRequest
             pendingWebPermissionRequest = null
             if (pending != null) {
                 try {
-                    val allOk = results.isNotEmpty() && results.values.all { it }
-                    if (allOk) {
-                        pending.grant(pending.resources)
+                    val requested = pending.resources ?: emptyArray()
+                    val granted = mutableListOf<String>()
+                    if (requested.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE) &&
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        granted.add(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+                    }
+                    if (requested.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE) &&
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        granted.add(PermissionRequest.RESOURCE_VIDEO_CAPTURE)
+                    }
+                    if (granted.isNotEmpty()) {
+                        pending.grant(granted.toTypedArray())
                     } else {
                         pending.deny()
                     }
@@ -220,6 +233,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var focusReq: AudioFocusRequest? = null
+    private var callWakeLock: PowerManager.WakeLock? = null
+
+    private fun releaseCallWakeLock() {
+        try {
+            callWakeLock?.let { wl ->
+                if (wl.isHeld) wl.release()
+            }
+        } catch (_: Throwable) {
+        }
+        callWakeLock = null
+    }
+
+    override fun onDestroy() {
+        releaseCallWakeLock()
+        super.onDestroy()
+    }
 
     inner class RamAudioBridge {
         @JavascriptInterface
@@ -228,6 +257,19 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return@runOnUiThread
                     if (active) {
+                        try {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                            if (pm != null) {
+                                if (callWakeLock == null) {
+                                    callWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RamControl:CallAudio")
+                                }
+                                if (callWakeLock?.isHeld == false) {
+                                    callWakeLock?.acquire(60 * 60 * 1000L)
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                             val req = focusReq ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                                 .setAudioAttributes(
@@ -270,6 +312,11 @@ class MainActivity : AppCompatActivity() {
                         } catch (_: Throwable) {
                         }
                     } else {
+                        try {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } catch (_: Throwable) {
+                        }
+                        releaseCallWakeLock()
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                             try {
                                 am.clearCommunicationDevice()

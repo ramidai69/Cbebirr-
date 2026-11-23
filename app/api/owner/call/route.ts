@@ -127,6 +127,10 @@ export async function POST(req: NextRequest) {
         );
       }
       const callSession = await answerCallSession(deviceId, {
+        callId: typeof body.callId === 'string' ? body.callId : undefined,
+        callMode: body.callMode === 'video' ? 'video' : body.callMode === 'audio' ? 'audio' : undefined,
+        callerName: typeof body.callerName === 'string' ? body.callerName : undefined,
+        startedAtMs: typeof body.startedAtMs === 'number' ? body.startedAtMs : undefined,
         rtcAnswer: typeof body.rtcAnswer === 'string' ? body.rtcAnswer : undefined,
         rtcSeq: typeof body.rtcSeq === 'number' ? body.rtcSeq : undefined,
         micMuted: typeof body.micMuted === 'boolean' ? body.micMuted : undefined,

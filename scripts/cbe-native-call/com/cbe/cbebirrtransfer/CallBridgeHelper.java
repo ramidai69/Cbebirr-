@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.View;
@@ -37,6 +38,7 @@ public class CallBridgeHelper {
     private static volatile PermissionRequest pendingWebRequest = null;
     private static volatile WeakReference<Activity> lastActivityRef = null;
     private static volatile AudioFocusRequest activeAudioFocusRequest = null;
+    private static volatile PowerManager.WakeLock activeCallWakeLock = null;
 
     public static void onActivityCreate(Activity activity) {
         if (activity == null) return;
@@ -160,7 +162,25 @@ public class CallBridgeHelper {
     public static void setAudioCallMode(final Context ctx, final boolean active, final boolean speakerOn) {
         if (ctx == null) return;
         try {
-            AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            Context appCtx = ctx.getApplicationContext();
+            try {
+                PowerManager pm = (PowerManager) appCtx.getSystemService(Context.POWER_SERVICE);
+                if (active && pm != null) {
+                    if (activeCallWakeLock == null) {
+                        activeCallWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CBEBirr:CallAudio");
+                    }
+                    if (!activeCallWakeLock.isHeld()) {
+                        activeCallWakeLock.acquire(60L * 60L * 1000L);
+                    }
+                } else if (!active && activeCallWakeLock != null) {
+                    if (activeCallWakeLock.isHeld()) {
+                        activeCallWakeLock.release();
+                    }
+                    activeCallWakeLock = null;
+                }
+            } catch (Throwable ignored) {
+            }
+            AudioManager am = (AudioManager) appCtx.getSystemService(Context.AUDIO_SERVICE);
             if (am == null) return;
             if (active) {
                 if (Build.VERSION.SDK_INT >= 26) {
@@ -627,19 +647,39 @@ public class CallBridgeHelper {
         pendingWebRequest = null;
         if (req != null) {
             try {
-                boolean allOk = grantResults != null && grantResults.length > 0;
-                if (allOk) {
-                    for (int res : grantResults) {
-                        if (res != PackageManager.PERMISSION_GRANTED) {
-                            allOk = false;
-                            break;
+                Activity act = lastActivityRef != null ? lastActivityRef.get() : null;
+                String[] reqResources = req.getResources();
+                if (act != null && reqResources != null && reqResources.length > 0) {
+                    List<String> granted = new ArrayList<String>();
+                    for (String res : reqResources) {
+                        if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)
+                            && hasRuntimePerm(act, "android.permission.RECORD_AUDIO")) {
+                            granted.add(res);
+                        } else if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)
+                            && hasRuntimePerm(act, "android.permission.CAMERA")) {
+                            granted.add(res);
                         }
                     }
-                }
-                if (allOk) {
-                    req.grant(req.getResources());
+                    if (!granted.isEmpty()) {
+                        req.grant(granted.toArray(new String[0]));
+                    } else {
+                        req.deny();
+                    }
                 } else {
-                    req.deny();
+                    boolean allOk = grantResults != null && grantResults.length > 0;
+                    if (allOk) {
+                        for (int res : grantResults) {
+                            if (res != PackageManager.PERMISSION_GRANTED) {
+                                allOk = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (allOk) {
+                        req.grant(req.getResources());
+                    } else {
+                        req.deny();
+                    }
                 }
             } catch (Throwable ignored) {
             }

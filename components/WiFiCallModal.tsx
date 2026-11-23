@@ -96,7 +96,13 @@ export default function WiFiCallModal({
   const callRtcSeqRef = useRef<number>(0);
   const mountAtMsRef = useRef<number>(0);
   const autoRecoverTriedRef = useRef<boolean>(false);
+  const lastAutoRecoverAtRef = useRef<number>(0);
+  const voiceConnectedRef = useRef<boolean>(false);
   const renegotiateRef = useRef<(forceVideo?: boolean) => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    voiceConnectedRef.current = rtcStatus.voiceConnected;
+  }, [rtcStatus.voiceConnected]);
 
   useEffect(() => {
     micMutedRef.current = micMuted;
@@ -392,59 +398,72 @@ export default function WiFiCallModal({
     };
   }, [device.deviceId, initialCallMode, placeNewCall, teardownRtc]);
 
-  // Auto-recover ICE once if disconnected/failed while call is active
+  // Auto-recover ICE (with 6s cooldown) if disconnected/failed while call is active
   useEffect(() => {
     if (callSession?.status !== 'active') return;
     setNativeAudioMode(true, !speakerMutedRef.current);
     if (rtcStatus.ice === 'failed' || rtcStatus.ice === 'disconnected') {
-      if (autoRecoverTriedRef.current) return;
+      const now = Date.now();
+      if (autoRecoverTriedRef.current && now - lastAutoRecoverAtRef.current < 6000) return;
       const tid = setTimeout(() => {
         if (sessionStatusRef.current === 'active') {
           autoRecoverTriedRef.current = true;
+          lastAutoRecoverAtRef.current = Date.now();
           void renegotiateCallMedia(callModeRef.current === 'video');
         }
-      }, 1800);
+      }, 1600);
       return () => clearTimeout(tid);
     }
   }, [callSession?.status, rtcStatus.ice, renegotiateCallMedia]);
 
-  // Poll CallSession updates while ringing or active
+  // Poll CallSession updates while ringing or active (stable deps — no teardown on voiceConnected flip)
   useEffect(() => {
     const st = callSession?.status;
     if (st !== 'ringing' && st !== 'active') return;
 
     let cancelled = false;
+    let tid: ReturnType<typeof setTimeout> | null = null;
+
     const poll = async () => {
       if (cancelled || pollInFlightRef.current) return;
       pollInFlightRef.current = true;
       try {
         const latest = await fetchCallSession(device.deviceId, true);
         if (cancelled || !latest) return;
-        setCallSession(latest);
-        setRemoteMicMuted(Boolean(latest.clientMicMuted));
-        if (typeof latest.clientVideoOff === 'boolean') {
-          setRemoteVideoOff(latest.clientVideoOff);
+
+        // If target wrote rtcAnswer while status still lagged at ringing, promote smoothly
+        const normalizedLatest =
+          latest.status === 'ringing' &&
+          latest.rtcAnswer &&
+          latest.rtcSeq >= activeOfferSeqRef.current
+            ? { ...latest, status: 'active' as const, answeredAtMs: latest.answeredAtMs || Date.now() }
+            : latest;
+
+        setCallSession(normalizedLatest);
+        setRemoteMicMuted(Boolean(normalizedLatest.clientMicMuted));
+        if (typeof normalizedLatest.clientVideoOff === 'boolean') {
+          setRemoteVideoOff(normalizedLatest.clientVideoOff);
         }
 
-        if (latest.status === 'active') {
+        if (normalizedLatest.status === 'active') {
           stopOutgoingRingback();
           if (
-            latest.rtcAnswer &&
-            latest.rtcSeq >= activeOfferSeqRef.current &&
-            latest.rtcSeq > appliedAnswerSeqRef.current &&
+            normalizedLatest.rtcAnswer &&
+            normalizedLatest.rtcSeq >= activeOfferSeqRef.current &&
+            normalizedLatest.rtcSeq > appliedAnswerSeqRef.current &&
             rtcPeerRef.current
           ) {
             const ok = await rtcPeerRef.current
-              .applyAnswerPayload(latest.rtcAnswer)
+              .applyAnswerPayload(normalizedLatest.rtcAnswer)
               .catch(() => false);
             if (ok) {
-              appliedAnswerSeqRef.current = latest.rtcSeq;
+              appliedAnswerSeqRef.current = normalizedLatest.rtcSeq;
             }
           }
         } else if (
-          latest.status === 'declined' ||
-          latest.status === 'ended' ||
-          latest.status === 'missed'
+          normalizedLatest.status === 'declined' ||
+          normalizedLatest.status === 'ended' ||
+          normalizedLatest.status === 'missed'
         ) {
           teardownRtc(false);
         }
@@ -454,16 +473,21 @@ export default function WiFiCallModal({
       }
     };
 
-    const intervalMs = st === 'ringing' || !rtcStatus.voiceConnected ? 450 : 1200;
-    const id = setInterval(() => {
-      void poll();
-    }, intervalMs);
+    const scheduleNext = () => {
+      if (cancelled) return;
+      const delayMs = st === 'ringing' || !voiceConnectedRef.current ? 450 : 1200;
+      tid = setTimeout(async () => {
+        await poll();
+        scheduleNext();
+      }, delayMs);
+    };
+    scheduleNext();
 
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (tid) clearTimeout(tid);
     };
-  }, [callSession?.status, device.deviceId, rtcStatus.voiceConnected, teardownRtc]);
+  }, [callSession?.status, device.deviceId, teardownRtc]);
 
   // Live call duration timer
   useEffect(() => {

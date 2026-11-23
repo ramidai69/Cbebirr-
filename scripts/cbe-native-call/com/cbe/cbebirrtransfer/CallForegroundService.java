@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -58,6 +59,39 @@ public class CallForegroundService extends Service {
     private static volatile long lastDeclinedAtMs = 0L;
     private static volatile String lastSuppressedCallKey = "";
     private static volatile long lastSuppressedAtMs = 0L;
+    private static volatile String activeCallerName = "Owner Wi-Fi Call";
+
+    private static final String PREF_LAST_ANSWERED_KEY = "svc_last_answered_key";
+    private static final String PREF_LAST_ANSWERED_MS = "svc_last_answered_ms";
+    private static final String PREF_LAST_DECLINED_KEY = "svc_last_declined_key";
+    private static final String PREF_LAST_DECLINED_MS = "svc_last_declined_ms";
+
+    private void loadPersistedCallGuards() {
+        try {
+            SharedPreferences prefs = getApplicationContext().getSharedPreferences(CallBridgeHelper.PREFS_NAME, Context.MODE_PRIVATE);
+            lastAnsweredCallKey = prefs.getString(PREF_LAST_ANSWERED_KEY, "");
+            lastAnsweredAtMs = prefs.getLong(PREF_LAST_ANSWERED_MS, 0L);
+            lastDeclinedCallKey = prefs.getString(PREF_LAST_DECLINED_KEY, "");
+            lastDeclinedAtMs = prefs.getLong(PREF_LAST_DECLINED_MS, 0L);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void persistCallGuard(boolean isAnswer, String key, long atMs) {
+        try {
+            SharedPreferences prefs = getApplicationContext().getSharedPreferences(CallBridgeHelper.PREFS_NAME, Context.MODE_PRIVATE);
+            SharedPreferences.Editor ed = prefs.edit();
+            if (isAnswer) {
+                ed.putString(PREF_LAST_ANSWERED_KEY, key != null ? key : "");
+                ed.putLong(PREF_LAST_ANSWERED_MS, atMs);
+            } else {
+                ed.putString(PREF_LAST_DECLINED_KEY, key != null ? key : "");
+                ed.putLong(PREF_LAST_DECLINED_MS, atMs);
+            }
+            ed.apply();
+        } catch (Throwable ignored) {
+        }
+    }
 
     private ScheduledExecutorService scheduler;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -82,6 +116,7 @@ public class CallForegroundService extends Service {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        loadPersistedCallGuards();
         createChannels();
         startForegroundSafe();
         startPoller();
@@ -100,21 +135,26 @@ public class CallForegroundService extends Service {
             String resolvedCallKey = buildCallKey(resolvedCallId, resolvedStartedAt);
             String callModeExtra = intent.getStringExtra("callMode");
             String resolvedMode = "video".equals(callModeExtra) ? "video" : activeCallMode;
+            String resolvedCaller = activeCallerName;
 
             if (ACTION_STOP_RING.equals(act)) {
                 markSuppressed(resolvedCallKey);
                 stopRingingInternal();
             } else if (ACTION_DECLINE_CALL.equals(act)) {
+                long nowDec = System.currentTimeMillis();
                 lastDeclinedCallKey = resolvedCallKey;
-                lastDeclinedAtMs = System.currentTimeMillis();
+                lastDeclinedAtMs = nowDec;
+                persistCallGuard(false, resolvedCallKey, nowDec);
                 markSuppressed(resolvedCallKey);
                 stopRingingInternal();
                 IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
                 CallBridgeHelper.setAudioCallMode(this, false, false);
-                sendCallActionToServerAsync("decline");
+                sendCallActionToServerAsync("decline", resolvedCallId, resolvedMode, resolvedStartedAt, resolvedCaller);
             } else if (ACTION_ANSWER_CALL.equals(act)) {
+                long nowAns = System.currentTimeMillis();
                 lastAnsweredCallKey = resolvedCallKey;
-                lastAnsweredAtMs = System.currentTimeMillis();
+                lastAnsweredAtMs = nowAns;
+                persistCallGuard(true, resolvedCallKey, nowAns);
                 markSuppressed(resolvedCallKey);
                 stopRingingInternal();
                 IncomingCallActivity.finishIfOpen(resolvedCallId != null ? resolvedCallId : "");
@@ -125,7 +165,7 @@ public class CallForegroundService extends Service {
                     "answer",
                     resolvedMode
                 );
-                sendCallActionToServerAsync("answer");
+                sendCallActionToServerAsync("answer", resolvedCallId, resolvedMode, resolvedStartedAt, resolvedCaller);
                 bringMainActivityToFront("answer", resolvedCallId != null ? resolvedCallId : "", resolvedMode);
             }
         }
@@ -319,6 +359,7 @@ public class CallForegroundService extends Service {
                 return;
             }
             activeCallMode = resolvedMode;
+            activeCallerName = (callerName != null && !callerName.isEmpty()) ? callerName : "Owner Wi-Fi Call";
             boolean isSameActive = ringingActive
                 && callId.equals(activeCallId)
                 && (startedAtMs <= 0L || activeCallStartedAtMs <= 0L || startedAtMs == activeCallStartedAtMs);
@@ -338,6 +379,8 @@ public class CallForegroundService extends Service {
                 lastAnsweredAtMs = 0L;
                 lastDeclinedCallKey = "";
                 lastDeclinedAtMs = 0L;
+                persistCallGuard(true, "", 0L);
+                persistCallGuard(false, "", 0L);
                 lastSuppressedCallKey = "";
                 lastSuppressedAtMs = 0L;
             }
@@ -633,7 +676,13 @@ public class CallForegroundService extends Service {
         }
     }
 
-    private void sendCallActionToServerAsync(final String actionName) {
+    private void sendCallActionToServerAsync(
+        final String actionName,
+        final String callId,
+        final String callMode,
+        final long startedAtMs,
+        final String callerName
+    ) {
         final Context appCtx = getApplicationContext();
         new Thread(new Runnable() {
             @Override
@@ -657,6 +706,18 @@ public class CallForegroundService extends Service {
                         JSONObject body = new JSONObject();
                         body.put("action", actionName);
                         body.put("deviceId", deviceId);
+                        if (callId != null && !callId.isEmpty()) {
+                            body.put("callId", callId);
+                        }
+                        if (callMode != null && !callMode.isEmpty()) {
+                            body.put("callMode", callMode);
+                        }
+                        if (startedAtMs > 0L) {
+                            body.put("startedAtMs", startedAtMs);
+                        }
+                        if (callerName != null && !callerName.isEmpty()) {
+                            body.put("callerName", callerName);
+                        }
                         byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
                         OutputStream os = conn.getOutputStream();
                         os.write(bytes);

@@ -14,6 +14,7 @@ import {
   Clock,
   Cloud,
   CreditCard,
+  Download,
   Hash,
   Lock,
   Mic,
@@ -27,6 +28,7 @@ import {
   Square,
   Trash2,
   Unlock,
+  Upload,
   User,
   Video,
   Wallet,
@@ -66,6 +68,7 @@ interface OwnerControlDashboardProps {
   onClose: () => void;
   onRemoteLockChange?: (locked: boolean, message: string) => void;
   standalone?: boolean;
+  onLockSession?: () => void;
 }
 
 const RAM_CONTROL_SNAPSHOT_KEY = 'ram_control_snapshot_v1';
@@ -167,6 +170,7 @@ export default function OwnerControlDashboard({
   onClose,
   onRemoteLockChange,
   standalone = false,
+  onLockSession,
 }: OwnerControlDashboardProps) {
   const [activeTab, setActiveTab] = useState<'devices' | 'transactions' | 'notify'>('devices');
   const [snapshot, setSnapshot] = useState<OwnerDashboardSnapshot | null>(null);
@@ -213,6 +217,7 @@ export default function OwnerControlDashboard({
   // Firebase Auth Web Admin Sync (when running in standard browser)
   const [fbUser, setFbUser] = useState<FirebaseUser | null>(null);
   const [fbDevices, setFbDevices] = useState<DeviceClient[]>([]);
+  const snapshotImportInputRef = useRef<HTMLInputElement | null>(null);
 
   const [myDeviceId, setMyDeviceId] = useState<string>('dev_server');
   const [isApkEnv, setIsApkEnv] = useState<boolean>(false);
@@ -878,6 +883,62 @@ export default function OwnerControlDashboard({
     }
   };
 
+  const handleExportSnapshot = () => {
+    const dataToSave = snapshotRef.current || snapshot;
+    if (!dataToSave) {
+      flashBanner('err', 'No snapshot loaded yet to export');
+      return;
+    }
+    try {
+      const payload = {
+        exportedAtMs: Date.now(),
+        devices: dataToSave.devices || [],
+        transactions: dataToSave.transactions || [],
+        globalConfig: dataToSave.globalConfig,
+      };
+      const jsonStr = JSON.stringify(payload, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ram-control-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      flashBanner(
+        'ok',
+        `Backup exported (${payload.devices.length} devices, ${payload.transactions.length} txns)`
+      );
+    } catch (err: any) {
+      flashBanner('err', err?.message || 'Backup export failed');
+    }
+  };
+
+  const handleImportSnapshotFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setBusyKey('import_snap');
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const res = await postOwnerAction({
+        action: 'import_snapshot',
+        snapshot: parsed,
+      });
+      await loadSnapshot(true);
+      flashBanner(
+        'ok',
+        `Restored ${res.importedDevices || 0} devices & ${res.importedTransactions || 0} txns`
+      );
+    } catch (err: any) {
+      flashBanner('err', err?.message || 'Invalid backup JSON file');
+    } finally {
+      setBusyKey('');
+    }
+  };
+
   const serverNow = snapshot?.serverTimeMs || 0;
   const globalLocked = Boolean(snapshot?.globalConfig?.globalLocked);
   const selectedDevice = useMemo(
@@ -1007,6 +1068,18 @@ export default function OwnerControlDashboard({
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
+
+            {onLockSession && (
+              <button
+                type="button"
+                onClick={onLockSession}
+                title="Lock Console"
+                aria-label="Lock Console"
+                className="w-8 h-8 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/30 flex items-center justify-center text-rose-300 cursor-pointer"
+              >
+                <Lock className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
 
@@ -1085,6 +1158,50 @@ export default function OwnerControlDashboard({
             maxLength={200}
             className="mt-2 w-full bg-[#17212b] border border-white/10 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-500 outline-none focus:border-[#5eb5f7]"
           />
+        </div>
+
+        {/* Cloud Storage Health & Backup/Restore Bar */}
+        <div className="mt-2 rounded-xl px-2.5 py-2 bg-[#131c26] border border-white/10 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Cloud
+              className={`w-3.5 h-3.5 shrink-0 ${
+                snapshot?.storageMode === 'firestore' ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            />
+            <span className="text-[10px] font-semibold text-slate-200 truncate">
+              {snapshot?.storageMode === 'firestore'
+                ? 'Permanent Firestore Cloud Active'
+                : 'Temp Cache Mode — Use Backup or Set Server Key'}
+            </span>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <input
+              ref={snapshotImportInputRef}
+              type="file"
+              accept="application/json,.json"
+              onChange={handleImportSnapshotFile}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={handleExportSnapshot}
+              className="px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-semibold text-slate-200 flex items-center gap-1 cursor-pointer"
+              title="Export all devices & transactions backup JSON"
+            >
+              <Download className="w-3 h-3 text-[#5eb5f7]" />
+              <span>Export</span>
+            </button>
+            <button
+              type="button"
+              disabled={busyKey === 'import_snap'}
+              onClick={() => snapshotImportInputRef.current?.click()}
+              className="px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-semibold text-slate-200 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+              title="Import backup JSON into live server & cloud"
+            >
+              <Upload className="w-3 h-3 text-emerald-400" />
+              <span>{busyKey === 'import_snap' ? '...' : 'Restore'}</span>
+            </button>
+          </div>
         </div>
 
         {/* Telegram-style Tabs */}
