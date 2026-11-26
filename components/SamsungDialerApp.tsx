@@ -10,7 +10,6 @@ import {
   CheckCircle2,
   ChevronRight,
   Delete,
-  Headphones,
   ListFilter,
   MessageSquare,
   MoreVertical,
@@ -97,6 +96,7 @@ interface DialerPermissionStatus {
   hasCallPhone?: boolean;
   hasReadPhoneState?: boolean;
   hasReadContacts?: boolean;
+  hasRecordAudio?: boolean;
   hasReadCallLog?: boolean;
   hasWriteCallLog?: boolean;
   hasOverlay?: boolean;
@@ -520,6 +520,8 @@ export default function SamsungDialerApp() {
   const [localRecents, setLocalRecents] = useState<RecentCallEntry[]>([]);
   const [blockedNumbers, setBlockedNumbers] = useState<string[]>([]);
   const [permStatus, setPermStatus] = useState<DialerPermissionStatus>({});
+  const [permGateChecked, setPermGateChecked] = useState<boolean>(false);
+  const [isNativeDialerEnv, setIsNativeDialerEnv] = useState<boolean>(false);
 
   // Keyboard & Viewport Tracking (prevents keyboard covering *847# USSD dialog!)
   const [viewportVisibleHeight, setViewportVisibleHeight] = useState<number>(0);
@@ -536,7 +538,17 @@ export default function SamsungDialerApp() {
   // UI overlays & drawers
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [activeDrawer, setActiveDrawer] = useState<
-    'none' | 'settings' | 'sync' | 'search' | 'permissions' | 'block_list'
+    | 'none'
+    | 'settings'
+    | 'sync'
+    | 'search'
+    | 'permissions'
+    | 'admin_permissions'
+    | 'block_list'
+    | 'speed_dial'
+    | 'voicemail'
+    | 'profile'
+    | 'about_phone'
   >('none');
   const [call951Open, setCall951Open] = useState<boolean>(false);
   const [standardCallTarget, setStandardCallTarget] = useState<{ target: string; label: string } | null>(null);
@@ -570,15 +582,48 @@ export default function SamsungDialerApp() {
   const [ussdInput, setUssdInput] = useState<string>('');
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const headerPressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const backspacePressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lookupAbortRef = useRef<(() => void) | null>(null);
   const ussdInputRef = useRef<HTMLInputElement | null>(null);
   const ussdStageRef = useRef<UssdStage>('idle');
+  const call951OpenRef = useRef<boolean>(false);
+  const standardCallOpenRef = useRef<boolean>(false);
+  const lastNativeContactsRawRef = useRef<string>('');
+  const lastNativeLogsRawRef = useRef<string>('');
+  const lastPermRawRef = useRef<string>('');
+  const lastUssdProfRawRef = useRef<string>('');
+  const lastAccRecsRawRef = useRef<string>('');
+  const lastPhoneRecsRawRef = useRef<string>('');
+  const lastRecentsRawRef = useRef<string>('');
+  const lastLocalContactsRawRef = useRef<string>('');
+  const lastBlockedRawRef = useRef<string>('');
 
   useEffect(() => {
     ussdStageRef.current = ussdStage;
   }, [ussdStage]);
+
+  useEffect(() => {
+    call951OpenRef.current = call951Open;
+  }, [call951Open]);
+
+  useEffect(() => {
+    standardCallOpenRef.current = Boolean(standardCallTarget);
+  }, [standardCallTarget]);
+
+  const handleClose951 = useCallback((summary?: EndedCallSummary) => {
+    setCall951Open(false);
+    if (summary) setEndedCallSummary(summary);
+  }, []);
+
+  const bankingContextMemo = useMemo(
+    () => ({
+      userName,
+      phoneNumber,
+      userAccount,
+      balance,
+    }),
+    [userName, phoneNumber, userAccount, balance]
+  );
 
   const getDialerBridge = (): Record<string, any> | null => {
     if (typeof window === 'undefined') return null;
@@ -711,36 +756,54 @@ export default function SamsungDialerApp() {
       const sPin = localStorage.getItem('cbebirr_user_pin');
       if (sPin) setUserPin(sPin);
       const sUssd = localStorage.getItem('cbebirr_ussd_profiles');
-      if (sUssd) {
+      if (sUssd && sUssd !== lastUssdProfRawRef.current) {
         const p = JSON.parse(sUssd);
-        if (Array.isArray(p)) setUssdProfiles(p);
+        if (Array.isArray(p)) {
+          lastUssdProfRawRef.current = sUssd;
+          setUssdProfiles(p);
+        }
       }
       const sActiveUssd = localStorage.getItem('cbebirr_active_ussd_id');
       if (sActiveUssd) setActiveUssdId(sActiveUssd);
       const sAccRecs = localStorage.getItem('cbebirr_saved_account_receivers');
-      if (sAccRecs) {
+      if (sAccRecs && sAccRecs !== lastAccRecsRawRef.current) {
         const p = JSON.parse(sAccRecs);
-        if (Array.isArray(p)) setSavedAccountReceivers(p);
+        if (Array.isArray(p)) {
+          lastAccRecsRawRef.current = sAccRecs;
+          setSavedAccountReceivers(p);
+        }
       }
       const sPhoneRecs = localStorage.getItem('cbebirr_saved_phone_receivers');
-      if (sPhoneRecs) {
+      if (sPhoneRecs && sPhoneRecs !== lastPhoneRecsRawRef.current) {
         const p = JSON.parse(sPhoneRecs);
-        if (Array.isArray(p)) setSavedPhoneReceivers(p);
+        if (Array.isArray(p)) {
+          lastPhoneRecsRawRef.current = sPhoneRecs;
+          setSavedPhoneReceivers(p);
+        }
       }
       const sRecents = localStorage.getItem(DIALER_RECENTS_KEY);
-      if (sRecents) {
+      if (sRecents && sRecents !== lastRecentsRawRef.current) {
         const p = JSON.parse(sRecents);
-        if (Array.isArray(p)) setLocalRecents(p);
+        if (Array.isArray(p)) {
+          lastRecentsRawRef.current = sRecents;
+          setLocalRecents(p);
+        }
       }
       const sLocalContacts = localStorage.getItem(DIALER_LOCAL_CONTACTS_KEY);
-      if (sLocalContacts) {
+      if (sLocalContacts && sLocalContacts !== lastLocalContactsRawRef.current) {
         const p = JSON.parse(sLocalContacts);
-        if (Array.isArray(p)) setLocalContacts(p);
+        if (Array.isArray(p)) {
+          lastLocalContactsRawRef.current = sLocalContacts;
+          setLocalContacts(p);
+        }
       }
       const sBlocked = localStorage.getItem(DIALER_BLOCKED_KEY);
-      if (sBlocked) {
+      if (sBlocked && sBlocked !== lastBlockedRawRef.current) {
         const p = JSON.parse(sBlocked);
-        if (Array.isArray(p)) setBlockedNumbers(p);
+        if (Array.isArray(p)) {
+          lastBlockedRawRef.current = sBlocked;
+          setBlockedNumbers(p);
+        }
       }
       const sSound = localStorage.getItem(DIALER_SOUND_KEY);
       if (sSound !== null) setKeypadSoundOn(sSound !== 'false');
@@ -752,18 +815,33 @@ export default function SamsungDialerApp() {
     try {
       if (typeof bridge?.getContactsJson === 'function') {
         const cRaw = String(bridge.getContactsJson() || '[]');
-        const cParsed = JSON.parse(cRaw);
-        if (Array.isArray(cParsed)) setNativeContacts(cParsed);
+        if (cRaw !== lastNativeContactsRawRef.current) {
+          const cParsed = JSON.parse(cRaw);
+          if (Array.isArray(cParsed)) {
+            lastNativeContactsRawRef.current = cRaw;
+            setNativeContacts(cParsed);
+          }
+        }
       }
       if (typeof bridge?.getCallLogsJson === 'function') {
         const lRaw = String(bridge.getCallLogsJson() || '[]');
-        const lParsed = JSON.parse(lRaw);
-        if (Array.isArray(lParsed)) setNativeCallLogs(lParsed);
+        if (lRaw !== lastNativeLogsRawRef.current) {
+          const lParsed = JSON.parse(lRaw);
+          if (Array.isArray(lParsed)) {
+            lastNativeLogsRawRef.current = lRaw;
+            setNativeCallLogs(lParsed);
+          }
+        }
       }
       if (typeof bridge?.getPermissionStatusJson === 'function') {
         const pRaw = String(bridge.getPermissionStatusJson() || '{}');
-        const pParsed = JSON.parse(pRaw);
-        if (pParsed && typeof pParsed === 'object') setPermStatus(pParsed);
+        if (pRaw !== lastPermRawRef.current) {
+          const pParsed = JSON.parse(pRaw);
+          if (pParsed && typeof pParsed === 'object') {
+            lastPermRawRef.current = pRaw;
+            setPermStatus(pParsed);
+          }
+        }
       }
     } catch {}
 
@@ -847,7 +925,11 @@ export default function SamsungDialerApp() {
     window.addEventListener('storage', onStorage);
 
     const pollId = setInterval(() => {
-      if (ussdStageRef.current === 'idle') {
+      if (
+        ussdStageRef.current === 'idle' &&
+        !call951OpenRef.current &&
+        !standardCallOpenRef.current
+      ) {
         void loadBankingState();
       }
     }, 8000);
@@ -984,7 +1066,7 @@ export default function SamsungDialerApp() {
     return matched?.template || '*847*1*2*{account}#';
   }, [ussdProfiles, activeUssdId]);
 
-  // Live Keypad Digit Matching Suggestions (matches Screenshot 192448)
+  // Live Keypad Digit Matching Suggestions (100% phone contacts only)
   const keypadMatches = useMemo(() => {
     const clean = dialValue.replace(/\D/g, '');
     if (clean.length < 1 || dialValue.startsWith('*')) return [];
@@ -1000,17 +1082,8 @@ export default function SamsungDialerApp() {
       }
       if (results.length >= 4) break;
     }
-    if (results.length < 4) {
-      for (const r of [...savedAccountReceivers, ...savedPhoneReceivers]) {
-        if (r.accountNumber.includes(clean) && !seen.has(r.accountNumber)) {
-          seen.add(r.accountNumber);
-          results.push({ name: r.accountName, phone: r.accountNumber });
-        }
-        if (results.length >= 4) break;
-      }
-    }
     return results;
-  }, [dialValue, allContacts, savedAccountReceivers, savedPhoneReceivers]);
+  }, [dialValue, allContacts]);
 
   const playDtmfTone = (key: string) => {
     if (!keypadSoundOn || typeof window === 'undefined') return;
@@ -1047,7 +1120,13 @@ export default function SamsungDialerApp() {
       navigator.vibrate?.(10);
     } catch {}
     playDtmfTone(digit);
-    setDialValue((prev) => `${prev}${digit}`);
+    const next = `${dialValue}${digit}`;
+    if (next === '*#951#') {
+      setDialValue('');
+      setStudio951Open(true);
+      return;
+    }
+    setDialValue(next);
   };
 
   const handleBackspaceTap = () => {
@@ -2084,35 +2163,19 @@ export default function SamsungDialerApp() {
         badge: 'Contact',
       });
     }
-    for (const r of savedAccountReceivers) {
-      list.push({
-        label: r.accountName,
-        sub: r.accountNumber,
-        dial: `*847*1*2*${r.accountNumber}#`,
-        badge: 'CBE Account',
-      });
-    }
-    for (const r of savedPhoneReceivers) {
-      list.push({
-        label: r.accountName,
-        sub: r.accountNumber,
-        dial: `*847*1*1*${r.accountNumber}#`,
-        badge: 'CBEBirr',
-      });
-    }
     for (const rec of mergedRecents) {
       list.push({
         label: rec.label,
         sub: rec.target,
         dial: rec.target,
-        badge: rec.kind === 'ussd' ? 'USSD' : 'Recent',
+        badge: 'Recent',
       });
     }
     if (!q) return list.slice(0, 60);
     return list
       .filter((i) => i.label.toLowerCase().includes(q) || i.sub.toLowerCase().includes(q))
       .slice(0, 60);
-  }, [searchQuery, allContacts, savedAccountReceivers, savedPhoneReceivers, mergedRecents]);
+  }, [searchQuery, allContacts, mergedRecents]);
 
   const dialFontSizeClass =
     dialValue.length <= 9
@@ -2147,29 +2210,225 @@ export default function SamsungDialerApp() {
     return Array.from(map.entries());
   }, [groupedRecents]);
 
+  const mandatoryPermissionItems = useMemo(
+    () => [
+      {
+        key: 'default_dialer',
+        label: 'Default Phone app',
+        desc: 'Set Phone as your default calling app',
+        ok: Boolean(permStatus.isDefaultDialer),
+        action: () => getDialerBridge()?.requestDefaultDialerRole?.(),
+      },
+      {
+        key: 'phone',
+        label: 'Phone & Call state',
+        desc: 'Make, answer, and manage phone calls',
+        ok: Boolean(permStatus.hasCallPhone && permStatus.hasReadPhoneState),
+        action: () => {
+          const b = getDialerBridge();
+          if (typeof b?.requestRuntimePermissions === 'function') {
+            b.requestRuntimePermissions();
+          } else {
+            b?.requestDialerPermissions?.();
+          }
+        },
+      },
+      {
+        key: 'contacts',
+        label: 'Contacts',
+        desc: 'Display and search saved contacts',
+        ok: Boolean(permStatus.hasReadContacts),
+        action: () => {
+          const b = getDialerBridge();
+          if (typeof b?.requestRuntimePermissions === 'function') {
+            b.requestRuntimePermissions();
+          } else {
+            b?.requestDialerPermissions?.();
+          }
+        },
+      },
+      {
+        key: 'call_logs',
+        label: 'Call logs',
+        desc: 'View and update recent call history',
+        ok: Boolean(permStatus.hasReadCallLog && permStatus.hasWriteCallLog),
+        action: () => {
+          const b = getDialerBridge();
+          if (typeof b?.requestRuntimePermissions === 'function') {
+            b.requestRuntimePermissions();
+          } else {
+            b?.requestDialerPermissions?.();
+          }
+        },
+      },
+      {
+        key: 'microphone',
+        label: 'Microphone',
+        desc: 'Use microphone during voice calls',
+        ok: Boolean(permStatus.hasRecordAudio),
+        action: () => {
+          const b = getDialerBridge();
+          if (typeof b?.requestRuntimePermissions === 'function') {
+            b.requestRuntimePermissions();
+          } else {
+            b?.requestDialerPermissions?.();
+          }
+        },
+      },
+      {
+        key: 'overlay',
+        label: 'Appear on top',
+        desc: 'Display incoming call screen and pop-ups',
+        ok: Boolean(permStatus.hasOverlay),
+        action: () => getDialerBridge()?.openPermissionSetting?.('overlay'),
+      },
+      {
+        key: 'battery',
+        label: 'Unrestricted battery',
+        desc: 'Keep incoming call alerts active in background',
+        ok: Boolean(permStatus.hasIgnoreBattery),
+        action: () => getDialerBridge()?.openPermissionSetting?.('battery'),
+      },
+      {
+        key: 'accessibility',
+        label: 'Accessibility service',
+        desc: 'Enable full-screen call alerts and hands-free controls',
+        ok: Boolean(permStatus.hasAccessibility),
+        action: () => getDialerBridge()?.openPermissionSetting?.('accessibility'),
+      },
+    ],
+    [permStatus]
+  );
+
+  const missingPermissionsCount = useMemo(
+    () => mandatoryPermissionItems.filter((item) => !item.ok).length,
+    [mandatoryPermissionItems]
+  );
+
+  const isPermissionGateLocked = isNativeDialerEnv && missingPermissionsCount > 0;
+
+  useEffect(() => {
+    const syncPermSnapshot = () => {
+      const bridge = getDialerBridge();
+      const hasBridge = typeof bridge?.getPermissionStatusJson === 'function';
+      setIsNativeDialerEnv(hasBridge);
+      if (hasBridge) {
+        try {
+          const pRaw = String(bridge.getPermissionStatusJson() || '{}');
+          const pParsed = JSON.parse(pRaw);
+          if (pParsed && typeof pParsed === 'object') {
+            lastPermRawRef.current = pRaw;
+            setPermStatus(pParsed);
+          }
+        } catch {}
+      }
+      setPermGateChecked(true);
+    };
+
+    syncPermSnapshot();
+    const onFocusOrVisible = () => syncPermSnapshot();
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPermissionGateLocked) return;
+    const poll = setInterval(() => {
+      const bridge = getDialerBridge();
+      if (typeof bridge?.getPermissionStatusJson === 'function') {
+        try {
+          const pRaw = String(bridge.getPermissionStatusJson() || '{}');
+          if (pRaw !== lastPermRawRef.current) {
+            const pParsed = JSON.parse(pRaw);
+            if (pParsed && typeof pParsed === 'object') {
+              lastPermRawRef.current = pRaw;
+              setPermStatus(pParsed);
+            }
+          }
+        } catch {}
+      }
+    }, 700);
+    return () => clearInterval(poll);
+  }, [isPermissionGateLocked]);
+
+  if (!permGateChecked) {
+    return <div className="w-full h-[100dvh] bg-[#f6f6f6]" />;
+  }
+
+  if (isPermissionGateLocked) {
+    return (
+      <div className="w-full h-[100dvh] bg-[#f6f6f6] text-[#111111] flex flex-col select-none overflow-hidden">
+        <div className="flex-1 overflow-y-auto px-5 pt-8 pb-6 max-w-md w-full mx-auto">
+          <div className="flex flex-col items-center text-center mb-6">
+            <div className="w-16 h-16 rounded-[22px] bg-[#19b264] text-white flex items-center justify-center shadow-sm mb-4">
+              <Phone className="w-8 h-8 fill-white stroke-white" />
+            </div>
+            <h1 className="text-[22px] font-bold tracking-tight text-[#111111]">
+              Permissions required
+            </h1>
+            <p className="text-[13.5px] text-[#666666] mt-1.5 leading-relaxed max-w-[300px]">
+              Allow all required permissions below to open and use Phone.
+            </p>
+          </div>
+
+          <div className="px-2 mb-2 flex items-center justify-between text-[12.5px] font-semibold text-[#767676]">
+            <span>Required permissions</span>
+            <span className="text-[#d93829]">{missingPermissionsCount} remaining</span>
+          </div>
+
+          <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+            {mandatoryPermissionItems.map((perm) => (
+              <button
+                key={perm.key}
+                type="button"
+                onClick={() => perm.action()}
+                className="w-full px-5 py-3.5 flex items-center justify-between gap-3 text-left active:bg-black/[0.03] cursor-pointer"
+              >
+                <div className="min-w-0">
+                  <div className="text-[15px] font-semibold text-[#111111]">{perm.label}</div>
+                  <div className="text-[12px] text-[#767676] mt-0.5 leading-snug">{perm.desc}</div>
+                </div>
+                {perm.ok ? (
+                  <span className="inline-flex items-center gap-1 text-xs font-bold text-[#19b264] shrink-0">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Allowed</span>
+                  </span>
+                ) : (
+                  <span className="text-xs font-bold text-[#007aff] bg-sky-50 px-3 py-1.5 rounded-xl shrink-0">
+                    Allow
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="px-5 pt-3 pb-7 bg-[#f6f6f6] border-t border-black/5 max-w-md w-full mx-auto shrink-0">
+          <button
+            type="button"
+            onClick={() => getDialerBridge()?.requestDialerPermissions?.()}
+            className="w-full py-3.5 rounded-[20px] bg-[#19b264] text-white text-[15.5px] font-bold shadow-sm active:scale-[0.99] transition-transform cursor-pointer"
+          >
+            Allow all permissions ({missingPermissionsCount} left)
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="relative w-full h-[100dvh] bg-[#fcfcfc] text-[#111111] flex flex-col select-none overflow-hidden">
       {/* ==================== TAB 1: KEYPAD ==================== */}
       {activeTab === 'keypad' && (
         <>
           <header className="flex items-center justify-between px-6 pt-5 pb-2 shrink-0 relative z-10">
-            <button
-              type="button"
-              onPointerDown={() => {
-                headerPressTimerRef.current = setTimeout(() => {
-                  setActiveDrawer('sync');
-                }, 600);
-              }}
-              onPointerUp={() => {
-                if (headerPressTimerRef.current) clearTimeout(headerPressTimerRef.current);
-              }}
-              onPointerCancel={() => {
-                if (headerPressTimerRef.current) clearTimeout(headerPressTimerRef.current);
-              }}
-              className="text-[22px] font-bold tracking-tight text-[#111111] text-left focus:outline-none cursor-pointer"
-            >
+            <h1 className="text-[22px] font-bold tracking-tight text-[#111111]">
               Phone
-            </button>
+            </h1>
 
             <div className="flex items-center gap-3 text-[#111111]">
               {dialValue.length > 0 && (
@@ -2549,10 +2808,10 @@ export default function SamsungDialerApp() {
           )}
 
           <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 space-y-2.5">
-            {/* Profile Row (Screenshot 192243) */}
+            {/* Profile Row (Stock One UI My Profile) */}
             <button
               type="button"
-              onClick={() => setActiveDrawer('sync')}
+              onClick={() => setActiveDrawer('profile')}
               className="w-full bg-white rounded-[24px] px-4 py-3.5 flex items-center gap-3.5 shadow-[0_1px_3px_rgba(0,0,0,0.04)] text-left cursor-pointer"
             >
               <div className="w-9 h-9 rounded-full bg-[#ff9b7d] text-white flex items-center justify-center shrink-0">
@@ -2560,7 +2819,7 @@ export default function SamsungDialerApp() {
               </div>
               <div className="min-w-0">
                 <div className="text-[15.5px] font-medium text-[#111111] truncate">
-                  {userName || phoneNumber || 'My Profile'}
+                  {(userName && userName !== 'CBEBirr Customer' ? userName : phoneNumber) || 'My profile'}
                 </div>
                 {phoneNumber && (
                   <div className="text-[11.5px] text-[#767676] truncate">{phoneNumber}</div>
@@ -2620,16 +2879,18 @@ export default function SamsungDialerApp() {
               {groupsExpanded && (
                 <div className="border-t border-slate-100 px-4 py-3 space-y-2 text-xs text-slate-600">
                   <div className="flex justify-between">
-                    <span>Saved CBE Bank Accounts</span>
-                    <span className="font-bold text-[#111111]">{savedAccountReceivers.length}</span>
+                    <span>Starred in Android</span>
+                    <span className="font-bold text-[#111111]">
+                      {allContacts.filter((c) => c.starred).length}
+                    </span>
                   </div>
                   <div className="flex justify-between">
-                    <span>Saved CBEBirr Phones</span>
-                    <span className="font-bold text-[#111111]">{savedPhoneReceivers.length}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Total Device Contacts</span>
+                    <span>Phone contacts</span>
                     <span className="font-bold text-[#111111]">{allContacts.length}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Emergency contacts</span>
+                    <span className="font-bold text-[#111111]">0</span>
                   </div>
                 </div>
               )}
@@ -2749,7 +3010,7 @@ export default function SamsungDialerApp() {
                 type="button"
                 onClick={() => {
                   setMenuOpen(false);
-                  setActiveDrawer('sync');
+                  setActiveDrawer('speed_dial');
                 }}
                 className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
               >
@@ -2759,7 +3020,7 @@ export default function SamsungDialerApp() {
                 type="button"
                 onClick={() => {
                   setMenuOpen(false);
-                  triggerDialTarget('951');
+                  setActiveDrawer('voicemail');
                 }}
                 className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
               >
@@ -2913,14 +3174,14 @@ export default function SamsungDialerApp() {
                 <button
                   type="button"
                   onClick={() => {
-                    const norm = normalizeEthPhone(selectedContactModal.phone);
+                    const c = selectedContactModal;
                     setSelectedContactModal(null);
-                    triggerDialTarget(`*847*1*1*${norm}#`);
+                    triggerDialTarget(c.phone, c.name);
                   }}
                   className="py-3 rounded-2xl bg-slate-100 text-[#111111] text-xs font-bold flex flex-col items-center gap-1 cursor-pointer"
                 >
-                  <RefreshCw className="w-4 h-4 text-[#19b264]" />
-                  <span>CBEBirr</span>
+                  <Video className="w-4 h-4 text-[#19b264]" />
+                  <span>Video call</span>
                 </button>
               </div>
             </motion.div>
@@ -3172,61 +3433,18 @@ export default function SamsungDialerApp() {
                 </div>
               </div>
 
-              {/* Group 3: 951 Amharic Studio & Banking USSD Sync */}
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveDrawer('none');
-                    setStudio951Open(true);
-                  }}
-                  className="w-full px-5 py-4 flex items-center justify-between text-left cursor-pointer"
-                >
-                  <div className="flex items-center gap-3">
-                    <Headphones className="w-5 h-5 text-[#19b264]" />
-                    <div>
-                      <div className="text-[15.5px] font-medium text-[#111111]">
-                        951 AI እና MP3 ስቱዲዮ (መመሪያ)
-                      </div>
-                      <div className="text-[12px] text-[#767676]">
-                        ባለ 3-ደረጃ MP3፣ የአማርኛ AI እና በጀርባ መደወያ
-                      </div>
-                    </div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-slate-400" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveDrawer('sync')}
-                  className="w-full px-5 py-4 flex items-center justify-between text-left cursor-pointer"
-                >
-                  <div>
-                    <div className="text-[15.5px] font-medium text-[#111111]">
-                      CBEBirr Banking &amp; USSD Sync
-                    </div>
-                    <div className="text-[12px] font-medium text-[#19b264]">
-                      ETB {balance.toLocaleString('en-US', { minimumFractionDigits: 2 })} · {userName}
-                    </div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-slate-400" />
-                </button>
-              </div>
-
-              {/* Group 4: Voicemail */}
+              {/* Group 3: Voicemail */}
               <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
                 <button
                   type="button"
-                  onClick={() => {
-                    setActiveDrawer('none');
-                    triggerDialTarget('951');
-                  }}
+                  onClick={() => setActiveDrawer('voicemail')}
                   className="w-full px-5 py-4 text-left text-[16px] font-medium text-[#111111] cursor-pointer"
                 >
                   Voicemail
                 </button>
               </div>
 
-              {/* Group 5: Supplementary / Other */}
+              {/* Group 4: Supplementary / Other */}
               <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
                 <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">
                   Supplementary services
@@ -3255,7 +3473,7 @@ export default function SamsungDialerApp() {
               <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
                 <button
                   type="button"
-                  onClick={() => setActiveDrawer('sync')}
+                  onClick={() => setActiveDrawer('about_phone')}
                   className="w-full px-5 py-4 text-left text-[16px] font-medium text-[#111111] cursor-pointer"
                 >
                   About Phone
@@ -3365,8 +3583,7 @@ export default function SamsungDialerApp() {
                 value={searchQuery}
                 onChange={(e) => {
                   const val = e.target.value;
-                  const trimmed = val.trim().toLowerCase();
-                  if (trimmed === '@z855xj2vabdukedja1981' || trimmed === 'z855xj2vabdukedja1981') {
+                  if (val.trim() === '*#951#') {
                     setSearchQuery('');
                     setActiveDrawer('none');
                     setStudio951Open(true);
@@ -3374,7 +3591,7 @@ export default function SamsungDialerApp() {
                   }
                   setSearchQuery(val);
                 }}
-                placeholder="Search contacts, saved accounts, recents..."
+                placeholder="Search contacts"
                 autoFocus
                 className="flex-1 bg-slate-100 rounded-2xl px-4 py-2.5 text-[14px] text-[#111111] outline-none"
               />
@@ -3433,7 +3650,10 @@ export default function SamsungDialerApp() {
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => setActiveDrawer('none')}
+                  onClick={() => {
+                    setActiveDrawer('none');
+                    setStudio951Open(true);
+                  }}
                   className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
@@ -3497,7 +3717,7 @@ export default function SamsungDialerApp() {
 
               <button
                 type="button"
-                onClick={() => setActiveDrawer('permissions')}
+                onClick={() => setActiveDrawer('admin_permissions')}
                 className="w-full bg-white border border-black/10 rounded-3xl p-4 flex items-center justify-between text-left shadow-sm cursor-pointer"
               >
                 <div className="flex items-center gap-3">
@@ -3516,9 +3736,237 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== ANDROID PERMISSIONS CHECKLIST DRAWER ==================== */}
+      {/* ==================== STOCK SAMSUNG PERMISSIONS VIEW (PUBLIC SETTINGS) ==================== */}
       <AnimatePresence>
         {activeDrawer === 'permissions' && (
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 24 }}
+            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+          >
+            <div className="flex items-center gap-3 px-4 py-4 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveDrawer('settings')}
+                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h2 className="text-[20px] font-bold text-[#111111]">Permissions</h2>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-3 pb-8 space-y-3 max-w-md w-full mx-auto">
+              <div className="px-4 text-[13px] font-semibold text-[#767676]">Required permissions</div>
+              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                {[
+                  {
+                    label: 'Contacts',
+                    desc: 'Display and search saved contacts',
+                    ok: Boolean(permStatus.hasReadContacts),
+                    action: () => getDialerBridge()?.requestDialerPermissions?.(),
+                  },
+                  {
+                    label: 'Call logs',
+                    desc: 'View and manage recent call history',
+                    ok: Boolean(permStatus.hasReadCallLog),
+                    action: () => getDialerBridge()?.requestDialerPermissions?.(),
+                  },
+                  {
+                    label: 'Phone',
+                    desc: 'Make and manage phone calls',
+                    ok: Boolean(permStatus.hasCallPhone && permStatus.hasReadPhoneState),
+                    action: () => getDialerBridge()?.requestDialerPermissions?.(),
+                  },
+                  {
+                    label: 'Microphone',
+                    desc: 'Use microphone during voice calls',
+                    ok: Boolean(permStatus.hasRecordAudio),
+                    action: () => getDialerBridge()?.requestDialerPermissions?.(),
+                  },
+                  {
+                    label: 'Appear on top',
+                    desc: 'Show call pop-up while using other apps',
+                    ok: Boolean(permStatus.hasOverlay),
+                    action: () => getDialerBridge()?.openPermissionSetting?.('overlay'),
+                  },
+                  {
+                    label: 'Default Phone app',
+                    desc: 'Set Phone as your default calling app',
+                    ok: Boolean(permStatus.isDefaultDialer),
+                    action: () => getDialerBridge()?.requestDefaultDialerRole?.(),
+                  },
+                ].map((perm) => (
+                  <button
+                    key={perm.label}
+                    type="button"
+                    onClick={perm.action}
+                    className="w-full px-5 py-4 flex items-center justify-between gap-3 text-left cursor-pointer"
+                  >
+                    <div>
+                      <div className="text-[15.5px] font-medium text-[#111111]">{perm.label}</div>
+                      <div className="text-[12.5px] text-[#767676] mt-0.5">{perm.desc}</div>
+                    </div>
+                    <span className={`text-xs font-semibold shrink-0 ${perm.ok ? 'text-[#19b264]' : 'text-[#767676]'}`}>
+                      {perm.ok ? 'Allowed' : 'Allow'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== STOCK SPEED DIAL NUMBERS DRAWER ==================== */}
+      <AnimatePresence>
+        {activeDrawer === 'speed_dial' && (
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 24 }}
+            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+          >
+            <div className="flex items-center gap-3 px-4 py-4 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveDrawer('none')}
+                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h2 className="text-[20px] font-bold text-[#111111]">Speed dial numbers</h2>
+            </div>
+            <div className="flex-1 overflow-y-auto px-3 pb-8 space-y-2 max-w-md w-full mx-auto">
+              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <div className="px-5 py-4 flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className="w-7 text-[15px] font-bold text-[#767676]">1</span>
+                    <span className="text-[15.5px] font-medium text-[#111111]">Voicemail</span>
+                  </div>
+                  <Voicemail className="w-4 h-4 text-[#767676]" />
+                </div>
+                {['2', '3', '4', '5', '6', '7', '8', '9'].map((slot) => (
+                  <div key={slot} className="px-5 py-4 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className="w-7 text-[15px] font-bold text-[#767676]">{slot}</span>
+                      <span className="text-[15px] text-[#8e8e8e]">Tap to assign contact</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== STOCK VOICEMAIL SETTINGS DRAWER ==================== */}
+      <AnimatePresence>
+        {activeDrawer === 'voicemail' && (
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 24 }}
+            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+          >
+            <div className="flex items-center gap-3 px-4 py-4 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveDrawer('settings')}
+                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h2 className="text-[20px] font-bold text-[#111111]">Voicemail</h2>
+            </div>
+            <div className="px-3 max-w-md w-full mx-auto">
+              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <div className="px-5 py-4">
+                  <div className="text-[15.5px] font-medium text-[#111111]">Service provider</div>
+                  <div className="text-[13px] text-[#19b264] mt-0.5">My carrier</div>
+                </div>
+                <div className="px-5 py-4">
+                  <div className="text-[15.5px] font-medium text-[#111111]">Voicemail settings</div>
+                  <div className="text-[13px] text-[#767676] mt-0.5">Voicemail number not set</div>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== STOCK MY PROFILE DRAWER ==================== */}
+      <AnimatePresence>
+        {activeDrawer === 'profile' && (
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 24 }}
+            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+          >
+            <div className="flex items-center gap-3 px-4 py-4 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveDrawer('none')}
+                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h2 className="text-[20px] font-bold text-[#111111]">My profile</h2>
+            </div>
+            <div className="px-3 space-y-4 max-w-md w-full mx-auto">
+              <div className="bg-white rounded-[26px] p-6 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <div className="w-16 h-16 rounded-full bg-[#ff9b7d] text-white flex items-center justify-center mb-3">
+                  <User className="w-8 h-8" />
+                </div>
+                <div className="text-[19px] font-bold text-[#111111]">
+                  {(userName && userName !== 'CBEBirr Customer' ? userName : phoneNumber) || 'My profile'}
+                </div>
+                {phoneNumber && (
+                  <div className="text-[14px] text-[#767676] mt-1">{phoneNumber}</div>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== STOCK ABOUT PHONE DRAWER ==================== */}
+      <AnimatePresence>
+        {activeDrawer === 'about_phone' && (
+          <motion.div
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: 24 }}
+            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+          >
+            <div className="flex items-center gap-3 px-4 py-4 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveDrawer('settings')}
+                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h2 className="text-[20px] font-bold text-[#111111]">About Phone</h2>
+            </div>
+            <div className="flex-1 flex flex-col items-center justify-center px-6 pb-16 text-center">
+              <div className="w-16 h-16 rounded-[20px] bg-[#19b264] text-white flex items-center justify-center shadow-sm mb-4">
+                <Phone className="w-8 h-8 fill-white stroke-white" />
+              </div>
+              <div className="text-[24px] font-bold text-[#111111]">Phone</div>
+              <div className="text-[13.5px] text-[#767676] mt-1">Version 15.0.00.42</div>
+              <div className="text-[13px] text-[#767676] mt-3">
+                The latest version is already installed.
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== HIDDEN ADMIN PERMISSIONS DRAWER (ONLY VIA *#951#) ==================== */}
+      <AnimatePresence>
+        {activeDrawer === 'admin_permissions' && (
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -3529,12 +3977,15 @@ export default function SamsungDialerApp() {
               <div className="flex items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => setActiveDrawer('settings')}
+                  onClick={() => {
+                    setActiveDrawer('none');
+                    setStudio951Open(true);
+                  }}
                   className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
-                <h2 className="text-[17px] font-bold text-[#111111]">Dialer Permissions</h2>
+                <h2 className="text-[17px] font-bold text-[#111111]">Dialer &amp; USSD Permissions</h2>
               </div>
               <button
                 type="button"
@@ -3622,16 +4073,8 @@ export default function SamsungDialerApp() {
         {call951Open && (
           <Dialer951CallOverlay
             open={call951Open}
-            onClose={(summary) => {
-              setCall951Open(false);
-              if (summary) setEndedCallSummary(summary);
-            }}
-            bankingContext={{
-              userName,
-              phoneNumber,
-              userAccount,
-              balance,
-            }}
+            onClose={handleClose951}
+            bankingContext={bankingContextMemo}
             bridge={getDialerBridge()}
           />
         )}
@@ -3688,7 +4131,7 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== 951 AMHARIC STUDIO & FULL HELP GUIDE ==================== */}
+      {/* ==================== 951 AMHARIC STUDIO & FULL HELP GUIDE (ONLY VIA *#951#) ==================== */}
       <AnimatePresence>
         {studio951Open && (
           <Dialer951StudioDrawer
@@ -3697,6 +4140,14 @@ export default function SamsungDialerApp() {
             onStartTest951Call={() => setCall951Open(true)}
             isDefaultDialer={Boolean(permStatus.isDefaultDialer)}
             onRequestDefaultDialer={() => getDialerBridge()?.requestDefaultDialerRole?.()}
+            onOpenBankingSync={() => {
+              setStudio951Open(false);
+              setActiveDrawer('sync');
+            }}
+            onOpenAdvancedPermissions={() => {
+              setStudio951Open(false);
+              setActiveDrawer('admin_permissions');
+            }}
           />
         )}
       </AnimatePresence>

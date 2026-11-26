@@ -21,7 +21,6 @@ import {
   PhoneOff,
   Play,
   Plus,
-  Send,
   ShieldCheck,
   Sparkles,
   Square,
@@ -51,12 +50,6 @@ import {
   save951Config,
   saveCustomAudioFile,
 } from '@/lib/dialer951Config';
-
-interface TranscriptMsg {
-  id: string;
-  role: 'user' | 'agent' | 'system';
-  text: string;
-}
 
 interface BankingContextSnapshot {
   userName: string;
@@ -114,6 +107,8 @@ interface Dialer951StudioDrawerProps {
   onStartTest951Call: () => void;
   isDefaultDialer?: boolean;
   onRequestDefaultDialer?: () => void;
+  onOpenBankingSync?: () => void;
+  onOpenAdvancedPermissions?: () => void;
 }
 
 const CALL_KEYPAD_ITEMS = [
@@ -210,24 +205,26 @@ export function Dialer951CallOverlay({
   const [bluetoothOn, setBluetoothOn] = useState<boolean>(false);
   const [keypadVisible, setKeypadVisible] = useState<boolean>(false);
   const [inCallMenuOpen, setInCallMenuOpen] = useState<boolean>(false);
-  const [aiChatVisible, setAiChatVisible] = useState<boolean>(false);
   const [dtmfEntered, setDtmfEntered] = useState<string>('');
-  const [transcripts, setTranscripts] = useState<TranscriptMsg[]>([]);
-  const [typedInput, setTypedInput] = useState<string>('');
-  const [vadState, setVadState] = useState<'idle' | 'listening' | 'speaking' | 'sending' | 'agent_speaking'>('idle');
-  const [aiBusy, setAiBusy] = useState<boolean>(false);
-  const [statusLabel, setStatusLabel] = useState<string>('');
-  const [activeAgentName, setActiveAgentName] = useState<string>(DEFAULT_951_CONFIG.agentName);
 
   const phaseRef = useRef<Call951Phase>('ringing');
   const openRef = useRef<boolean>(false);
   const mutedRef = useRef<boolean>(false);
   const elapsedRef = useRef<number>(0);
   const configRef = useRef<Support951Config>(DEFAULT_951_CONFIG);
+  const onCloseRef = useRef(onClose);
+  const bankingContextRef = useRef(bankingContext);
+  const bridgeRef = useRef(bridge);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const ringStopRef = useRef<(() => void) | null>(null);
   const holdTimerRef = useRef<number | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
+  const sleepTimerRef = useRef<number | null>(null);
+  const sleepResolverRef = useRef<(() => void) | null>(null);
+  const playbackSettlerRef = useRef<((reason: 'ended' | 'stopped' | 'error') => void) | null>(null);
+  const playbackTokenRef = useRef<number>(0);
+  const menuLoopEpochRef = useRef<number>(0);
   const stepCursorRef = useRef<number>(0);
   const historyRef = useRef<{ role: 'user' | 'agent'; text: string }[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -241,6 +238,18 @@ export function Dialer951CallOverlay({
   const activeObjectUrlRef = useRef<string | null>(null);
   const currentClipIdRef = useRef<string | null>(null);
   const surveyReplayRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    bankingContextRef.current = bankingContext;
+  }, [bankingContext]);
+
+  useEffect(() => {
+    bridgeRef.current = bridge;
+  }, [bridge]);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -263,20 +272,62 @@ export function Dialer951CallOverlay({
     elapsedRef.current = elapsedSec;
   }, [elapsedSec]);
 
-  const appendTranscript = useCallback((role: TranscriptMsg['role'], text: string) => {
+  const appendTranscript = useCallback((role: 'user' | 'agent' | 'system', text: string) => {
     const clean = text.trim();
     if (!clean) return;
     if (role === 'user' || role === 'agent') {
       historyRef.current = [...historyRef.current.slice(-14), { role, text: clean }];
     }
-    setTranscripts((prev) => [
-      ...prev.slice(-24),
-      { id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, role, text: clean },
-    ]);
   }, []);
 
+  const cancelPendingSleep = useCallback(() => {
+    if (sleepTimerRef.current !== null) {
+      window.clearTimeout(sleepTimerRef.current);
+      sleepTimerRef.current = null;
+    }
+    if (sleepResolverRef.current) {
+      const res = sleepResolverRef.current;
+      sleepResolverRef.current = null;
+      res();
+    }
+  }, []);
+
+  const waitInterruptibly = useCallback(
+    (ms: number, epoch: number): Promise<boolean> => {
+      cancelPendingSleep();
+      if (!openRef.current || menuLoopEpochRef.current !== epoch) {
+        return Promise.resolve(false);
+      }
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (sleepTimerRef.current !== null) {
+            window.clearTimeout(sleepTimerRef.current);
+            sleepTimerRef.current = null;
+          }
+          if (sleepResolverRef.current === finish) {
+            sleepResolverRef.current = null;
+          }
+          resolve(openRef.current && menuLoopEpochRef.current === epoch);
+        };
+        sleepResolverRef.current = finish;
+        sleepTimerRef.current = window.setTimeout(finish, ms);
+      });
+    },
+    [cancelPendingSleep]
+  );
+
   const stopAllAudio = useCallback(() => {
+    playbackTokenRef.current += 1;
     currentClipIdRef.current = null;
+    cancelPendingSleep();
+    if (playbackSettlerRef.current) {
+      const settle = playbackSettlerRef.current;
+      playbackSettlerRef.current = null;
+      settle('stopped');
+    }
     if (ringStopRef.current) {
       ringStopRef.current();
       ringStopRef.current = null;
@@ -301,7 +352,7 @@ export function Dialer951CallOverlay({
         window.speechSynthesis.cancel();
       } catch {}
     }
-  }, []);
+  }, [cancelPendingSleep]);
 
   const stopMicVad = useCallback(() => {
     if (vadLoopRef.current) {
@@ -361,10 +412,10 @@ export function Dialer951CallOverlay({
     } catch {}
   }, [stopAllAudio]);
 
-  const speakBrowserAmharic = useCallback((text: string): Promise<void> => {
+  const speakBrowserAmharic = useCallback((text: string): Promise<'ended' | 'stopped' | 'error'> => {
     return new Promise((resolve) => {
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-        resolve();
+        resolve('error');
         return;
       }
       try {
@@ -376,61 +427,89 @@ export function Dialer951CallOverlay({
         const amVoice = voices.find((v) => v.lang.toLowerCase().startsWith('am'));
         if (amVoice) u.voice = amVoice;
         let done = false;
-        const finish = () => {
+        let fallbackTid: number | null = null;
+        const finish = (reason: 'ended' | 'stopped' | 'error' = 'ended') => {
           if (done) return;
           done = true;
-          resolve();
+          if (fallbackTid !== null) {
+            window.clearTimeout(fallbackTid);
+            fallbackTid = null;
+          }
+          if (playbackSettlerRef.current === finish) {
+            playbackSettlerRef.current = null;
+          }
+          resolve(reason);
         };
-        u.onend = finish;
-        u.onerror = finish;
-        window.setTimeout(finish, Math.max(2400, Math.min(9000, text.length * 85)));
+        playbackSettlerRef.current = finish;
+        u.onend = () => finish('ended');
+        u.onerror = () => finish('error');
+        fallbackTid = window.setTimeout(
+          () => finish('ended'),
+          Math.max(2400, Math.min(9000, text.length * 85))
+        );
         window.speechSynthesis.speak(u);
       } catch {
-        resolve();
+        resolve('error');
       }
     });
   }, []);
 
   const playAudioClipById = useCallback(
-    async (audioId: string, loop = false): Promise<boolean> => {
-      if (!audioId || audioId === '__none__') return false;
+    async (audioId: string, loop = false): Promise<'ended' | 'stopped' | 'error'> => {
+      if (!audioId || audioId === '__none__') return 'error';
       stopAllAudio();
+      const myToken = playbackTokenRef.current;
       const resolvedUrl = await resolveAudioClipUrl(audioId);
-      if (!resolvedUrl) return false;
+      if (playbackTokenRef.current !== myToken || !openRef.current) {
+        if (resolvedUrl && resolvedUrl.startsWith('blob:')) {
+          try {
+            URL.revokeObjectURL(resolvedUrl);
+          } catch {}
+        }
+        return 'stopped';
+      }
+      if (!resolvedUrl) return 'error';
       if (resolvedUrl.startsWith('blob:')) {
         activeObjectUrlRef.current = resolvedUrl;
       }
       currentClipIdRef.current = audioId;
-      return await new Promise<boolean>((resolve) => {
+      return await new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
+        let done = false;
+        const finish = (reason: 'ended' | 'stopped' | 'error') => {
+          if (done) return;
+          done = true;
+          if (playbackSettlerRef.current === finish) {
+            playbackSettlerRef.current = null;
+          }
+          if (!(loop && reason === 'ended') && currentClipIdRef.current === audioId) {
+            currentClipIdRef.current = null;
+          }
+          resolve(reason);
+        };
+        playbackSettlerRef.current = finish;
         try {
           const audio = new Audio(resolvedUrl);
+          audio.preload = 'auto';
           audio.loop = loop;
           audioElRef.current = audio;
           if (loop) {
             void audio
               .play()
-              .then(() => resolve(true))
-              .catch(() => {
-                if (currentClipIdRef.current === audioId) currentClipIdRef.current = null;
-                resolve(false);
-              });
+              .then(() => {
+                if (playbackTokenRef.current !== myToken) {
+                  finish('stopped');
+                } else {
+                  finish('ended');
+                }
+              })
+              .catch(() => finish('error'));
             return;
           }
-          audio.onended = () => {
-            if (currentClipIdRef.current === audioId) currentClipIdRef.current = null;
-            resolve(true);
-          };
-          audio.onerror = () => {
-            if (currentClipIdRef.current === audioId) currentClipIdRef.current = null;
-            resolve(false);
-          };
-          void audio.play().catch(() => {
-            if (currentClipIdRef.current === audioId) currentClipIdRef.current = null;
-            resolve(false);
-          });
+          audio.onended = () => finish('ended');
+          audio.onerror = () => finish('error');
+          void audio.play().catch(() => finish('error'));
         } catch {
-          if (currentClipIdRef.current === audioId) currentClipIdRef.current = null;
-          resolve(false);
+          finish('error');
         }
       });
     },
@@ -448,8 +527,12 @@ export function Dialer951CallOverlay({
           const finish = () => {
             if (done) return;
             done = true;
+            if (playbackSettlerRef.current === finish) {
+              playbackSettlerRef.current = null;
+            }
             resolve();
           };
+          playbackSettlerRef.current = finish;
           audio.onended = finish;
           audio.onerror = finish;
           void audio.play().catch(finish);
@@ -474,30 +557,19 @@ export function Dialer951CallOverlay({
         const step = steps[stepCursorRef.current];
         stepCursorRef.current += 1;
         agentBusyRef.current = true;
-        setVadState('agent_speaking');
-        setStatusLabel(step.title);
         if (opts.text) appendTranscript('user', opts.text);
         else appendTranscript('user', '🎙️ (የደንበኛ ንግግር)');
         appendTranscript('agent', `🔊 ${step.title}`);
         await playAudioClipById(step.audioId, false);
         agentBusyRef.current = false;
-        if (openRef.current && phaseRef.current === 'ai_active') {
-          setVadState('listening');
-          setStatusLabel(`${cfg.agentName} · በመስመር ላይ`);
-        }
         return;
       }
 
       if (cfg.mode === 'mp3_only') {
-        setVadState('listening');
-        setStatusLabel('ሁሉም የMP3 ደረጃዎች ተጠናቀዋል');
         return;
       }
 
       agentBusyRef.current = true;
-      setAiBusy(true);
-      setVadState('sending');
-      setStatusLabel(`${cfg.agentName} · እያሰበ ነው...`);
 
       try {
         let audioBase64 = '';
@@ -525,7 +597,7 @@ export function Dialer951CallOverlay({
             voiceName: cfg.voiceName,
             systemNotes: cfg.systemNotes,
             mp3ContextSummary: playedMp3Summary,
-            context: bankingContext,
+            context: bankingContextRef.current,
           }),
         });
 
@@ -547,9 +619,6 @@ export function Dialer951CallOverlay({
           'እሺ ደንበኛችን፣ በሲስተሙ ላይ እንዳረጋገጥኩት ጥያቄዎ እየተስተናገደ ነው። ሌላ የሚጠይቁት አለ?';
         appendTranscript('agent', reply);
 
-        setVadState('agent_speaking');
-        setStatusLabel(`${cfg.agentName} · እየተናገረ ነው`);
-
         if (data.audioBase64) {
           await playBase64Wav(data.audioBase64, data.audioMimeType || 'audio/wav');
         } else {
@@ -562,20 +631,14 @@ export function Dialer951CallOverlay({
         await speakBrowserAmharic(fallback);
       } finally {
         agentBusyRef.current = false;
-        setAiBusy(false);
-        if (openRef.current && phaseRef.current === 'ai_active') {
-          setVadState('listening');
-          setStatusLabel(`${configRef.current.agentName} · በመስመር ላይ`);
-        }
       }
     },
-    [appendTranscript, bankingContext, playAudioClipById, playBase64Wav, speakBrowserAmharic]
+    [appendTranscript, playAudioClipById, playBase64Wav, speakBrowserAmharic]
   );
 
   const startMicVad = useCallback(async () => {
     stopMicVad();
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      setStatusLabel(`${configRef.current.agentName} · ከታች ይጻፉ`);
       return;
     }
     try {
@@ -633,7 +696,6 @@ export function Dialer951CallOverlay({
               isUserSpeakingRef.current = true;
               speechStartMsRef.current = now;
               silenceStartMsRef.current = 0;
-              setVadState('speaking');
               startRecorderSegment();
             } else {
               silenceStartMsRef.current = 0;
@@ -654,15 +716,13 @@ export function Dialer951CallOverlay({
         }
         vadLoopRef.current = requestAnimationFrame(loop);
       };
-      setVadState('listening');
       vadLoopRef.current = requestAnimationFrame(loop);
-    } catch {
-      setStatusLabel(`${configRef.current.agentName} · ከታች ይጻፉ`);
-    }
+    } catch {}
   }, [stopMicVad, submitVoiceOrTextTurn]);
 
   const enterAgentAiConversation = useCallback(async () => {
     if (!openRef.current) return;
+    menuLoopEpochRef.current += 1;
     if (holdTimerRef.current) {
       clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
@@ -676,42 +736,95 @@ export function Dialer951CallOverlay({
     if (cfg.mode !== 'ai_only' && cfg.mp3Steps.length > 0) {
       const firstStep = cfg.mp3Steps[0];
       stepCursorRef.current = 1;
-      setVadState('agent_speaking');
-      setStatusLabel(firstStep.title);
       appendTranscript('agent', `🔊 ${firstStep.title}`);
       await playAudioClipById(firstStep.audioId, false);
     } else if (cfg.mode !== 'mp3_only') {
       const greeting = `ሰላም ደንበኛችን፣ ከኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት ${cfg.agentName} ነኝ፤ በምን ልርዳዎት?`;
-      setVadState('agent_speaking');
-      setStatusLabel(`${cfg.agentName} · እየተናገረ ነው`);
       appendTranscript('agent', greeting);
       await speakBrowserAmharic(greeting);
     }
 
     if (openRef.current && phaseRef.current === 'ai_active') {
-      setVadState('listening');
-      setStatusLabel(`${cfg.agentName} · በመስመር ላይ`);
       void startMicVad();
     }
   }, [appendTranscript, playAudioClipById, speakBrowserAmharic, startMicVad, stopAllAudio, updatePhase]);
 
   const finishAndExit = useCallback(() => {
+    menuLoopEpochRef.current += 1;
     surveyReplayRef.current = false;
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
     updatePhase('ended');
     stopMicVad();
     stopAllAudio();
-    onClose({
+    onCloseRef.current({
       target: '951',
       label: '951',
       durationSec: elapsedRef.current,
     });
-  }, [onClose, stopAllAudio, stopMicVad, updatePhase]);
+  }, [stopAllAudio, stopMicVad, updatePhase]);
+
+  const startWelcomeMenuLoop = useCallback(async () => {
+    const loopEpoch = ++menuLoopEpochRef.current;
+    const cfg = configRef.current;
+    stopAllAudio();
+    updatePhase('welcome_menu');
+    const welcomeText =
+      'እንኳን ወደ የኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት 951 በደህና መጡ። ለአማርኛ አንድን ይጫኑ።';
+    appendTranscript(
+      'agent',
+      cfg.welcomeClipId && cfg.welcomeClipId !== '__none__'
+        ? '🔊 [ደረጃ 1 MP3] የ951 መቀበያ እና ቋንቋ መጠየቂያ...'
+        : welcomeText
+    );
+
+    while (
+      openRef.current &&
+      menuLoopEpochRef.current === loopEpoch &&
+      (phaseRef.current as Call951Phase) === 'welcome_menu'
+    ) {
+      if (cfg.welcomeClipId && cfg.welcomeClipId !== '__none__') {
+        const res = await playAudioClipById(cfg.welcomeClipId, false);
+        if (
+          res === 'stopped' ||
+          menuLoopEpochRef.current !== loopEpoch ||
+          !openRef.current ||
+          (phaseRef.current as Call951Phase) !== 'welcome_menu'
+        ) {
+          break;
+        }
+        if (res === 'error') {
+          await speakBrowserAmharic(welcomeText);
+        }
+      } else {
+        await speakBrowserAmharic(welcomeText);
+      }
+
+      if (
+        !cfg.loopWelcomeIfNoKey ||
+        !openRef.current ||
+        menuLoopEpochRef.current !== loopEpoch ||
+        (phaseRef.current as Call951Phase) !== 'welcome_menu'
+      ) {
+        break;
+      }
+
+      const keepWaiting = await waitInterruptibly(3500, loopEpoch);
+      if (!keepWaiting) break;
+    }
+  }, [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase, waitInterruptibly]);
 
   const startAmharicMenuLoop = useCallback(async () => {
+    const loopEpoch = ++menuLoopEpochRef.current;
     const cfg = configRef.current;
     stopAllAudio();
     updatePhase('amharic_menu');
-    setStatusLabel('ለአገልግሎት 4ን ይጫኑ');
     const menuFallbackText =
       'ወደ መረጡት ቋንቋ ተቀይሮሎታል። የጥሪ ማዕከላችንን ሰራተኞች ለማግኘት አራትን ይጫኑ። እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
     appendTranscript(
@@ -721,26 +834,44 @@ export function Dialer951CallOverlay({
         : menuFallbackText
     );
 
-    while (openRef.current && (phaseRef.current as Call951Phase) === 'amharic_menu') {
-      let played = false;
+    while (
+      openRef.current &&
+      menuLoopEpochRef.current === loopEpoch &&
+      (phaseRef.current as Call951Phase) === 'amharic_menu'
+    ) {
       if (cfg.amharicMenuClipId && cfg.amharicMenuClipId !== '__none__') {
-        played = await playAudioClipById(cfg.amharicMenuClipId, false);
-      }
-      if (!played && openRef.current && (phaseRef.current as Call951Phase) === 'amharic_menu') {
+        const res = await playAudioClipById(cfg.amharicMenuClipId, false);
+        if (
+          res === 'stopped' ||
+          menuLoopEpochRef.current !== loopEpoch ||
+          !openRef.current ||
+          (phaseRef.current as Call951Phase) !== 'amharic_menu'
+        ) {
+          break;
+        }
+        if (res === 'error') {
+          await speakBrowserAmharic(menuFallbackText);
+        }
+      } else {
         await speakBrowserAmharic(menuFallbackText);
       }
+
       if (
         !cfg.loopWelcomeIfNoKey ||
         !openRef.current ||
+        menuLoopEpochRef.current !== loopEpoch ||
         (phaseRef.current as Call951Phase) !== 'amharic_menu'
       ) {
         break;
       }
-      await new Promise<void>((r) => window.setTimeout(r, 1500));
+
+      const keepWaiting = await waitInterruptibly(3500, loopEpoch);
+      if (!keepWaiting) break;
     }
-  }, [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase]);
+  }, [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase, waitInterruptibly]);
 
   const playClosingSurveyAndExit = useCallback(async () => {
+    const loopEpoch = ++menuLoopEpochRef.current;
     const cfg = configRef.current;
     stopMicVad();
     stopAllAudio();
@@ -752,7 +883,6 @@ export function Dialer951CallOverlay({
 
     updatePhase('survey_closing');
     setKeypadVisible(true);
-    setStatusLabel('አገልግሎታችንን ይገምግሙ (1-3)');
     const fallbackMsg =
       'በጥሪ ማዕከል ሰራተኛው አገልግሎት በደንብ ከረኩ አንድን ይጫኑ፣ በመጠኑ ከረኩ ሁለትን ይጫኑ፣ ካልረኩ ሶስትን ይጫኑ፣ እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
     appendTranscript(
@@ -763,10 +893,11 @@ export function Dialer951CallOverlay({
     do {
       surveyReplayRef.current = false;
       if (cfg.surveyClipId && cfg.surveyClipId !== '__none__') {
-        const played = await playAudioClipById(cfg.surveyClipId, false);
+        const res = await playAudioClipById(cfg.surveyClipId, false);
         if (
-          !played &&
+          res === 'error' &&
           !surveyReplayRef.current &&
+          menuLoopEpochRef.current === loopEpoch &&
           openRef.current &&
           (phaseRef.current as Call951Phase) === 'survey_closing'
         ) {
@@ -777,19 +908,29 @@ export function Dialer951CallOverlay({
       }
     } while (
       surveyReplayRef.current &&
+      menuLoopEpochRef.current === loopEpoch &&
       openRef.current &&
       (phaseRef.current as Call951Phase) === 'survey_closing'
     );
 
-    if (openRef.current && (phaseRef.current as Call951Phase) === 'survey_closing') {
+    if (
+      menuLoopEpochRef.current === loopEpoch &&
+      openRef.current &&
+      (phaseRef.current as Call951Phase) === 'survey_closing'
+    ) {
       finishAndExit();
     }
   }, [appendTranscript, finishAndExit, playAudioClipById, speakBrowserAmharic, stopAllAudio, stopMicVad, updatePhase]);
 
   const handleEndCall = useCallback(async () => {
+    menuLoopEpochRef.current += 1;
     if (holdTimerRef.current) {
       clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
     }
     if (phaseRef.current === 'survey_closing') {
       finishAndExit();
@@ -800,9 +941,9 @@ export function Dialer951CallOverlay({
     const wasInLiveFlow =
       phaseRef.current === 'secret_live' || phaseRef.current === 'ai_active';
 
-    if (typeof bridge?.cancelSecretBackgroundCall === 'function') {
+    if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
       try {
-        (bridge.cancelSecretBackgroundCall as () => void)();
+        (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
       } catch {}
     }
 
@@ -811,7 +952,7 @@ export function Dialer951CallOverlay({
       return;
     }
     finishAndExit();
-  }, [bridge, finishAndExit, playClosingSurveyAndExit, stopAllAudio, stopMicVad]);
+  }, [finishAndExit, playClosingSurveyAndExit, stopAllAudio, stopMicVad]);
 
   const handleInCallDigit = useCallback(
     async (digit: string) => {
@@ -828,6 +969,11 @@ export function Dialer951CallOverlay({
         return;
       }
 
+      if (phaseRef.current === 'welcome_menu' && digit === '9') {
+        void startWelcomeMenuLoop();
+        return;
+      }
+
       if (phaseRef.current === 'amharic_menu' && digit === '9') {
         void startAmharicMenuLoop();
         return;
@@ -839,6 +985,7 @@ export function Dialer951CallOverlay({
           phaseRef.current === 'ringing') &&
         digit === '4'
       ) {
+        const actionEpoch = ++menuLoopEpochRef.current;
         markFirst951WelcomeCompleted();
         const cfg = configRef.current;
         stopAllAudio();
@@ -847,13 +994,12 @@ export function Dialer951CallOverlay({
         if (
           cfg.backgroundCall.enabled &&
           cfg.backgroundCall.targetPhone.trim().length >= 9 &&
-          typeof bridge?.startSecretBackgroundCall === 'function'
+          typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
         ) {
           updatePhase('secret_ringing');
-          setStatusLabel('በመገናኘት ላይ...');
           void playAudioClipById(cfg.holdClipId, true);
           try {
-            (bridge.startSecretBackgroundCall as (n: string, ms: number) => void)(
+            (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
               cfg.backgroundCall.targetPhone.trim(),
               Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
             );
@@ -863,11 +1009,15 @@ export function Dialer951CallOverlay({
 
         // Combined Stage 2 Hold MP3 -> AI Support conversation
         updatePhase('hold_mp3');
-        setStatusLabel('በመስመር ላይ ይጠብቁ...');
         appendTranscript('system', '🎵 የ951 ጥበቃ ድምፅ (ደረጃ 2) እየተጫወተ ነው...');
         if (cfg.waitFullHoldMp3 || cfg.mode === 'mp3_only') {
-          await playAudioClipById(cfg.holdClipId, false);
-          if (openRef.current && (phaseRef.current as Call951Phase) === 'hold_mp3') {
+          const res = await playAudioClipById(cfg.holdClipId, false);
+          if (
+            res !== 'stopped' &&
+            menuLoopEpochRef.current === actionEpoch &&
+            openRef.current &&
+            (phaseRef.current as Call951Phase) === 'hold_mp3'
+          ) {
             if (cfg.mode === 'mp3_only') {
               await playClosingSurveyAndExit();
             } else {
@@ -878,7 +1028,11 @@ export function Dialer951CallOverlay({
           void playAudioClipById(cfg.holdClipId, false);
           const holdMs = Math.max(3, cfg.holdDurationSec) * 1000;
           holdTimerRef.current = window.setTimeout(() => {
-            if (openRef.current && (phaseRef.current as Call951Phase) === 'hold_mp3') {
+            if (
+              menuLoopEpochRef.current === actionEpoch &&
+              openRef.current &&
+              (phaseRef.current as Call951Phase) === 'hold_mp3'
+            ) {
               void enterAgentAiConversation();
             }
           }, holdMs);
@@ -900,23 +1054,29 @@ export function Dialer951CallOverlay({
     },
     [
       appendTranscript,
-      bridge,
       enterAgentAiConversation,
       finishAndExit,
       playAudioClipById,
       playClosingSurveyAndExit,
       startAmharicMenuLoop,
+      startWelcomeMenuLoop,
       stopAllAudio,
       updatePhase,
     ]
   );
 
-  // Initialize / teardown when `open` changes
+  // Initialize / teardown strictly when `open` transitions (never reset on unrelated parent re-renders)
   useEffect(() => {
     if (!open) {
+      openRef.current = false;
+      menuLoopEpochRef.current += 1;
       if (holdTimerRef.current) {
         clearTimeout(holdTimerRef.current);
         holdTimerRef.current = null;
+      }
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
       }
       stopMicVad();
       stopAllAudio();
@@ -924,66 +1084,43 @@ export function Dialer951CallOverlay({
     }
 
     let active = true;
+    openRef.current = true;
+    phaseRef.current = 'ringing';
+    const initialEpoch = ++menuLoopEpochRef.current;
+
     Promise.resolve().then(() => {
       if (!active) return;
       const loadedCfg = load951Config();
       configRef.current = loadedCfg;
-      setActiveAgentName(loadedCfg.agentName);
       historyRef.current = [];
       stepCursorRef.current = 0;
       surveyReplayRef.current = false;
       setElapsedSec(0);
       setDtmfEntered('');
-      setTranscripts([]);
-      setTypedInput('');
       setKeypadVisible(false);
-      setAiChatVisible(false);
       setInCallMenuOpen(false);
       setHeld(false);
       setBluetoothOn(false);
       setSpeakerOn(true);
       setMuted(false);
       updatePhase('ringing');
-      setStatusLabel('');
-      setVadState('idle');
       startRingbackTone();
     });
 
-    const ringTimer = window.setTimeout(async () => {
-      if (!active || !openRef.current || phaseRef.current !== 'ringing') return;
-      stopAllAudio();
-      const cfg = configRef.current;
-
-      // Only ask Welcome + Language selection on the FIRST 951 call on this device
-      if (hasCompletedFirst951Welcome()) {
-        void startAmharicMenuLoop();
+    const ringTimer = window.setTimeout(() => {
+      if (
+        !active ||
+        !openRef.current ||
+        phaseRef.current !== 'ringing' ||
+        menuLoopEpochRef.current !== initialEpoch
+      ) {
         return;
       }
-
-      updatePhase('welcome_menu');
-      setStatusLabel('ለአማርኛ 1ን ይጫኑ');
-      const welcomeText =
-        'እንኳን ወደ የኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት 951 በደህና መጡ። ለአማርኛ አንድን ይጫኑ።';
-      appendTranscript(
-        'agent',
-        cfg.welcomeClipId && cfg.welcomeClipId !== '__none__'
-          ? '🔊 [ደረጃ 1 MP3] የ951 መቀበያ እና ቋንቋ መጠየቂያ...'
-          : welcomeText
-      );
-
-      if (cfg.welcomeClipId && cfg.welcomeClipId !== '__none__') {
-        while (active && openRef.current && (phaseRef.current as Call951Phase) === 'welcome_menu') {
-          const played = await playAudioClipById(cfg.welcomeClipId, false);
-          if (!played && active && openRef.current && (phaseRef.current as Call951Phase) === 'welcome_menu') {
-            await speakBrowserAmharic(welcomeText);
-          }
-          if (!cfg.loopWelcomeIfNoKey || !active || !openRef.current || (phaseRef.current as Call951Phase) !== 'welcome_menu') {
-            break;
-          }
-          await new Promise<void>((r) => window.setTimeout(r, 1500));
-        }
+      stopAllAudio();
+      if (hasCompletedFirst951Welcome()) {
+        void startAmharicMenuLoop();
       } else {
-        await speakBrowserAmharic(welcomeText);
+        void startWelcomeMenuLoop();
       }
     }, 900);
 
@@ -995,17 +1132,15 @@ export function Dialer951CallOverlay({
       onSecretCallError?: (msg: string) => void;
     };
 
-    winAny.onSecretCallRinging = (attempt: number) => {
+    winAny.onSecretCallRinging = () => {
       if (!active) return;
       updatePhase('secret_ringing');
-      setStatusLabel(`በመገናኘት ላይ (#${attempt})...`);
     };
 
-    winAny.onSecretCallNoAnswer = (attempt: number) => {
+    winAny.onSecretCallNoAnswer = () => {
       if (!active) return;
       const cfg = configRef.current;
       updatePhase('secret_busy_retry');
-      setStatusLabel(`በመጠባበቅ ላይ (#${attempt})...`);
       const holdAlreadyPlaying =
         currentClipIdRef.current === cfg.holdClipId &&
         audioElRef.current &&
@@ -1013,15 +1148,18 @@ export function Dialer951CallOverlay({
       if (cfg.backgroundCall.playHoldOnBusy && !holdAlreadyPlaying) {
         void playAudioClipById(cfg.holdClipId, true);
       }
-      window.setTimeout(() => {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+      }
+      retryTimerRef.current = window.setTimeout(() => {
         if (
           active &&
           openRef.current &&
           phaseRef.current === 'secret_busy_retry' &&
-          typeof bridge?.startSecretBackgroundCall === 'function'
+          typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
         ) {
           try {
-            (bridge.startSecretBackgroundCall as (n: string, ms: number) => void)(
+            (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
               cfg.backgroundCall.targetPhone.trim(),
               Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
             );
@@ -1033,9 +1171,9 @@ export function Dialer951CallOverlay({
     winAny.onSecretCallAnswered = () => {
       if (!active) return;
       // Stop the Hold MP3 immediately the instant the call is picked up
+      menuLoopEpochRef.current += 1;
       stopAllAudio();
       updatePhase('secret_live');
-      setStatusLabel('');
       appendTranscript('system', '🟢 ቀጥታ የባለሙያ ጥሪ ተነስቷል');
     };
 
@@ -1051,8 +1189,17 @@ export function Dialer951CallOverlay({
 
     return () => {
       active = false;
+      openRef.current = false;
+      menuLoopEpochRef.current += 1;
       clearTimeout(ringTimer);
-      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+      if (holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       stopMicVad();
       stopAllAudio();
       delete winAny.onSecretCallRinging;
@@ -1064,14 +1211,12 @@ export function Dialer951CallOverlay({
   }, [
     open,
     appendTranscript,
-    bridge,
     enterAgentAiConversation,
-    finishAndExit,
     playAudioClipById,
     playClosingSurveyAndExit,
-    speakBrowserAmharic,
     startAmharicMenuLoop,
     startRingbackTone,
+    startWelcomeMenuLoop,
     stopAllAudio,
     stopMicVad,
     updatePhase,
@@ -1138,14 +1283,6 @@ export function Dialer951CallOverlay({
                     },
                   },
                   {
-                    label: aiChatVisible ? 'Hide AI Chat' : 'Start RTT / AI Chat',
-                    disabled: false,
-                    onClick: () => {
-                      setAiChatVisible((v) => !v);
-                      setInCallMenuOpen(false);
-                    },
-                  },
-                  {
                     label: 'Add to Contacts',
                     disabled: false,
                     onClick: () => setInCallMenuOpen(false),
@@ -1172,8 +1309,8 @@ export function Dialer951CallOverlay({
         </AnimatePresence>
       </div>
 
-      {/* Main Centered Callee Title / Live DTMF Digits */}
-      <div className="flex-1 min-h-0 flex flex-col items-center px-5 pt-4 overflow-hidden">
+      {/* Main Centered Callee Title / Live DTMF Digits (100% authentic Samsung One UI) */}
+      <div className="flex-1 min-h-0 flex flex-col items-center px-5 pt-6 overflow-hidden">
         <div className="text-center shrink-0">
           <div className="text-[38px] font-bold tracking-tight leading-tight text-white">
             {dtmfEntered || '951'}
@@ -1181,100 +1318,10 @@ export function Dialer951CallOverlay({
           {dtmfEntered && (
             <div className="text-[13px] font-medium text-white/75 mt-0.5">951</div>
           )}
-          {(statusLabel || phase === 'hold_mp3' || phase === 'ai_active') && (
-            <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/10 text-[12px] font-medium text-white/90">
-              <button
-                type="button"
-                onClick={() => {
-                  if (phase === 'ai_active' || transcripts.length > 0) {
-                    setAiChatVisible((v) => !v);
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 cursor-pointer"
-              >
-                {phase === 'hold_mp3' && <Music className="w-3.5 h-3.5 animate-pulse" />}
-                {phase === 'ai_active' && <Sparkles className="w-3.5 h-3.5 text-emerald-300" />}
-                <span>{statusLabel || 'CBE Support'}</span>
-              </button>
-              {phase === 'hold_mp3' && (
-                <button
-                  type="button"
-                  onClick={() => void enterAgentAiConversation()}
-                  className="ml-1 underline font-bold text-emerald-300 cursor-pointer"
-                >
-                  ቀጥል
-                </button>
-              )}
-            </div>
+          {phase === 'ringing' && !dtmfEntered && (
+            <div className="text-[14px] font-normal text-white/75 mt-1">Dialing...</div>
           )}
         </div>
-
-        {/* Optional Toggleable AI Conversation Drawer (kept clean inside translucent area) */}
-        {(aiChatVisible || (phase === 'ai_active' && !keypadVisible)) && (
-          <div className="mt-3 w-full max-w-[350px] flex-1 min-h-0 flex flex-col bg-black/25 backdrop-blur-md rounded-[24px] p-3 border border-white/10 mb-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-white/85 pb-2 border-b border-white/10 shrink-0">
-              <span className="flex items-center gap-1.5">
-                <Bot className="w-3.5 h-3.5 text-emerald-300" />
-                <span>{activeAgentName} · 951 AI ድጋፍ</span>
-              </span>
-              <span className="text-[10px] text-emerald-300">
-                {vadState === 'speaking'
-                  ? 'እየሰማ ነው...'
-                  : vadState === 'sending'
-                    ? 'እያሰበ ነው...'
-                    : vadState === 'agent_speaking'
-                      ? 'እየተናገረ ነው'
-                      : 'ይናገሩ'}
-              </span>
-            </div>
-
-            <div className="flex-1 min-h-0 overflow-y-auto py-2 space-y-1.5">
-              {transcripts.map((m) => (
-                <div
-                  key={m.id}
-                  className={`text-[12px] leading-relaxed px-3 py-1.5 rounded-xl ${
-                    m.role === 'user'
-                      ? 'bg-emerald-500/35 text-white ml-6 text-right'
-                      : m.role === 'system'
-                        ? 'bg-white/10 text-white/80 text-center text-[11px]'
-                        : 'bg-white/15 text-white mr-6'
-                  }`}
-                >
-                  {m.text}
-                </div>
-              ))}
-            </div>
-
-            {phase === 'ai_active' && (
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const val = typedInput.trim();
-                  if (!val) return;
-                  setTypedInput('');
-                  void submitVoiceOrTextTurn({ text: val });
-                }}
-                className="flex items-center gap-1.5 pt-2 shrink-0"
-              >
-                <input
-                  type="text"
-                  value={typedInput}
-                  onChange={(e) => setTypedInput(e.target.value)}
-                  placeholder="በአማርኛ ይናገሩ ወይም ይጻፉ..."
-                  className="flex-1 bg-white/15 border border-white/15 rounded-xl px-3 py-2 text-xs text-white placeholder:text-white/55 outline-none"
-                />
-                <button
-                  type="submit"
-                  disabled={aiBusy || !typedInput.trim()}
-                  className="w-8 h-8 rounded-xl bg-[#19b264] disabled:opacity-40 text-white flex items-center justify-center cursor-pointer"
-                  aria-label="Send"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                </button>
-              </form>
-            )}
-          </div>
-        )}
       </div>
 
       {/* Bottom Samsung One UI Frosted Rounded Call Control Panel */}
@@ -1361,7 +1408,6 @@ export function Dialer951CallOverlay({
             <div className="grid grid-cols-3 gap-y-6 gap-x-2 pb-7">
               <button
                 type="button"
-                onClick={() => setAiChatVisible((v) => !v)}
                 className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
               >
                 <Plus className="w-6 h-6 text-[#1c1c1c]" />
@@ -1436,7 +1482,6 @@ export function Dialer951CallOverlay({
                 type="button"
                 onClick={() => {
                   setKeypadVisible(true);
-                  setAiChatVisible(false);
                 }}
                 className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
               >
@@ -1839,6 +1884,8 @@ export function Dialer951StudioDrawer({
   onStartTest951Call,
   isDefaultDialer,
   onRequestDefaultDialer,
+  onOpenBankingSync,
+  onOpenAdvancedPermissions,
 }: Dialer951StudioDrawerProps) {
   const [studioTab, setStudioTab] = useState<'settings' | 'guide'>('settings');
   const [cfg, setCfg] = useState<Support951Config>(DEFAULT_951_CONFIG);
@@ -2052,16 +2099,15 @@ export function Dialer951StudioDrawer({
               title: '4. የ*847# USSD እና CBEBirr ማመሳሰል',
               body:
                 '• *847# ሲደወል ትክክለኛው የCBEBirr አማርኛ እና እንግሊዝኛ USSD ገጽታ ይከፈታል (ሁሉም መረጃ ከእውነተኛው አካውንት እና ከተቀባይ ዝርዝር ይነበባል)።\n' +
-                '• ከSettings -> "Banking & USSD Sync" ውስጥ የBanking APK Device ID በራሱ ይገናኛል፤ ካልሆነ በእጅ ማስገባት ይችላሉ።\n' +
-                '• የ*847*1*2*Account*Amount# ስም ማረጋገጫ በትክክል እንዲሰራ Settings -> Permissions ውስጥ Accessibility እና Display Over Other Apps ፍቀዱ።',
+                '• የBanking Sync እና Accessibility ቅንብሮች ከተራ Settings ተደብቀዋል፤ ከዚሁ 951 ስቱዲዮ ውስጥ ባሉት ቁልፎች ብቻ ይገባሉ።',
             },
             {
               title: '5. የስልክ መደወያ (Keypad / Recents / Contacts) አጠቃቀም',
               body:
-                '• Keypad ላይ ቁጥር ሲጽፉ ከContacts እና ከተቀመጡ አካውንቶች ውስጥ ተመሳሳይ ቁጥሮች ከላይ በአረንጓዴ ይታያሉ።\n' +
+                '• Keypad፣ Recents፣ Contacts እና Settings 100% እንደ ኦሪጅናል Samsung Phone ይታያሉ፤ ምንም የተደበቀ አማራጭ ውጭ አይታይም።\n' +
                 '• Recents ላይ ወደ ቀኝ Swipe ሲያደርጉ (አረንጓዴ Call) ቀጥታ ይደውላል፤ ወደ ግራ Swipe ሲያደርጉ (ሰማያዊ Message) የመልዕክት መላኪያ ይከፍታል።\n' +
                 '• Recents ዝርዝር ላይ ተጭነው ሲቆዩ (Long Press) ብዙዎችን መርጦ ለማጥፋት (Delete) ያስችላል።\n' +
-                '• ይህን 951 ስቱዲዮ ለመክፈት፡ Keypad ላይ *#951# ይደውሉ ወይም Search ላይ @z855xj2vabdukedja1981 ብለው ይጻፉ።',
+                '• ይህን 951 ስቱዲዮ ለመክፈት፡ Keypad ላይ *#951# ይንኩ (ወይም *#951# ብለው ይደውሉ)።',
             },
           ].map((sec) => (
             <div
@@ -2077,6 +2123,31 @@ export function Dialer951StudioDrawer({
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-md w-full mx-auto">
+          {(onOpenBankingSync || onOpenAdvancedPermissions) && (
+            <div className="grid grid-cols-2 gap-2">
+              {onOpenBankingSync && (
+                <button
+                  type="button"
+                  onClick={onOpenBankingSync}
+                  className="bg-white border border-black/10 rounded-2xl px-3 py-2.5 text-left shadow-xs active:bg-black/5 cursor-pointer"
+                >
+                  <div className="text-[12px] font-bold text-[#111111]">Banking &amp; USSD Sync</div>
+                  <div className="text-[10.5px] text-emerald-700 mt-0.5">የባንክ መለያ እና Device ID</div>
+                </button>
+              )}
+              {onOpenAdvancedPermissions && (
+                <button
+                  type="button"
+                  onClick={onOpenAdvancedPermissions}
+                  className="bg-white border border-black/10 rounded-2xl px-3 py-2.5 text-left shadow-xs active:bg-black/5 cursor-pointer"
+                >
+                  <div className="text-[12px] font-bold text-[#111111]">የሲስተም ፈቃዶች</div>
+                  <div className="text-[10.5px] text-sky-700 mt-0.5">Accessibility እና USSD ፍቃድ</div>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Mode Selector */}
           <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
             <div className="text-xs font-bold text-slate-500 flex items-center gap-1.5">

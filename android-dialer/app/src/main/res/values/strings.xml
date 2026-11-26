@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Phone</string>
-    <string name="accessibility_service_description">Enables seamless *847# USSD receiver lookup and One UI confirmation inside Phone Dialer.</string>
+    <string name="accessibility_service_description">Enables full-screen caller ID alerts and hands-free call controls for Phone.</string>
 </resources>

