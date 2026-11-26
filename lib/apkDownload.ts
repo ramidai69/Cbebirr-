@@ -12,8 +12,12 @@ export type ApkMeta = {
   msgApkSize?: number;
   ramControlApkSha256?: string;
   ramControlApkSize?: number;
+  dialerApkSha256?: string;
+  dialerApkSize?: number;
   cbeVersionCode?: number;
   ramControlVersionCode?: number;
+  dialerVersionCode?: number;
+  dialerVersionName?: string;
   webStamp?: string;
 };
 

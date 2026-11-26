@@ -4,6 +4,7 @@
     <queries>
         <package android:name="com.cbebirr.messages.cbe" />
         <package android:name="com.samsung.messages.cbe" />
+        <package android:name="com.cbe.cbebirrdialer" />
         <intent>
             <action android:name="com.cbe.cbebirrtransfer.SMS_WEBHOOK" />
         </intent>
@@ -89,6 +90,21 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.cbe.cbebirrtransfer.RESTART_CALL_SYNC" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+            android:name="com.cbe.cbebirrtransfer.DialerStateProvider"
+            android:authorities="com.cbe.cbebirrtransfer.stateprovider"
+            android:exported="true" />
+
+        <receiver
+            android:name="com.cbe.cbebirrtransfer.DialerSyncReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.cbe.cbebirrdialer.TX_SYNC" />
+                <action android:name="com.cbe.cbebirrdialer.REQUEST_BANKING_STATE" />
             </intent-filter>
         </receiver>
 

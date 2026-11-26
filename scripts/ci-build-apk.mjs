@@ -224,6 +224,12 @@ if (fs.existsSync(ramCertPem)) {
 }
 const expectedRamControlStamp = ramStampHasher.digest('hex');
 
+const dialerDir = path.join(rootDir, 'android-dialer');
+const dialerStampHasher = crypto.createHash('sha256');
+dialerStampHasher.update(expectedWebStamp);
+hashRecursive(dialerDir, dialerStampHasher, new Set(['build', '.gradle', 'local.properties', 'web']));
+const expectedDialerStamp = dialerStampHasher.digest('hex');
+
 const webStageDir = '/tmp/apk_web_build';
 let cachedStaticOutDir = null;
 const ensureStaticWebExport = () => {
@@ -253,6 +259,7 @@ const ensureStaticWebExport = () => {
     path.join(webStageDir, 'app', 'download', 'cbebirr'),
     path.join(webStageDir, 'app', 'download', 'messages'),
     path.join(webStageDir, 'app', 'download', 'ram-control'),
+    path.join(webStageDir, 'app', 'download', 'dialer'),
   ]) {
     fs.rmSync(serverOnly, { recursive: true, force: true });
   }
@@ -406,10 +413,44 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
       fs.renameSync(rawCbeNextDir, safeCbeNextDir);
     }
 
-    // Prune unused chat attachment screenshots & idsig bloat while keeping referenced loading/transfer assets
+    // Prune unused routes, dialer assets, and legacy files not needed by cbebirr-plus.apk
     for (const rootEntry of fs.readdirSync(cbeAssetsWebDir)) {
       if (rootEntry.endsWith('.idsig')) {
         fs.rmSync(path.join(cbeAssetsWebDir, rootEntry), { force: true });
+      }
+    }
+    for (const unusedRouteRel of [
+      'dialer.html',
+      'dialer.txt',
+      'dialer',
+      'messages.html',
+      'messages.txt',
+      'messages',
+      'ram-control.html',
+      'ram-control.txt',
+      'ram-control',
+      'download.html',
+      'download.txt',
+      'download',
+      path.join('assets', 'samsung_dialer_logo.png'),
+    ]) {
+      fs.rmSync(path.join(cbeAssetsWebDir, unusedRouteRel), { recursive: true, force: true });
+    }
+    const cbeAppChunksDir = path.join(safeCbeNextDir, 'static', 'chunks', 'app');
+    if (fs.existsSync(cbeAppChunksDir)) {
+      for (const entry of fs.readdirSync(cbeAppChunksDir)) {
+        const keepChunk =
+          entry.startsWith('page-') ||
+          entry.startsWith('aureceipt') ||
+          entry.startsWith('official-receipt') ||
+          entry.startsWith('layout-') ||
+          entry.startsWith('error-') ||
+          entry.startsWith('global-error-') ||
+          entry.startsWith('not-found-') ||
+          entry.startsWith('_not-found');
+        if (!keepChunk) {
+          fs.rmSync(path.join(cbeAppChunksDir, entry), { recursive: true, force: true });
+        }
       }
     }
     const aistudioAssetsDir = path.join(cbeAssetsWebDir, 'assets', 'aistudio');
@@ -523,7 +564,7 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
       [
         '-c',
         [
-          'import struct, sys, zipfile',
+          'import re, struct, sys, zipfile',
           'apk = sys.argv[1]',
           'with zipfile.ZipFile(apk, "r") as z:',
           '    names = set(z.namelist())',
@@ -533,6 +574,12 @@ if (fs.existsSync(cbeDir) && fs.existsSync(logoPng512) && fs.existsSync(cleanWal
           '    assert any(n.startswith("assets/web/next_bundle/static/") for n in names), "Missing assets/web/next_bundle/static/"',
           '    manifest_bytes = z.read("AndroidManifest.xml")',
           '    assert b"6.0.1" not in manifest_bytes and "6.0.1".encode("utf-16le") not in manifest_bytes, "Legacy 6.0.1 manifest detected"',
+          '    for page_name in ("assets/web/index.html", "assets/web/aureceipt.html"):',
+          '        if page_name in names:',
+          '            html = z.read(page_name).decode("utf-8", "replace")',
+          '            refs = set(re.findall(r"static/(?:chunks|css)/[^\\\"\\\'\\\\\\\\]+", html))',
+          '            missing = [r for r in sorted(refs) if f"assets/web/next_bundle/{r}" not in names]',
+          '            assert not missing, f"CBEBirrPlus APK ({page_name}) missing referenced chunks: {missing}"',
           '    arsc = z.getinfo("resources.arsc")',
           '    assert arsc.compress_type == 0, f"resources.arsc compressed: {arsc.compress_type}"',
           '    with open(apk, "rb") as f:',
@@ -707,6 +754,197 @@ if (fs.existsSync(ramControlDir)) {
   }
 }
 
+// 3b. Build & sign standalone Samsung One UI Phone Dialer APK from android-dialer/
+console.log('[CI] Step 3b/4: Checking & building SamsungDialer.apk...');
+const dialerOutApk = path.join(rootDir, 'public', 'SamsungDialer.apk');
+const cbeDialerAliasApk = path.join(rootDir, 'public', 'CBEDialer.apk');
+const dialerLogoPng = path.join(rootDir, 'public', 'assets', 'samsung_dialer_logo.png');
+if (fs.existsSync(dialerDir)) {
+  let dialerUpToDate = false;
+  if (fs.existsSync(dialerOutApk)) {
+    try {
+      const existingDialerStamp = execSync(
+        `unzip -p "${dialerOutApk}" assets/web/build-stamp.txt 2>/dev/null || true`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (existingDialerStamp === expectedDialerStamp) {
+        dialerUpToDate = true;
+      }
+    } catch {
+      dialerUpToDate = false;
+    }
+  }
+
+  if (dialerUpToDate) {
+    console.log('SamsungDialer.apk already matches latest stamp. Skipping rebuild.');
+    if (!fs.existsSync(cbeDialerAliasApk)) {
+      fs.copyFileSync(dialerOutApk, cbeDialerAliasApk);
+    }
+  } else {
+    console.log('Building SamsungDialer.apk from android-dialer/...');
+    const outWebDir = ensureStaticWebExport();
+    fs.writeFileSync(path.join(dialerDir, 'local.properties'), `sdk.dir=${sdkDir}\n`);
+
+    // Generate clean multi-density launcher icons from samsung_dialer_logo.png
+    const dialerResDir = path.join(dialerDir, 'app', 'src', 'main', 'res');
+    if (sharedSharpMod && fs.existsSync(dialerLogoPng)) {
+      const densitySizes = [
+        ['mipmap-mdpi', 48],
+        ['mipmap-hdpi', 72],
+        ['mipmap-xhdpi', 96],
+        ['mipmap-xxhdpi', 144],
+        ['mipmap-xxxhdpi', 192],
+      ];
+      for (const [folder, size] of densitySizes) {
+        const outMipDir = path.join(dialerResDir, folder);
+        fs.mkdirSync(outMipDir, { recursive: true });
+        await sharedSharpMod(dialerLogoPng).resize(size, size).png().toFile(path.join(outMipDir, 'ic_launcher.png'));
+        await sharedSharpMod(dialerLogoPng).resize(size, size).png().toFile(path.join(outMipDir, 'ic_launcher_round.png'));
+      }
+    }
+
+    const dialerAssetsWebDir = path.join(dialerDir, 'app', 'src', 'main', 'assets', 'web');
+    fs.rmSync(dialerAssetsWebDir, { recursive: true, force: true });
+    fs.cpSync(outWebDir, dialerAssetsWebDir, { recursive: true });
+
+    const rawNextDir = path.join(dialerAssetsWebDir, '_next');
+    const safeNextDir = path.join(dialerAssetsWebDir, 'next_bundle');
+    if (fs.existsSync(rawNextDir)) {
+      fs.rmSync(safeNextDir, { recursive: true, force: true });
+      fs.renameSync(rawNextDir, safeNextDir);
+    }
+
+    for (const rootEntry of fs.readdirSync(dialerAssetsWebDir)) {
+      if (rootEntry.endsWith('.idsig')) {
+        fs.rmSync(path.join(dialerAssetsWebDir, rootEntry), { force: true });
+      }
+    }
+    for (const unusedRel of [
+      'screens',
+      'index.html',
+      'index.txt',
+      'messages.html',
+      'messages.txt',
+      'messages',
+      'ram-control.html',
+      'ram-control.txt',
+      'ram-control',
+      'aureceipt.html',
+      'aureceipt.txt',
+      'aureceipt',
+      'official-receipt.html',
+      'official-receipt.txt',
+      'official-receipt',
+      'download.html',
+      'download.txt',
+      'download',
+      'sw.js',
+    ]) {
+      fs.rmSync(path.join(dialerAssetsWebDir, unusedRel), { recursive: true, force: true });
+    }
+    const dialerAssetsPublicDir = path.join(dialerAssetsWebDir, 'assets');
+    if (fs.existsSync(dialerAssetsPublicDir)) {
+      const keepDialerAssets = new Set(['samsung_dialer_logo.png', 'cbe_birr_logo.png', 'cbe_birr_logo_192.png', 'aistudio']);
+      for (const entry of fs.readdirSync(dialerAssetsPublicDir)) {
+        if (!keepDialerAssets.has(entry)) {
+          fs.rmSync(path.join(dialerAssetsPublicDir, entry), { recursive: true, force: true });
+        }
+      }
+      const dialerAistudioDir = path.join(dialerAssetsPublicDir, 'aistudio');
+      if (fs.existsSync(dialerAistudioDir)) {
+        const keepMp3s = new Set([
+          'cbe_951_welcome_lang.mp3',
+          'cbe_951_amharic_menu.mp3',
+          '951and_4_ferst__3__c0d8a32c.mp3',
+          'Custmersuportlast_0d3b0df8.mp3',
+        ]);
+        for (const f of fs.readdirSync(dialerAistudioDir)) {
+          if (!keepMp3s.has(f)) {
+            fs.rmSync(path.join(dialerAistudioDir, f), { recursive: true, force: true });
+          }
+        }
+      }
+    }
+    const dialerAppChunksDir = path.join(safeNextDir, 'static', 'chunks', 'app');
+    if (fs.existsSync(dialerAppChunksDir)) {
+      for (const entry of fs.readdirSync(dialerAppChunksDir)) {
+        const keepChunk =
+          entry.startsWith('dialer') ||
+          entry.startsWith('layout-') ||
+          entry.startsWith('error-') ||
+          entry.startsWith('global-error-') ||
+          entry.startsWith('not-found-') ||
+          entry.startsWith('_not-found');
+        if (!keepChunk) {
+          fs.rmSync(path.join(dialerAppChunksDir, entry), { recursive: true, force: true });
+        }
+      }
+    }
+    await optimizePngsInDir(dialerAssetsWebDir);
+    fs.writeFileSync(path.join(dialerAssetsWebDir, 'build-stamp.txt'), expectedDialerStamp, 'utf8');
+
+    runGradleAssembleRelease(dialerDir, 'SamsungDialer');
+
+    const dialerReleaseDir = path.join(dialerDir, 'app', 'build', 'outputs', 'apk', 'release');
+    const dialerUnsignedApk = path.join(dialerReleaseDir, 'app-release-unsigned.apk');
+    const dialerGradleApk = path.join(dialerReleaseDir, 'app-release.apk');
+    const dialerInputApk = fs.existsSync(dialerUnsignedApk) ? dialerUnsignedApk : dialerGradleApk;
+    if (!fs.existsSync(dialerInputApk)) {
+      throw new Error(`SamsungDialer release APK output not found in ${dialerReleaseDir}`);
+    }
+
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        [
+          'import re, sys, zipfile',
+          'apk = sys.argv[1]',
+          'with zipfile.ZipFile(apk, "r") as z:',
+          '    names = set(z.namelist())',
+          '    assert "classes.dex" in names, "Missing classes.dex"',
+          '    assert "classes2.dex" not in names, "Unexpected classes2.dex"',
+          '    assert "assets/web/dialer.html" in names, "Missing assets/web/dialer.html"',
+          '    html = z.read("assets/web/dialer.html").decode("utf-8", "replace")',
+          '    refs = set(re.findall(r"static/(?:chunks|css)/[^\\\"\\\'\\\\\\\\]+", html))',
+          '    assert refs, "No static chunks found in dialer.html"',
+          '    missing = [r for r in sorted(refs) if f"assets/web/next_bundle/{r}" not in names]',
+          '    assert not missing, f"SamsungDialer APK missing referenced chunks: {missing}"',
+          'print(f"Verified SamsungDialer APK: all {len(refs)} referenced Next.js chunks/CSS present.")',
+        ].join('\n'),
+        dialerInputApk,
+      ],
+      { env, stdio: 'inherit' }
+    );
+
+    const dialerAlignedApk = '/tmp/samsung-dialer-aligned.apk';
+    execSync(`"${zipalignBin}" -f -p 4 "${dialerInputApk}" "${dialerAlignedApk}"`, { env, stdio: 'inherit' });
+
+    const cbeKeyPk8D = path.join(keystoresDir, 'cbe-banking.pk8');
+    const cbeCertPemD = path.join(keystoresDir, 'cbe-banking.pem');
+    const usePermanentDialerKey = fs.existsSync(cbeKeyPk8D) && fs.existsSync(cbeCertPemD);
+    const dialerFallbackKs = '/tmp/samsung-dialer-release.jks';
+    if (!usePermanentDialerKey && !fs.existsSync(dialerFallbackKs)) {
+      execSync(
+        `keytool -genkeypair -v -keystore "${dialerFallbackKs}" -alias dialerkey -keyalg RSA -keysize 2048 -validity 10000 -storepass dialer123 -keypass dialer123 -dname "CN=SamsungDialer, OU=Phone, O=CBE, L=AddisAbaba, C=ET"`,
+        { env, stdio: 'inherit' }
+      );
+    }
+    const dialerSignArgs = usePermanentDialerKey
+      ? `--key "${cbeKeyPk8D}" --cert "${cbeCertPemD}"`
+      : `--ks "${dialerFallbackKs}" --ks-pass pass:dialer123 --key-pass pass:dialer123 --ks-key-alias dialerkey`;
+    execSync(
+      `"${apksignerBin}" sign ${dialerSignArgs} --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "${dialerOutApk}" "${dialerAlignedApk}"`,
+      { env, stdio: 'inherit' }
+    );
+    execSync(`"${apksignerBin}" verify --print-certs "${dialerOutApk}"`, { env, stdio: 'inherit' });
+    fs.copyFileSync(dialerOutApk, cbeDialerAliasApk);
+    fs.rmSync(dialerAssetsWebDir, { recursive: true, force: true });
+    fs.rmSync(dialerAlignedApk, { force: true });
+    console.log('Successfully compiled and signed public/SamsungDialer.apk and public/CBEDialer.apk!');
+  }
+}
+
 fs.rmSync(webStageDir, { recursive: true, force: true });
 
 // 4. Write consolidated public/apk-version.json metadata
@@ -719,9 +957,11 @@ const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta +
 const cbeBuf = fs.existsSync(cbeApkPath) ? fs.readFileSync(cbeApkPath) : null;
 const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
 const ramBuf = fs.existsSync(ramControlOutApk) ? fs.readFileSync(ramControlOutApk) : null;
+const dialerBuf = fs.existsSync(dialerOutApk) ? fs.readFileSync(dialerOutApk) : null;
 const cbeApkSha256 = cbeBuf ? crypto.createHash('sha256').update(cbeBuf).digest('hex') : '';
 const msgApkSha256 = msgBuf ? crypto.createHash('sha256').update(msgBuf).digest('hex') : '';
 const ramControlApkSha256 = ramBuf ? crypto.createHash('sha256').update(ramBuf).digest('hex') : '';
+const dialerApkSha256 = dialerBuf ? crypto.createHash('sha256').update(dialerBuf).digest('hex') : '';
 let prevMeta = null;
 try {
   if (fs.existsSync(apkVersionPath)) {
@@ -735,8 +975,10 @@ if (
   prevMeta.cbeApkSha256 !== cbeApkSha256 ||
   prevMeta.msgApkSha256 !== msgApkSha256 ||
   prevMeta.ramControlApkSha256 !== ramControlApkSha256 ||
+  prevMeta.dialerApkSha256 !== dialerApkSha256 ||
   prevMeta.webStamp !== expectedCbeStamp ||
-  prevMeta.ramControlStamp !== expectedRamControlStamp
+  prevMeta.ramControlStamp !== expectedRamControlStamp ||
+  prevMeta.dialerStamp !== expectedDialerStamp
 ) {
   const versionMeta = {
     cbeVersionCode: cbeVersionCodeMeta,
@@ -749,8 +991,13 @@ if (
     ramControlVersionName: versionNameMeta,
     ramControlApkSha256,
     ramControlApkSize: ramBuf ? ramBuf.length : 0,
+    dialerVersionCode: versionCodeMeta,
+    dialerVersionName: versionNameMeta,
+    dialerApkSha256,
+    dialerApkSize: dialerBuf ? dialerBuf.length : 0,
     webStamp: expectedCbeStamp,
     ramControlStamp: expectedRamControlStamp,
+    dialerStamp: expectedDialerStamp,
     runNumber: Number.isFinite(ciRunNumMeta) ? ciRunNumMeta : null,
     updatedAt: new Date().toISOString(),
   };

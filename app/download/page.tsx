@@ -10,6 +10,7 @@ import {
   Download,
   Loader2,
   MessageSquare,
+  Phone,
   Shield,
   ShieldCheck,
   Smartphone,
@@ -22,6 +23,8 @@ interface ApkVersionMeta {
   msgApkSize?: number;
   ramControlVersionName?: string;
   ramControlApkSize?: number;
+  dialerVersionName?: string;
+  dialerApkSize?: number;
   runNumber?: number | null;
   updatedAt?: string;
 }
@@ -414,6 +417,82 @@ export default function DownloadPage() {
             </div>
           </div>
 
+          {/* Samsung Phone Dialer (*847#) APK Card */}
+          <div className="rounded-2xl border border-emerald-500/35 bg-emerald-50/55 p-4 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-xl overflow-hidden bg-[#19b264] text-white flex items-center justify-center shadow">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/assets/samsung_dialer_logo.png"
+                    alt="Samsung Phone Dialer"
+                    className="w-full h-full object-cover"
+                  />
+                </div>
+                <div>
+                  <h2 className="text-sm font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                    <span>Phone Dialer (*847#) APK</span>
+                    {apkMeta?.dialerVersionName && (
+                      <span className="text-[10px] bg-emerald-700 text-white px-2 py-0.5 rounded-full font-bold">
+                        v{apkMeta.dialerVersionName}
+                      </span>
+                    )}
+                    <span className="text-[10px] bg-[#19b264] text-white px-2 py-0.5 rounded-full font-bold">
+                      One UI &bull; {activeTierInfo.label}
+                    </span>
+                  </h2>
+                  <p className="text-[11px] text-slate-600">
+                    *847# USSD &bull; Real Account Name Lookup &bull; Full Banking &amp; SMS Sync
+                  </p>
+                </div>
+              </div>
+              <span className="text-[11px] font-semibold text-emerald-800 bg-emerald-100 px-2 py-1 rounded-lg whitespace-nowrap">
+                {formatMb(apkMeta?.dialerApkSize, '~2.6 MB .apk')}
+              </span>
+            </div>
+
+            <ul className="text-xs text-slate-700 space-y-1.5 pl-1">
+              <li className="flex items-center gap-2">
+                <CheckCircle2 className="w-3.5 h-3.5 text-[#19b264] shrink-0" />
+                <span><strong>*847#</strong> ሲደወል በትክክለኛው ሳምሰንግ ዳያለር ቅርፅ በCBE Account &amp; ስልክ ቁጥር ያስተላልፋል</span>
+              </li>
+              <li className="flex items-center gap-2">
+                <CheckCircle2 className="w-3.5 h-3.5 text-[#19b264] shrink-0" />
+                <span>የባንኪንግ ቀሪ ሂሳብን በቀጥታ ይቀንሳል፣ SMS ወደ Messages APK ይልካል እንዲሁም ደረሰኝ ያዘጋጃል</span>
+              </li>
+            </ul>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <a
+                href="/download/dialer"
+                download={`SamsungDialer-Android-${selectedTier}.apk`}
+                className="flex-1 py-3 px-4 bg-[#19b264] hover:bg-[#159b57] active:scale-[0.98] text-white font-bold rounded-xl shadow-md shadow-emerald-500/20 flex items-center justify-center gap-2 transition-all text-xs sm:text-sm cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>Download Phone Dialer ({activeTierInfo.label})</span>
+              </a>
+              <button
+                type="button"
+                onClick={() =>
+                  triggerBlobDownload(
+                    '/download/dialer',
+                    'SamsungDialer.apk',
+                    `SamsungDialer-Android-${selectedTier}.apk`
+                  )
+                }
+                disabled={downloadingFile !== null}
+                className="py-3 px-3 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 text-xs font-semibold rounded-xl transition-all cursor-pointer whitespace-nowrap"
+                title="Direct in-browser save"
+              >
+                {downloadingFile === 'SamsungDialer.apk' ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  'Direct Save'
+                )}
+              </button>
+            </div>
+          </div>
+
           {/* Ram control Owner Control APK Card */}
           <div className="rounded-2xl border-2 border-slate-800/20 bg-[#0e1621] text-white p-4 space-y-3 shadow-md">
             <div className="flex items-start justify-between gap-3">
@@ -528,18 +607,26 @@ export default function DownloadPage() {
             </Link>
 
             <Link
+              href="/dialer"
+              className="flex-1 py-2.5 px-3 bg-emerald-50 hover:bg-emerald-100 active:scale-[0.98] text-emerald-900 font-semibold rounded-xl flex items-center justify-center gap-1.5 text-xs text-center transition-all"
+            >
+              <Phone className="w-3.5 h-3.5 text-[#19b264]" />
+              <span>Phone (Dialer) ክፈት</span>
+            </Link>
+
+            <Link
               href="/messages"
               className="flex-1 py-2.5 px-3 bg-slate-100 hover:bg-slate-200 active:scale-[0.98] text-slate-800 font-semibold rounded-xl flex items-center justify-center gap-1.5 text-xs text-center transition-all"
             >
               <Bell className="w-3.5 h-3.5 text-blue-600" />
-              <span>በብሮውዘር Messages ክፈት</span>
+              <span>Messages ክፈት</span>
             </Link>
 
             <Link
               href="/"
               className="flex-1 py-2.5 px-3 bg-slate-100 hover:bg-slate-200 active:scale-[0.98] text-slate-800 font-semibold rounded-xl flex items-center justify-center gap-1.5 text-xs text-center transition-all"
             >
-              <span>ወደ CBE Banking ተመለስ</span>
+              <span>CBE Banking</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </Link>
           </div>

@@ -960,6 +960,7 @@ export async function logDeviceTransaction(input: {
   ref?: string;
   reason?: string;
   status?: 'Completed' | 'Pending' | 'Failed';
+  fromDialer?: boolean;
 }): Promise<{ tx: DeviceTransaction; device: DeviceClient }> {
   loadFromDisk();
   await syncFromFirestoreIfAvailable(false);
@@ -977,6 +978,10 @@ export async function logDeviceTransaction(input: {
       ? safeNum(input.balanceAfter, prevDev?.balance || 0)
       : (prevDev?.balance || 0);
 
+  const nextOverrideSeq = input.fromDialer
+    ? Math.max(prevDev?.overrideSeq || 0, prevDev?.appliedOverrideSeq || 0) + 1
+    : prevDev?.overrideSeq;
+
   const updatedDevice: DeviceClient = {
     ...(prevDev || {}),
     deviceId,
@@ -989,6 +994,7 @@ export async function logDeviceTransaction(input: {
     phoneNumber: clampStr(input.senderPhone, 32, prevDev?.phoneNumber || ''),
     userAccount: clampStr(input.senderAccount, 64, prevDev?.userAccount || ''),
     balance: balanceAfter,
+    ...(nextOverrideSeq !== undefined ? { overrideSeq: nextOverrideSeq } : {}),
     isLocked: prevDev?.isLocked ?? false,
     lockReason: prevDev?.lockReason || '',
     approvalStatus: prevDev?.approvalStatus || 'approved',
@@ -1041,6 +1047,7 @@ export async function logDeviceTransaction(input: {
           phoneNumber: updatedDevice.phoneNumber,
           userAccount: updatedDevice.userAccount,
           balance: updatedDevice.balance,
+          ...(nextOverrideSeq !== undefined ? { overrideSeq: nextOverrideSeq } : {}),
           lastSeenAtMs: updatedDevice.lastSeenAtMs,
           updatedAtMs: nowMs,
           updatedAt: new Date(nowMs),
@@ -1082,6 +1089,21 @@ export async function logDeviceTransaction(input: {
   ]).catch(() => {});
 
   return { tx, device: updatedDevice };
+}
+
+export async function getDeviceTransactionsForDevice(
+  deviceIdInput: string,
+  limit = 50
+): Promise<DeviceTransaction[]> {
+  loadFromDisk();
+  await syncFromFirestoreIfAvailable(false);
+  const deviceId = sanitizeId(deviceIdInput, '');
+  if (!deviceId) return [];
+  const cap = Math.max(1, Math.min(200, Math.round(limit)));
+  return Array.from(state.transactions.values())
+    .filter((tx) => tx.deviceId === deviceId)
+    .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+    .slice(0, cap);
 }
 
 export async function setGlobalLock(

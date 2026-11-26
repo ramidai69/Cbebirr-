@@ -46,6 +46,10 @@ public class CallBridgeHelper {
     public static final String KEY_NATIVE_LOCK_STATE_JSON = "native_lock_state_json";
     public static final String KEY_DELIVERED_NOTIF_IDS = "delivered_notif_ids_json";
     public static final String KEY_USSD_HANDLED_JSON = "ussd_handled_state_json";
+    public static final String KEY_BANKING_EXTRAS_JSON = "banking_extras_json";
+    public static final String KEY_PENDING_DIALER_TX_JSON = "pending_dialer_tx_json";
+    public static final String ACTION_BANKING_STATE_SYNC = "com.cbe.cbebirrtransfer.BANKING_STATE_SYNC";
+    public static final String DIALER_PKG = "com.cbe.cbebirrdialer";
 
     public static final int REQ_WEB_PERMISSIONS = 0x1b9d;
     public static final int REQ_CALL_PERMISSIONS = 0x1b9e;
@@ -402,6 +406,7 @@ public class CallBridgeHelper {
                 .putString(KEY_API_BASE, cleanBase)
                 .apply();
             startCallServiceIfReady(ctx.getApplicationContext());
+            broadcastBankingStateToDialer(ctx.getApplicationContext());
         } catch (Throwable ignored) {
         }
     }
@@ -455,6 +460,7 @@ public class CallBridgeHelper {
                 SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
                 prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, jsonStr).apply();
             }
+            broadcastBankingStateToDialer(ctx.getApplicationContext());
         } catch (Throwable ignored) {
         }
     }
@@ -469,6 +475,162 @@ public class CallBridgeHelper {
             }
         } catch (Throwable ignored) {
             return "";
+        }
+    }
+
+    public static void saveBankingExtrasJson(Context ctx, String jsonStr) {
+        if (ctx == null || jsonStr == null || jsonStr.trim().isEmpty()) return;
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                prefs.edit().putString(KEY_BANKING_EXTRAS_JSON, jsonStr).apply();
+            }
+            broadcastBankingStateToDialer(ctx.getApplicationContext());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static String getBankingExtrasJson(Context ctx) {
+        if (ctx == null) return "";
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String val = prefs.getString(KEY_BANKING_EXTRAS_JSON, "");
+                return val != null ? val : "";
+            }
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    public static String consumePendingDialerTxsJson(Context ctx) {
+        if (ctx == null) return "[]";
+        try {
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                String val = prefs.getString(KEY_PENDING_DIALER_TX_JSON, "[]");
+                prefs.edit().remove(KEY_PENDING_DIALER_TX_JSON).apply();
+                return (val != null && !val.trim().isEmpty()) ? val : "[]";
+            }
+        } catch (Throwable ignored) {
+            return "[]";
+        }
+    }
+
+    public static void broadcastBankingStateToDialer(Context ctx) {
+        if (ctx == null) return;
+        try {
+            Context appCtx = ctx.getApplicationContext();
+            String deviceId = getDeviceId(appCtx);
+            String apiBase = getApiBaseUrl(appCtx);
+            String snapshotJson = getSyncSnapshotJson(appCtx);
+            String extrasJson = getBankingExtrasJson(appCtx);
+            Intent i = new Intent(ACTION_BANKING_STATE_SYNC);
+            i.setClassName(DIALER_PKG, DIALER_PKG + ".DialerSyncReceiver");
+            i.addFlags(285212704);
+            i.putExtra("deviceId", deviceId);
+            i.putExtra("apiBase", apiBase);
+            i.putExtra("syncSnapshotJson", snapshotJson);
+            i.putExtra("bankingExtrasJson", extrasJson);
+            appCtx.sendBroadcast(i);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void applyDialerTransferLocally(Context ctx, String txJsonStr) {
+        if (ctx == null || txJsonStr == null || txJsonStr.trim().isEmpty()) return;
+        try {
+            Context appCtx = ctx.getApplicationContext();
+            JSONObject incoming = new JSONObject(txJsonStr);
+            synchronized (STATE_LOCK) {
+                SharedPreferences prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+
+                // 1. Update balance in stored syncSnapshotJson if provided
+                if (incoming.has("balanceAfter")) {
+                    double newBal = incoming.optDouble("balanceAfter", -1);
+                    if (newBal >= 0) {
+                        String snapRaw = prefs.getString(KEY_SYNC_SNAPSHOT_JSON, "");
+                        JSONObject snap = (snapRaw != null && !snapRaw.isEmpty())
+                            ? new JSONObject(snapRaw)
+                            : new JSONObject();
+                        snap.put("balance", newBal);
+                        prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, snap.toString()).apply();
+                    }
+                }
+
+                // 2. Append to pending dialer queue for Banking WebView consumption
+                String queueRaw = prefs.getString(KEY_PENDING_DIALER_TX_JSON, "[]");
+                JSONArray queueArr = new JSONArray((queueRaw != null && !queueRaw.isEmpty()) ? queueRaw : "[]");
+                String incomingId = incoming.optString("id", incoming.optString("ref", ""));
+                boolean dup = false;
+                for (int k = 0; k < queueArr.length(); k++) {
+                    JSONObject prev = queueArr.optJSONObject(k);
+                    if (prev != null && !incomingId.isEmpty() && incomingId.equals(prev.optString("id", prev.optString("ref", "")))) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    queueArr.put(incoming);
+                    prefs.edit().putString(KEY_PENDING_DIALER_TX_JSON, queueArr.toString()).apply();
+                }
+
+                // 3. Also update cached extras (savedAccountReceivers / savedPhoneReceivers / transactions)
+                String extrasRaw = prefs.getString(KEY_BANKING_EXTRAS_JSON, "");
+                if (extrasRaw != null && !extrasRaw.isEmpty()) {
+                    try {
+                        JSONObject extras = new JSONObject(extrasRaw);
+                        JSONArray txList = extras.optJSONArray("transactions");
+                        if (txList == null) txList = new JSONArray();
+                        JSONArray nextTxList = new JSONArray();
+                        nextTxList.put(incoming);
+                        for (int idx = 0; idx < txList.length() && idx < 49; idx++) {
+                            JSONObject item = txList.optJSONObject(idx);
+                            if (item != null && !incomingId.isEmpty() && incomingId.equals(item.optString("id", item.optString("ref", "")))) {
+                                continue;
+                            }
+                            nextTxList.put(txList.opt(idx));
+                        }
+                        extras.put("transactions", nextTxList);
+
+                        String rcvAcc = incoming.optString("account", "").trim();
+                        String rcvName = incoming.optString("receiverName", "").trim();
+                        String mode = incoming.optString("dialerMode", "");
+                        if (!rcvAcc.isEmpty() && !rcvName.isEmpty()) {
+                            String arrKey = "phone".equals(mode) ? "savedPhoneReceivers" : "savedAccountReceivers";
+                            JSONArray recs = extras.optJSONArray(arrKey);
+                            if (recs == null) recs = new JSONArray();
+                            boolean exists = false;
+                            for (int r = 0; r < recs.length(); r++) {
+                                JSONObject rec = recs.optJSONObject(r);
+                                if (rec != null && rcvAcc.equals(rec.optString("accountNumber", ""))) {
+                                    rec.put("accountName", rcvName);
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) {
+                                JSONObject nr = new JSONObject();
+                                nr.put("id", "rec_" + System.currentTimeMillis());
+                                nr.put("accountNumber", rcvAcc);
+                                nr.put("accountName", rcvName);
+                                JSONArray nextRecs = new JSONArray();
+                                nextRecs.put(nr);
+                                for (int r = 0; r < recs.length() && r < 49; r++) nextRecs.put(recs.opt(r));
+                                extras.put(arrKey, nextRecs);
+                            }
+                        }
+                        prefs.edit().putString(KEY_BANKING_EXTRAS_JSON, extras.toString()).apply();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            broadcastBankingStateToDialer(appCtx);
+            MainActivity act = MainActivity.currentInstance;
+            if (act != null) {
+                act.notifyDialerTxApplied();
+            }
+        } catch (Throwable ignored) {
         }
     }
 

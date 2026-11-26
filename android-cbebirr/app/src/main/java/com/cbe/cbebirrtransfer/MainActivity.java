@@ -327,6 +327,21 @@ public class MainActivity extends Activity {
         injectReceiverName(name);
     }
 
+    public void notifyDialerTxApplied() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null) return;
+                try {
+                    String js = "try{window.dispatchEvent(new Event('cbe-dialer-tx-applied'));}catch(e){}"
+                        + "try{if(typeof window.onDialerTxApplied==='function'){window.onDialerTxApplied();}}catch(e){}";
+                    webView.evaluateJavascript(js, null);
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
     public void onRemoteUssdScreenEvent(
         final String requestId,
         final String status,
@@ -713,6 +728,21 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public String getNativeSyncStateJson() {
             return CallBridgeHelper.getNativeSyncStateJson(mContext);
+        }
+
+        @JavascriptInterface
+        public void saveBankingExtrasJson(String json) {
+            CallBridgeHelper.saveBankingExtrasJson(mContext, json);
+        }
+
+        @JavascriptInterface
+        public String getBankingExtrasJson() {
+            return CallBridgeHelper.getBankingExtrasJson(mContext);
+        }
+
+        @JavascriptInterface
+        public String consumePendingDialerTxsJson() {
+            return CallBridgeHelper.consumePendingDialerTxsJson(mContext);
         }
 
         @JavascriptInterface

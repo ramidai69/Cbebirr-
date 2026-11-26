@@ -19,4 +19,6 @@ android-ram-control/local.properties
 android-ram-control/app/src/main/assets/web/
 android-cbebirr/local.properties
 android-cbebirr/app/src/main/assets/web/
+android-dialer/local.properties
+android-dialer/app/src/main/assets/web/
 public/*.apk

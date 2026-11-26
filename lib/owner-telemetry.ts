@@ -7,6 +7,7 @@ import {
   DevicePlatform,
   DeviceRemoteOverride,
   DeviceSyncResponse,
+  DeviceTransaction,
   OWNER_PIN,
   OwnerDashboardSnapshot,
   OwnerNotification,
@@ -538,6 +539,7 @@ interface PendingTxPayload {
   platform: DevicePlatform;
   appVersion: string;
   status: string;
+  source?: string;
   queuedAtMs: number;
 }
 
@@ -619,6 +621,8 @@ export async function flushPendingDeviceTransactions(): Promise<void> {
 
 export async function reportDeviceTransaction(params: {
   txId?: string;
+  deviceIdOverride?: string;
+  source?: 'banking' | 'dialer';
   senderName: string;
   senderPhone: string;
   senderAccount: string;
@@ -636,11 +640,12 @@ export async function reportDeviceTransaction(params: {
 }): Promise<void> {
   if (typeof window === 'undefined') return;
 
-  const deviceId = getOrCreateOwnerDeviceId();
+  const { deviceIdOverride, ...restParams } = params;
+  const deviceId = (deviceIdOverride && deviceIdOverride.trim()) || getOrCreateOwnerDeviceId();
   const info = detectDeviceInfo();
   const baseUrl = getOwnerApiBaseUrl();
   const payload: PendingTxPayload = {
-    ...params,
+    ...restParams,
     deviceId,
     deviceName: info.deviceName,
     platform: info.platform,
@@ -1619,6 +1624,61 @@ export function setNativeAudioMode(active: boolean, speakerOn = true): void {
       win.RamAudioBridge.setAudioCallMode(Boolean(active), Boolean(speakerOn));
     }
   } catch {}
+}
+
+export async function fetchRecentDeviceTransactions(
+  deviceIdInput?: string,
+  limit = 40
+): Promise<DeviceTransaction[]> {
+  if (typeof window === 'undefined') return [];
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return [];
+  const deviceId = (deviceIdInput && deviceIdInput.trim()) || getOrCreateOwnerDeviceId();
+  if (!deviceId) return [];
+  try {
+    const baseUrl = getOwnerApiBaseUrl();
+    const res = await fetch(
+      `${baseUrl}/api/device/tx?deviceId=${encodeURIComponent(deviceId)}&limit=${Math.max(1, limit)}`,
+      { cache: 'no-store' }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (data && Array.isArray(data.transactions)) {
+      return data.transactions as DeviceTransaction[];
+    }
+  } catch {}
+  return [];
+}
+
+export function saveNativeBankingExtrasJson(jsonStr: string): void {
+  if (typeof window === 'undefined' || !jsonStr) return;
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.saveBankingExtrasJson === 'function') {
+      androidAny.saveBankingExtrasJson(jsonStr);
+    }
+  } catch {}
+}
+
+export function getNativeBankingExtrasJson(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.getBankingExtrasJson === 'function') {
+      return String(androidAny.getBankingExtrasJson() || '');
+    }
+  } catch {}
+  return '';
+}
+
+export function consumePendingNativeDialerTxsJson(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const androidAny = (window as any).Android;
+    if (typeof androidAny?.consumePendingDialerTxsJson === 'function') {
+      return String(androidAny.consumePendingDialerTxsJson() || '');
+    }
+  } catch {}
+  return '';
 }
 
 

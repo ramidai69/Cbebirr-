@@ -679,6 +679,7 @@ export interface SendTransactionSmsParams {
   serviceCharge?: string | number;
   vat?: string | number;
   totalPaid?: string | number;
+  deviceId?: string;
 }
 
 /**
@@ -707,6 +708,10 @@ export async function sendTransactionSms(
     vat: params.vat,
     totalPaid: params.totalPaid,
   });
+
+  if (params.deviceId && params.deviceId.trim()) {
+    payload.deviceId = params.deviceId.trim();
+  }
 
   return sendSmsWebhook(payload);
 }
