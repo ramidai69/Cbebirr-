@@ -2,6 +2,7 @@ package com.cbe.cbebirrdialer;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.media.AudioManager;
@@ -16,7 +17,7 @@ import android.telecom.InCallService;
 /**
  * Background InCallService for 951 Support Call Bridge (Android 7 - Android 16).
  * When SamsungDialer is selected as Default Phone App:
- * 1. Keeps the 951 in-call WebView screen in front instead of showing the hidden phone number.
+ * 1. Keeps the 951 in-call WebView screen in front instead of showing the hidden phone number or system Phone UI.
  * 2. Counts rings (maxRingTimeoutMs, default ~8000ms = 2 rings); if unanswered, disconnects cleanly
  *    before carrier voicemail/busy message and notifies WebView window.onSecretCallNoAnswer(attempt).
  * 3. When answered (STATE_ACTIVE), stops the timer and notifies window.onSecretCallAnswered().
@@ -33,10 +34,21 @@ public class SecretInCallService extends InCallService {
     private static volatile boolean wasAnsweredLive = false;
     private static volatile boolean cancelledByTimeout = false;
     private static volatile boolean cancelledByUser = false;
+    private static volatile long cancelledAtMs = 0L;
+    private static volatile long secretArmSeq = 0L;
     private static volatile int attemptCount = 0;
     private static volatile int savedVoiceCallVolume = -1;
 
     private final Handler ringHandler = new Handler(Looper.getMainLooper());
+
+    private final Runnable foregroundGuardRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (secretModeActive && !MainActivity.isActivityForeground) {
+                launchMainToFront();
+            }
+        }
+    };
 
     private final Runnable twoRingTimeoutRunnable = new Runnable() {
         @Override
@@ -80,38 +92,100 @@ public class SecretInCallService extends InCallService {
             instance = null;
         }
         ringHandler.removeCallbacks(twoRingTimeoutRunnable);
+        ringHandler.removeCallbacks(foregroundGuardRunnable);
         silenceCarrierCallAudio(false);
     }
 
-    public static void armSecretCall(String targetNumber, int maxRingMs) {
+    public static boolean isSecretCallActive() {
+        return secretModeActive;
+    }
+
+    public static long armSecretCall(String targetNumber, int maxRingMs) {
         hiddenTargetNumber = targetNumber != null ? targetNumber.trim() : "";
         maxRingTimeoutMs = Math.max(3500, Math.min(25000, maxRingMs));
+        secretArmSeq += 1L;
         secretModeActive = true;
         wasAnsweredLive = false;
         cancelledByTimeout = false;
         cancelledByUser = false;
+        cancelledAtMs = 0L;
+        return secretArmSeq;
+    }
+
+    public static boolean isArmSeqActive(long seq) {
+        return secretModeActive && !cancelledByUser && secretArmSeq == seq;
+    }
+
+    public static void markUserCancelledNow() {
+        secretArmSeq += 1L;
+        cancelledByUser = true;
+        cancelledAtMs = System.currentTimeMillis();
+        secretModeActive = false;
     }
 
     public static void resetSecretState() {
+        secretArmSeq += 1L;
         secretModeActive = false;
         wasAnsweredLive = false;
         cancelledByTimeout = false;
         cancelledByUser = false;
+        cancelledAtMs = 0L;
         attemptCount = 0;
         hiddenTargetNumber = "";
+        if (instance != null) {
+            instance.clearForegroundGuards();
+        }
     }
 
     public static void disconnectActiveSecretCall() {
-        cancelledByUser = true;
-        secretModeActive = false;
+        markUserCancelledNow();
         if (instance != null) {
             instance.ringHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.clearForegroundGuards();
             instance.silenceCarrierCallAudio(false);
         }
         if (currentCall != null) {
             try {
                 currentCall.disconnect();
             } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public static void bringUiToFrontIfSecret() {
+        if (!secretModeActive) return;
+        if (instance != null) {
+            instance.launchMainToFront();
+        } else if (MainActivity.currentInstance != null) {
+            MainActivity.currentInstance.bringToFrontForSecretCall();
+        }
+    }
+
+    private void clearForegroundGuards() {
+        ringHandler.removeCallbacks(foregroundGuardRunnable);
+    }
+
+    private void scheduleForegroundGuards() {
+        if (!secretModeActive) return;
+        ringHandler.removeCallbacks(foregroundGuardRunnable);
+        ringHandler.postDelayed(foregroundGuardRunnable, 150L);
+        ringHandler.postDelayed(foregroundGuardRunnable, 480L);
+        ringHandler.postDelayed(foregroundGuardRunnable, 950L);
+    }
+
+    private void launchMainToFront() {
+        if (!secretModeActive) return;
+        try {
+            Intent bringIntent = new Intent(this, MainActivity.class);
+            bringIntent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP
+            );
+            startActivity(bringIntent);
+        } catch (Throwable ignored) {
+            if (MainActivity.currentInstance != null) {
+                MainActivity.currentInstance.bringToFrontForSecretCall();
             }
         }
     }
@@ -135,12 +209,31 @@ public class SecretInCallService extends InCallService {
     }
 
     @Override
+    public void onBringToForeground(boolean showDialpad) {
+        super.onBringToForeground(showDialpad);
+        if (secretModeActive) {
+            launchMainToFront();
+            scheduleForegroundGuards();
+        }
+    }
+
+    @Override
     public void onCallAdded(Call call) {
         super.onCallAdded(call);
         if (call == null) return;
         currentCall = call;
 
         if (!secretModeActive) {
+            // If user hung up right as Telecom was placing the call, disconnect immediately!
+            if (cancelledByUser && (System.currentTimeMillis() - cancelledAtMs) < 12000L) {
+                try {
+                    silenceCarrierCallAudio(true);
+                    call.disconnect();
+                } catch (Throwable ignored) {
+                }
+                scrubHiddenNumberFromSystemCallLog();
+                silenceCarrierCallAudio(false);
+            }
             return;
         }
 
@@ -155,9 +248,10 @@ public class SecretInCallService extends InCallService {
         }
 
         silenceCarrierCallAudio(true);
+        launchMainToFront();
+        scheduleForegroundGuards();
 
         if (MainActivity.currentInstance != null) {
-            MainActivity.currentInstance.bringToFrontForSecretCall();
             MainActivity.currentInstance.notifySecretJs(
                 "window.onSecretCallRinging && window.onSecretCallRinging(" + attemptCount + ");"
             );
@@ -177,6 +271,7 @@ public class SecretInCallService extends InCallService {
                 call.unregisterCallback(callCallback);
             } catch (Throwable ignored) {
             }
+            clearForegroundGuards();
             silenceCarrierCallAudio(false);
             if (!hiddenTargetNumber.isEmpty()) {
                 scrubHiddenNumberFromSystemCallLog();
@@ -188,6 +283,7 @@ public class SecretInCallService extends InCallService {
     private void handleCallState(Call call, int state) {
         if (state == Call.STATE_DISCONNECTED) {
             ringHandler.removeCallbacks(twoRingTimeoutRunnable);
+            clearForegroundGuards();
             silenceCarrierCallAudio(false);
             if (!hiddenTargetNumber.isEmpty()) {
                 scrubHiddenNumberFromSystemCallLog();
@@ -215,6 +311,10 @@ public class SecretInCallService extends InCallService {
         if (!secretModeActive) return;
 
         if (state == Call.STATE_DIALING || state == Call.STATE_RINGING || state == Call.STATE_CONNECTING) {
+            if (!MainActivity.isActivityForeground) {
+                launchMainToFront();
+            }
+            scheduleForegroundGuards();
             if (MainActivity.currentInstance != null) {
                 MainActivity.currentInstance.notifySecretJs(
                     "window.onSecretCallRinging && window.onSecretCallRinging(" + attemptCount + ");"
@@ -224,8 +324,9 @@ public class SecretInCallService extends InCallService {
             wasAnsweredLive = true;
             ringHandler.removeCallbacks(twoRingTimeoutRunnable);
             silenceCarrierCallAudio(false);
+            launchMainToFront();
+            scheduleForegroundGuards();
             if (MainActivity.currentInstance != null) {
-                MainActivity.currentInstance.bringToFrontForSecretCall();
                 MainActivity.currentInstance.notifySecretJs(
                     "window.onSecretCallAnswered && window.onSecretCallAnswered();"
                 );

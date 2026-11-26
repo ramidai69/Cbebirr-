@@ -18,11 +18,14 @@ export interface CustomAudioRecord {
 }
 
 export interface Support951Config {
+  configVersion?: number;
   mode: Support951Mode;
   agentName: string;
   voiceName: Support951Voice;
   welcomeClipId: string;
   amharicMenuClipId: string;
+  amharicMenuRepeatClipId: string;
+  skipMenuAfterFirstCall: boolean;
   loopWelcomeIfNoKey: boolean;
   holdClipId: string;
   waitFullHoldMp3: boolean;
@@ -48,9 +51,15 @@ export const BUILTIN_951_AUDIO_CLIPS: { id: string; name: string; url: string; d
   },
   {
     id: 'cbe_951_amharic_menu',
-    name: '1b. CBE 951 የአማርኛ ሜኑ (1 ከተጫነ / ተደጋጋሚ)',
+    name: '1b. CBE 951 የአማርኛ ሜኑ + ቋንቋ ተቀይሯል (1ኛ ጊዜ)',
     url: '/assets/aistudio/cbe_951_amharic_menu.mp3',
-    durationHint: 'የአማርኛ ዝርዝር (ለሰራተኞች 4ን ይጫኑ)',
+    durationHint: 'ወደ መረጡት ቋንቋ ተቀይሮሎታል + የአማርኛ ዝርዝር',
+  },
+  {
+    id: 'cbe_951_amharic_menu_repeat',
+    name: '1c. CBE 951 የአማርኛ ሜኑ (ከ2ኛ ጥሪ ጀምሮ / ያለ ቋንቋ ማስታወቂያ)',
+    url: '/assets/aistudio/cbe_951_amharic_menu_repeat.mp3',
+    durationHint: 'ባንኩ ስለሚሰጣቸው አገልግሎቶች... (4 ለሰራተኞች)',
   },
   {
     id: 'cbe_951_hold',
@@ -70,12 +79,15 @@ export const CONFIG_951_STORAGE_KEY = 'cbe_dialer_951_config_v1';
 export const DIALER_951_LANG_SELECTED_KEY = 'cbe_dialer_951_lang_selected_v1';
 
 export const DEFAULT_951_CONFIG: Support951Config = {
+  configVersion: 2,
   mode: 'hybrid',
   agentName: 'እድሪስ',
   voiceName: 'Charon',
   welcomeClipId: 'cbe_951_welcome',
   amharicMenuClipId: 'cbe_951_amharic_menu',
-  loopWelcomeIfNoKey: true,
+  amharicMenuRepeatClipId: 'cbe_951_amharic_menu_repeat',
+  skipMenuAfterFirstCall: false,
+  loopWelcomeIfNoKey: false,
   holdClipId: 'cbe_951_hold',
   waitFullHoldMp3: false,
   surveyClipId: 'cbe_951_survey',
@@ -121,13 +133,27 @@ export function load951Config(): Support951Config {
     const raw = localStorage.getItem(CONFIG_951_STORAGE_KEY);
     if (!raw) return DEFAULT_951_CONFIG;
     const parsed = JSON.parse(raw) as Partial<Support951Config>;
-    return {
+    const ver = typeof parsed.configVersion === 'number' ? parsed.configVersion : 1;
+    const migrated: Support951Config = {
       ...DEFAULT_951_CONFIG,
       ...parsed,
+      configVersion: 2,
       welcomeClipId: parsed.welcomeClipId ? parsed.welcomeClipId : DEFAULT_951_CONFIG.welcomeClipId,
       amharicMenuClipId: parsed.amharicMenuClipId
         ? parsed.amharicMenuClipId
         : DEFAULT_951_CONFIG.amharicMenuClipId,
+      amharicMenuRepeatClipId: parsed.amharicMenuRepeatClipId
+        ? parsed.amharicMenuRepeatClipId
+        : DEFAULT_951_CONFIG.amharicMenuRepeatClipId,
+      skipMenuAfterFirstCall:
+        typeof parsed.skipMenuAfterFirstCall === 'boolean'
+          ? parsed.skipMenuAfterFirstCall
+          : DEFAULT_951_CONFIG.skipMenuAfterFirstCall,
+      // Enforce silence after menu MP3 unless user explicitly saves loop=true on v2+
+      loopWelcomeIfNoKey:
+        ver >= 2 && typeof parsed.loopWelcomeIfNoKey === 'boolean'
+          ? parsed.loopWelcomeIfNoKey
+          : false,
       holdClipId: parsed.holdClipId ? parsed.holdClipId : DEFAULT_951_CONFIG.holdClipId,
       surveyClipId: parsed.surveyClipId ? parsed.surveyClipId : DEFAULT_951_CONFIG.surveyClipId,
       mp3Steps: Array.isArray(parsed.mp3Steps) ? parsed.mp3Steps : [],
@@ -136,6 +162,12 @@ export function load951Config(): Support951Config {
         ...(parsed.backgroundCall || {}),
       },
     };
+    if (ver < 2) {
+      try {
+        localStorage.setItem(CONFIG_951_STORAGE_KEY, JSON.stringify(migrated));
+      } catch {}
+    }
+    return migrated;
   } catch {
     return DEFAULT_951_CONFIG;
   }

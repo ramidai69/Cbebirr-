@@ -855,6 +855,7 @@ if (fs.existsSync(dialerDir)) {
         const keepMp3s = new Set([
           'cbe_951_welcome_lang.mp3',
           'cbe_951_amharic_menu.mp3',
+          'cbe_951_amharic_menu_repeat.mp3',
           '951and_4_ferst__3__c0d8a32c.mp3',
           'Custmersuportlast_0d3b0df8.mp3',
         ]);

