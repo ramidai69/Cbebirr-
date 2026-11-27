@@ -633,7 +633,9 @@ export function Dialer951CallOverlay({
       }
       currentClipIdRef.current = audioId;
 
-      if (typeof bridgeRef.current?.playNativeAudio === 'function') {
+      const hasNativeAudioEx = typeof bridgeRef.current?.playNativeAudioEx === 'function';
+      const hasNativeAudioLegacy = typeof bridgeRef.current?.playNativeAudio === 'function';
+      if (hasNativeAudioEx || hasNativeAudioLegacy) {
         let nativeUrlOrAsset = '';
         let nativeBase64 = '';
         if (resolvedUrl.startsWith('blob:')) {
@@ -703,15 +705,26 @@ export function Dialer951CallOverlay({
             };
             safetyTid = window.setTimeout(() => finish('ended'), loop ? 12000 : 120000);
             try {
-              (
-                bridgeRef.current!.playNativeAudio as (
-                  t: string,
-                  u: string,
-                  b: string,
-                  l: boolean,
-                  pm?: boolean
-                ) => void
-              )(nativeToken, nativeUrlOrAsset, nativeBase64, loop, preferMediaStream);
+              if (hasNativeAudioEx) {
+                (
+                  bridgeRef.current!.playNativeAudioEx as (
+                    t: string,
+                    u: string,
+                    b: string,
+                    l: boolean,
+                    isHold: boolean
+                  ) => void
+                )(nativeToken, nativeUrlOrAsset, nativeBase64, loop, preferMediaStream);
+              } else {
+                (
+                  bridgeRef.current!.playNativeAudio as (
+                    t: string,
+                    u: string,
+                    b: string,
+                    l: boolean
+                  ) => void
+                )(nativeToken, nativeUrlOrAsset, nativeBase64, loop);
+              }
             } catch {
               finish('error');
             }

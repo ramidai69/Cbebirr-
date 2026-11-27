@@ -830,16 +830,16 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void playNativeAudio(final String token, final String urlOrAsset, final String base64Data, final boolean loop) {
-            playNativeAudio(token, urlOrAsset, base64Data, loop, false);
+            playNativeAudioEx(token, urlOrAsset, base64Data, loop, false);
         }
 
         @JavascriptInterface
-        public void playNativeAudio(
+        public void playNativeAudioEx(
             final String token,
             final String urlOrAsset,
             final String base64Data,
             final boolean loop,
-            final boolean preferMediaStream
+            final boolean isSecretHold
         ) {
             NativeAudioEngine.playAssetOrBase64(
                 mContext,
@@ -851,7 +851,7 @@ public class MainActivity extends Activity {
                 SecretInCallService.isCarrierStreamSilenced(),
                 SecretInCallService.isSpeakerWantedForUi(),
                 SecretInCallService.isBluetoothWantedForUi(),
-                preferMediaStream
+                isSecretHold
             );
         }
 

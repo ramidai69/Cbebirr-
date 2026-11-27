@@ -203,6 +203,11 @@ public class SecretInCallService extends InCallService {
         return currentCall != null || activeCallMode != MODE_NONE || handoffInProgress;
     }
 
+    public static boolean hasActiveTelecomCallForAudio() {
+        if (currentCall == null || handoffInProgress) return false;
+        return activeCallMode == MODE_REAL_951 || activeCallMode == MODE_SECRET_TARGET;
+    }
+
     public static boolean isCarrierStreamSilenced() {
         return streamVoiceMutedByUs;
     }
@@ -501,8 +506,23 @@ public class SecretInCallService extends InCallService {
                         svc.setAudioRoute(targetRoute);
                     } catch (Throwable ignored) {
                     }
+                    if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(svc, !handoffInProgress, on, pendingBluetoothWanted);
+                        svc.enforceCarrierSilenceStepLocked();
+                    }
                     svc.refreshCallNotification();
                     svc.pushNativeStateToWeb();
+                    staticMainHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (audioRouteSeq == mySeq && instance == svc && currentCall != null && pendingSpeakerWanted == on) {
+                                if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                                    NativeAudioEngine.reconcileSecretHoldAudio(svc, !handoffInProgress, on, pendingBluetoothWanted);
+                                    svc.enforceCarrierSilenceStepLocked();
+                                }
+                            }
+                        }
+                    }, 90L);
                     // Re-assert Telecom route only if this is still the latest toggle and Telecom hadn't finished attaching audio stream
                     staticMainHandler.postDelayed(new Runnable() {
                         @Override
@@ -516,13 +536,21 @@ public class SecretInCallService extends InCallService {
                                     }
                                 } catch (Throwable ignored) {
                                 }
+                                if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                                    NativeAudioEngine.reconcileSecretHoldAudio(svc, !handoffInProgress, on, pendingBluetoothWanted);
+                                    svc.enforceCarrierSilenceStepLocked();
+                                }
                             }
                         }
-                    }, 180L);
+                    }, 200L);
                 } else {
                     // Standalone 951 MP3 / AI / Post-Call Survey mode (no active Telecom call)
                     standaloneAudioActive = true;
-                    applyAudioManagerRouting(MainActivity.currentInstance, true, on, true);
+                    Context appCtx = resolveAudioContext(MainActivity.currentInstance);
+                    applyAudioManagerRouting(appCtx, true, on, true);
+                    if (appCtx != null) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(appCtx, false, on, standaloneBluetoothWanted);
+                    }
                 }
             }
         });
@@ -546,21 +574,29 @@ public class SecretInCallService extends InCallService {
             public void run() {
                 SecretInCallService svc = instance;
                 if (svc != null && currentCall != null) {
+                    boolean restoreSpeaker = (activeCallMode == MODE_NATIVE_NORMAL)
+                        ? nativeSpeakerWanted
+                        : secretSpeakerWanted;
                     try {
-                        boolean restoreSpeaker = (activeCallMode == MODE_NATIVE_NORMAL)
-                            ? nativeSpeakerWanted
-                            : secretSpeakerWanted;
                         int targetRoute = on
                             ? CallAudioState.ROUTE_BLUETOOTH
                             : (restoreSpeaker ? CallAudioState.ROUTE_SPEAKER : svc.resolveNonSpeakerRoute());
                         svc.setAudioRoute(targetRoute);
                     } catch (Throwable ignored) {
                     }
+                    if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(svc, !handoffInProgress, !on && restoreSpeaker, on);
+                        svc.enforceCarrierSilenceStepLocked();
+                    }
                     svc.refreshCallNotification();
                     svc.pushNativeStateToWeb();
                 } else {
                     standaloneAudioActive = true;
-                    applyAudioManagerRouting(MainActivity.currentInstance, true, standaloneSpeakerWanted, true);
+                    Context appCtx = resolveAudioContext(MainActivity.currentInstance);
+                    applyAudioManagerRouting(appCtx, true, standaloneSpeakerWanted, true);
+                    if (appCtx != null) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(appCtx, false, standaloneSpeakerWanted, on);
+                    }
                 }
             }
         });
@@ -871,16 +907,22 @@ public class SecretInCallService extends InCallService {
             if (actualSpeaker == pendingSpeakerWanted && actualBt == pendingBluetoothWanted) {
                 pendingAudioRouteUntilMs = 0L;
             }
-            if (System.currentTimeMillis() >= pendingAudioRouteUntilMs) {
+            boolean settled = System.currentTimeMillis() >= pendingAudioRouteUntilMs;
+            if (settled) {
                 secretSpeakerWanted = actualSpeaker;
                 nativeSpeakerWanted = actualSpeaker;
                 standaloneSpeakerWanted = actualSpeaker;
                 standaloneBluetoothWanted = actualBt;
+                pendingBluetoothWanted = actualBt;
             }
             if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                if (settled && !handoffInProgress && currentCall != null) {
+                    NativeAudioEngine.reconcileSecretHoldAudio(this, true, secretSpeakerWanted, actualBt);
+                }
                 enforceCarrierSilenceStepLocked();
             }
-            if ((activeCallMode == MODE_SECRET_TARGET || activeCallMode == MODE_REAL_951)
+            if (settled
+                && (activeCallMode == MODE_SECRET_TARGET || activeCallMode == MODE_REAL_951)
                 && MainActivity.currentInstance != null) {
                 MainActivity.currentInstance.notifySecretJs(
                     "window.onSecretCallSpeakerChanged && window.onSecretCallSpeakerChanged("
@@ -967,6 +1009,35 @@ public class SecretInCallService extends InCallService {
             silenceCarrierCallAudio(true);
             startCarrierSilenceWatchdog();
             setSpeakerEnabled(secretSpeakerWanted);
+            NativeAudioEngine.reconcileSecretHoldAudio(this, true, secretSpeakerWanted, pendingBluetoothWanted);
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (secretModeActive && !wasAnsweredLive && currentCall != null) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(
+                            SecretInCallService.this,
+                            true,
+                            secretSpeakerWanted,
+                            pendingBluetoothWanted
+                        );
+                        enforceCarrierSilenceStepLocked();
+                    }
+                }
+            }, 260L);
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (secretModeActive && !wasAnsweredLive && currentCall != null) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(
+                            SecretInCallService.this,
+                            true,
+                            secretSpeakerWanted,
+                            pendingBluetoothWanted
+                        );
+                        enforceCarrierSilenceStepLocked();
+                    }
+                }
+            }, 650L);
             postOrUpdateCallNotification("951", "Ongoing call", false, false, 0L);
             launchMainToFront(true);
             scheduleForegroundGuards();
@@ -1075,7 +1146,10 @@ public class SecretInCallService extends InCallService {
         pendingAudioRouteUntilMs = 0L;
 
         if (handoffInProgress) {
-            // Keep carrier stream silenced & UI active while transitioning from 951 to secret target
+            // Keep carrier stream silenced & transition Hold MP3 cleanly to standalone speaker/earpiece
+            activeCallMode = MODE_NONE;
+            NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
+            enforceCarrierSilenceStepLocked();
             return;
         }
 
@@ -1096,6 +1170,7 @@ public class SecretInCallService extends InCallService {
                 return;
             }
             // Keep carrier stream strictly silenced while retrying after no-answer / busy / switched-off
+            NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
             enforceCarrierSilenceStepLocked();
             restoreAudioModeNormal();
             if (!cancelledByTimeout && !cancelledByUser) {
@@ -1107,6 +1182,7 @@ public class SecretInCallService extends InCallService {
 
         if (secretModeActive && !wasAnsweredLive) {
             // Busy/unreachable retry already kicked off from STATE_DISCONNECTED
+            NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
             enforceCarrierSilenceStepLocked();
             return;
         }
@@ -1689,28 +1765,106 @@ public class SecretInCallService extends InCallService {
         silenceCarrierCallAudio(true);
     }
 
+    private static void applyCarrierDownlinkSuppression(AudioManager am, boolean mute) {
+        if (am == null) return;
+        if (mute) {
+            if (savedVoiceCallVolume < 0) {
+                savedVoiceCallVolume = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
+            }
+            streamVoiceMutedByUs = true;
+            try {
+                am.setParameters("voice_rx_mute=true");
+                am.setParameters("rx_mute=1");
+            } catch (Throwable ignoredParams) {
+            }
+
+            // When built-in Earpiece plays Hold MP3 on USAGE_VOICE_COMMUNICATION, it shares STREAM_VOICE_CALL.
+            // Never ADJUST_MUTE STREAM_VOICE_CALL in that case or Hold MP3 itself becomes silent in the Earpiece;
+            // instead clamp to minimum audible level while relying on HAL rx mute where supported.
+            boolean holdUsingVoiceStream = NativeAudioEngine.isPlayingHoldAudio()
+                && NativeAudioEngine.isPlayingCommAudio()
+                && !handoffInProgress;
+
+            int minVol = 0;
+            if (Build.VERSION.SDK_INT >= 28) {
+                try {
+                    minVol = am.getStreamMinVolume(AudioManager.STREAM_VOICE_CALL);
+                } catch (Throwable ignoredMin) {
+                    minVol = 1;
+                }
+            }
+            int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+
+            if (holdUsingVoiceStream) {
+                if (Build.VERSION.SDK_INT >= 23 && am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
+                    try {
+                        am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
+                    } catch (Throwable ignoredUnmute) {
+                    }
+                }
+                int earpieceVol = Math.max(1, minVol);
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, earpieceVol, 0);
+                } catch (Throwable ignoredVol) {
+                }
+                return;
+            }
+
+            try {
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, 0, 0);
+            } catch (Throwable ignoredZero) {
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, Math.max(0, minVol), 0);
+                } catch (Throwable ignoredMinSet) {
+                }
+            }
+            try {
+                int steps = Math.max(1, maxVol + 1);
+                for (int i = 0; i < steps && am.getStreamVolume(AudioManager.STREAM_VOICE_CALL) > minVol; i++) {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_LOWER, 0);
+                }
+            } catch (Throwable ignoredLower) {
+            }
+            if (Build.VERSION.SDK_INT >= 23 && !am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0);
+                } catch (Throwable ignoredMute) {
+                }
+            }
+        } else {
+            try {
+                am.setParameters("voice_rx_mute=false");
+                am.setParameters("rx_mute=0");
+            } catch (Throwable ignoredParams) {
+            }
+            if (Build.VERSION.SDK_INT >= 23 && (streamVoiceMutedByUs || am.isStreamMute(AudioManager.STREAM_VOICE_CALL))) {
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Throwable ignoredUnmute) {
+                }
+            }
+            streamVoiceMutedByUs = false;
+            if (savedVoiceCallVolume >= 0) {
+                int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+                int safeRestore = (savedVoiceCallVolume <= 1 && maxVol > 1)
+                    ? Math.max(1, (maxVol * 2) / 3)
+                    : savedVoiceCallVolume;
+                try {
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, safeRestore, 0);
+                } catch (Throwable ignoredRestore) {
+                }
+                savedVoiceCallVolume = -1;
+            }
+        }
+    }
+
     private static void silenceCarrierStatic(Context ctx, boolean mute) {
         if (ctx == null) return;
         try {
             AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
             if (am != null) {
                 am.setMicrophoneMute(mute);
-                if (mute) {
-                    if (savedVoiceCallVolume < 0) {
-                        savedVoiceCallVolume = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
-                    }
-                    if (Build.VERSION.SDK_INT >= 23 && !am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
-                        try {
-                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0);
-                        } catch (Throwable ignoredM) {
-                        }
-                    }
-                    streamVoiceMutedByUs = true;
-                    try {
-                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, 0, 0);
-                    } catch (Throwable ignoredVol) {
-                    }
-                }
+                applyCarrierDownlinkSuppression(am, mute);
             }
         } catch (Throwable ignored) {
         }
@@ -1725,38 +1879,7 @@ public class SecretInCallService extends InCallService {
             AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
             if (am != null) {
                 am.setMicrophoneMute(mute);
-                if (mute) {
-                    if (savedVoiceCallVolume < 0) {
-                        savedVoiceCallVolume = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
-                    }
-                    if (Build.VERSION.SDK_INT >= 23 && !am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
-                        try {
-                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_MUTE, 0);
-                        } catch (Throwable ignoredM) {
-                        }
-                    }
-                    streamVoiceMutedByUs = true;
-                    try {
-                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, 0, 0);
-                    } catch (Throwable ignoredVol) {
-                    }
-                } else {
-                    if (Build.VERSION.SDK_INT >= 23 && (streamVoiceMutedByUs || am.isStreamMute(AudioManager.STREAM_VOICE_CALL))) {
-                        try {
-                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
-                        } catch (Throwable ignoredU) {
-                        }
-                    }
-                    streamVoiceMutedByUs = false;
-                    if (savedVoiceCallVolume >= 0) {
-                        int targetVol = savedVoiceCallVolume > 0 ? savedVoiceCallVolume : Math.max(1, am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL) / 2);
-                        try {
-                            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetVol, 0);
-                        } catch (Throwable ignoredR) {
-                        }
-                        savedVoiceCallVolume = -1;
-                    }
-                }
+                applyCarrierDownlinkSuppression(am, mute);
             }
         } catch (Throwable ignored) {
         }
@@ -1764,8 +1887,8 @@ public class SecretInCallService extends InCallService {
 
     @SuppressWarnings("deprecation")
     private void restoreAudioModeNormal() {
-        // Never tear down communication routing while post-call Survey MP3 or standalone 951 audio is active
-        if (standaloneAudioActive || NativeAudioEngine.isPlayingCommAudio()) {
+        // Never tear down communication routing while post-call Survey MP3, Hold MP3, or standalone 951 audio is active
+        if (standaloneAudioActive || NativeAudioEngine.isPlayingCommAudio() || NativeAudioEngine.isPlayingHoldAudio()) {
             return;
         }
         try {

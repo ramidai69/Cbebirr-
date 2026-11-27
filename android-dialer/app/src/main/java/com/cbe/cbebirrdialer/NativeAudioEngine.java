@@ -34,6 +34,11 @@ public final class NativeAudioEngine {
     private static boolean isPrepared = false;
     private static boolean pendingPaused = false;
     private static boolean currentUsesCommUsage = true;
+    private static boolean activeHoldMode = false;
+    private static boolean activeLoop = false;
+    private static File activeAudioFile = null;
+    private static int pendingSeekMs = 0;
+    private static int savedMusicVolume = -1;
 
     private NativeAudioEngine() {
     }
@@ -73,21 +78,22 @@ public final class NativeAudioEngine {
         final boolean carrierStreamSilenced,
         final boolean speakerOn,
         final boolean bluetoothOn,
-        final boolean preferMediaStream
+        final boolean isSecretHold
     ) {
         if (ctx == null) {
             dispatchEvent(token, "error");
             return;
         }
         final Context appCtx = ctx.getApplicationContext();
-        final boolean useMediaUsage = carrierStreamSilenced || preferMediaStream;
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 stopInternal(appCtx, false);
                 activeToken = token != null ? token : "";
                 pendingPaused = false;
-                currentUsesCommUsage = !useMediaUsage;
+                activeHoldMode = isSecretHold;
+                activeLoop = loop;
+                pendingSeekMs = 0;
 
                 try {
                     File audioFile = null;
@@ -98,91 +104,219 @@ public final class NativeAudioEngine {
                     }
 
                     if (audioFile == null || !audioFile.exists() || audioFile.length() == 0L) {
+                        activeHoldMode = false;
+                        activeAudioFile = null;
                         dispatchEvent(activeToken, "error");
                         activeToken = "";
                         return;
                     }
+                    activeAudioFile = audioFile;
 
-                    if (!useMediaUsage) {
-                        applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
-                    } else {
-                        ensureMediaStreamAudible(appCtx);
-                    }
-
-                    final String myToken = activeToken;
-                    final MediaPlayer mp = new MediaPlayer();
-                    activePlayer = mp;
-                    isPrepared = false;
-
-                    AudioAttributes attrs = new AudioAttributes.Builder()
-                        .setUsage(
-                            useMediaUsage
-                                ? AudioAttributes.USAGE_MEDIA
-                                : AudioAttributes.USAGE_VOICE_COMMUNICATION
-                        )
-                        .setContentType(
-                            useMediaUsage
-                                ? AudioAttributes.CONTENT_TYPE_MUSIC
-                                : AudioAttributes.CONTENT_TYPE_SPEECH
-                        )
-                        .build();
-                    mp.setAudioAttributes(attrs);
-                    mp.setLooping(loop);
-                    mp.setDataSource(appCtx, Uri.fromFile(audioFile));
-
-                    mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
-                        @Override
-                        public void onPrepared(MediaPlayer player) {
-                            if (activePlayer != player || !myToken.equals(activeToken)) {
-                                try {
-                                    player.release();
-                                } catch (Throwable ignored) {
-                                }
-                                return;
-                            }
-                            isPrepared = true;
-                            if (!pendingPaused) {
-                                try {
-                                    player.start();
-                                } catch (Throwable startErr) {
-                                    dispatchEvent(myToken, "error");
-                                    return;
-                                }
-                            }
-                            dispatchEvent(myToken, "started");
-                        }
-                    });
-
-                    mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                        @Override
-                        public void onCompletion(MediaPlayer player) {
-                            if (loop) return;
-                            if (activePlayer == player && myToken.equals(activeToken)) {
-                                activeToken = "";
-                                stopInternal(appCtx, false);
-                                dispatchEvent(myToken, "ended");
-                            }
-                        }
-                    });
-
-                    mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
-                        @Override
-                        public boolean onError(MediaPlayer player, int what, int extra) {
-                            if (activePlayer == player && myToken.equals(activeToken)) {
-                                activeToken = "";
-                                stopInternal(appCtx, false);
-                                dispatchEvent(myToken, "error");
-                            }
-                            return true;
-                        }
-                    });
-
-                    mp.prepareAsync();
+                    boolean hasTelecomCall = SecretInCallService.hasActiveTelecomCallForAudio();
+                    boolean useMediaUsage = computeUseMediaUsage(appCtx, isSecretHold, hasTelecomCall, speakerOn, bluetoothOn);
+                    startPlayerInternal(appCtx, activeToken, audioFile, loop, useMediaUsage, hasTelecomCall, speakerOn, bluetoothOn, 0, true);
                 } catch (Throwable err) {
                     String errToken = activeToken;
                     activeToken = "";
+                    activeHoldMode = false;
+                    activeAudioFile = null;
                     stopInternal(appCtx, false);
                     dispatchEvent(errToken, "error");
+                }
+            }
+        });
+    }
+
+    private static boolean computeUseMediaUsage(
+        Context appCtx,
+        boolean isSecretHold,
+        boolean hasTelecomCall,
+        boolean speakerOn,
+        boolean bluetoothOn
+    ) {
+        if (!isSecretHold) {
+            return false;
+        }
+        // When no Telecom call is active (e.g. 5s pre-dial or 2.8s retry), always use USAGE_VOICE_COMMUNICATION
+        // so Loudspeaker (Speaker ON) and Earpiece (Speaker OFF) behave identically to Stage 1 & Stage 3.
+        if (!hasTelecomCall) {
+            return false;
+        }
+        // During active secret Telecom call: use USAGE_MEDIA on Loudspeaker/Bluetooth/Headset so carrier ringback
+        // on STREAM_VOICE_CALL can stay muted to minVol; use USAGE_VOICE_COMMUNICATION ONLY for built-in Earpiece.
+        return speakerOn || bluetoothOn || isWiredHeadsetConnected(appCtx);
+    }
+
+    private static void startPlayerInternal(
+        final Context appCtx,
+        final String myToken,
+        final File audioFile,
+        final boolean loop,
+        final boolean useMediaUsage,
+        final boolean hasTelecomCall,
+        final boolean speakerOn,
+        final boolean bluetoothOn,
+        final int seekToMs,
+        final boolean emitStartedEvent
+    ) throws Exception {
+        currentUsesCommUsage = !useMediaUsage;
+        pendingSeekMs = Math.max(0, seekToMs);
+
+        if (!useMediaUsage) {
+            restoreSavedMusicVolume(appCtx);
+            if (!hasTelecomCall) {
+                applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
+            }
+        } else {
+            ensureMediaStreamAudible(appCtx, true);
+        }
+
+        final MediaPlayer mp = new MediaPlayer();
+        activePlayer = mp;
+        isPrepared = false;
+
+        AudioAttributes attrs = new AudioAttributes.Builder()
+            .setUsage(
+                useMediaUsage
+                    ? AudioAttributes.USAGE_MEDIA
+                    : AudioAttributes.USAGE_VOICE_COMMUNICATION
+            )
+            .setContentType(
+                useMediaUsage
+                    ? AudioAttributes.CONTENT_TYPE_MUSIC
+                    : AudioAttributes.CONTENT_TYPE_SPEECH
+            )
+            .build();
+        mp.setAudioAttributes(attrs);
+        mp.setLooping(loop);
+        mp.setVolume(1.0f, 1.0f);
+        mp.setDataSource(appCtx, Uri.fromFile(audioFile));
+
+        mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+            @Override
+            public void onPrepared(MediaPlayer player) {
+                if (activePlayer != player || !myToken.equals(activeToken)) {
+                    try {
+                        player.release();
+                    } catch (Throwable ignored) {
+                    }
+                    return;
+                }
+                isPrepared = true;
+                int targetSeek = pendingSeekMs;
+                pendingSeekMs = 0;
+                if (targetSeek > 0) {
+                    try {
+                        int dur = player.getDuration();
+                        if (dur > 0) {
+                            player.seekTo(targetSeek % dur);
+                        }
+                    } catch (Throwable ignoredSeek) {
+                    }
+                }
+                if (!pendingPaused) {
+                    try {
+                        player.start();
+                    } catch (Throwable startErr) {
+                        dispatchEvent(myToken, "error");
+                        return;
+                    }
+                }
+                if (emitStartedEvent) {
+                    dispatchEvent(myToken, "started");
+                }
+            }
+        });
+
+        mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+            @Override
+            public void onCompletion(MediaPlayer player) {
+                if (loop) return;
+                if (activePlayer == player && myToken.equals(activeToken)) {
+                    activeToken = "";
+                    activeHoldMode = false;
+                    activeAudioFile = null;
+                    stopInternal(appCtx, false);
+                    dispatchEvent(myToken, "ended");
+                }
+            }
+        });
+
+        mp.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+            @Override
+            public boolean onError(MediaPlayer player, int what, int extra) {
+                if (activePlayer == player && myToken.equals(activeToken)) {
+                    activeToken = "";
+                    activeHoldMode = false;
+                    activeAudioFile = null;
+                    stopInternal(appCtx, false);
+                    dispatchEvent(myToken, "error");
+                }
+                return true;
+            }
+        });
+
+        mp.prepareAsync();
+    }
+
+    public static void reconcileSecretHoldAudio(
+        final Context ctx,
+        final boolean hasTelecomCall,
+        final boolean speakerOn,
+        final boolean bluetoothOn
+    ) {
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!activeHoldMode || activePlayer == null || activeAudioFile == null || activeToken.isEmpty()) {
+                    return;
+                }
+                boolean desiredUseMedia = computeUseMediaUsage(appCtx, true, hasTelecomCall, speakerOn, bluetoothOn);
+                boolean currentlyUsingMedia = !currentUsesCommUsage;
+
+                if (desiredUseMedia != currentlyUsingMedia) {
+                    int pos = 0;
+                    if (isPrepared) {
+                        try {
+                            pos = activePlayer.getCurrentPosition();
+                        } catch (Throwable ignored) {
+                            pos = 0;
+                        }
+                    }
+                    String tok = activeToken;
+                    boolean loop = activeLoop;
+                    File file = activeAudioFile;
+                    boolean wasPaused = pendingPaused;
+                    stopPlayerOnly();
+                    pendingPaused = wasPaused;
+                    try {
+                        startPlayerInternal(appCtx, tok, file, loop, desiredUseMedia, hasTelecomCall, speakerOn, bluetoothOn, pos, false);
+                    } catch (Throwable err) {
+                        activeToken = "";
+                        activeHoldMode = false;
+                        activeAudioFile = null;
+                        stopInternal(appCtx, false);
+                        dispatchEvent(tok, "error");
+                    }
+                    return;
+                }
+
+                if (!desiredUseMedia && !hasTelecomCall) {
+                    applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
+                } else if (desiredUseMedia) {
+                    ensureMediaStreamAudible(appCtx, true);
+                }
+
+                if (isPrepared && !pendingPaused && activePlayer != null) {
+                    try {
+                        activePlayer.setVolume(1.0f, 1.0f);
+                        if (!activePlayer.isPlaying()) {
+                            activePlayer.start();
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         });
@@ -195,6 +329,8 @@ public final class NativeAudioEngine {
             public void run() {
                 String prevToken = activeToken;
                 activeToken = "";
+                activeHoldMode = false;
+                activeAudioFile = null;
                 stopInternal(appCtx, restoreNormalAudio);
                 if (!prevToken.isEmpty()) {
                     dispatchEvent(prevToken, "stopped");
@@ -226,7 +362,42 @@ public final class NativeAudioEngine {
         return activePlayer != null && currentUsesCommUsage;
     }
 
+    public static boolean isPlayingHoldAudio() {
+        return activeHoldMode && activePlayer != null && !activeToken.isEmpty();
+    }
+
+    @SuppressWarnings("deprecation")
+    public static boolean isWiredHeadsetConnected(Context ctx) {
+        if (ctx == null) return false;
+        try {
+            AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return false;
+            if (Build.VERSION.SDK_INT >= 23) {
+                AudioDeviceInfo[] outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+                if (outs != null) {
+                    for (AudioDeviceInfo dev : outs) {
+                        if (dev == null) continue;
+                        int t = dev.getType();
+                        if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                            || t == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                            || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            return am.isWiredHeadsetOn();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static void ensureMediaStreamAudible(Context ctx) {
+        ensureMediaStreamAudible(ctx, false);
+    }
+
+    public static void ensureMediaStreamAudible(Context ctx, boolean boostForHold) {
         if (ctx == null) return;
         try {
             AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
@@ -238,11 +409,31 @@ public final class NativeAudioEngine {
                 }
             }
             int curVol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
-            if (curVol <= 0) {
-                int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-                if (maxVol > 0) {
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, (maxVol * 2) / 3), 0);
+            int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            if (maxVol <= 0) return;
+            if (boostForHold) {
+                if (savedMusicVolume < 0) {
+                    savedMusicVolume = curVol;
                 }
+                int desired = Math.max(1, (maxVol * 5) / 6);
+                if (curVol < desired) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, desired, 0);
+                }
+            } else if (curVol <= 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, (maxVol * 2) / 3), 0);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void restoreSavedMusicVolume(Context ctx) {
+        if (savedMusicVolume < 0 || ctx == null) return;
+        int target = savedMusicVolume;
+        savedMusicVolume = -1;
+        try {
+            AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
             }
         } catch (Throwable ignored) {
         }
@@ -289,11 +480,9 @@ public final class NativeAudioEngine {
             }
             try {
                 int curVol = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL);
-                if (curVol <= 0) {
-                    int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
-                    if (maxVol > 0) {
-                        am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, Math.max(1, (maxVol * 2) / 3), 0);
-                    }
+                int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+                if (curVol <= 1 && maxVol > 1) {
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, Math.max(1, (maxVol * 2) / 3), 0);
                 }
             } catch (Throwable ignored) {
             }
@@ -363,7 +552,7 @@ public final class NativeAudioEngine {
         }
     }
 
-    private static void stopInternal(Context appCtx, boolean restoreNormalAudio) {
+    private static void stopPlayerOnly() {
         isPrepared = false;
         pendingPaused = false;
         MediaPlayer mp = activePlayer;
@@ -386,6 +575,13 @@ public final class NativeAudioEngine {
                 mp.release();
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    private static void stopInternal(Context appCtx, boolean restoreNormalAudio) {
+        stopPlayerOnly();
+        if (appCtx != null) {
+            restoreSavedMusicVolume(appCtx);
         }
         if (restoreNormalAudio && appCtx != null) {
             applyStandaloneCommunicationRouting(appCtx, false, false, false);
