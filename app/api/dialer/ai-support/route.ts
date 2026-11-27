@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { NextRequest, NextResponse } from 'next/server';
 
 const corsHeaders = {
@@ -24,7 +24,13 @@ interface SupportContext {
   recentTxSummary?: string;
 }
 
+interface TrainingPair {
+  question?: string;
+  answer?: string;
+}
+
 interface RequestBody {
+  speakOnlyText?: string;
   audioBase64?: string;
   audioMimeType?: string;
   text?: string;
@@ -33,10 +39,51 @@ interface RequestBody {
   agentName?: string;
   voiceName?: string;
   systemNotes?: string;
+  customKnowledge?: string;
+  trainingPairs?: TrainingPair[];
   mp3ContextSummary?: string;
 }
 
 const VALID_VOICES = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
+
+async function synthesizeSpeechWav(
+  ai: GoogleGenAI,
+  text: string,
+  voiceName: string
+): Promise<string | null> {
+  if (!text.trim()) return null;
+  try {
+    const ttsRes = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: text.trim(),
+              speechMetadata: {
+                style:
+                  'Warm, calm, professional Ethiopian bank customer support agent speaking clearly on a phone call',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName },
+          },
+        },
+      },
+    });
+    return ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
+  } catch (ttsErr) {
+    console.warn('[Dialer AI Support TTS fallback]', ttsErr);
+    return null;
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -49,19 +96,9 @@ export async function POST(req: NextRequest) {
     }
 
     const body = (await req.json()) as RequestBody;
-    const audioBase64 = typeof body.audioBase64 === 'string' ? body.audioBase64.trim() : '';
-    const audioMimeType =
-      typeof body.audioMimeType === 'string' && body.audioMimeType.trim()
-        ? body.audioMimeType.trim()
-        : 'audio/webm';
-    const typedText = typeof body.text === 'string' ? body.text.trim() : '';
-
-    if (!audioBase64 && !typedText) {
-      return NextResponse.json(
-        { ok: false, error: 'Either audioBase64 or text is required.' },
-        { status: 400, headers: corsHeaders }
-      );
-    }
+    const voiceName = VALID_VOICES.has(String(body.voiceName || ''))
+      ? String(body.voiceName)
+      : 'Charon';
 
     const ai = new GoogleGenAI({
       apiKey,
@@ -72,16 +109,54 @@ export async function POST(req: NextRequest) {
       },
     });
 
+    const speakOnlyText =
+      typeof body.speakOnlyText === 'string' ? body.speakOnlyText.trim() : '';
+    if (speakOnlyText) {
+      const audioBase64 = await synthesizeSpeechWav(ai, speakOnlyText, voiceName);
+      return NextResponse.json(
+        {
+          ok: true,
+          transcript: '',
+          replyText: speakOnlyText,
+          audioBase64,
+          audioMimeType: audioBase64 ? 'audio/wav' : null,
+        },
+        { headers: corsHeaders }
+      );
+    }
+
+    const audioBase64 = typeof body.audioBase64 === 'string' ? body.audioBase64.trim() : '';
+    const audioMimeType =
+      typeof body.audioMimeType === 'string' && body.audioMimeType.trim()
+        ? body.audioMimeType.trim()
+        : 'audio/webm';
+    const typedText = typeof body.text === 'string' ? body.text.trim() : '';
+
+    if (!audioBase64 && !typedText) {
+      return NextResponse.json(
+        { ok: false, error: 'Either audioBase64, text, or speakOnlyText is required.' },
+        { status: 400, headers: corsHeaders }
+      );
+    }
+
     const ctx = body.context || {};
     const agentName = (body.agentName || 'እድሪስ').trim();
-    const voiceName = VALID_VOICES.has(String(body.voiceName || ''))
-      ? String(body.voiceName)
-      : 'Charon';
 
     const historyLines = Array.isArray(body.history)
       ? body.history
           .slice(-10)
           .map((h) => `${h.role === 'user' ? 'ደንበኛ' : 'ባለሙያ'}: ${String(h.text || '').trim()}`)
+          .filter(Boolean)
+          .join('\n')
+      : '';
+
+    const trainingLines = Array.isArray(body.trainingPairs)
+      ? body.trainingPairs
+          .map((p) => {
+            const q = String(p?.question || '').trim();
+            const a = String(p?.answer || '').trim();
+            return q && a ? `- ደንበኛው "${q}" (ወይም ተመሳሳይ) ሲጠይቅ -> "${a}"` : '';
+          })
           .filter(Boolean)
           .join('\n')
       : '';
@@ -96,6 +171,10 @@ export async function POST(req: NextRequest) {
       ctx.recentTxSummary ? `የቅርብ ጊዜ ግብይት: ${ctx.recentTxSummary}` : '',
       body.mp3ContextSummary
         ? `ከዚህ ቀደም የተጫወቱት የMP3 ድምፆች: ${body.mp3ContextSummary}`
+        : '',
+      body.customKnowledge ? `የባንኩ እውቀትና መረጃ:\n${body.customKnowledge.trim()}` : '',
+      trainingLines
+        ? `የተማርካቸው የጥያቄና መልስ መመሪያዎች (በተቻለ መጠን እነዚህን ተከተል):\n${trainingLines}`
         : '',
       body.systemNotes ? `ተጨማሪ የስራ መመሪያ: ${body.systemNotes}` : '',
       'ደንበኛው ገንዘብ ልኬ አልደረሰም/SMS አልመጣም ካለ በባንኩ ሲስተም ፍተሻ መሠረት መረጋገጡን፣ አልፎ አልፎ በሲስተም መጨናነቅ ምክንያት ከሆነ በ24 ሰዓት ውስጥ ገቢ እንደሚሆን በትህትና አስረዳ፤ ወይም ስሙንና ዝርዝሩን ጠይቀህ አረጋግጥ።',
@@ -131,6 +210,7 @@ export async function POST(req: NextRequest) {
       contents,
       config: {
         systemInstruction,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -170,39 +250,7 @@ export async function POST(req: NextRequest) {
       replyText = 'ይቅርታ ደንበኛችን፣ ጥያቄዎን በድጋሚ በግልፅ ይንገሩኝ።';
     }
 
-    // Generate spoken WAV audio via Gemini TTS
-    let replyAudioBase64: string | null = null;
-    try {
-      const ttsRes = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: replyText,
-                speechMetadata: {
-                  style: 'Warm, calm, professional Ethiopian bank customer support agent on a phone call',
-                },
-              },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
-            },
-          },
-        },
-      });
-      replyAudioBase64 =
-        ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
-    } catch (ttsErr) {
-      console.warn('[Dialer AI Support TTS fallback]', ttsErr);
-      replyAudioBase64 = null;
-    }
+    const replyAudioBase64 = await synthesizeSpeechWav(ai, replyText, voiceName);
 
     return NextResponse.json(
       {

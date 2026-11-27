@@ -21,6 +21,7 @@ import {
   PhoneOff,
   Play,
   Plus,
+  Send,
   ShieldCheck,
   Sparkles,
   Square,
@@ -33,6 +34,7 @@ import {
 } from 'lucide-react';
 import { getOwnerApiBaseUrl } from '@/lib/owner-types';
 import {
+  AiTrainingPair,
   BUILTIN_951_AUDIO_CLIPS,
   CustomAudioRecord,
   DEFAULT_951_CONFIG,
@@ -172,6 +174,71 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+function base64ToAudioPlaybackUrl(base64: string, mimeType = 'audio/wav'): { url: string; isObjectUrl: boolean } {
+  try {
+    const clean = base64.replace(/\s+/g, '');
+    const binary = atob(clean);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: mimeType });
+    return { url: URL.createObjectURL(blob), isObjectUrl: true };
+  } catch {
+    return { url: `data:${mimeType};base64,${base64}`, isObjectUrl: false };
+  }
+}
+
+interface AiSupportApiResult {
+  ok: boolean;
+  transcript?: string;
+  replyText?: string;
+  audioBase64?: string | null;
+  audioMimeType?: string | null;
+  error?: string;
+}
+
+async function postAiSupportRequest(payload: Record<string, unknown>): Promise<AiSupportApiResult> {
+  const endpoints: string[] = [];
+  if (typeof window !== 'undefined') {
+    const origin = window.location?.origin || '';
+    const protocol = window.location?.protocol || '';
+    if (
+      protocol.startsWith('http') &&
+      !origin.includes('appassets.androidplatform.net') &&
+      !origin.includes('offline-api-disabled.local')
+    ) {
+      endpoints.push('/api/dialer/ai-support');
+    }
+  }
+  const ownerBase = getOwnerApiBaseUrl();
+  const remoteEndpoint = `${ownerBase}/api/dialer/ai-support`;
+  if (!endpoints.includes(remoteEndpoint)) {
+    endpoints.push(remoteEndpoint);
+  }
+
+  let lastError = 'AI server connection failed';
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = (await res.json()) as AiSupportApiResult;
+      if (res.ok && data?.ok) {
+        return data;
+      }
+      if (data?.error) {
+        lastError = data.error;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : lastError;
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
 export function formatCallTimer(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
@@ -251,6 +318,9 @@ export function Dialer951CallOverlay({
   const [keypadVisible, setKeypadVisible] = useState<boolean>(false);
   const [inCallMenuOpen, setInCallMenuOpen] = useState<boolean>(false);
   const [dtmfEntered, setDtmfEntered] = useState<string>('');
+  const [aiStatusText, setAiStatusText] = useState<string>('');
+  const [aiTextBoxOpen, setAiTextBoxOpen] = useState<boolean>(false);
+  const [aiTextInput, setAiTextInput] = useState<string>('');
 
   const phaseRef = useRef<Call951Phase>('ringing');
   const openRef = useRef<boolean>(false);
@@ -585,27 +655,44 @@ export function Dialer951CallOverlay({
   );
 
   const playBase64Wav = useCallback(
-    (base64: string, mimeType = 'audio/wav'): Promise<void> => {
+    (base64: string, mimeType = 'audio/wav'): Promise<'ended' | 'stopped' | 'error'> => {
       stopAllAudio();
+      const myToken = playbackTokenRef.current;
       return new Promise((resolve) => {
         try {
-          const audio = new Audio(`data:${mimeType};base64,${base64}`);
+          const { url, isObjectUrl } = base64ToAudioPlaybackUrl(base64, mimeType);
+          if (isObjectUrl) {
+            activeObjectUrlRef.current = url;
+          }
+          const audio = new Audio(url);
+          audio.preload = 'auto';
           audioElRef.current = audio;
           let done = false;
-          const finish = () => {
+          const finish = (reason: 'ended' | 'stopped' | 'error' = 'ended') => {
             if (done) return;
             done = true;
             if (playbackSettlerRef.current === finish) {
               playbackSettlerRef.current = null;
             }
-            resolve();
+            resolve(reason);
           };
           playbackSettlerRef.current = finish;
-          audio.onended = finish;
-          audio.onerror = finish;
-          void audio.play().catch(finish);
+          audio.onended = () => finish('ended');
+          audio.onerror = () => finish('error');
+          void audio
+            .play()
+            .then(() => {
+              if (playbackTokenRef.current !== myToken || !openRef.current) {
+                try {
+                  audio.pause();
+                  audio.currentTime = 0;
+                } catch {}
+                finish('stopped');
+              }
+            })
+            .catch(() => finish('error'));
         } catch {
-          resolve();
+          resolve('error');
         }
       });
     },
@@ -640,6 +727,7 @@ export function Dialer951CallOverlay({
       agentBusyRef.current = true;
 
       try {
+        setAiStatusText('AI እያሰበ ነው...');
         let audioBase64 = '';
         let audioMimeType = 'audio/webm';
         if (opts.blob && opts.blob.size > 400) {
@@ -647,37 +735,35 @@ export function Dialer951CallOverlay({
           audioMimeType = opts.blob.type || 'audio/webm';
         }
 
-        const baseUrl = getOwnerApiBaseUrl();
         const playedMp3Summary =
           steps.length > 0
             ? steps.map((s) => s.title).join(', ')
             : 'የ951 የጥበቃ ድምፅ ("ጥሪዎ ወደ ጥሪ ማዕከሉ ሰራተኞች እየተላለፈ ስለሆነ...")';
 
-        const res = await fetch(`${baseUrl}/api/dialer/ai-support`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            audioBase64: audioBase64 || undefined,
-            audioMimeType,
-            text: opts.text || undefined,
-            history: historyRef.current,
-            agentName: cfg.agentName,
-            voiceName: cfg.voiceName,
-            systemNotes: cfg.systemNotes,
-            mp3ContextSummary: playedMp3Summary,
-            context: bankingContextRef.current,
-          }),
+        const data = await postAiSupportRequest({
+          audioBase64: audioBase64 || undefined,
+          audioMimeType,
+          text: opts.text || undefined,
+          history: historyRef.current,
+          agentName: cfg.agentName,
+          voiceName: cfg.voiceName,
+          systemNotes: cfg.systemNotes,
+          customKnowledge: cfg.aiKnowledge,
+          trainingPairs: cfg.aiTrainingPairs,
+          mp3ContextSummary: playedMp3Summary,
+          context: bankingContextRef.current,
         });
 
-        const data = (await res.json()) as {
-          ok?: boolean;
-          transcript?: string;
-          replyText?: string;
-          audioBase64?: string | null;
-          audioMimeType?: string | null;
-        };
-
         if (!openRef.current) return;
+
+        if (!data.ok) {
+          const errNote =
+            'ይቅርታ ደንበኛችን፣ የAI ሰርቨር ግንኙነት አልተገኘም። እባክዎ ኢንተርኔት ወይም API Key ያረጋግጡ።';
+          appendTranscript('agent', errNote);
+          setAiStatusText('የኔትወርክ/ሰርቨር ስህተት');
+          await speakBrowserAmharic(errNote);
+          return;
+        }
 
         if (data.transcript) {
           appendTranscript('user', data.transcript);
@@ -686,9 +772,16 @@ export function Dialer951CallOverlay({
           data.replyText ||
           'እሺ ደንበኛችን፣ በሲስተሙ ላይ እንዳረጋገጥኩት ጥያቄዎ እየተስተናገደ ነው። ሌላ የሚጠይቁት አለ?';
         appendTranscript('agent', reply);
+        setAiStatusText('AI እያወራ ነው...');
 
         if (data.audioBase64) {
-          await playBase64Wav(data.audioBase64, data.audioMimeType || 'audio/wav');
+          const resPlay = await playBase64Wav(
+            data.audioBase64,
+            data.audioMimeType || 'audio/wav'
+          );
+          if (resPlay === 'error') {
+            await speakBrowserAmharic(reply);
+          }
         } else {
           await speakBrowserAmharic(reply);
         }
@@ -699,6 +792,9 @@ export function Dialer951CallOverlay({
         await speakBrowserAmharic(fallback);
       } finally {
         agentBusyRef.current = false;
+        if (openRef.current && phaseRef.current === 'ai_active') {
+          setAiStatusText('እየሰማዎት ነው — ይናገሩ');
+        }
       }
     },
     [appendTranscript, playAudioClipById, playBase64Wav, speakBrowserAmharic]
@@ -707,6 +803,7 @@ export function Dialer951CallOverlay({
   const startMicVad = useCallback(async () => {
     stopMicVad();
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      setAiStatusText('ማይክ አልተገኘም — በጽሑፍ መጠየቅ ይችላሉ');
       return;
     }
     try {
@@ -785,7 +882,10 @@ export function Dialer951CallOverlay({
         vadLoopRef.current = requestAnimationFrame(loop);
       };
       vadLoopRef.current = requestAnimationFrame(loop);
-    } catch {}
+      setAiStatusText('እየሰማዎት ነው — ይናገሩ');
+    } catch {
+      setAiStatusText('ማይክ ፍቃድ አልተሰጠም — በጽሑፍ መጠየቅ ይችላሉ');
+    }
   }, [stopMicVad, submitVoiceOrTextTurn]);
 
   const enterAgentAiConversation = useCallback(async () => {
@@ -807,15 +907,46 @@ export function Dialer951CallOverlay({
       appendTranscript('agent', `🔊 ${firstStep.title}`);
       await playAudioClipById(firstStep.audioId, false);
     } else if (cfg.mode !== 'mp3_only') {
-      const greeting = `ሰላም ደንበኛችን፣ ከኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት ${cfg.agentName} ነኝ፤ በምን ልርዳዎት?`;
+      const greeting =
+        cfg.aiGreeting?.trim() ||
+        `ሰላም ደንበኛችን፣ ከኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት ${cfg.agentName} ነኝ፤ በምን ልርዳዎት?`;
       appendTranscript('agent', greeting);
-      await speakBrowserAmharic(greeting);
+      setAiStatusText('AI እያወራ ነው...');
+      agentBusyRef.current = true;
+      try {
+        const ttsData = await postAiSupportRequest({
+          speakOnlyText: greeting,
+          voiceName: cfg.voiceName,
+        });
+        if (!openRef.current || phaseRef.current !== 'ai_active') return;
+        if (ttsData.ok && ttsData.audioBase64) {
+          const playRes = await playBase64Wav(
+            ttsData.audioBase64,
+            ttsData.audioMimeType || 'audio/wav'
+          );
+          if (playRes === 'error') {
+            await speakBrowserAmharic(greeting);
+          }
+        } else {
+          await speakBrowserAmharic(greeting);
+        }
+      } finally {
+        agentBusyRef.current = false;
+      }
     }
 
     if (openRef.current && phaseRef.current === 'ai_active') {
       void startMicVad();
     }
-  }, [appendTranscript, playAudioClipById, speakBrowserAmharic, startMicVad, stopAllAudio, updatePhase]);
+  }, [
+    appendTranscript,
+    playAudioClipById,
+    playBase64Wav,
+    speakBrowserAmharic,
+    startMicVad,
+    stopAllAudio,
+    updatePhase,
+  ]);
 
   const finishAndExit = useCallback(() => {
     openRef.current = false;
@@ -1406,6 +1537,9 @@ export function Dialer951CallOverlay({
       setBluetoothOn(false);
       setSpeakerOn(true);
       setMuted(false);
+      setAiStatusText('');
+      setAiTextBoxOpen(false);
+      setAiTextInput('');
 
       const useReal951 =
         loadedCfg.backgroundCall.enabled &&
@@ -1437,6 +1571,14 @@ export function Dialer951CallOverlay({
           return;
         }
         stopAllAudio();
+        if (
+          loadedCfg.mode === 'ai_only' &&
+          !loadedCfg.backgroundCall.enabled &&
+          (loadedCfg.aiSkipIntroInAiOnly ?? true)
+        ) {
+          void enterAgentAiConversation();
+          return;
+        }
         if (hasCompletedFirst951Welcome()) {
           if (configRef.current.skipMenuAfterFirstCall) {
             void triggerStage2HoldAndBackgroundCall(initialEpoch);
@@ -1603,6 +1745,49 @@ export function Dialer951CallOverlay({
           )}
           {(phase === 'ringing' || phase === 'real_951_ringing') && !dtmfEntered && (
             <div className="text-[14px] font-normal text-white/75 mt-1">Dialing...</div>
+          )}
+          {phase === 'ai_active' && !held && aiStatusText && (
+            <div className="mt-2 flex flex-col items-center gap-2">
+              <div className="text-[12px] font-medium text-white/80">{aiStatusText}</div>
+              <button
+                type="button"
+                onClick={() => setAiTextBoxOpen((v) => !v)}
+                className="px-3 py-1 rounded-xl bg-white/15 text-white/90 text-[11px] font-semibold active:bg-white/25 cursor-pointer"
+              >
+                {aiTextBoxOpen ? 'መጻፊያ ዝጋ' : 'በጽሑፍ ጠይቅ'}
+              </button>
+              {aiTextBoxOpen && (
+                <div className="w-72 flex items-center gap-1.5 bg-white/15 backdrop-blur-md rounded-2xl p-1.5 mt-1">
+                  <input
+                    type="text"
+                    value={aiTextInput}
+                    onChange={(e) => setAiTextInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && aiTextInput.trim()) {
+                        const txt = aiTextInput.trim();
+                        setAiTextInput('');
+                        void submitVoiceOrTextTurn({ text: txt });
+                      }
+                    }}
+                    placeholder="ጥያቄዎን እዚህ ይጻፉ..."
+                    className="flex-1 min-w-0 bg-transparent px-2.5 py-1.5 text-xs text-white placeholder:text-white/60 outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!aiTextInput.trim()) return;
+                      const txt = aiTextInput.trim();
+                      setAiTextInput('');
+                      void submitVoiceOrTextTurn({ text: txt });
+                    }}
+                    className="w-8 h-8 rounded-xl bg-[#19b264] text-white flex items-center justify-center shrink-0 cursor-pointer"
+                    aria-label="Send message to AI"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
           )}
           {held && (
             <div className="text-[14px] font-normal text-white/75 mt-1">On hold</div>
@@ -2368,14 +2553,21 @@ export function Dialer951StudioDrawer({
   onOpenBankingSync,
   onOpenAdvancedPermissions,
 }: Dialer951StudioDrawerProps) {
-  const [studioTab, setStudioTab] = useState<'settings' | 'guide'>('settings');
+  const [studioTab, setStudioTab] = useState<'settings' | 'ai_train' | 'guide'>('settings');
   const [cfg, setCfg] = useState<Support951Config>(DEFAULT_951_CONFIG);
   const [customClips, setCustomClips] = useState<CustomAudioRecord[]>([]);
   const [previewPlayingId, setPreviewPlayingId] = useState<string | null>(null);
   const [stepTitleInput, setStepTitleInput] = useState<string>('');
   const [stepAudioInput, setStepAudioInput] = useState<string>('cbe_951_hold');
+  const [trainQInput, setTrainQInput] = useState<string>('');
+  const [trainAInput, setTrainAInput] = useState<string>('');
+  const [aiTestInput, setAiTestInput] = useState<string>('ገንዘብ ልኬ SMS አልመጣልኝም');
+  const [aiTestBusy, setAiTestBusy] = useState<boolean>(false);
+  const [aiTestReply, setAiTestReply] = useState<string>('');
+  const [aiTestError, setAiTestError] = useState<string>('');
   const [savedNotice, setSavedNotice] = useState<string>('');
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewObjectUrlRef = useRef<string | null>(null);
 
   const stopPreview = useCallback(() => {
     if (previewAudioRef.current) {
@@ -2384,6 +2576,12 @@ export function Dialer951StudioDrawer({
         previewAudioRef.current.currentTime = 0;
       } catch {}
       previewAudioRef.current = null;
+    }
+    if (previewObjectUrlRef.current) {
+      try {
+        URL.revokeObjectURL(previewObjectUrlRef.current);
+      } catch {}
+      previewObjectUrlRef.current = null;
     }
     setPreviewPlayingId(null);
   }, []);
@@ -2409,8 +2607,57 @@ export function Dialer951StudioDrawer({
         } catch {}
         previewAudioRef.current = null;
       }
+      if (previewObjectUrlRef.current) {
+        try {
+          URL.revokeObjectURL(previewObjectUrlRef.current);
+        } catch {}
+        previewObjectUrlRef.current = null;
+      }
     };
   }, [open, stopPreview]);
+
+  const handleTestAiTraining = async (overrideQuestion?: string) => {
+    const q = (overrideQuestion ?? aiTestInput).trim();
+    if (!q || aiTestBusy) return;
+    stopPreview();
+    setAiTestBusy(true);
+    setAiTestError('');
+    setAiTestReply('');
+    try {
+      save951Config(cfg);
+      const data = await postAiSupportRequest({
+        text: q,
+        agentName: cfg.agentName,
+        voiceName: cfg.voiceName,
+        systemNotes: cfg.systemNotes,
+        customKnowledge: cfg.aiKnowledge,
+        trainingPairs: cfg.aiTrainingPairs,
+      });
+      if (!data.ok) {
+        setAiTestError(data.error || 'የAI ሰርቨር ግንኙነት አልተገኘም።');
+        return;
+      }
+      const reply = data.replyText || '';
+      setAiTestReply(reply);
+      if (data.audioBase64) {
+        const { url, isObjectUrl } = base64ToAudioPlaybackUrl(
+          data.audioBase64,
+          data.audioMimeType || 'audio/wav'
+        );
+        if (isObjectUrl) previewObjectUrlRef.current = url;
+        const audio = new Audio(url);
+        previewAudioRef.current = audio;
+        setPreviewPlayingId('__ai_test__');
+        audio.onended = () => setPreviewPlayingId(null);
+        audio.onerror = () => setPreviewPlayingId(null);
+        void audio.play().catch(() => setPreviewPlayingId(null));
+      }
+    } catch {
+      setAiTestError('የAI ሙከራ አልተሳካም — ኢንተርኔትዎን ያረጋግጡ።');
+    } finally {
+      setAiTestBusy(false);
+    }
+  };
 
   const allClips = useMemo(
     () => [
@@ -2521,35 +2768,371 @@ export function Dialer951StudioDrawer({
         </button>
       </div>
 
-      {/* Sub-navigation: Settings vs Full Amharic Help Guide */}
-      <div className="px-4 pt-2.5 pb-1 bg-white border-b border-black/5 shrink-0 flex gap-2 max-w-md w-full mx-auto">
+      {/* Sub-navigation: MP3 & Call vs AI Training vs Full Amharic Help Guide */}
+      <div className="px-4 pt-2.5 pb-1 bg-white border-b border-black/5 shrink-0 grid grid-cols-3 gap-1.5 max-w-md w-full mx-auto">
         <button
           type="button"
           onClick={() => setStudioTab('settings')}
-          className={`flex-1 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer ${
+          className={`py-2 px-1.5 rounded-xl text-[11.5px] font-bold flex items-center justify-center gap-1 cursor-pointer ${
             studioTab === 'settings'
               ? 'bg-[#111111] text-white'
               : 'bg-slate-100 text-slate-600'
           }`}
         >
-          <Bot className="w-3.5 h-3.5" />
-          <span>ቅንብሮች</span>
+          <Music className="w-3.5 h-3.5 shrink-0" />
+          <span>MP3 እና ጥሪ</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setStudioTab('ai_train')}
+          className={`py-2 px-1.5 rounded-xl text-[11.5px] font-bold flex items-center justify-center gap-1 cursor-pointer ${
+            studioTab === 'ai_train'
+              ? 'bg-sky-600 text-white'
+              : 'bg-slate-100 text-slate-600'
+          }`}
+        >
+          <Sparkles className="w-3.5 h-3.5 shrink-0" />
+          <span>AI ማሰልጠኛ</span>
         </button>
         <button
           type="button"
           onClick={() => setStudioTab('guide')}
-          className={`flex-1 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer ${
+          className={`py-2 px-1.5 rounded-xl text-[11.5px] font-bold flex items-center justify-center gap-1 cursor-pointer ${
             studioTab === 'guide'
               ? 'bg-[#19b264] text-white'
               : 'bg-slate-100 text-slate-600'
           }`}
         >
-          <BookOpen className="w-3.5 h-3.5" />
-          <span>ሙሉ መመሪያ (Help)</span>
+          <BookOpen className="w-3.5 h-3.5 shrink-0" />
+          <span>መመሪያ</span>
         </button>
       </div>
 
-      {studioTab === 'guide' ? (
+      {studioTab === 'ai_train' ? (
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-md w-full mx-auto">
+          {/* Background Call conflict check */}
+          {cfg.backgroundCall.enabled && (
+            <div className="bg-amber-50 border border-amber-200 rounded-3xl p-4 space-y-2">
+              <div className="text-xs font-bold text-amber-900">
+                ማሳሰቢያ፡ አሁን &quot;በጀርባ መደወያ (Background Call)&quot; በርቷል!
+              </div>
+              <p className="text-[11.5px] text-amber-800 leading-relaxed">
+                በጀርባ መደወያ ON ከሆነ 951 ተደውሎ 4 ሲጫን ወደ እውነተኛ ሰው ስለሚደውል AIው አያወራም። የAI ድምፅን ለመጠቀም ከታች ያለውን ቁልፍ በመንካት Background Callን ያጥፉ።
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  const nextCfg: Support951Config = {
+                    ...cfg,
+                    mode: cfg.mode === 'mp3_only' ? 'hybrid' : cfg.mode,
+                    backgroundCall: { ...cfg.backgroundCall, enabled: false },
+                  };
+                  setCfg(nextCfg);
+                  save951Config(nextCfg);
+                  setSavedNotice('Background Call ጠፍቷል — አሁን AI ይሰራል!');
+                  window.setTimeout(() => setSavedNotice(''), 2500);
+                }}
+                className="w-full py-2 rounded-xl bg-amber-600 text-white text-xs font-bold cursor-pointer"
+              >
+                Background Call አጥፋና AIን አብራ
+              </button>
+            </div>
+          )}
+
+          {/* Quick AI Mode Switcher */}
+          <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
+            <div className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+              <Bot className="w-4 h-4 text-sky-600" />
+              <span>የAI አጀማመር ሁኔታ</span>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {(
+                [
+                  { id: 'hybrid', label: 'MP3 + AI ጥምር' },
+                  { id: 'ai_only', label: 'AI ድምፅ ብቻ' },
+                  { id: 'mp3_only', label: 'MP3 ብቻ' },
+                ] as { id: Support951Mode; label: string }[]
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setCfg((prev) => ({ ...prev, mode: opt.id }))}
+                  className={`py-2 px-1.5 rounded-2xl text-[11.5px] font-bold border transition-all cursor-pointer ${
+                    cfg.mode === opt.id
+                      ? 'bg-sky-600 text-white border-sky-600'
+                      : 'bg-slate-50 text-slate-700 border-slate-200'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <label className="flex items-center justify-between text-[11.5px] text-slate-700 pt-1">
+              <span>&quot;AI ድምፅ ብቻ&quot; ሲመረጥ 951 ሲደወል ቀጥታ AI ያናግር (ያለ MP3)</span>
+              <input
+                type="checkbox"
+                checked={cfg.aiSkipIntroInAiOnly ?? true}
+                onChange={(e) =>
+                  setCfg((prev) => ({ ...prev, aiSkipIntroInAiOnly: e.target.checked }))
+                }
+                className="accent-sky-600 w-4 h-4 shrink-0"
+              />
+            </label>
+          </div>
+
+          {/* Identity, Voice & Greeting */}
+          <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
+            <div className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+              <Sparkles className="w-4 h-4 text-sky-600" />
+              <span>1. የAI ባለሙያ ማንነት፣ ድምፅ እና መክፈቻ ሰላምታ</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-[11px] font-semibold text-slate-600">የባለሙያው ስም</label>
+                <input
+                  type="text"
+                  value={cfg.agentName}
+                  onChange={(e) => setCfg((prev) => ({ ...prev, agentName: e.target.value }))}
+                  className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none"
+                />
+              </div>
+              <div>
+                <label className="text-[11px] font-semibold text-slate-600">የGemini ድምፅ</label>
+                <select
+                  value={cfg.voiceName}
+                  onChange={(e) =>
+                    setCfg((prev) => ({ ...prev, voiceName: e.target.value as Support951Voice }))
+                  }
+                  className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white outline-none"
+                >
+                  <option value="Charon">Charon (የወንድ ረጋ ያለ)</option>
+                  <option value="Puck">Puck (ሞቅ ያለ)</option>
+                  <option value="Kore">Kore (የሴት ጥርት ያለ)</option>
+                  <option value="Fenrir">Fenrir (ወፍራም)</option>
+                  <option value="Zephyr">Zephyr (ለስላሳ)</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-600">
+                AI ሲያነሳ መጀመሪያ የሚናገረው ሰላምታ (Greeting)
+              </label>
+              <textarea
+                rows={2}
+                value={cfg.aiGreeting}
+                onChange={(e) => setCfg((prev) => ({ ...prev, aiGreeting: e.target.value }))}
+                className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none resize-none"
+              />
+            </div>
+          </div>
+
+          {/* Script & Bank Knowledge */}
+          <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
+            <div className="text-xs font-bold text-slate-500">
+              2. የAI መመሪያ እና የባንክ እውቀት (Instructions &amp; Knowledge)
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                {
+                  label: '+ 24 ሰዓት መጨናነቅ',
+                  note: 'ደንበኛው ገንዘብ ልኬ አልደረሰም ወይም SMS አልመጣም ካለ ግብይቱ መረጋገጡን እና በሲስተም መጨናነቅ ምክንያት በ24 ሰዓት ውስጥ ገቢ እንደሚሆን አረጋጋው።',
+                },
+                {
+                  label: '+ አጭር እና ትሁት አማርኛ',
+                  note: 'ሁልጊዜ በትህትና እና በአጭር የስልክ ንግግር (1-2 አረፍተ ነገር) ብቻ መልስ።',
+                },
+              ].map((preset) => (
+                <button
+                  key={preset.label}
+                  type="button"
+                  onClick={() =>
+                    setCfg((prev) => ({
+                      ...prev,
+                      systemNotes: prev.systemNotes
+                        ? `${prev.systemNotes}\n${preset.note}`
+                        : preset.note,
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-sky-50 border border-sky-200 text-sky-800 text-[10.5px] font-semibold cursor-pointer"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-600">
+                የAI ባህሪ እና ዋና መመሪያ (System Script)
+              </label>
+              <textarea
+                rows={3}
+                value={cfg.systemNotes}
+                onChange={(e) => setCfg((prev) => ({ ...prev, systemNotes: e.target.value }))}
+                className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none resize-none"
+              />
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-600">
+                AIው ሊያውቃቸው የሚገቡ የባንክ መረጃዎች (Facts &amp; Policies)
+              </label>
+              <textarea
+                rows={3}
+                value={cfg.aiKnowledge}
+                onChange={(e) => setCfg((prev) => ({ ...prev, aiKnowledge: e.target.value }))}
+                placeholder="ምሳሌ፡ የአገልግሎት ክፍያ፣ የስራ ሰዓት፣ የቅርንጫፍ መረጃ..."
+                className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none resize-none"
+              />
+            </div>
+          </div>
+
+          {/* Custom Q&A Training Rules */}
+          <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
+            <div className="text-xs font-bold text-slate-500">
+              3. የጥያቄና መልስ ማሰልጠኛ (Q&amp;A Training Rules)
+            </div>
+            {(cfg.aiTrainingPairs || []).length === 0 ? (
+              <div className="text-xs text-slate-400">
+                ገና ምንም የጥያቄ/መልስ ደንብ አልተጨመረም።
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {(cfg.aiTrainingPairs || []).map((pair: AiTrainingPair) => (
+                  <div
+                    key={pair.id}
+                    className="p-2.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-1 relative pr-8"
+                  >
+                    <div className="text-[11px] font-bold text-slate-700">
+                      ጥያቄ: {pair.question}
+                    </div>
+                    <div className="text-[11px] text-emerald-800">
+                      መልስ: {pair.answer}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCfg((prev) => ({
+                          ...prev,
+                          aiTrainingPairs: (prev.aiTrainingPairs || []).filter(
+                            (x) => x.id !== pair.id
+                          ),
+                        }))
+                      }
+                      className="absolute right-2 top-2 text-rose-500 p-1 cursor-pointer"
+                      aria-label="Delete rule"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="space-y-2 pt-1 border-t border-black/5">
+              <input
+                type="text"
+                value={trainQInput}
+                onChange={(e) => setTrainQInput(e.target.value)}
+                placeholder="ደንበኛው ይህን ሲጠይቅ (ምሳሌ፡ ገንዘቤ ለምን ዘገየ?)"
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none"
+              />
+              <textarea
+                rows={2}
+                value={trainAInput}
+                onChange={(e) => setTrainAInput(e.target.value)}
+                placeholder="AIው እንዲህ ብሎ ይመልስ..."
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 text-xs outline-none resize-none"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  if (!trainQInput.trim() || !trainAInput.trim()) return;
+                  setCfg((prev) => ({
+                    ...prev,
+                    aiTrainingPairs: [
+                      ...(prev.aiTrainingPairs || []),
+                      {
+                        id: `pair_${Date.now()}`,
+                        question: trainQInput.trim(),
+                        answer: trainAInput.trim(),
+                      },
+                    ],
+                  }));
+                  setTrainQInput('');
+                  setTrainAInput('');
+                }}
+                className="w-full py-2 rounded-xl bg-slate-900 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>የጥያቄና መልስ መመሪያ ጨምር</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Live AI Voice Test Sandbox */}
+          <div className="bg-sky-50 border border-sky-200 rounded-3xl p-4 space-y-2.5 shadow-sm">
+            <div className="text-xs font-bold text-sky-900 flex items-center gap-1.5">
+              <Volume2 className="w-4 h-4 text-sky-700" />
+              <span>4. የAI ድምፅ እና መልስ እዚሁ መሞከሪያ (Test Live)</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {['ገንዘብ ልኬ SMS አልመጣልኝም', 'ቀሪ ሂሳቤን አረጋግጥልኝ', 'Hello I need help'].map(
+                (sample) => (
+                  <button
+                    key={sample}
+                    type="button"
+                    onClick={() => {
+                      setAiTestInput(sample);
+                      void handleTestAiTraining(sample);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-white border border-sky-200 text-sky-900 text-[10.5px] font-medium cursor-pointer"
+                  >
+                    {sample}
+                  </button>
+                )
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <input
+                type="text"
+                value={aiTestInput}
+                onChange={(e) => setAiTestInput(e.target.value)}
+                placeholder="የሙከራ ጥያቄ ይጻፉ..."
+                className="flex-1 min-w-0 px-3 py-2 rounded-xl border border-sky-200 bg-white text-xs outline-none"
+              />
+              <button
+                type="button"
+                disabled={aiTestBusy}
+                onClick={() => void handleTestAiTraining()}
+                className="px-3 py-2 rounded-xl bg-sky-600 text-white text-xs font-bold shrink-0 disabled:opacity-50 cursor-pointer"
+              >
+                {aiTestBusy ? 'እያሰበ...' : 'AI ሞክር'}
+              </button>
+            </div>
+            {aiTestReply && (
+              <div className="p-2.5 rounded-xl bg-white border border-sky-200 text-xs text-slate-800 leading-relaxed">
+                <span className="font-bold text-sky-700">{cfg.agentName}: </span>
+                {aiTestReply}
+              </div>
+            )}
+            {aiTestError && (
+              <div className="p-2 rounded-xl bg-rose-50 border border-rose-200 text-[11px] text-rose-700">
+                {aiTestError}
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={handleSave}
+            className="w-full py-3 rounded-2xl bg-[#19b264] text-white text-sm font-bold flex items-center justify-center gap-2 cursor-pointer"
+          >
+            <Check className="w-4 h-4" />
+            <span>የAI ማሰልጠኛ ቅንብሮችን አስቀምጥ</span>
+          </button>
+          {savedNotice && (
+            <div className="text-center text-xs font-semibold text-emerald-700">{savedNotice}</div>
+          )}
+        </div>
+      ) : studioTab === 'guide' ? (
         <div className="flex-1 overflow-y-auto p-4 space-y-3.5 max-w-md w-full mx-auto">
           <div className="bg-emerald-50 border border-emerald-200 rounded-3xl p-4 space-y-1.5">
             <div className="flex items-center gap-2 text-emerald-900 font-bold text-sm">
@@ -3119,11 +3702,20 @@ export function Dialer951StudioDrawer({
             </select>
           </div>
 
-          {/* AI Voice & Persona Config */}
+          {/* AI Voice & Training Quick Card */}
           <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
-            <div className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
-              <Sparkles className="w-4 h-4 text-sky-600" />
-              <span>የAI ባለሙያ መረጃ (Gemini Voice)</span>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+                <Sparkles className="w-4 h-4 text-sky-600" />
+                <span>የAI ባለሙያ መረጃ (Gemini Voice)</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setStudioTab('ai_train')}
+                className="px-2.5 py-1 rounded-xl bg-sky-50 border border-sky-200 text-sky-700 text-[11px] font-bold cursor-pointer"
+              >
+                ሙሉ AI ማሰልጠኛ ክፈት →
+              </button>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div>

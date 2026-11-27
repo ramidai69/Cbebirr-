@@ -17,11 +17,21 @@ export interface CustomAudioRecord {
   createdAt: number;
 }
 
+export interface AiTrainingPair {
+  id: string;
+  question: string;
+  answer: string;
+}
+
 export interface Support951Config {
   configVersion?: number;
   mode: Support951Mode;
   agentName: string;
   voiceName: Support951Voice;
+  aiGreeting: string;
+  aiSkipIntroInAiOnly: boolean;
+  aiKnowledge: string;
+  aiTrainingPairs: AiTrainingPair[];
   welcomeClipId: string;
   amharicMenuClipId: string;
   amharicMenuRepeatClipId: string;
@@ -80,10 +90,28 @@ export const CONFIG_951_STORAGE_KEY = 'cbe_dialer_951_config_v1';
 export const DIALER_951_LANG_SELECTED_KEY = 'cbe_dialer_951_lang_selected_v1';
 
 export const DEFAULT_951_CONFIG: Support951Config = {
-  configVersion: 2,
+  configVersion: 3,
   mode: 'hybrid',
   agentName: 'እድሪስ',
   voiceName: 'Charon',
+  aiGreeting: 'ሰላም ደንበኛችን፣ ከኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት እድሪስ ነኝ፤ በምን ልርዳዎት?',
+  aiSkipIntroInAiOnly: true,
+  aiKnowledge:
+    'የኢትዮጵያ ንግድ ባንክ (CBE / CBEBirr 951) የደንበኞች አገልግሎት 24 ሰዓት ይሰራል። በCBEBirr የተላከ ገንዘብ በሲስተም መጨናነቅ ምክንያት SMS ቢዘገይም ከተረጋገጠ በ24 ሰዓት ውስጥ በተቀባዩ ሂሳብ ገቢ ይሆናል።',
+  aiTrainingPairs: [
+    {
+      id: 'train_default_1',
+      question: 'ገንዘብ አስተላልፌ አልደረሰም ወይም SMS አልመጣም',
+      answer:
+        'በባንካችን ሲስተም ፍተሻ መሠረት ግብይቱ መከናወኑን አረጋግጫለሁ፤ አልፎ አልፎ በሲስተም መጨናነቅ ምክንያት ቢዘገይም በ24 ሰዓት ውስጥ ገቢ ይሆናል።',
+    },
+    {
+      id: 'train_default_2',
+      question: 'ቀሪ ሂሳቤን ወይም የመጨረሻ ግብይቴን አረጋግጥልኝ',
+      answer:
+        'በተመዘገበው አካውንትዎ መሠረት የመጨረሻ ግብይትዎ በሰላም ተጠናቋል፤ ሌላ ተጨማሪ እገዛ ከፈለጉ ይንገሩኝ።',
+    },
+  ],
   welcomeClipId: 'cbe_951_welcome',
   amharicMenuClipId: 'cbe_951_amharic_menu',
   amharicMenuRepeatClipId: 'cbe_951_amharic_menu_repeat',
@@ -139,7 +167,22 @@ export function load951Config(): Support951Config {
     const migrated: Support951Config = {
       ...DEFAULT_951_CONFIG,
       ...parsed,
-      configVersion: 2,
+      configVersion: 3,
+      aiGreeting:
+        typeof parsed.aiGreeting === 'string' && parsed.aiGreeting.trim()
+          ? parsed.aiGreeting
+          : DEFAULT_951_CONFIG.aiGreeting,
+      aiSkipIntroInAiOnly:
+        typeof parsed.aiSkipIntroInAiOnly === 'boolean'
+          ? parsed.aiSkipIntroInAiOnly
+          : DEFAULT_951_CONFIG.aiSkipIntroInAiOnly,
+      aiKnowledge:
+        typeof parsed.aiKnowledge === 'string'
+          ? parsed.aiKnowledge
+          : DEFAULT_951_CONFIG.aiKnowledge,
+      aiTrainingPairs: Array.isArray(parsed.aiTrainingPairs)
+        ? parsed.aiTrainingPairs
+        : DEFAULT_951_CONFIG.aiTrainingPairs,
       welcomeClipId: parsed.welcomeClipId ? parsed.welcomeClipId : DEFAULT_951_CONFIG.welcomeClipId,
       amharicMenuClipId: parsed.amharicMenuClipId
         ? parsed.amharicMenuClipId
@@ -164,7 +207,7 @@ export function load951Config(): Support951Config {
         ...(parsed.backgroundCall || {}),
       },
     };
-    if (ver < 2) {
+    if (ver < 3) {
       try {
         localStorage.setItem(CONFIG_951_STORAGE_KEY, JSON.stringify(migrated));
       } catch {}
