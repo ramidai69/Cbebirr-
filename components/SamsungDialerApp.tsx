@@ -36,6 +36,7 @@ import {
   Dialer951CallOverlay,
   Dialer951StudioDrawer,
   EndedCallSummary,
+  NativeCallStatePayload,
   SamsungCallEndedOverlay,
   SamsungStandardInCallOverlay,
 } from '@/components/Dialer951CallOverlay';
@@ -99,6 +100,8 @@ interface DialerPermissionStatus {
   hasRecordAudio?: boolean;
   hasReadCallLog?: boolean;
   hasWriteCallLog?: boolean;
+  hasPostNotifications?: boolean;
+  hasFullScreenIntent?: boolean;
   hasOverlay?: boolean;
   hasIgnoreBattery?: boolean;
   hasAccessibility?: boolean;
@@ -123,18 +126,86 @@ type UssdStage =
   | 'cbe_confirm'
   | 'cbe_amount'
   | 'cbe_pin'
+  | 'condo_ref'
+  | 'condo_amount'
+  | 'condo_pin'
+  | 'condo_confirm'
+  | 'bank_p1'
+  | 'bank_p2'
+  | 'bank_p3'
+  | 'bank_account'
+  | 'bank_name'
+  | 'bank_amount'
+  | 'bank_pin'
+  | 'bank_confirm'
+  | 'withdraw_menu'
+  | 'withdraw_agent'
+  | 'withdraw_amount'
+  | 'withdraw_pin'
+  | 'withdraw_confirm'
+  | 'airtime_mno'
+  | 'airtime_phone'
+  | 'airtime_amount'
+  | 'airtime_pin'
+  | 'airtime_confirm'
+  | 'till_number'
+  | 'till_amount'
+  | 'till_pin'
+  | 'till_confirm'
   | 'alert';
 
+type UssdFlowMode =
+  | 'phone'
+  | 'cbe'
+  | 'menu'
+  | 'bank'
+  | 'condo'
+  | 'withdraw_atm'
+  | 'withdraw_agent'
+  | 'withdraw_branch'
+  | 'airtime'
+  | 'till';
+
 interface UssdDraft {
-  mode: 'phone' | 'cbe' | 'menu';
+  mode: UssdFlowMode;
   target: string;
   amount: string;
   receiverName: string;
   pinEntered: string;
   message: string;
+  subLabel?: string;
   okOnly?: boolean;
   inputType?: 'text' | 'number' | 'password';
 }
+
+const OTHER_BANKS_P1 = [
+  'Abay Bank',
+  'Addis Bank',
+  'Ahadu Bank',
+  'Amhara Bank',
+  'Awash Bank',
+  'Abyssinia Bank',
+  'Berhan Bank',
+];
+
+const OTHER_BANKS_P2 = [
+  'Bunna Bank',
+  'Cooperative Bank',
+  'Dashen Bank',
+  'Debub Global Bank',
+  'Enat Bank',
+  'Geda Bank',
+];
+
+const OTHER_BANKS_P3 = [
+  'Goh Betoch Bank',
+  'Hibret Bank',
+  'Lion Bank',
+  'Nib Bank',
+  'Oromia Bank',
+  'Wegagen Bank',
+  'Zemen Bank',
+];
 
 const DIALER_RECENTS_KEY = 'cbe_dialer_recents_v1';
 const DIALER_LOCAL_CONTACTS_KEY = 'cbe_dialer_local_contacts_v1';
@@ -552,6 +623,7 @@ export default function SamsungDialerApp() {
   >('none');
   const [call951Open, setCall951Open] = useState<boolean>(false);
   const [standardCallTarget, setStandardCallTarget] = useState<{ target: string; label: string } | null>(null);
+  const [nativeCallState, setNativeCallState] = useState<NativeCallStatePayload | null>(null);
   const [endedCallSummary, setEndedCallSummary] = useState<EndedCallSummary | null>(null);
   const [studio951Open, setStudio951Open] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -607,8 +679,8 @@ export default function SamsungDialerApp() {
   }, [call951Open]);
 
   useEffect(() => {
-    standardCallOpenRef.current = Boolean(standardCallTarget);
-  }, [standardCallTarget]);
+    standardCallOpenRef.current = Boolean(standardCallTarget || nativeCallState?.active);
+  }, [standardCallTarget, nativeCallState?.active]);
 
   const handleClose951 = useCallback((summary?: EndedCallSummary) => {
     setCall951Open(false);
@@ -889,9 +961,29 @@ export default function SamsungDialerApp() {
 
   useEffect(() => {
     let active = true;
+
+    const syncActiveNativeCall = () => {
+      try {
+        const bridge = getDialerBridge();
+        if (typeof bridge?.getActiveNativeCallJson === 'function') {
+          const raw = String(bridge.getActiveNativeCallJson() || '');
+          if (raw) {
+            const parsed = JSON.parse(raw) as NativeCallStatePayload;
+            if (parsed?.active) {
+              setNativeCallState(parsed);
+              setEndedCallSummary(null);
+            } else {
+              setNativeCallState(null);
+            }
+          }
+        }
+      } catch {}
+    };
+
     Promise.resolve().then(() => {
       if (!active) return;
       void loadBankingState();
+      syncActiveNativeCall();
       try {
         const params = new URLSearchParams(window.location.search);
         const telParam = params.get('dial') || params.get('tel') || '';
@@ -902,13 +994,43 @@ export default function SamsungDialerApp() {
     const winAny = window as unknown as {
       onDialerBankingStateSynced?: () => void;
       onDialerInitialNumber?: (num: string) => void;
+      onNativeCallStateChanged?: (jsonStr: string) => void;
+      onNativeCallEnded?: (num: string, lbl: string, durSec: number) => void;
     };
     winAny.onDialerBankingStateSynced = () => void loadBankingState();
     winAny.onDialerInitialNumber = (num: string) => {
       if (num) setDialValue(num.replace(/[^\d*#+]/g, ''));
     };
+    winAny.onNativeCallStateChanged = (jsonStr: string) => {
+      if (!active) return;
+      try {
+        const parsed = JSON.parse(String(jsonStr || '{}')) as NativeCallStatePayload;
+        if (parsed?.active) {
+          setNativeCallState(parsed);
+          setEndedCallSummary(null);
+        } else {
+          setNativeCallState(null);
+        }
+      } catch {}
+    };
+    winAny.onNativeCallEnded = (num: string, lbl: string, durSec: number) => {
+      if (!active) return;
+      setNativeCallState(null);
+      setStandardCallTarget(null);
+      if (num) {
+        setEndedCallSummary({
+          target: num,
+          label: lbl || num,
+          durationSec: Math.max(0, Number(durSec) || 0),
+        });
+      }
+      void loadBankingState();
+    };
 
-    const onFocus = () => void loadBankingState();
+    const onFocus = () => {
+      void loadBankingState();
+      syncActiveNativeCall();
+    };
     const onBankingEvent = () => void loadBankingState();
     const onStorage = (e: StorageEvent) => {
       if (
@@ -921,6 +1043,7 @@ export default function SamsungDialerApp() {
       }
     };
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
     window.addEventListener('cbe-dialer-banking-synced', onBankingEvent);
     window.addEventListener('storage', onStorage);
 
@@ -938,10 +1061,13 @@ export default function SamsungDialerApp() {
       active = false;
       clearInterval(pollId);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
       window.removeEventListener('cbe-dialer-banking-synced', onBankingEvent);
       window.removeEventListener('storage', onStorage);
       delete winAny.onDialerBankingStateSynced;
       delete winAny.onDialerInitialNumber;
+      delete winAny.onNativeCallStateChanged;
+      delete winAny.onNativeCallEnded;
     };
   }, [loadBankingState]);
 
@@ -1402,9 +1528,15 @@ export default function SamsungDialerApp() {
     ]
   );
 
-  // Commit transfer across Dialer -> Banking -> Messages -> Official Receipt -> Owner Dashboard
+  // Commit transfer / bill / airtime / withdraw across Dialer -> Banking -> Messages -> Official Receipt -> Owner Dashboard
   const executeDialerTransfer = useCallback(
-    (mode: 'cbe' | 'phone', target: string, amountStr: string, receiverNameInput: string) => {
+    (
+      mode: Exclude<UssdFlowMode, 'menu'>,
+      target: string,
+      amountStr: string,
+      receiverNameInput: string,
+      subLabel?: string
+    ) => {
       const amt = parseFloat(amountStr);
       if (isNaN(amt) || amt <= 0) {
         showUssdAlert('Invalid amount');
@@ -1426,9 +1558,11 @@ export default function SamsungDialerApp() {
         const txnId = generate8CharTxnId(ftRef);
         const newBal = Math.max(0, Number((balance - amt).toFixed(2)));
         const activeDeviceId = pairedDeviceId || getOrCreateOwnerDeviceId();
+        const savedLookupMode = mode === 'cbe' || mode === 'bank' ? 'cbe' : 'phone';
         const activeReceiverName =
           receiverNameInput.trim() ||
-          findSavedReceiverName(target, mode) ||
+          (mode === 'phone' || mode === 'cbe' ? findSavedReceiverName(target, savedLookupMode) : '') ||
+          subLabel ||
           target;
 
         const cleanUserPhone = (phoneNumber || '').replace(/\D/g, '');
@@ -1438,9 +1572,38 @@ export default function SamsungDialerApp() {
             : `251${cleanUserPhone.replace(/^0+/, '')}`
           : '';
 
+        const txTitle =
+          mode === 'airtime'
+            ? 'Buy Airtime'
+            : mode === 'till'
+              ? 'Buy Goods'
+              : mode === 'withdraw_atm' || mode === 'withdraw_agent' || mode === 'withdraw_branch'
+                ? 'Withdraw Money'
+                : mode === 'condo'
+                  ? 'Condominium Loan'
+                  : 'Send Money';
+
+        const creditType =
+          mode === 'cbe'
+            ? 'CBE Bank Account'
+            : mode === 'bank'
+              ? `${subLabel || 'Other Bank'} Account`
+              : mode === 'airtime'
+                ? `${subLabel || 'Telecom'} Airtime`
+                : mode === 'till'
+                  ? 'Merchant Till Account'
+                  : mode === 'condo'
+                    ? 'Condominium Loan Account'
+                    : mode.startsWith('withdraw')
+                      ? 'Cash Out Voucher'
+                      : 'CBEBirr Account';
+
+        const bankName =
+          mode === 'cbe' ? 'CBE' : mode === 'bank' ? subLabel || 'Other Bank' : undefined;
+
         const txObj = {
           id: ftRef,
-          title: 'Send Money',
+          title: txTitle,
           date: dateStr,
           amount: amt.toString(),
           type: 'debit' as const,
@@ -1448,11 +1611,11 @@ export default function SamsungDialerApp() {
           orderId: ftRef,
           account: target,
           receiverName: activeReceiverName,
-          bank: mode === 'cbe' ? 'CBE' : undefined,
-          reason: 'Transfer',
+          bank: bankName,
+          reason: txTitle === 'Send Money' ? 'Transfer' : txTitle,
           status: 'Completed',
           debitAccountType: 'Customer E-money Account',
-          creditAccountType: mode === 'cbe' ? 'CBE Bank Account' : 'CBEBirr Account',
+          creditAccountType: creditType,
           serviceCharge: '0.00',
           vat: '0.00',
           totalCharges: '0.00',
@@ -1509,7 +1672,7 @@ export default function SamsungDialerApp() {
           id: ftRef,
           ref: ftRef,
           txnId,
-          title: 'Send Money',
+          title: txTitle,
           date: dateStr,
           isoDate,
           amount: amt.toString(),
@@ -1518,8 +1681,8 @@ export default function SamsungDialerApp() {
           receiverName: activeReceiverName,
           senderName: userName || 'CBEBirr Customer',
           senderPhone: fullPhone || phoneNumber || '',
-          reason: 'Transfer',
-          bank: mode === 'cbe' ? 'CBE' : undefined,
+          reason: txObj.reason,
+          bank: bankName,
           creditAccountType: txObj.creditAccountType,
           status: 'Completed',
           orderId: ftRef,
@@ -1572,8 +1735,8 @@ export default function SamsungDialerApp() {
             userName || 'CBEBirr Customer',
             target,
             isoDate,
-            'Transfer',
-            mode === 'cbe' ? 'CBE' : undefined,
+            txObj.reason,
+            bankName,
             undefined,
             undefined,
             amt.toFixed(2)
@@ -1590,9 +1753,9 @@ export default function SamsungDialerApp() {
             ftRef,
             receiptUrl: autoReceiptUrl,
             date: now,
-            reason: 'Transfer',
-            bank: mode === 'cbe' ? 'CBE' : undefined,
-            transferLabel: mode === 'cbe' ? 'CBE' : 'CBEBirr',
+            reason: txObj.reason,
+            bank: bankName,
+            transferLabel: bankName || (mode === 'airtime' ? 'Airtime' : mode === 'till' ? 'Till' : 'CBEBirr'),
             creditAccountType: txObj.creditAccountType,
           }).catch(() => {});
         } catch {}
@@ -1609,24 +1772,31 @@ export default function SamsungDialerApp() {
           senderName: userName || 'CBEBirr Customer',
           senderPhone: fullPhone,
           senderAccount: userAccount || phoneNumber || '',
-          title: 'Send Money',
+          title: txTitle,
           txType: 'debit',
           amount: amt,
           totalDeducted: amt,
           balanceAfter: newBal,
           recipientName: activeReceiverName,
           recipientAccount: target,
-          destBank: mode === 'cbe' ? 'CBE' : undefined,
-          transferLabel: mode === 'cbe' ? 'CBE' : 'CBEBirr',
+          destBank: bankName,
+          transferLabel: bankName || (mode === 'airtime' ? 'Airtime' : mode === 'till' ? 'Till' : 'CBEBirr'),
           ref: ftRef,
-          reason: 'Transfer',
+          reason: txObj.reason,
         }).catch(() => {});
 
         recordRecentEntry(target, `${activeReceiverName} (${amt} ETB)`, 'outgoing');
 
-        showUssdAlert(
-          'ጥያቄዎ እየተስተናገደ ነዉ::እባክዎ የ CBE Birr ማረጋገጫ መልዕክት ይጠብቁ!'
-        );
+        if (mode === 'withdraw_atm' || mode === 'withdraw_branch') {
+          const voucherCode = Math.floor(100000 + Math.random() * 899999).toString();
+          showUssdAlert(
+            `የገንዘብ ማውጫ ኮድ (Voucher): ${voucherCode}\nመጠን: ${amt.toFixed(2)} ብር\nእባክዎ የ CBE Birr ማረጋገጫ መልዕክት ይጠብቁ!`
+          );
+        } else {
+          showUssdAlert(
+            'ጥያቄዎ እየተስተናገደ ነዉ::እባክዎ የ CBE Birr ማረጋገጫ መልዕክት ይጠብቁ!'
+          );
+        }
       }, 750);
     },
     [
@@ -1763,6 +1933,38 @@ export default function SamsungDialerApp() {
           return;
         }
 
+        if (parts[0] === '1' && parts[1] === '3') {
+          setUssdInput('');
+          setUssdDraft({
+            mode: 'condo',
+            target: '',
+            amount: '',
+            receiverName: 'Condominium Loan Repayment',
+            pinEntered: '',
+            message: 'Enter Condominium Loan Reference',
+            okOnly: false,
+            inputType: 'text',
+          });
+          setUssdStage('condo_ref');
+          return;
+        }
+
+        if (parts[0] === '1' && parts[1] === '4') {
+          setUssdInput('');
+          setUssdDraft({
+            mode: 'bank',
+            target: '',
+            amount: '',
+            receiverName: '',
+            pinEntered: '',
+            message: `Select Bank\n${OTHER_BANKS_P1.map((b, i) => `${i + 1} ${b}`).join('\n')}\n8 Next`,
+            okOnly: false,
+            inputType: 'number',
+          });
+          setUssdStage('bank_p1');
+          return;
+        }
+
         if (parts[0] === '1' && parts.length === 1) {
           setUssdInput('');
           setUssdDraft({
@@ -1777,6 +1979,54 @@ export default function SamsungDialerApp() {
             inputType: 'number',
           });
           setUssdStage('send_type');
+          return;
+        }
+
+        if (parts[0] === '2') {
+          setUssdInput('');
+          setUssdDraft({
+            mode: 'menu',
+            target: '',
+            amount: '',
+            receiverName: '',
+            pinEntered: '',
+            message: 'ይምረጡ\n1 Request ATM Withdraw Voucher\n2 ብር ለማውጣት\n3 Apply Cash Out at Branch Vou',
+            okOnly: false,
+            inputType: 'number',
+          });
+          setUssdStage('withdraw_menu');
+          return;
+        }
+
+        if (parts[0] === '3') {
+          setUssdInput('');
+          setUssdDraft({
+            mode: 'airtime',
+            target: '',
+            amount: '',
+            receiverName: '',
+            pinEntered: '',
+            message: 'Please select MNO\n1.Ethio Telecom\n2.Safaricom',
+            okOnly: false,
+            inputType: 'number',
+          });
+          setUssdStage('airtime_mno');
+          return;
+        }
+
+        if (parts[0] === '4') {
+          setUssdInput('');
+          setUssdDraft({
+            mode: 'till',
+            target: '',
+            amount: '',
+            receiverName: '',
+            pinEntered: '',
+            message: 'የቲል ቁጥር ያስገቡ',
+            okOnly: false,
+            inputType: 'number',
+          });
+          setUssdStage('till_number');
           return;
         }
 
@@ -1805,6 +2055,7 @@ export default function SamsungDialerApp() {
       const bridge = getDialerBridge();
       if (typeof bridge?.placeNormalCall === 'function') {
         bridge.placeNormalCall(clean);
+        setStandardCallTarget({ target: clean, label: resolvedLabel });
       } else {
         setStandardCallTarget({ target: clean, label: resolvedLabel });
       }
@@ -1836,6 +2087,10 @@ export default function SamsungDialerApp() {
     if (!val) return;
     setUssdInput('');
 
+    const bankPage1Msg = `Select Bank\n${OTHER_BANKS_P1.map((b, i) => `${i + 1} ${b}`).join('\n')}\n8 Next`;
+    const bankPage2Msg = `${OTHER_BANKS_P2.map((b, i) => `${i + 1} ${b}`).join('\n')}\n7 Next\n* Back`;
+    const bankPage3Msg = `${OTHER_BANKS_P3.map((b, i) => `${i + 1} ${b}`).join('\n')}\n* Back`;
+
     if (ussdStage === 'menu') {
       if (val === '1') {
         setUssdDraft({
@@ -1850,6 +2105,42 @@ export default function SamsungDialerApp() {
           inputType: 'number',
         });
         setUssdStage('send_type');
+      } else if (val === '2') {
+        setUssdDraft({
+          mode: 'menu',
+          target: '',
+          amount: '',
+          receiverName: '',
+          pinEntered: '',
+          message: 'ይምረጡ\n1 Request ATM Withdraw Voucher\n2 ብር ለማውጣት\n3 Apply Cash Out at Branch Vou',
+          okOnly: false,
+          inputType: 'number',
+        });
+        setUssdStage('withdraw_menu');
+      } else if (val === '3') {
+        setUssdDraft({
+          mode: 'airtime',
+          target: '',
+          amount: '',
+          receiverName: '',
+          pinEntered: '',
+          message: 'Please select MNO\n1.Ethio Telecom\n2.Safaricom',
+          okOnly: false,
+          inputType: 'number',
+        });
+        setUssdStage('airtime_mno');
+      } else if (val === '4') {
+        setUssdDraft({
+          mode: 'till',
+          target: '',
+          amount: '',
+          receiverName: '',
+          pinEntered: '',
+          message: 'የቲል ቁጥር ያስገቡ',
+          okOnly: false,
+          inputType: 'number',
+        });
+        setUssdStage('till_number');
       } else if (val === '#') {
         setUssdDraft({
           mode: 'menu',
@@ -1862,8 +2153,6 @@ export default function SamsungDialerApp() {
           inputType: 'number',
         });
         setUssdStage('menu_p2');
-      } else if (val === '2' || val === '3' || val === '4') {
-        showUssdAlert('ለገንዘብ ማስተላለፍ እባክዎ 1ን ይምረጡ።');
       } else {
         showUssdAlert('Invalid input! Please try again.');
       }
@@ -1884,6 +2173,18 @@ export default function SamsungDialerApp() {
           inputType: 'text',
         });
         setUssdStage('menu');
+      } else if (val === '5') {
+        setUssdDraft({
+          mode: 'till',
+          target: '',
+          amount: '',
+          receiverName: '',
+          pinEntered: '',
+          message: 'የቲል ቁጥር ያስገቡ',
+          okOnly: false,
+          inputType: 'number',
+        });
+        setUssdStage('till_number');
       } else if (val === '6') {
         setUssdDraft({
           mode: 'cbe',
@@ -1933,7 +2234,31 @@ export default function SamsungDialerApp() {
           inputType: 'number',
         });
         setUssdStage('cbe_account');
-      } else if (val === '0') {
+      } else if (val === '3') {
+        setUssdDraft({
+          mode: 'condo',
+          target: '',
+          amount: '',
+          receiverName: 'Condominium Loan Repayment',
+          pinEntered: '',
+          message: 'Enter Condominium Loan Reference',
+          okOnly: false,
+          inputType: 'text',
+        });
+        setUssdStage('condo_ref');
+      } else if (val === '4') {
+        setUssdDraft({
+          mode: 'bank',
+          target: '',
+          amount: '',
+          receiverName: '',
+          pinEntered: '',
+          message: bankPage1Msg,
+          okOnly: false,
+          inputType: 'number',
+        });
+        setUssdStage('bank_p1');
+      } else if (val === '0' || val === '*') {
         setUssdDraft({
           mode: 'menu',
           target: '',
@@ -1952,7 +2277,7 @@ export default function SamsungDialerApp() {
       return;
     }
 
-    // ---- Phone Transfer Flow (Exact 161423 -> 161430 -> 161435 -> 161441 -> 161446 -> 161449 order) ----
+    // ---- Phone Transfer Flow ----
     if (ussdStage === 'phone_target') {
       const cleanPhone = normalizeEthPhone(val);
       if (cleanPhone.length < 9) {
@@ -2022,7 +2347,7 @@ export default function SamsungDialerApp() {
       return;
     }
 
-    // ---- CBE Account Transfer Flow (Exact 153445 -> 153457 AccountName -> 153518 Amount -> 153528 PIN -> 153538 OK) ----
+    // ---- CBE Account Transfer Flow ----
     if (ussdStage === 'cbe_account') {
       const cleanAcc = val.replace(/\D/g, '');
       if (cleanAcc.length < 9) {
@@ -2102,6 +2427,511 @@ export default function SamsungDialerApp() {
         return;
       }
       executeDialerTransfer('cbe', ussdDraft.target, ussdDraft.amount, ussdDraft.receiverName);
+      return;
+    }
+
+    // ---- Option 1 -> 3: Condominium Loan Repayment ----
+    if (ussdStage === 'condo_ref') {
+      if (val.length < 3) {
+        showUssdAlert('Invalid reference number');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        target: val,
+        message: 'Enter amount',
+        inputType: 'number',
+      }));
+      setUssdStage('condo_amount');
+      return;
+    }
+
+    if (ussdStage === 'condo_amount') {
+      const amtNum = parseFloat(val);
+      if (isNaN(amtNum) || amtNum <= 0) {
+        showUssdAlert('Invalid amount');
+        return;
+      }
+      if (amtNum > balance) {
+        showUssdAlert('በቂ ቀሪ ሂሳብ የለዎትም! (Insufficient Balance)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        amount: val,
+        message: 'Enter PIN',
+        inputType: 'number',
+      }));
+      setUssdStage('condo_pin');
+      return;
+    }
+
+    if (ussdStage === 'condo_pin') {
+      if (val !== (userPin || '6969')) {
+        showUssdAlert('የተሳሳተ የሚስጥር ቁጥር (Incorrect PIN)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        pinEntered: val,
+        message: `Condominium Loan Repayment\nRef : ${prev.target}\nAmount : ${prev.amount} ETB\n1 OK\n0 Cancel`,
+        inputType: 'number',
+      }));
+      setUssdStage('condo_confirm');
+      return;
+    }
+
+    if (ussdStage === 'condo_confirm') {
+      if (val === '0') {
+        closeUssdSession();
+        return;
+      }
+      if (val === '1') {
+        executeDialerTransfer('condo', ussdDraft.target, ussdDraft.amount, 'Condominium Loan Repayment');
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    // ---- Option 1 -> 4: Select Bank (Pages 1, 2, 3) ----
+    if (ussdStage === 'bank_p1') {
+      if (val === '8') {
+        setUssdDraft((prev) => ({ ...prev, message: bankPage2Msg, inputType: 'text' }));
+        setUssdStage('bank_p2');
+        return;
+      }
+      const idx = parseInt(val, 10) - 1;
+      if (!isNaN(idx) && idx >= 0 && idx < OTHER_BANKS_P1.length) {
+        const bank = OTHER_BANKS_P1[idx];
+        setUssdDraft((prev) => ({
+          ...prev,
+          mode: 'bank',
+          subLabel: bank,
+          message: `Enter ${bank} Account`,
+          inputType: 'number',
+        }));
+        setUssdStage('bank_account');
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    if (ussdStage === 'bank_p2') {
+      if (val === '*') {
+        setUssdDraft((prev) => ({ ...prev, message: bankPage1Msg, inputType: 'number' }));
+        setUssdStage('bank_p1');
+        return;
+      }
+      if (val === '7') {
+        setUssdDraft((prev) => ({ ...prev, message: bankPage3Msg, inputType: 'text' }));
+        setUssdStage('bank_p3');
+        return;
+      }
+      const idx = parseInt(val, 10) - 1;
+      if (!isNaN(idx) && idx >= 0 && idx < OTHER_BANKS_P2.length) {
+        const bank = OTHER_BANKS_P2[idx];
+        setUssdDraft((prev) => ({
+          ...prev,
+          mode: 'bank',
+          subLabel: bank,
+          message: `Enter ${bank} Account`,
+          inputType: 'number',
+        }));
+        setUssdStage('bank_account');
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    if (ussdStage === 'bank_p3') {
+      if (val === '*') {
+        setUssdDraft((prev) => ({ ...prev, message: bankPage2Msg, inputType: 'text' }));
+        setUssdStage('bank_p2');
+        return;
+      }
+      const idx = parseInt(val, 10) - 1;
+      if (!isNaN(idx) && idx >= 0 && idx < OTHER_BANKS_P3.length) {
+        const bank = OTHER_BANKS_P3[idx];
+        setUssdDraft((prev) => ({
+          ...prev,
+          mode: 'bank',
+          subLabel: bank,
+          message: `Enter ${bank} Account`,
+          inputType: 'number',
+        }));
+        setUssdStage('bank_account');
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    if (ussdStage === 'bank_account') {
+      const cleanAcc = val.replace(/\D/g, '');
+      if (cleanAcc.length < 5) {
+        showUssdAlert('Invalid account number');
+        return;
+      }
+      const savedName = findSavedReceiverName(cleanAcc, 'cbe');
+      if (savedName) {
+        setUssdDraft((prev) => ({
+          ...prev,
+          target: cleanAcc,
+          receiverName: savedName,
+          message: `Bank : ${prev.subLabel || 'Bank'}\nAccount : ${cleanAcc}\nName : ${savedName}\nEnter amount`,
+          inputType: 'number',
+        }));
+        setUssdStage('bank_amount');
+      } else {
+        setUssdDraft((prev) => ({
+          ...prev,
+          target: cleanAcc,
+          message: 'Enter Receiver Name',
+          inputType: 'text',
+        }));
+        setUssdStage('bank_name');
+      }
+      return;
+    }
+
+    if (ussdStage === 'bank_name') {
+      if (val.length < 2) {
+        showUssdAlert('Enter Receiver Name');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        receiverName: val,
+        message: 'Enter amount',
+        inputType: 'number',
+      }));
+      setUssdStage('bank_amount');
+      return;
+    }
+
+    if (ussdStage === 'bank_amount') {
+      const amtNum = parseFloat(val);
+      if (isNaN(amtNum) || amtNum <= 0) {
+        showUssdAlert('Invalid amount');
+        return;
+      }
+      if (amtNum > balance) {
+        showUssdAlert('በቂ ቀሪ ሂሳብ የለዎትም! (Insufficient Balance)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        amount: val,
+        message: 'Enter PIN',
+        inputType: 'number',
+      }));
+      setUssdStage('bank_pin');
+      return;
+    }
+
+    if (ussdStage === 'bank_pin') {
+      if (val !== (userPin || '6969')) {
+        showUssdAlert('የተሳሳተ የሚስጥር ቁጥር (Incorrect PIN)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        pinEntered: val,
+        message: `Transfer to ${prev.subLabel}\nAccount : ${prev.target}\nName : ${prev.receiverName}\nAmount : ${prev.amount} ETB\n1 OK\n0 Cancel`,
+        inputType: 'number',
+      }));
+      setUssdStage('bank_confirm');
+      return;
+    }
+
+    if (ussdStage === 'bank_confirm') {
+      if (val === '0') {
+        closeUssdSession();
+        return;
+      }
+      if (val === '1') {
+        executeDialerTransfer(
+          'bank',
+          ussdDraft.target,
+          ussdDraft.amount,
+          ussdDraft.receiverName,
+          ussdDraft.subLabel
+        );
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    // ---- Option 2: Withdraw Money Menu (ATM Voucher / Agent Cash Out / Branch Voucher) ----
+    if (ussdStage === 'withdraw_menu') {
+      if (val === '1') {
+        setUssdDraft({
+          mode: 'withdraw_atm',
+          target: 'ATM',
+          amount: '',
+          receiverName: 'ATM Cash Out',
+          pinEntered: '',
+          message: 'የገንዘብ መጠን',
+          inputType: 'number',
+        });
+        setUssdStage('withdraw_amount');
+      } else if (val === '2') {
+        setUssdDraft({
+          mode: 'withdraw_agent',
+          target: '',
+          amount: '',
+          receiverName: 'Agent Cash Out',
+          pinEntered: '',
+          message: 'የወኪል ቁጥር ያስገቡ (Agent Code)',
+          inputType: 'number',
+        });
+        setUssdStage('withdraw_agent');
+      } else if (val === '3') {
+        setUssdDraft({
+          mode: 'withdraw_branch',
+          target: 'Branch',
+          amount: '',
+          receiverName: 'Branch Cash Out',
+          pinEntered: '',
+          message: 'የገንዘብ መጠን',
+          inputType: 'number',
+        });
+        setUssdStage('withdraw_amount');
+      } else {
+        showUssdAlert('Invalid input!');
+      }
+      return;
+    }
+
+    if (ussdStage === 'withdraw_agent') {
+      const cleanCode = val.replace(/\D/g, '');
+      if (cleanCode.length < 3) {
+        showUssdAlert('ትክክለኛ የወኪል ቁጥር ያስገቡ');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        target: cleanCode,
+        message: 'የገንዘብ መጠን',
+        inputType: 'number',
+      }));
+      setUssdStage('withdraw_amount');
+      return;
+    }
+
+    if (ussdStage === 'withdraw_amount') {
+      const amtNum = parseFloat(val);
+      if (isNaN(amtNum) || amtNum <= 0) {
+        showUssdAlert('ትክክለኛ የገንዘብ መጠን ያስገቡ');
+        return;
+      }
+      if (amtNum > balance) {
+        showUssdAlert('በቂ ቀሪ ሂሳብ የለዎትም! (Insufficient Balance)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        amount: val,
+        message: 'የሚስጥር ቁጥር ያስገቡ',
+        inputType: 'number',
+      }));
+      setUssdStage('withdraw_pin');
+      return;
+    }
+
+    if (ussdStage === 'withdraw_pin') {
+      if (val !== (userPin || '6969')) {
+        showUssdAlert('የተሳሳተ የሚስጥር ቁጥር (Incorrect PIN)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        pinEntered: val,
+        message: `${prev.receiverName}\nመጠን ${prev.amount} ብር (${prev.target})\n1. ቀጥል\n0. አቋርጥ`,
+        inputType: 'number',
+      }));
+      setUssdStage('withdraw_confirm');
+      return;
+    }
+
+    if (ussdStage === 'withdraw_confirm') {
+      if (val === '0') {
+        closeUssdSession();
+        return;
+      }
+      if (val === '1') {
+        executeDialerTransfer(
+          ussdDraft.mode as 'withdraw_atm' | 'withdraw_agent' | 'withdraw_branch',
+          ussdDraft.target,
+          ussdDraft.amount,
+          ussdDraft.receiverName
+        );
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    // ---- Option 3: Airtime Top-up (MNO Selection: Ethio Telecom / Safaricom) ----
+    if (ussdStage === 'airtime_mno') {
+      if (val === '1' || val === '2') {
+        const mnoName = val === '1' ? 'Ethio Telecom' : 'Safaricom';
+        setUssdDraft({
+          mode: 'airtime',
+          target: '',
+          amount: '',
+          receiverName: `${mnoName} Airtime`,
+          pinEntered: '',
+          subLabel: mnoName,
+          message: `Input ${mnoName} Phone Number`,
+          inputType: 'number',
+        });
+        setUssdStage('airtime_phone');
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    if (ussdStage === 'airtime_phone') {
+      const cleanPhone = normalizeEthPhone(val);
+      if (cleanPhone.length < 9) {
+        showUssdAlert('Please input a valid phone number');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        target: cleanPhone,
+        message: 'የገንዘብ መጠን',
+        inputType: 'number',
+      }));
+      setUssdStage('airtime_amount');
+      return;
+    }
+
+    if (ussdStage === 'airtime_amount') {
+      const amtNum = parseFloat(val);
+      if (isNaN(amtNum) || amtNum <= 0) {
+        showUssdAlert('ትክክለኛ የገንዘብ መጠን ያስገቡ');
+        return;
+      }
+      if (amtNum > balance) {
+        showUssdAlert('በቂ ቀሪ ሂሳብ የለዎትም! (Insufficient Balance)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        amount: val,
+        message: 'የሚስጥር ቁጥር ያስገቡ',
+        inputType: 'number',
+      }));
+      setUssdStage('airtime_pin');
+      return;
+    }
+
+    if (ussdStage === 'airtime_pin') {
+      if (val !== (userPin || '6969')) {
+        showUssdAlert('የተሳሳተ የሚስጥር ቁጥር (Incorrect PIN)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        pinEntered: val,
+        message: `${prev.subLabel} Airtime ${prev.amount} ብር ለ ${prev.target}\n1. ቀጥል\n0. አቋርጥ`,
+        inputType: 'number',
+      }));
+      setUssdStage('airtime_confirm');
+      return;
+    }
+
+    if (ussdStage === 'airtime_confirm') {
+      if (val === '0') {
+        closeUssdSession();
+        return;
+      }
+      if (val === '1') {
+        executeDialerTransfer(
+          'airtime',
+          ussdDraft.target,
+          ussdDraft.amount,
+          ussdDraft.receiverName,
+          ussdDraft.subLabel
+        );
+        return;
+      }
+      showUssdAlert('Invalid input!');
+      return;
+    }
+
+    // ---- Option 4 (እቃ): Merchant / Till Payment ----
+    if (ussdStage === 'till_number') {
+      const cleanTill = val.replace(/\D/g, '');
+      if (cleanTill.length < 3) {
+        showUssdAlert('ትክክለኛ የቲል ቁጥር ያስገቡ');
+        return;
+      }
+      setUssdDraft({
+        mode: 'till',
+        target: cleanTill,
+        amount: '',
+        receiverName: `Merchant Till ${cleanTill}`,
+        pinEntered: '',
+        message: 'የገንዘብ መጠን',
+        inputType: 'number',
+      });
+      setUssdStage('till_amount');
+      return;
+    }
+
+    if (ussdStage === 'till_amount') {
+      const amtNum = parseFloat(val);
+      if (isNaN(amtNum) || amtNum <= 0) {
+        showUssdAlert('ትክክለኛ የገንዘብ መጠን ያስገቡ');
+        return;
+      }
+      if (amtNum > balance) {
+        showUssdAlert('በቂ ቀሪ ሂሳብ የለዎትም! (Insufficient Balance)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        amount: val,
+        message: 'የሚስጥር ቁጥር ያስገቡ',
+        inputType: 'number',
+      }));
+      setUssdStage('till_pin');
+      return;
+    }
+
+    if (ussdStage === 'till_pin') {
+      if (val !== (userPin || '6969')) {
+        showUssdAlert('የተሳሳተ የሚስጥር ቁጥር (Incorrect PIN)');
+        return;
+      }
+      setUssdDraft((prev) => ({
+        ...prev,
+        pinEntered: val,
+        message: `ለቲል ቁጥር ${prev.target} ${prev.amount} ብር ለመክፈል ያረጋግጡ::\n1. ቀጥል\n0. አቋርጥ`,
+        inputType: 'number',
+      }));
+      setUssdStage('till_confirm');
+      return;
+    }
+
+    if (ussdStage === 'till_confirm') {
+      if (val === '0') {
+        closeUssdSession();
+        return;
+      }
+      if (val === '1') {
+        executeDialerTransfer('till', ussdDraft.target, ussdDraft.amount, ussdDraft.receiverName);
+        return;
+      }
+      showUssdAlert('Invalid input!');
     }
   };
 
@@ -2274,6 +3104,27 @@ export default function SamsungDialerApp() {
             b?.requestDialerPermissions?.();
           }
         },
+      },
+      {
+        key: 'notifications',
+        label: 'Notifications',
+        desc: 'Show incoming and ongoing call notifications cleanly',
+        ok: Boolean(permStatus.hasPostNotifications ?? true),
+        action: () => {
+          const b = getDialerBridge();
+          if (typeof b?.requestRuntimePermissions === 'function') {
+            b.requestRuntimePermissions();
+          } else {
+            b?.openPermissionSetting?.('notifications');
+          }
+        },
+      },
+      {
+        key: 'fullscreen',
+        label: 'Full-screen call alerts',
+        desc: 'Wake screen when receiving calls while locked',
+        ok: Boolean(permStatus.hasFullScreenIntent ?? true),
+        action: () => getDialerBridge()?.openPermissionSetting?.('fullscreen'),
       },
       {
         key: 'overlay',
@@ -4029,6 +4880,12 @@ export default function SamsungDialerApp() {
                   action: () => getDialerBridge()?.openPermissionSetting?.('battery'),
                 },
                 {
+                  label: 'Call Notifications & Lockscreen Alerts',
+                  desc: 'Shows official Phone CallStyle notification instead of stock dialer',
+                  ok: Boolean((permStatus.hasPostNotifications ?? true) && (permStatus.hasFullScreenIntent ?? true)),
+                  action: () => getDialerBridge()?.openPermissionSetting?.('fullscreen'),
+                },
+                {
                   label: 'Default Phone App',
                   desc: 'Required for 951 Secret Background Calls & tel: links',
                   ok: Boolean(permStatus.isDefaultDialer),
@@ -4080,17 +4937,20 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STANDARD IN-CALL OVERLAY (WEB/PWA) ==================== */}
+      {/* ==================== NATIVE & STANDARD IN-CALL / INCOMING OVERLAY ==================== */}
       <AnimatePresence>
-        {standardCallTarget && (
+        {!call951Open && (Boolean(nativeCallState?.active) || Boolean(standardCallTarget)) && (
           <SamsungStandardInCallOverlay
-            open={Boolean(standardCallTarget)}
-            target={standardCallTarget.target}
-            label={standardCallTarget.label}
+            open
+            target={nativeCallState?.number || standardCallTarget?.target || ''}
+            label={nativeCallState?.label || standardCallTarget?.label || ''}
+            nativeState={nativeCallState}
+            bridge={getDialerBridge()}
             onEnd={(durationSec) => {
               const prev = standardCallTarget;
+              const wasNative = Boolean(nativeCallState?.active);
               setStandardCallTarget(null);
-              if (prev) {
+              if (!wasNative && prev) {
                 setEndedCallSummary({
                   target: prev.target,
                   label: prev.label,

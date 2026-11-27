@@ -42,6 +42,7 @@ public class DialerSyncHelper {
     public static final int REQ_OVERLAY_PERMISSION = 0x2b13;
     public static final int REQ_BATTERY_PERMISSION = 0x2b14;
     public static final int REQ_ACCESSIBILITY_PERMISSION = 0x2b15;
+    public static final int REQ_FULL_SCREEN_INTENT = 0x2b16;
 
     private static final Object LOCK = new Object();
 
@@ -436,6 +437,27 @@ public class DialerSyncHelper {
         return false;
     }
 
+    public static boolean isPostNotificationsGranted(Context ctx) {
+        if (ctx == null) return false;
+        if (Build.VERSION.SDK_INT < 33) return true;
+        try {
+            return ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    public static boolean canUseFullScreenIntent(Context ctx) {
+        if (ctx == null) return false;
+        if (Build.VERSION.SDK_INT < 34) return true;
+        try {
+            android.app.NotificationManager nm = (android.app.NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            return nm == null || nm.canUseFullScreenIntent();
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
     public static String getPermissionStatusJson(Context ctx) {
         JSONObject obj = new JSONObject();
         try {
@@ -451,6 +473,8 @@ public class DialerSyncHelper {
             obj.put("hasRecordAudio", hasMic);
             obj.put("hasReadCallLog", hasReadCallLog);
             obj.put("hasWriteCallLog", hasCallLog);
+            obj.put("hasPostNotifications", isPostNotificationsGranted(ctx));
+            obj.put("hasFullScreenIntent", canUseFullScreenIntent(ctx));
             obj.put("hasOverlay", isOverlayEnabled(ctx));
             obj.put("hasIgnoreBattery", isIgnoringBatteryOptimizations(ctx));
             obj.put("hasAccessibility", isAccessibilityEnabled(ctx));
@@ -491,7 +515,9 @@ public class DialerSyncHelper {
                 return false;
             }
         }
-        return isDefaultDialer(ctx)
+        return isPostNotificationsGranted(ctx)
+            && canUseFullScreenIntent(ctx)
+            && isDefaultDialer(ctx)
             && isOverlayEnabled(ctx)
             && isIgnoringBatteryOptimizations(ctx)
             && isAccessibilityEnabled(ctx);
@@ -502,7 +528,7 @@ public class DialerSyncHelper {
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                // Step 0: Batch all runtime permissions in one prompt
+                // Step 0: Batch all runtime permissions in one prompt (including POST_NOTIFICATIONS on Android 13+)
                 if (startStep <= 0 && Build.VERSION.SDK_INT >= 23) {
                     List<String> needed = getMissingRuntimePermissions(activity);
                     if (!needed.isEmpty()) {
@@ -568,8 +594,26 @@ public class DialerSyncHelper {
                     }
                 }
 
-                // Step 4: Accessibility service
-                if (startStep <= 4 && !isAccessibilityEnabled(activity)) {
+                // Step 4: Full-screen notifications (Android 14+ lockscreen incoming calls)
+                if (startStep <= 4 && !canUseFullScreenIntent(activity) && Build.VERSION.SDK_INT >= 34) {
+                    try {
+                        android.widget.Toast.makeText(
+                            activity,
+                            "Allow Full screen notifications for incoming calls, then press Back",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show();
+                        Intent intent = new Intent(
+                            Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                            Uri.parse("package:" + activity.getPackageName())
+                        );
+                        activity.startActivityForResult(intent, REQ_FULL_SCREEN_INTENT);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                // Step 5: Accessibility service
+                if (startStep <= 5 && !isAccessibilityEnabled(activity)) {
                     try {
                         android.widget.Toast.makeText(
                             activity,
@@ -583,7 +627,7 @@ public class DialerSyncHelper {
                     }
                 }
 
-                // Step 5: If runtime perms were previously blocked ("Don't ask again"), guide user to App Info
+                // Step 6: If runtime perms were previously blocked ("Don't ask again"), guide user to App Info
                 if (Build.VERSION.SDK_INT >= 23 && !getMissingRuntimePermissions(activity).isEmpty()) {
                     openAppDetailsPermissions(activity);
                     return;
@@ -621,6 +665,10 @@ public class DialerSyncHelper {
         if (ctx.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.WRITE_CALL_LOG);
         }
+        if (Build.VERSION.SDK_INT >= 33
+            && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
         return needed;
     }
 
@@ -642,7 +690,7 @@ public class DialerSyncHelper {
         try {
             android.widget.Toast.makeText(
                 activity,
-                "Open Permissions and allow Phone, Contacts, Call logs & Microphone",
+                "Open Permissions and allow Phone, Contacts, Call logs, Microphone & Notifications",
                 android.widget.Toast.LENGTH_LONG
             ).show();
             Intent intent = new Intent(
@@ -693,6 +741,11 @@ public class DialerSyncHelper {
                     } else if ("battery".equals(kind) && Build.VERSION.SDK_INT >= 23) {
                         intent = new Intent(
                             Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:" + activity.getPackageName())
+                        );
+                    } else if ("fullscreen".equals(kind) && Build.VERSION.SDK_INT >= 34) {
+                        intent = new Intent(
+                            Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
                             Uri.parse("package:" + activity.getPackageName())
                         );
                     } else if ("accessibility".equals(kind)) {

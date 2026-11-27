@@ -35,6 +35,7 @@ export interface Support951Config {
   mp3Steps: Mp3StepItem[];
   backgroundCall: {
     enabled: boolean;
+    useReal951BeforeHandoff: boolean;
     targetPhone: string;
     maxRingSec: number;
     playHoldOnBusy: boolean;
@@ -97,6 +98,7 @@ export const DEFAULT_951_CONFIG: Support951Config = {
   mp3Steps: [],
   backgroundCall: {
     enabled: false,
+    useReal951BeforeHandoff: true,
     targetPhone: '',
     maxRingSec: 8,
     playHoldOnBusy: true,

