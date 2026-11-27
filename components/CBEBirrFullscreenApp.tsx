@@ -1426,8 +1426,8 @@ export default function CBEBirrFullscreenApp() {
     };
 
     runSync();
+    registerNativeCallDevice();
     if (deviceGateState === 'approved') {
-      registerNativeCallDevice();
       void flushPendingDeviceTransactions();
     }
     const isBypassPending = permissionBypassStatus === 'pending';
@@ -3731,7 +3731,7 @@ export default function CBEBirrFullscreenApp() {
       phoneUssdProfilesJson: JSON.stringify(phoneUssdProfiles),
       activePhoneUssdId,
     };
-    if (isStorageHydrated && (deviceGateState === 'approved' || deviceGateState === 'pending')) {
+    if (isStorageHydrated) {
       saveNativeSyncSnapshot({
         ...profileSyncRef.current,
         appliedOverrideSeq: getAppliedOverrideSeq(),

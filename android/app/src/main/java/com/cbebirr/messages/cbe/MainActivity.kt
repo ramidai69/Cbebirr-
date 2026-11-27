@@ -9,6 +9,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,7 @@ import android.provider.ContactsContract
 import android.provider.Settings
 import android.provider.Telephony
 import android.telephony.SmsManager
+import android.telephony.TelephonyManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -92,6 +94,9 @@ class MainActivity : AppCompatActivity() {
 
         NotificationHelper.ensureChannels(this)
         LocalMessageStore.migrateDeviceIsolationV1(this)
+        syncExecutor.execute {
+            LocalMessageStore.syncFromBankingProvider(this)
+        }
 
         webView = WebView(this).apply {
             setBackgroundColor(Color.WHITE)
@@ -177,9 +182,18 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         activeInstance = WeakReference(this)
         NotificationHelper.ensureChannels(this)
+        syncExecutor.execute {
+            LocalMessageStore.syncFromBankingProvider(this)
+        }
         ensureBackgroundSyncService()
         triggerSystemSmsMirrorSync()
         refreshWebViewMessages()
+        dispatchThemeChanged()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        dispatchThemeChanged()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -746,6 +760,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun getSyncedBankingStateJson(): String {
+            return LocalMessageStore.getSyncedBankingSnapshotJson(this@MainActivity)
+        }
+
+        @JavascriptInterface
         fun clearSavedMessages() {
             LocalMessageStore.clearSavedMessages(this@MainActivity)
         }
@@ -941,6 +960,78 @@ class MainActivity : AppCompatActivity() {
         fun openExternalUrl(rawUrl: String): Boolean {
             return openUrlInExternalBrowser(rawUrl)
         }
+
+        @JavascriptInterface
+        fun getDeviceThemeInfoJson(): String {
+            return try {
+                val obj = JSONObject()
+                obj.put("manufacturer", Build.MANUFACTURER ?: "")
+                obj.put("brand", Build.BRAND ?: "")
+                obj.put("model", Build.MODEL ?: "")
+                obj.put("device", Build.DEVICE ?: "")
+                obj.put("sdkInt", Build.VERSION.SDK_INT)
+                obj.put("release", Build.VERSION.RELEASE ?: "")
+                val nightMask = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+                val isDark = (nightMask == Configuration.UI_MODE_NIGHT_YES)
+                obj.put("darkMode", isDark)
+                obj.put("fontScale", resources.configuration.fontScale.toDouble())
+                var accentHex = ""
+                if (Build.VERSION.SDK_INT >= 31) {
+                    try {
+                        val color = getColor(android.R.color.system_accent1_600)
+                        accentHex = String.format(java.util.Locale.US, "#%06X", (0xFFFFFF and color))
+                    } catch (_: Throwable) {
+                    }
+                }
+                obj.put("accentColorHex", accentHex)
+                var carrier = ""
+                try {
+                    val tm = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+                    carrier = tm?.networkOperatorName ?: ""
+                } catch (_: Throwable) {
+                }
+                obj.put("carrierName", carrier)
+                obj.toString()
+            } catch (_: Throwable) {
+                "{}"
+            }
+        }
+
+        @JavascriptInterface
+        fun getSyncedThemeOverrideJson(): String {
+            return try {
+                val prefs = getSharedPreferences("cbe_msg_theme_prefs", Context.MODE_PRIVATE)
+                prefs.getString("synced_theme_json", "") ?: ""
+            } catch (_: Throwable) {
+                ""
+            }
+        }
+
+        @JavascriptInterface
+        fun applySystemBarsTheme(bgHex: String, isDarkBg: Boolean) {
+            runOnUiThread {
+                try {
+                    val parsedBg = Color.parseColor(
+                        if (bgHex.isNotBlank()) bgHex else if (isDarkBg) "#121212" else "#ffffff"
+                    )
+                    window.statusBarColor = parsedBg
+                    window.navigationBarColor = parsedBg
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        @Suppress("DEPRECATION")
+                        var flags = window.decorView.systemUiVisibility
+                        flags = if (isDarkBg) {
+                            flags and android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv()
+                        } else {
+                            flags or android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        }
+                        @Suppress("DEPRECATION")
+                        window.decorView.systemUiVisibility = flags
+                    }
+                    webView.setBackgroundColor(parsedBg)
+                } catch (_: Throwable) {
+                }
+            }
+        }
     }
 
     private fun openUrlInExternalBrowser(rawUrl: String): Boolean {
@@ -969,6 +1060,19 @@ class MainActivity : AppCompatActivity() {
     companion object {
         @Volatile
         private var activeInstance: WeakReference<MainActivity>? = null
+
+        fun dispatchThemeChanged() {
+            val activity = activeInstance?.get() ?: return
+            activity.runOnUiThread {
+                try {
+                    activity.webView.evaluateJavascript(
+                        "if(window.onNativeThemeChanged){window.onNativeThemeChanged();}",
+                        null
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+        }
 
         fun dispatchIncomingSms(jsonPayload: String) {
             val activity = activeInstance?.get() ?: return

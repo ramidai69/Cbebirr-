@@ -11,6 +11,8 @@
       --text-main: #1c1b1f;
       --text-muted: #747775;
       --oneui-blue: #0381fe;
+      --oem-accent: #0381fe;
+      --oem-accent-soft: #dceafe;
       --border: #e2e4e8;
       --cbe-purple: #7a1c7d;
     }
@@ -1070,6 +1072,312 @@
       font-weight: 600;
       cursor: pointer;
     }
+
+    /* ==================== ADAPTIVE OEM & DARK THEME ENGINE ==================== */
+    .tab-item {
+      color: var(--oem-accent);
+    }
+    .tab-item::after {
+      background: var(--oem-accent);
+    }
+    .unread-view-btn.active {
+      background: var(--oem-accent-soft);
+      color: var(--oem-accent);
+    }
+    .msg-row.out .msg-bubble {
+      background: var(--oem-accent);
+    }
+    .blue-link {
+      color: var(--oem-accent);
+    }
+    .perm-gate-primary {
+      background: var(--oem-accent);
+    }
+    .fab-btn svg {
+      stroke: var(--oem-accent);
+    }
+
+    /* Pixel / Material You Skin */
+    html[data-oem-skin="pixel"] .home-title {
+      font-size: 25px;
+      font-weight: 600;
+      letter-spacing: -0.2px;
+    }
+    html[data-oem-skin="pixel"] .home-header.has-unread .home-title {
+      display: block;
+    }
+    html[data-oem-skin="pixel"] .unread-hero {
+      display: none !important;
+    }
+    html[data-oem-skin="pixel"] .home-header.has-unread .home-top-row {
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    html[data-oem-skin="pixel"] .fab-btn {
+      border-radius: 16px;
+      background: var(--oem-accent-soft);
+      border-color: transparent;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+    }
+    html[data-oem-skin="pixel"] #chat-view {
+      background: #f8f9fd;
+    }
+    html[data-oem-skin="pixel"] .msg-bubble {
+      border-radius: 22px;
+      background: #eef2f9;
+      box-shadow: none;
+    }
+    html[data-oem-skin="pixel"] .msg-row.out .msg-bubble {
+      background: var(--oem-accent);
+    }
+
+    /* Xiaomi HyperOS / MIUI Skin */
+    html[data-oem-skin="xiaomi"] .home-title {
+      font-size: 27px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+    html[data-oem-skin="xiaomi"] .conv-item {
+      padding: 13px 18px;
+    }
+    html[data-oem-skin="xiaomi"] .fab-btn {
+      border-radius: 50%;
+      background: var(--oem-accent);
+      border-color: transparent;
+    }
+    html[data-oem-skin="xiaomi"] .fab-btn svg {
+      stroke: #ffffff;
+    }
+    html[data-oem-skin="xiaomi"] #chat-view {
+      background: #f5f6f8;
+    }
+
+    /* Tecno HiOS / Infinix XOS Skin */
+    html[data-oem-skin="tecno"] .home-title {
+      font-size: 26px;
+      font-weight: 700;
+    }
+    html[data-oem-skin="tecno"] .fab-btn {
+      border-radius: 18px;
+      background: var(--oem-accent);
+      border-color: transparent;
+    }
+    html[data-oem-skin="tecno"] .fab-btn svg {
+      stroke: #ffffff;
+    }
+    html[data-oem-skin="tecno"] #chat-view {
+      background: #f2f5fa;
+    }
+
+    /* OPPO / Realme / OnePlus ColorOS Skin */
+    html[data-oem-skin="oppo"] .home-title {
+      font-size: 28px;
+      font-weight: 600;
+    }
+    html[data-oem-skin="oppo"] .fab-btn {
+      border-radius: 50%;
+      background: var(--oem-accent);
+      border-color: transparent;
+    }
+    html[data-oem-skin="oppo"] .fab-btn svg {
+      stroke: #ffffff;
+    }
+    html[data-oem-skin="oppo"] #chat-view {
+      background: #f7f8fa;
+    }
+
+    /* Huawei EMUI Skin */
+    html[data-oem-skin="huawei"] .home-title {
+      font-size: 27px;
+      font-weight: 700;
+    }
+    html[data-oem-skin="huawei"] #chat-view {
+      background: #f3f5f8;
+    }
+
+    /* System & Manual Dark Mode */
+    html[data-theme="dark"] body,
+    html[data-theme="dark"],
+    html[data-theme="dark"] .view,
+    html[data-theme="dark"] .home-header,
+    html[data-theme="dark"] .conv-list,
+    html[data-theme="dark"] .search-bar-wrap,
+    html[data-theme="dark"] .contacts-panel,
+    html[data-theme="dark"] .contacts-header,
+    html[data-theme="dark"] .contacts-search-wrap,
+    html[data-theme="dark"] .contacts-list,
+    html[data-theme="dark"] #full-msg-view,
+    html[data-theme="dark"] .full-msg-header,
+    html[data-theme="dark"] .full-msg-body-wrap {
+      background: #0d0f14;
+      color: #f1f5f9;
+    }
+    html[data-theme="dark"] .home-title,
+    html[data-theme="dark"] .unread-hero-title,
+    html[data-theme="dark"] .conv-title,
+    html[data-theme="dark"] .contacts-title,
+    html[data-theme="dark"] .contact-name,
+    html[data-theme="dark"] .chat-header-title,
+    html[data-theme="dark"] .full-msg-sender,
+    html[data-theme="dark"] .confirm-title {
+      color: #f8fafc;
+    }
+    html[data-theme="dark"] .icon-btn {
+      color: #e2e8f0;
+    }
+    html[data-theme="dark"] .icon-btn:active {
+      background: rgba(255, 255, 255, 0.08);
+    }
+    html[data-theme="dark"] .tabs-row,
+    html[data-theme="dark"] .contacts-search-wrap,
+    html[data-theme="dark"] .bottom-nav,
+    html[data-theme="dark"] .full-msg-bottom-bar,
+    html[data-theme="dark"] .chat-input-bar {
+      border-color: #1e2330;
+    }
+    html[data-theme="dark"] .unread-view-btn {
+      background: #1d222e;
+      color: #e2e8f0;
+    }
+    html[data-theme="dark"] .unread-view-btn.active {
+      background: rgba(3, 129, 254, 0.22);
+      color: var(--oem-accent);
+    }
+    html[data-theme="dark"] .conv-item:active,
+    html[data-theme="dark"] .contact-row:active,
+    html[data-theme="dark"] .menu-item:active,
+    html[data-theme="dark"] .sheet-item:active,
+    html[data-theme="dark"] .full-msg-action:active {
+      background: #171b24;
+    }
+    html[data-theme="dark"] .conv-time,
+    html[data-theme="dark"] .conv-snippet,
+    html[data-theme="dark"] .contacts-count,
+    html[data-theme="dark"] .contact-num,
+    html[data-theme="dark"] .msg-time,
+    html[data-theme="dark"] .chat-date-separator,
+    html[data-theme="dark"] .full-msg-time,
+    html[data-theme="dark"] .confirm-desc,
+    html[data-theme="dark"] .sheet-title,
+    html[data-theme="dark"] .nav-tab {
+      color: #94a3b8;
+    }
+    html[data-theme="dark"] .conv-item.is-unread .conv-snippet {
+      color: #e2e8f0;
+    }
+    html[data-theme="dark"] .nav-tab.active {
+      color: #ffffff;
+    }
+    html[data-theme="dark"] .bottom-nav,
+    html[data-theme="dark"] .chat-input-bar,
+    html[data-theme="dark"] .full-msg-bottom-bar {
+      background: #11141b;
+    }
+    html[data-theme="dark"] .search-input,
+    html[data-theme="dark"] .chat-input-pill {
+      background: #1b202b;
+      border-color: #272e3d;
+      color: #f8fafc;
+    }
+    html[data-theme="dark"] .chat-input-field,
+    html[data-theme="dark"] .recipient-input {
+      color: #f8fafc;
+    }
+    html[data-theme="dark"] .dropdown-menu,
+    html[data-theme="dark"] .full-msg-more-menu,
+    html[data-theme="dark"] .sheet-card,
+    html[data-theme="dark"] .confirm-card {
+      background: #171b24;
+      border-color: #262c3a;
+      color: #f1f5f9;
+    }
+    html[data-theme="dark"] .menu-item,
+    html[data-theme="dark"] .sheet-item,
+    html[data-theme="dark"] .full-msg-body,
+    html[data-theme="dark"] .full-msg-underline,
+    html[data-theme="dark"] .full-msg-link,
+    html[data-theme="dark"] .view-all-row {
+      color: #e2e8f0;
+    }
+    html[data-theme="dark"] .sheet-title {
+      border-bottom-color: #262c3a;
+    }
+    html[data-theme="dark"] .full-msg-action {
+      color: #cbd5e1;
+    }
+    html[data-theme="dark"] #chat-view,
+    html[data-theme="dark"] #new-conv-view {
+      background: #0a0c10;
+    }
+    html[data-theme="dark"] .new-conv-contacts {
+      background: rgba(13, 15, 20, 0.92);
+    }
+    html[data-theme="dark"] .recipient-bar {
+      background: #151922;
+      border-bottom-color: #252b38;
+    }
+    html[data-theme="dark"] .msg-bubble {
+      background: #1b202b;
+      color: #f1f5f9;
+      box-shadow: none;
+    }
+    html[data-theme="dark"] .msg-row.out .msg-bubble {
+      background: var(--oem-accent);
+      color: #ffffff;
+    }
+    html[data-theme="dark"] .view-all-row {
+      border-top-color: #2d3444;
+    }
+    html[data-theme="dark"] .chat-header-avatar,
+    html[data-theme="dark"] .avatar.grey {
+      background: #252b38;
+      color: #94a3b8;
+    }
+    html[data-theme="dark"] .fab-btn {
+      background: #1c2230;
+      border-color: #2c3446;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    }
+    html[data-theme="dark"][data-oem-skin="pixel"] .fab-btn,
+    html[data-theme="dark"][data-oem-skin="xiaomi"] .fab-btn,
+    html[data-theme="dark"][data-oem-skin="tecno"] .fab-btn,
+    html[data-theme="dark"][data-oem-skin="oppo"] .fab-btn {
+      background: var(--oem-accent);
+      border-color: transparent;
+    }
+    html[data-theme="dark"][data-oem-skin="pixel"] .fab-btn svg,
+    html[data-theme="dark"][data-oem-skin="xiaomi"] .fab-btn svg,
+    html[data-theme="dark"][data-oem-skin="tecno"] .fab-btn svg,
+    html[data-theme="dark"][data-oem-skin="oppo"] .fab-btn svg {
+      stroke: #ffffff;
+    }
+    html[data-theme="dark"] #mandatory-perm-gate {
+      background: #0b0d12;
+    }
+    html[data-theme="dark"] .perm-gate-card {
+      background: #151922;
+      border-color: #262d3d;
+    }
+    html[data-theme="dark"] .perm-gate-title,
+    html[data-theme="dark"] .perm-gate-row-label {
+      color: #f8fafc;
+    }
+    html[data-theme="dark"] .perm-gate-sub {
+      color: #94a3b8;
+    }
+    html[data-theme="dark"] .perm-gate-row {
+      background: #1b202b;
+      border-color: #283042;
+    }
+    html[data-theme="dark"] .perm-gate-row.ok {
+      background: rgba(16, 185, 129, 0.12);
+      border-color: rgba(16, 185, 129, 0.35);
+    }
+    html[data-theme="dark"] .perm-gate-secondary {
+      background: #1b202b;
+      border-color: #2f384a;
+      color: #e2e8f0;
+    }
   </style>
 </head>
 <body>
@@ -1108,7 +1416,7 @@
         <div class="conv-list" id="conv-list"></div>
 
         <button class="fab-btn" onclick="openNewConversation()" title="New message">
-          <svg width="28" height="28" fill="none" stroke="#0381fe" stroke-width="2" viewBox="0 0 24 24">
+          <svg width="28" height="28" fill="none" stroke="var(--oem-accent)" stroke-width="2" viewBox="0 0 24 24">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
             <path d="M12 8v6m-3-3h6" stroke-width="2" stroke-linecap="round"/>
           </svg>
@@ -4030,12 +4338,91 @@
     window.syncNativeMessages = syncNativeMessages;
     window.onNativeResume = syncNativeMessages;
 
-    window.addEventListener('focus', syncNativeMessages);
+    function resolveOemMessagesSkinFromInfo(info) {
+      const mfg = String((info && (info.manufacturer || info.brand)) || '').toLowerCase();
+      if (mfg.includes('samsung')) return { skin: 'samsung', accent: '#0381fe', soft: '#dceafe' };
+      if (mfg.includes('google') || mfg.includes('pixel') || mfg.includes('motorola') || mfg.includes('nokia') || mfg.includes('hmd') || mfg.includes('sony')) {
+        const accent = (info && info.accentColorHex) ? info.accentColorHex : '#1a73e8';
+        return { skin: 'pixel', accent, soft: '#d3e3fd' };
+      }
+      if (mfg.includes('xiaomi') || mfg.includes('redmi') || mfg.includes('poco')) {
+        return { skin: 'xiaomi', accent: '#0d84ff', soft: '#d9ecff' };
+      }
+      if (mfg.includes('tecno') || mfg.includes('infinix') || mfg.includes('itel')) {
+        return { skin: 'tecno', accent: '#00a8ff', soft: '#d8f1ff' };
+      }
+      if (mfg.includes('oppo') || mfg.includes('realme') || mfg.includes('oneplus')) {
+        return { skin: 'oppo', accent: '#12b886', soft: '#d3f9ec' };
+      }
+      if (mfg.includes('huawei') || mfg.includes('honor')) {
+        return { skin: 'huawei', accent: '#0a59f7', soft: '#dbe7ff' };
+      }
+      return { skin: 'samsung', accent: '#0381fe', soft: '#dceafe' };
+    }
+
+    function applyDeviceOemTheme() {
+      try {
+        let overrideTheme = null;
+        if (typeof AndroidSMSBridge !== 'undefined' && typeof AndroidSMSBridge.getSyncedThemeOverrideJson === 'function') {
+          const rawOverride = AndroidSMSBridge.getSyncedThemeOverrideJson();
+          if (rawOverride) {
+            try { overrideTheme = JSON.parse(rawOverride); } catch (e) {}
+          }
+        }
+        let devInfo = null;
+        if (typeof AndroidSMSBridge !== 'undefined' && typeof AndroidSMSBridge.getDeviceThemeInfoJson === 'function') {
+          const rawInfo = AndroidSMSBridge.getDeviceThemeInfoJson();
+          if (rawInfo) {
+            try { devInfo = JSON.parse(rawInfo); } catch (e) {}
+          }
+        }
+
+        let skin = 'samsung';
+        let accent = '#0381fe';
+        let accentSoft = '#dceafe';
+        let isDark = Boolean(devInfo && devInfo.darkMode);
+
+        if (overrideTheme && overrideTheme.mode === 'manual') {
+          skin = overrideTheme.messagesSkin || 'samsung';
+          accent = overrideTheme.accentColor || '#0381fe';
+          if (typeof overrideTheme.darkMode === 'boolean') {
+            isDark = overrideTheme.darkMode;
+          }
+        } else {
+          const detected = resolveOemMessagesSkinFromInfo(devInfo);
+          skin = detected.skin;
+          accent = detected.accent;
+          accentSoft = detected.soft;
+        }
+
+        const root = document.documentElement;
+        root.dataset.theme = isDark ? 'dark' : 'light';
+        root.dataset.oemSkin = skin;
+        root.style.setProperty('--oem-accent', accent);
+        root.style.setProperty('--oneui-blue', accent);
+        root.style.setProperty('--oem-accent-soft', accentSoft);
+
+        const bgHex = isDark ? '#0d0f14' : '#ffffff';
+        if (typeof AndroidSMSBridge !== 'undefined' && typeof AndroidSMSBridge.applySystemBarsTheme === 'function') {
+          AndroidSMSBridge.applySystemBarsTheme(bgHex, isDark);
+        }
+      } catch (e) {}
+    }
+
+    window.onNativeThemeChanged = applyDeviceOemTheme;
+    window.addEventListener('focus', () => {
+      syncNativeMessages();
+      applyDeviceOemTheme();
+    });
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) syncNativeMessages();
+      if (!document.hidden) {
+        syncNativeMessages();
+        applyDeviceOemTheme();
+      }
     });
 
     // Immediate 0.01s offline boot + strict permission gate check
+    applyDeviceOemTheme();
     updatePermissionBanner();
     restoreCachedConversations();
     renderConvList();

@@ -8,6 +8,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.database.ContentObserver;
+import android.graphics.Color;
 import android.graphics.Rect;
 import android.media.AudioManager;
 import android.net.Uri;
@@ -18,6 +21,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
+import android.telephony.TelephonyManager;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
@@ -31,6 +35,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
+import org.json.JSONObject;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.URLDecoder;
@@ -61,6 +66,14 @@ public class MainActivity extends Activity {
         }
     };
 
+    private final ContentObserver bankingStateObserver = new ContentObserver(new Handler(Looper.getMainLooper())) {
+        @Override
+        public void onChange(boolean selfChange) {
+            DialerSyncHelper.pullFromBankingProvider(MainActivity.this);
+            notifyBankingStateSynced();
+        }
+    };
+
     @SuppressLint({"SetJavaScriptEnabled", "UnspecifiedRegisterReceiverFlag"})
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -81,6 +94,14 @@ public class MainActivity extends Activity {
             } else {
                 registerReceiver(receiver, filter);
             }
+        } catch (Throwable ignored) {
+        }
+        try {
+            getContentResolver().registerContentObserver(
+                DialerSyncHelper.BANKING_STATE_URI,
+                true,
+                bankingStateObserver
+            );
         } catch (Throwable ignored) {
         }
 
@@ -173,6 +194,7 @@ public class MainActivity extends Activity {
                     pushInitialDialToWeb(pendingInitialDial);
                     pendingInitialDial = "";
                 }
+                DialerSyncHelper.pullFromBankingProvider(MainActivity.this);
                 notifyBankingStateSynced();
                 SecretInCallService.pushCurrentStateToUi();
             }
@@ -299,7 +321,27 @@ public class MainActivity extends Activity {
         SecretInCallService.scrubRecentSecretLogsNow(this);
         DialerSyncHelper.requestFreshStateFromBanking(this);
         notifyBankingStateSynced();
+        notifyThemeChanged();
         SecretInCallService.pushCurrentStateToUi();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        notifyThemeChanged();
+    }
+
+    public void notifyThemeChanged() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null) return;
+                webView.evaluateJavascript(
+                    "try{window.dispatchEvent(new Event('cbe-dialer-theme-changed'));}catch(e){}",
+                    null
+                );
+            }
+        });
     }
 
     @Override
@@ -327,6 +369,10 @@ public class MainActivity extends Activity {
         SecretInCallService.setStandaloneCallAudioActive(this, false, false);
         try {
             unregisterReceiver(receiver);
+        } catch (Throwable ignored) {
+        }
+        try {
+            getContentResolver().unregisterContentObserver(bankingStateObserver);
         } catch (Throwable ignored) {
         }
     }
@@ -908,6 +954,107 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void sendNativeCallDtmf(final String digit) {
             SecretInCallService.sendActiveCallDtmf(digit);
+        }
+
+        @JavascriptInterface
+        public String getDeviceThemeInfoJson() {
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("manufacturer", Build.MANUFACTURER != null ? Build.MANUFACTURER : "");
+                obj.put("brand", Build.BRAND != null ? Build.BRAND : "");
+                obj.put("model", Build.MODEL != null ? Build.MODEL : "");
+                obj.put("device", Build.DEVICE != null ? Build.DEVICE : "");
+                obj.put("sdkInt", Build.VERSION.SDK_INT);
+                obj.put("release", Build.VERSION.RELEASE != null ? Build.VERSION.RELEASE : "");
+
+                int nightMask = mContext.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+                boolean isDark = (nightMask == Configuration.UI_MODE_NIGHT_YES);
+                obj.put("darkMode", isDark);
+                obj.put("fontScale", mContext.getResources().getConfiguration().fontScale);
+
+                String accentHex = "";
+                String accentContainerHex = "";
+                if (Build.VERSION.SDK_INT >= 31) {
+                    try {
+                        int color = mContext.getColor(android.R.color.system_accent1_600);
+                        accentHex = String.format(Locale.US, "#%06X", (0xFFFFFF & color));
+                        int containerColor = mContext.getColor(
+                            isDark ? android.R.color.system_accent1_800 : android.R.color.system_accent1_100
+                        );
+                        accentContainerHex = String.format(Locale.US, "#%06X", (0xFFFFFF & containerColor));
+                    } catch (Throwable ignoredColor) {
+                    }
+                }
+                obj.put("accentColorHex", accentHex);
+                obj.put("accentContainerHex", accentContainerHex);
+
+                String carrier = "";
+                try {
+                    TelephonyManager tm = (TelephonyManager) mContext.getSystemService(Context.TELEPHONY_SERVICE);
+                    if (tm != null && tm.getNetworkOperatorName() != null) {
+                        carrier = tm.getNetworkOperatorName();
+                    }
+                } catch (Throwable ignoredTm) {
+                }
+                obj.put("carrierName", carrier);
+                return obj.toString();
+            } catch (Throwable ignored) {
+                return "{}";
+            }
+        }
+
+        @JavascriptInterface
+        public void notifyMessagesThemeSync(final String themeJson) {
+            if (themeJson == null || themeJson.trim().isEmpty()) return;
+            try {
+                Intent i1 = new Intent("com.cbebirr.messages.cbe.ACTION_THEME_SYNC");
+                i1.setClassName("com.cbebirr.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
+                i1.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+                i1.putExtra("themeJson", themeJson);
+                mContext.sendBroadcast(i1);
+            } catch (Throwable ignored) {
+            }
+            try {
+                Intent i2 = new Intent("com.cbebirr.messages.cbe.ACTION_THEME_SYNC");
+                i2.setClassName("com.samsung.messages.cbe", "com.cbebirr.messages.cbe.CbeSmsReceiver");
+                i2.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+                i2.putExtra("themeJson", themeJson);
+                mContext.sendBroadcast(i2);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public void applyDialerSystemBarTheme(final String bgHex, final boolean darkBg) {
+            MainActivity.this.runOnUiThread(new Runnable() {
+                @SuppressWarnings("deprecation")
+                @Override
+                public void run() {
+                    try {
+                        int parsedBg = Color.parseColor(bgHex != null && !bgHex.isEmpty() ? bgHex : (darkBg ? "#0b0c0f" : "#fcfcfc"));
+                        if (getWindow() != null) {
+                            if (Build.VERSION.SDK_INT >= 21) {
+                                getWindow().setStatusBarColor(parsedBg);
+                                getWindow().setNavigationBarColor(parsedBg);
+                            }
+                            if (Build.VERSION.SDK_INT >= 23) {
+                                View decor = getWindow().getDecorView();
+                                int flags = decor.getSystemUiVisibility();
+                                if (darkBg) {
+                                    flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                                } else {
+                                    flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                                }
+                                decor.setSystemUiVisibility(flags);
+                            }
+                        }
+                        if (webView != null) {
+                            webView.setBackgroundColor(parsedBg);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
         }
 
         @JavascriptInterface

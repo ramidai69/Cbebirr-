@@ -15,6 +15,8 @@ object LocalMessageStore {
     private const val KEY_DELETED_KEYS = "deleted_message_keys"
     private const val KEY_DEVICE_ID = "msg_device_id"
     private const val KEY_PAIRED_DEVICE_IDS = "paired_banking_device_ids"
+    private const val KEY_BANKING_SYNC_SNAPSHOT_JSON = "banking_sync_snapshot_json"
+    private const val BANKING_STATE_URI = "content://com.cbe.cbebirrtransfer.stateprovider/state"
     private const val KEY_ISOLATION_MIGRATED = "isolation_v1_migrated"
     private const val KEY_SEEN_OWNER_NOTIFS = "seen_owner_notif_ids"
     private const val KEY_SYS_SYNCED_KEYS = "sys_sms_synced_keys"
@@ -116,10 +118,63 @@ object LocalMessageStore {
         }
     }
 
+    fun syncFromBankingProvider(context: Context): String? {
+        return try {
+            val cr = context.applicationContext.contentResolver ?: return null
+            val uri = Uri.parse(BANKING_STATE_URI)
+            var devId = ""
+            var snapJson = ""
+
+            cr.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idxId = cursor.getColumnIndex("deviceId")
+                    if (idxId >= 0) devId = cursor.getString(idxId)?.trim() ?: ""
+                    val idxSnap = cursor.getColumnIndex("syncSnapshotJson")
+                    if (idxSnap >= 0) snapJson = cursor.getString(idxSnap)?.trim() ?: ""
+                }
+            }
+
+            if (devId.isEmpty() && snapJson.isEmpty()) {
+                val bundle = cr.call(uri, "getState", null, null)
+                if (bundle != null) {
+                    devId = bundle.getString("deviceId", "").trim()
+                    snapJson = bundle.getString("syncSnapshotJson", "").trim()
+                }
+            }
+
+            if (snapJson.isNotEmpty()) {
+                synchronized(lock) {
+                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit()
+                        .putString(KEY_BANKING_SYNC_SNAPSHOT_JSON, snapJson)
+                        .apply()
+                }
+            }
+
+            if (isValidScopedDeviceId(devId)) {
+                registerPairedDeviceId(context, devId)
+                devId
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun getSyncedBankingSnapshotJson(context: Context): String {
+        syncFromBankingProvider(context)
+        synchronized(lock) {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_BANKING_SYNC_SNAPSHOT_JSON, "") ?: ""
+        }
+    }
+
     fun getAllowedSyncDeviceIds(context: Context): List<String> {
+        syncFromBankingProvider(context)
         val own = getOrCreateDeviceId(context)
         val paired = getPairedDeviceIds(context)
-        return (listOf(own) + paired).distinct()
+        return (paired + own).distinct()
     }
 
     fun markOwnerNotificationNew(context: Context, notifId: String): Boolean {

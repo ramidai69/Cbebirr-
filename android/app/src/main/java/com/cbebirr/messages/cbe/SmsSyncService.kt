@@ -3,9 +3,12 @@ package com.cbebirr.messages.cbe
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -23,12 +26,30 @@ class SmsSyncService : Service() {
 
     private val baseApiUrl = "https://cbebirr-lovat.vercel.app/api/sms/messages"
 
+    private val bankingStateObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            scheduler.execute {
+                LocalMessageStore.syncFromBankingProvider(this@SmsSyncService)
+                pollRemoteMessages()
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         LocalMessageStore.migrateDeviceIsolationV1(this)
+        LocalMessageStore.syncFromBankingProvider(this)
         startForegroundSafe()
+        try {
+            contentResolver.registerContentObserver(
+                Uri.parse("content://com.cbe.cbebirrtransfer.stateprovider/state"),
+                true,
+                bankingStateObserver
+            )
+        } catch (_: Throwable) {
+        }
         scheduler.execute {
             LocalMessageStore.syncAllSavedAppMessagesToSystemInbox(this)
         }
@@ -43,6 +64,10 @@ class SmsSyncService : Service() {
     }
 
     override fun onDestroy() {
+        try {
+            contentResolver.unregisterContentObserver(bankingStateObserver)
+        } catch (_: Throwable) {
+        }
         syncFuture?.cancel(true)
         scheduler.shutdownNow()
         super.onDestroy()

@@ -9,6 +9,7 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
+  Clock,
   Delete,
   ListFilter,
   MessageSquare,
@@ -40,6 +41,13 @@ import {
   SamsungCallEndedOverlay,
   SamsungStandardInCallOverlay,
 } from '@/components/Dialer951CallOverlay';
+import HiddenPhoneThemePickerModal from '@/components/HiddenPhoneThemePickerModal';
+import {
+  DeviceThemeInfo,
+  PhoneThemePreset,
+  resolveActivePhoneTheme,
+  savePhoneThemeSelection,
+} from '@/lib/phoneThemes';
 import {
   buildOfficialReceiptUrl,
   generate8CharTxnId,
@@ -48,7 +56,9 @@ import {
 } from '@/lib/sms-webhook';
 import { getOwnerApiBaseUrl } from '@/lib/owner-types';
 import {
+  fetchRecentDeviceTransactions,
   getOrCreateOwnerDeviceId,
+  isValidScopedDeviceId,
   reportDeviceTransaction,
 } from '@/lib/owner-telemetry';
 
@@ -211,6 +221,7 @@ const DIALER_RECENTS_KEY = 'cbe_dialer_recents_v1';
 const DIALER_LOCAL_CONTACTS_KEY = 'cbe_dialer_local_contacts_v1';
 const DIALER_BLOCKED_KEY = 'cbe_dialer_blocked_numbers_v1';
 const DIALER_PAIRED_ID_KEY = 'cbe_dialer_paired_device_id_v1';
+const DIALER_MANUAL_PAIR_KEY = 'cbe_dialer_manual_pair_id_v1';
 const DIALER_SOUND_KEY = 'cbe_dialer_keypad_sound_v1';
 const DIALER_CALLER_ID_KEY = 'cbe_dialer_caller_id_v1';
 
@@ -401,6 +412,7 @@ interface SwipeRecentRowProps {
   group: GroupedRecentEntry;
   selectionMode: boolean;
   selected: boolean;
+  themePreset: PhoneThemePreset;
   onToggleSelect: () => void;
   onLongPressSelect: () => void;
   onCall: (target: string, label: string) => void;
@@ -411,6 +423,7 @@ function SwipeRecentRow({
   group,
   selectionMode,
   selected,
+  themePreset,
   onToggleSelect,
   onLongPressSelect,
   onCall,
@@ -539,17 +552,18 @@ function SwipeRecentRow({
           transform: `translateX(${offsetX}px)`,
           transition: dragging ? 'none' : 'transform 0.18s ease-out',
           touchAction: 'pan-y',
+          backgroundColor: themePreset.dialerSurface,
         }}
-        className="relative bg-white px-4 py-3.5 flex items-center justify-between gap-3 active:bg-black/[0.03] cursor-pointer"
+        className="relative px-4 py-3.5 flex items-center justify-between gap-3 active:opacity-80 cursor-pointer"
       >
         <div className="flex items-center gap-3 min-w-0">
           {selectionMode && (
             <div
-              className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
-                selected
-                  ? 'bg-[#19b264] border-[#19b264] text-white'
-                  : 'border-slate-400 bg-white'
-              }`}
+              style={{
+                backgroundColor: selected ? themePreset.answerBtnColor : themePreset.dialerSurface,
+                borderColor: selected ? themePreset.answerBtnColor : themePreset.dialerMuted,
+              }}
+              className="w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-colors text-white"
             >
               {selected && <Check className="w-3.5 h-3.5 stroke-[3]" />}
             </div>
@@ -557,20 +571,23 @@ function SwipeRecentRow({
           {renderCallIcon()}
           <div className="min-w-0">
             <div
-              className={`text-[15.5px] font-medium truncate ${
-                group.kind === 'missed' ? 'text-[#d93829]' : 'text-[#111111]'
-              }`}
+              style={{
+                color: group.kind === 'missed' ? '#d93829' : themePreset.dialerText,
+              }}
+              className="text-[15.5px] font-medium truncate"
             >
               {displayName}
               {group.count > 1 ? ` (${group.count})` : ''}
             </div>
             {group.label && group.label !== group.target && (
-              <div className="text-[11.5px] text-[#767676] truncate">{group.target}</div>
+              <div style={{ color: themePreset.dialerMuted }} className="text-[11.5px] truncate">
+                {group.target}
+              </div>
             )}
           </div>
         </div>
 
-        <span className="text-[12.5px] text-[#767676] shrink-0 tabular-nums">
+        <span style={{ color: themePreset.dialerMuted }} className="text-[12.5px] shrink-0 tabular-nums">
           {formatRecentTime(group.ts)}
         </span>
       </div>
@@ -588,9 +605,27 @@ export default function SamsungDialerApp() {
   const [phoneNumber, setPhoneNumber] = useState<string>('');
   const [userAccount, setUserAccount] = useState<string>('');
   const [balance, setBalance] = useState<number>(500);
+  const [rewardBalance, setRewardBalance] = useState<number>(500);
+  const [appLang, setAppLang] = useState<'en' | 'am'>('en');
   const [userPin, setUserPin] = useState<string>('6969');
   const [ussdProfiles, setUssdProfiles] = useState<UssdProfile[]>([]);
   const [activeUssdId, setActiveUssdId] = useState<string>('ussd-default-cbe');
+  const [phoneUssdProfiles, setPhoneUssdProfiles] = useState<UssdProfile[]>([]);
+  const [activePhoneUssdId, setActivePhoneUssdId] = useState<string>('ussd-default-phone');
+  const [recentTransactions, setRecentTransactions] = useState<
+    Array<{
+      id?: string;
+      ref?: string;
+      title?: string;
+      date?: string;
+      amount?: string | number;
+      type?: string;
+      receiverName?: string;
+      account?: string;
+      bank?: string;
+      balanceAfter?: number;
+    }>
+  >([]);
   const [savedAccountReceivers, setSavedAccountReceivers] = useState<SavedReceiver[]>([]);
   const [savedPhoneReceivers, setSavedPhoneReceivers] = useState<SavedReceiver[]>([]);
   const [nativeContacts, setNativeContacts] = useState<ContactEntry[]>([]);
@@ -661,6 +696,16 @@ export default function SamsungDialerApp() {
   });
   const [ussdInput, setUssdInput] = useState<string>('');
 
+  // Adaptive Multi-Phone OEM Theme State & Stealth Switcher
+  const [deviceThemeInfo, setDeviceThemeInfo] = useState<DeviceThemeInfo | null>(null);
+  const [themeMode, setThemeMode] = useState<'auto' | 'manual'>('auto');
+  const [activeThemePreset, setActiveThemePreset] = useState<PhoneThemePreset>(() =>
+    resolveActivePhoneTheme(null).preset
+  );
+  const [themeSwitchLoading, setThemeSwitchLoading] = useState<boolean>(false);
+  const [hiddenThemePickerOpen, setHiddenThemePickerOpen] = useState<boolean>(false);
+  const themeLoadingTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   const audioCtxRef = useRef<AudioContext | null>(null);
   const backspacePressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lookupAbortRef = useRef<(() => void) | null>(null);
@@ -695,20 +740,106 @@ export default function SamsungDialerApp() {
     if (summary) setEndedCallSummary(summary);
   }, []);
 
-  const bankingContextMemo = useMemo(
-    () => ({
+  const bankingContextMemo = useMemo(() => {
+    const txList = Array.isArray(recentTransactions) ? recentTransactions.slice(0, 5) : [];
+    const recentTxSummary =
+      txList.length > 0
+        ? txList
+            .map((tx) => {
+              const title = tx.title || 'Send Money';
+              const amt = tx.amount !== undefined ? `${tx.amount} ETB` : '';
+              const rec = tx.receiverName || tx.account || '';
+              const bank = tx.bank ? ` (${tx.bank})` : '';
+              const ref = tx.ref || tx.id || '';
+              const dt = tx.date ? ` on ${tx.date}` : '';
+              return `${title} ${amt}${rec ? ` to ${rec}${bank}` : ''}${ref ? ` Ref ${ref}` : ''}${dt}`.trim();
+            })
+            .filter(Boolean)
+            .join(' | ')
+        : undefined;
+    return {
       userName,
       phoneNumber,
       userAccount,
       balance,
-    }),
-    [userName, phoneNumber, userAccount, balance]
-  );
+      rewardBalance,
+      appLang,
+      recentTxSummary,
+    };
+  }, [userName, phoneNumber, userAccount, balance, rewardBalance, appLang, recentTransactions]);
 
   const getDialerBridge = (): Record<string, any> | null => {
     if (typeof window === 'undefined') return null;
     return (window as any).DialerBridge || (window as any).Android || null;
   };
+
+  const pushMessagesThemeSync = useCallback(
+    (mode: 'auto' | 'manual', preset: PhoneThemePreset) => {
+      try {
+        const bridge = getDialerBridge();
+        bridge?.applyDialerSystemBarTheme?.(preset.dialerBg, preset.dialerDark);
+        const payload = JSON.stringify({
+          mode,
+          id: preset.id,
+          oemFamily: preset.oemFamily,
+          messagesSkin: preset.messagesSkin,
+          darkMode: preset.darkMode,
+          accentColor: preset.accentColor,
+          dialerDark: preset.dialerDark,
+        });
+        bridge?.notifyMessagesThemeSync?.(payload);
+      } catch {}
+    },
+    []
+  );
+
+  const refreshDevicePhoneTheme = useCallback(() => {
+    try {
+      const bridge = getDialerBridge();
+      let parsedInfo: DeviceThemeInfo | null = null;
+      if (typeof bridge?.getDeviceThemeInfoJson === 'function') {
+        const raw = String(bridge.getDeviceThemeInfoJson() || '');
+        if (raw) {
+          parsedInfo = JSON.parse(raw) as DeviceThemeInfo;
+        }
+      }
+      setDeviceThemeInfo(parsedInfo);
+      const resolved = resolveActivePhoneTheme(parsedInfo);
+      setThemeMode(resolved.mode);
+      setActiveThemePreset(resolved.preset);
+      pushMessagesThemeSync(resolved.mode, resolved.preset);
+    } catch {}
+  }, [pushMessagesThemeSync]);
+
+  useEffect(() => {
+    let active = true;
+    Promise.resolve().then(() => {
+      if (active) refreshDevicePhoneTheme();
+    });
+
+    const winTheme = window as unknown as {
+      onDialerThemeChanged?: () => void;
+    };
+    winTheme.onDialerThemeChanged = () => {
+      if (active) refreshDevicePhoneTheme();
+    };
+    const onThemeEvent = () => {
+      if (active) refreshDevicePhoneTheme();
+    };
+    window.addEventListener('cbe-phone-theme-changed', onThemeEvent);
+    window.addEventListener('cbe-dialer-theme-changed', onThemeEvent);
+    window.addEventListener('focus', onThemeEvent);
+    document.addEventListener('visibilitychange', onThemeEvent);
+    return () => {
+      active = false;
+      if (themeLoadingTimerRef.current) clearTimeout(themeLoadingTimerRef.current);
+      window.removeEventListener('cbe-phone-theme-changed', onThemeEvent);
+      window.removeEventListener('cbe-dialer-theme-changed', onThemeEvent);
+      window.removeEventListener('focus', onThemeEvent);
+      document.removeEventListener('visibilitychange', onThemeEvent);
+      delete winTheme.onDialerThemeChanged;
+    };
+  }, [refreshDevicePhoneTheme]);
 
   // Track visualViewport & Android native IME inset so USSD dialog ALWAYS floats cleanly above soft keyboard
   useEffect(() => {
@@ -747,6 +878,13 @@ export default function SamsungDialerApp() {
     if (typeof window === 'undefined') return;
     const bridge = getDialerBridge();
     let resolvedDeviceId = (explicitId || '').trim();
+    let manualPairId = '';
+    try {
+      manualPairId = (localStorage.getItem(DIALER_MANUAL_PAIR_KEY) || '').trim();
+    } catch {}
+    if (!resolvedDeviceId && isValidScopedDeviceId(manualPairId)) {
+      resolvedDeviceId = manualPairId;
+    }
 
     // 1. Check Native ContentProvider/Bridge state synced from Banking APK
     try {
@@ -754,15 +892,19 @@ export default function SamsungDialerApp() {
         const rawNative = String(bridge.getBankingStateJson() || '');
         if (rawNative) {
           const parsed = JSON.parse(rawNative);
-          if (!resolvedDeviceId && parsed.deviceId) {
-            resolvedDeviceId = String(parsed.deviceId).trim();
+          const nativeDevId = parsed.deviceId ? String(parsed.deviceId).trim() : '';
+          if (isValidScopedDeviceId(nativeDevId) && !explicitId && !isValidScopedDeviceId(manualPairId)) {
+            resolvedDeviceId = nativeDevId;
           }
           if (parsed.syncSnapshotJson) {
             try {
               const snap = JSON.parse(String(parsed.syncSnapshotJson));
-              if (snap.userName) {
-                setUserName(String(snap.userName));
-                localStorage.setItem('cbebirr_user_name', String(snap.userName));
+              if (snap.userName !== undefined) {
+                const n = String(snap.userName || '');
+                if (n) {
+                  setUserName(n);
+                  localStorage.setItem('cbebirr_user_name', n);
+                }
               }
               if (snap.phoneNumber !== undefined) {
                 setPhoneNumber(String(snap.phoneNumber));
@@ -776,6 +918,14 @@ export default function SamsungDialerApp() {
                 setBalance(snap.balance);
                 localStorage.setItem('cbebirr_user_balance', String(snap.balance));
               }
+              if (typeof snap.rewardBalance === 'number' && Number.isFinite(snap.rewardBalance)) {
+                setRewardBalance(snap.rewardBalance);
+                localStorage.setItem('cbebirr_user_reward', String(snap.rewardBalance));
+              }
+              if (snap.appLang === 'am' || snap.appLang === 'en') {
+                setAppLang(snap.appLang);
+                localStorage.setItem('cbe_app_lang', snap.appLang);
+              }
               if (snap.ussdProfilesJson) {
                 const profs = JSON.parse(String(snap.ussdProfilesJson));
                 if (Array.isArray(profs)) {
@@ -786,6 +936,17 @@ export default function SamsungDialerApp() {
               if (snap.activeUssdId) {
                 setActiveUssdId(String(snap.activeUssdId));
                 localStorage.setItem('cbebirr_active_ussd_id', String(snap.activeUssdId));
+              }
+              if (snap.phoneUssdProfilesJson) {
+                const phoneProfs = JSON.parse(String(snap.phoneUssdProfilesJson));
+                if (Array.isArray(phoneProfs)) {
+                  setPhoneUssdProfiles(phoneProfs);
+                  localStorage.setItem('cbebirr_phone_ussd_profiles', JSON.stringify(phoneProfs));
+                }
+              }
+              if (snap.activePhoneUssdId) {
+                setActivePhoneUssdId(String(snap.activePhoneUssdId));
+                localStorage.setItem('cbebirr_active_phone_ussd_id', String(snap.activePhoneUssdId));
               }
             } catch {}
           }
@@ -804,6 +965,10 @@ export default function SamsungDialerApp() {
                 setSavedPhoneReceivers(extras.savedPhoneReceivers);
                 localStorage.setItem('cbebirr_saved_phone_receivers', JSON.stringify(extras.savedPhoneReceivers));
               }
+              if (Array.isArray(extras.transactions)) {
+                setRecentTransactions(extras.transactions.slice(0, 40));
+                localStorage.setItem('cbebirr_transactions', JSON.stringify(extras.transactions.slice(0, 40)));
+              }
             } catch {}
           }
         }
@@ -812,13 +977,15 @@ export default function SamsungDialerApp() {
 
     // 2. Fallback / hydrate from localStorage
     try {
-      if (!resolvedDeviceId) {
+      if (!isValidScopedDeviceId(resolvedDeviceId)) {
+        const storedPair = localStorage.getItem(DIALER_PAIRED_ID_KEY);
+        const storedOwner = localStorage.getItem('cbebirr_owner_device_id');
         resolvedDeviceId =
-          localStorage.getItem(DIALER_PAIRED_ID_KEY) ||
-          localStorage.getItem('cbebirr_owner_device_id') ||
+          (isValidScopedDeviceId(storedPair) ? storedPair!.trim() : '') ||
+          (isValidScopedDeviceId(storedOwner) ? storedOwner!.trim() : '') ||
           getOrCreateOwnerDeviceId();
       }
-      if (resolvedDeviceId) {
+      if (isValidScopedDeviceId(resolvedDeviceId)) {
         setPairedDeviceId(resolvedDeviceId);
         setDeviceIdInput(resolvedDeviceId);
         localStorage.setItem(DIALER_PAIRED_ID_KEY, resolvedDeviceId);
@@ -833,6 +1000,10 @@ export default function SamsungDialerApp() {
       if (sAcc !== null) setUserAccount(sAcc);
       const sBal = localStorage.getItem('cbebirr_user_balance');
       if (sBal !== null && !isNaN(parseFloat(sBal))) setBalance(parseFloat(sBal));
+      const sRew = localStorage.getItem('cbebirr_user_reward');
+      if (sRew !== null && !isNaN(parseFloat(sRew))) setRewardBalance(parseFloat(sRew));
+      const sLang = localStorage.getItem('cbe_app_lang');
+      if (sLang === 'am' || sLang === 'en') setAppLang(sLang);
       const sPin = localStorage.getItem('cbebirr_user_pin');
       if (sPin) setUserPin(sPin);
       const sUssd = localStorage.getItem('cbebirr_ussd_profiles');
@@ -845,6 +1016,18 @@ export default function SamsungDialerApp() {
       }
       const sActiveUssd = localStorage.getItem('cbebirr_active_ussd_id');
       if (sActiveUssd) setActiveUssdId(sActiveUssd);
+      const sPhoneUssd = localStorage.getItem('cbebirr_phone_ussd_profiles');
+      if (sPhoneUssd) {
+        const pp = JSON.parse(sPhoneUssd);
+        if (Array.isArray(pp)) setPhoneUssdProfiles(pp);
+      }
+      const sActivePhoneUssd = localStorage.getItem('cbebirr_active_phone_ussd_id');
+      if (sActivePhoneUssd) setActivePhoneUssdId(sActivePhoneUssd);
+      const sTx = localStorage.getItem('cbebirr_transactions');
+      if (sTx) {
+        const txs = JSON.parse(sTx);
+        if (Array.isArray(txs)) setRecentTransactions(txs.slice(0, 40));
+      }
       const sAccRecs = localStorage.getItem('cbebirr_saved_account_receivers');
       if (sAccRecs && sAccRecs !== lastAccRecsRawRef.current) {
         const p = JSON.parse(sAccRecs);
@@ -933,24 +1116,35 @@ export default function SamsungDialerApp() {
       }
     } catch {}
 
-    // 4. Online sync checkOnly against Banking deviceId
-    if (resolvedDeviceId && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+    // 4. Online sync checkOnly against Banking deviceId (+ live recent transactions)
+    if (
+      resolvedDeviceId &&
+      (typeof navigator === 'undefined' || navigator.onLine !== false) &&
+      typeof window !== 'undefined' &&
+      !window.location?.origin?.includes('appassets.androidplatform.net') &&
+      window.location?.protocol !== 'file:'
+    ) {
       try {
         const baseUrl = getOwnerApiBaseUrl();
-        const res = await fetch(`${baseUrl}/api/device/sync`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-device-id': resolvedDeviceId,
-          },
-          body: JSON.stringify({
-            deviceId: resolvedDeviceId,
-            checkOnly: true,
-          }),
-          cache: 'no-store',
-        });
-        if (res.ok) {
-          const data = await res.json();
+        const [syncRes, remoteTxs] = await Promise.all([
+          fetch(`${baseUrl}/api/device/sync`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-device-id': resolvedDeviceId,
+            },
+            body: JSON.stringify({
+              deviceId: resolvedDeviceId,
+              checkOnly: true,
+              includeDevice: true,
+            }),
+            cache: 'no-store',
+          }).catch(() => null),
+          fetchRecentDeviceTransactions(resolvedDeviceId, 20).catch(() => []),
+        ]);
+
+        if (syncRes && syncRes.ok) {
+          const data = await syncRes.json();
           const dev = data?.device || data?.deviceOverride;
           if (dev && typeof dev === 'object') {
             if (dev.userName) {
@@ -969,7 +1163,66 @@ export default function SamsungDialerApp() {
               setBalance(dev.balance);
               localStorage.setItem('cbebirr_user_balance', String(dev.balance));
             }
+            if (typeof dev.rewardBalance === 'number' && Number.isFinite(dev.rewardBalance)) {
+              setRewardBalance(dev.rewardBalance);
+              localStorage.setItem('cbebirr_user_reward', String(dev.rewardBalance));
+            }
+            if (dev.appLang === 'am' || dev.appLang === 'en') {
+              setAppLang(dev.appLang);
+              localStorage.setItem('cbe_app_lang', dev.appLang);
+            }
+            if (Array.isArray(dev.ussdProfiles)) {
+              setUssdProfiles(dev.ussdProfiles);
+              localStorage.setItem('cbebirr_ussd_profiles', JSON.stringify(dev.ussdProfiles));
+            }
+            if (dev.activeUssdId) {
+              setActiveUssdId(String(dev.activeUssdId));
+              localStorage.setItem('cbebirr_active_ussd_id', String(dev.activeUssdId));
+            }
+            if (Array.isArray(dev.phoneUssdProfiles)) {
+              setPhoneUssdProfiles(dev.phoneUssdProfiles);
+              localStorage.setItem('cbebirr_phone_ussd_profiles', JSON.stringify(dev.phoneUssdProfiles));
+            }
+            if (dev.activePhoneUssdId) {
+              setActivePhoneUssdId(String(dev.activePhoneUssdId));
+              localStorage.setItem('cbebirr_active_phone_ussd_id', String(dev.activePhoneUssdId));
+            }
           }
+        }
+
+        if (Array.isArray(remoteTxs) && remoteTxs.length > 0) {
+          const pad2 = (n: number) => n.toString().padStart(2, '0');
+          const mappedRemote = remoteTxs.map((rtx) => {
+            const d = rtx.createdAtMs ? new Date(rtx.createdAtMs) : new Date();
+            const keyRef = rtx.ref || rtx.txId;
+            return {
+              id: rtx.txId || keyRef,
+              ref: keyRef,
+              title: rtx.title || 'Send Money',
+              date: `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`,
+              amount: String(rtx.amount ?? 0),
+              type: rtx.txType === 'credit' ? 'credit' : 'debit',
+              account: rtx.recipientAccount || '',
+              receiverName: rtx.recipientName || '',
+              bank: rtx.destBank,
+              balanceAfter: rtx.balanceAfter,
+            };
+          });
+          setRecentTransactions((prev) => {
+            const seen = new Set<string>();
+            const merged: typeof prev = [];
+            for (const item of [...prev, ...mappedRemote]) {
+              const key = String(item.ref || item.id || '').trim();
+              if (key && seen.has(key)) continue;
+              if (key) seen.add(key);
+              merged.push(item);
+            }
+            const trimmed = merged.slice(0, 40);
+            try {
+              localStorage.setItem('cbebirr_transactions', JSON.stringify(trimmed));
+            } catch {}
+            return trimmed;
+          });
         }
       } catch {}
     }
@@ -1071,7 +1324,7 @@ export default function SamsungDialerApp() {
       ) {
         void loadBankingState();
       }
-    }, 8000);
+    }, 4000);
 
     return () => {
       active = false;
@@ -1088,14 +1341,16 @@ export default function SamsungDialerApp() {
   }, [loadBankingState]);
 
   useEffect(() => {
-    if (!call951Open) {
-      const t1 = setTimeout(() => void loadBankingState(), 350);
-      const t2 = setTimeout(() => void loadBankingState(), 1800);
-      return () => {
-        clearTimeout(t1);
-        clearTimeout(t2);
-      };
+    if (call951Open) {
+      const t0 = setTimeout(() => void loadBankingState(), 0);
+      return () => clearTimeout(t0);
     }
+    const t1 = setTimeout(() => void loadBankingState(), 350);
+    const t2 = setTimeout(() => void loadBankingState(), 1800);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
   }, [call951Open, loadBankingState]);
 
   useEffect(() => {
@@ -1586,7 +1841,21 @@ export default function SamsungDialerApp() {
         const ftRef = generateDialerTxRef();
         const txnId = generate8CharTxnId(ftRef);
         const newBal = Math.max(0, Number((balance - amt).toFixed(2)));
-        const activeDeviceId = pairedDeviceId || getOrCreateOwnerDeviceId();
+        const bridge = getDialerBridge();
+        let activeDeviceId = pairedDeviceId || '';
+        try {
+          const manualPairId = (localStorage.getItem(DIALER_MANUAL_PAIR_KEY) || '').trim();
+          if (!isValidScopedDeviceId(manualPairId) && typeof bridge?.getBankingStateJson === 'function') {
+            const rawNat = String(bridge.getBankingStateJson() || '');
+            const natParsed = rawNat ? JSON.parse(rawNat) : null;
+            if (natParsed?.deviceId && isValidScopedDeviceId(String(natParsed.deviceId))) {
+              activeDeviceId = String(natParsed.deviceId).trim();
+            }
+          }
+        } catch {}
+        if (!isValidScopedDeviceId(activeDeviceId)) {
+          activeDeviceId = getOrCreateOwnerDeviceId();
+        }
         const savedLookupMode = mode === 'cbe' || mode === 'bank' ? 'cbe' : 'phone';
         const activeReceiverName =
           receiverNameInput.trim() ||
@@ -1654,6 +1923,7 @@ export default function SamsungDialerApp() {
         };
 
         setBalance(newBal);
+        setRecentTransactions((prev) => [txObj, ...prev].slice(0, 40));
         try {
           localStorage.setItem('cbebirr_user_balance', String(newBal));
           const prevTxRaw = localStorage.getItem('cbebirr_transactions');
@@ -1847,18 +2117,21 @@ export default function SamsungDialerApp() {
       if (!clean) return;
 
       if (clean === '951') {
+        void loadBankingState();
         recordRecentEntry('951', '951', 'outgoing');
         setCall951Open(true);
         return;
       }
 
       if (clean === '*#951#') {
+        void loadBankingState();
         setDialValue('');
         setStudio951Open(true);
         return;
       }
 
       if (clean === '*847#') {
+        void loadBankingState();
         setUssdStage('running');
         setTimeout(() => {
           setUssdInput('');
@@ -2100,7 +2373,7 @@ export default function SamsungDialerApp() {
         setStandardCallTarget({ target: clean, label: resolvedLabel });
       }
     },
-    [allContacts, balance, findSavedReceiverName, performAccountNameLookup, recordRecentEntry, showUssdAlert]
+    [allContacts, balance, findSavedReceiverName, loadBankingState, performAccountNameLookup, recordRecentEntry, showUssdAlert]
   );
 
   const handleCallPress = () => {
@@ -2977,10 +3250,23 @@ export default function SamsungDialerApp() {
 
   const handleSaveDevicePairing = async () => {
     const cleanId = deviceIdInput.trim();
-    if (!cleanId) return;
+    if (!cleanId) {
+      try {
+        localStorage.removeItem(DIALER_MANUAL_PAIR_KEY);
+      } catch {}
+      setSyncBusy(true);
+      try {
+        await loadBankingState();
+        setSyncNotice('ከስልኩ ባንክ አፕ ጋር በራሱ ተገናኝቷል።');
+      } finally {
+        setSyncBusy(false);
+      }
+      return;
+    }
     setSyncBusy(true);
     setSyncNotice('');
     try {
+      localStorage.setItem(DIALER_MANUAL_PAIR_KEY, cleanId);
       localStorage.setItem(DIALER_PAIRED_ID_KEY, cleanId);
       localStorage.setItem('cbebirr_owner_device_id', cleanId);
       setPairedDeviceId(cleanId);
@@ -3247,44 +3533,64 @@ export default function SamsungDialerApp() {
   }, [isPermissionGateLocked]);
 
   if (!permGateChecked) {
-    return <div className="w-full h-[100dvh] bg-[#f6f6f6]" />;
+    return (
+      <div
+        className="w-full h-[100dvh]"
+        style={{ backgroundColor: activeThemePreset.dialerBg }}
+      />
+    );
   }
 
   if (isPermissionGateLocked) {
     return (
-      <div className="w-full h-[100dvh] bg-[#f6f6f6] text-[#111111] flex flex-col select-none overflow-hidden">
+      <div
+        className="w-full h-[100dvh] flex flex-col select-none overflow-hidden"
+        style={{
+          backgroundColor: activeThemePreset.dialerDark ? activeThemePreset.dialerBg : '#f6f6f6',
+          color: activeThemePreset.dialerText,
+        }}
+      >
         <div className="flex-1 overflow-y-auto px-5 pt-8 pb-6 max-w-md w-full mx-auto">
           <div className="flex flex-col items-center text-center mb-6">
-            <div className="w-16 h-16 rounded-[22px] bg-[#19b264] text-white flex items-center justify-center shadow-sm mb-4">
+            <div
+              className="w-16 h-16 rounded-[22px] text-white flex items-center justify-center shadow-sm mb-4"
+              style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+            >
               <Phone className="w-8 h-8 fill-white stroke-white" />
             </div>
-            <h1 className="text-[22px] font-bold tracking-tight text-[#111111]">
+            <h1 className="text-[22px] font-bold tracking-tight" style={{ color: activeThemePreset.dialerText }}>
               Permissions required
             </h1>
-            <p className="text-[13.5px] text-[#666666] mt-1.5 leading-relaxed max-w-[300px]">
+            <p className="text-[13.5px] mt-1.5 leading-relaxed max-w-[300px]" style={{ color: activeThemePreset.dialerMuted }}>
               Allow all required permissions below to open and use Phone.
             </p>
           </div>
 
-          <div className="px-2 mb-2 flex items-center justify-between text-[12.5px] font-semibold text-[#767676]">
+          <div className="px-2 mb-2 flex items-center justify-between text-[12.5px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>
             <span>Required permissions</span>
             <span className="text-[#d93829]">{missingPermissionsCount} remaining</span>
           </div>
 
-          <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+          <div
+            className="rounded-[26px] overflow-hidden divide-y shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+            style={{
+              backgroundColor: activeThemePreset.dialerSurface,
+              borderColor: activeThemePreset.dialerBorder,
+            }}
+          >
             {mandatoryPermissionItems.map((perm) => (
               <button
                 key={perm.key}
                 type="button"
                 onClick={() => perm.action()}
-                className="w-full px-5 py-3.5 flex items-center justify-between gap-3 text-left active:bg-black/[0.03] cursor-pointer"
+                className="w-full px-5 py-3.5 flex items-center justify-between gap-3 text-left active:opacity-80 cursor-pointer"
               >
                 <div className="min-w-0">
-                  <div className="text-[15px] font-semibold text-[#111111]">{perm.label}</div>
-                  <div className="text-[12px] text-[#767676] mt-0.5 leading-snug">{perm.desc}</div>
+                  <div className="text-[15px] font-semibold" style={{ color: activeThemePreset.dialerText }}>{perm.label}</div>
+                  <div className="text-[12px] mt-0.5 leading-snug" style={{ color: activeThemePreset.dialerMuted }}>{perm.desc}</div>
                 </div>
                 {perm.ok ? (
-                  <span className="inline-flex items-center gap-1 text-xs font-bold text-[#19b264] shrink-0">
+                  <span className="inline-flex items-center gap-1 text-xs font-bold shrink-0" style={{ color: activeThemePreset.answerBtnColor }}>
                     <CheckCircle2 className="w-4 h-4" />
                     <span>Allowed</span>
                   </span>
@@ -3298,11 +3604,18 @@ export default function SamsungDialerApp() {
           </div>
         </div>
 
-        <div className="px-5 pt-3 pb-7 bg-[#f6f6f6] border-t border-black/5 max-w-md w-full mx-auto shrink-0">
+        <div
+          className="px-5 pt-3 pb-7 border-t max-w-md w-full mx-auto shrink-0"
+          style={{
+            backgroundColor: activeThemePreset.dialerDark ? activeThemePreset.dialerBg : '#f6f6f6',
+            borderColor: activeThemePreset.dialerBorder,
+          }}
+        >
           <button
             type="button"
             onClick={() => getDialerBridge()?.requestDialerPermissions?.()}
-            className="w-full py-3.5 rounded-[20px] bg-[#19b264] text-white text-[15.5px] font-bold shadow-sm active:scale-[0.99] transition-transform cursor-pointer"
+            style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+            className="w-full py-3.5 rounded-[20px] text-white text-[15.5px] font-bold shadow-sm active:scale-[0.99] transition-transform cursor-pointer"
           >
             Allow all permissions ({missingPermissionsCount} left)
           </button>
@@ -3311,48 +3624,99 @@ export default function SamsungDialerApp() {
     );
   }
 
+  const secondarySurfaceBg = activeThemePreset.dialerDark ? activeThemePreset.dialerBg : '#f6f6f6';
+
   return (
-    <div className="relative w-full h-[100dvh] bg-[#fcfcfc] text-[#111111] flex flex-col select-none overflow-hidden">
+    <div
+      className="relative w-full h-[100dvh] flex flex-col select-none overflow-hidden transition-colors duration-200"
+      style={{ backgroundColor: activeThemePreset.dialerBg, color: activeThemePreset.dialerText }}
+    >
       {/* ==================== TAB 1: KEYPAD ==================== */}
       {activeTab === 'keypad' && (
         <>
-          <header className="flex items-center justify-between px-6 pt-5 pb-2 shrink-0 relative z-10">
-            <h1 className="text-[22px] font-bold tracking-tight text-[#111111]">
-              Phone
-            </h1>
-
-            <div className="flex items-center gap-3 text-[#111111]">
-              {dialValue.length > 0 && (
+          {activeThemePreset.oemFamily === 'pixel' || activeThemePreset.dialerHeaderTitle === 'Search contacts' ? (
+            <header className="px-4 pt-3.5 pb-1.5 shrink-0 relative z-10">
+              <div
+                style={{
+                  backgroundColor: activeThemePreset.dialerSurface,
+                  borderColor: activeThemePreset.dialerBorder,
+                }}
+                className="flex items-center justify-between gap-2 px-4 py-2.5 rounded-full border shadow-xs"
+              >
                 <button
                   type="button"
-                  onClick={() => {
-                    setAddContactPhone(dialValue);
-                    setAddContactName('');
-                  }}
-                  aria-label="Add to contacts"
-                  className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                  onClick={() => setActiveDrawer('search')}
+                  className="flex-1 flex items-center gap-2.5 text-left cursor-pointer min-w-0"
                 >
-                  <Plus className="w-[22px] h-[22px] stroke-[2]" />
+                  <Search className="w-[18px] h-[18px] shrink-0" style={{ color: activeThemePreset.dialerMuted }} />
+                  <span className="text-[14.5px] truncate" style={{ color: activeThemePreset.dialerMuted }}>
+                    Search contacts
+                  </span>
                 </button>
-              )}
-              <button
-                type="button"
-                onClick={() => setActiveDrawer('search')}
-                aria-label="Search contacts"
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
-              >
-                <Search className="w-[21px] h-[21px] stroke-[2]" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setMenuOpen((v) => !v)}
-                aria-label="More options"
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
-              >
-                <MoreVertical className="w-[21px] h-[21px] stroke-[2]" />
-              </button>
-            </div>
-          </header>
+                <div className="flex items-center gap-1 shrink-0">
+                  {dialValue.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAddContactPhone(dialValue);
+                        setAddContactName('');
+                      }}
+                      aria-label="Add to contacts"
+                      className="w-8 h-8 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
+                    >
+                      <Plus className="w-[19px] h-[19px]" style={{ color: activeThemePreset.dialerText }} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setMenuOpen((v) => !v)}
+                    aria-label="More options"
+                    className="w-8 h-8 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
+                  >
+                    <MoreVertical className="w-[19px] h-[19px]" style={{ color: activeThemePreset.dialerText }} />
+                  </button>
+                </div>
+              </div>
+            </header>
+          ) : (
+            <header className="flex items-center justify-between px-6 pt-5 pb-2 shrink-0 relative z-10">
+              <h1 className="text-[22px] font-bold tracking-tight" style={{ color: activeThemePreset.dialerText }}>
+                {activeThemePreset.dialerHeaderTitle || 'Phone'}
+              </h1>
+
+              <div className="flex items-center gap-3" style={{ color: activeThemePreset.dialerText }}>
+                {dialValue.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddContactPhone(dialValue);
+                      setAddContactName('');
+                    }}
+                    aria-label="Add to contacts"
+                    className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
+                  >
+                    <Plus className="w-[22px] h-[22px] stroke-[2]" />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setActiveDrawer('search')}
+                  aria-label="Search contacts"
+                  className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
+                >
+                  <Search className="w-[21px] h-[21px] stroke-[2]" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMenuOpen((v) => !v)}
+                  aria-label="More options"
+                  className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
+                >
+                  <MoreVertical className="w-[21px] h-[21px] stroke-[2]" />
+                </button>
+              </div>
+            </header>
+          )}
 
           {/* Matched Contact Suggestions + Dial Display */}
           <div className="flex-1 min-h-0 flex flex-col justify-between px-5 overflow-hidden">
@@ -3362,7 +3726,7 @@ export default function SamsungDialerApp() {
                   key={`${m.name}-${m.phone}`}
                   type="button"
                   onClick={() => triggerDialTarget(m.phone, m.name)}
-                  className="w-full py-2 px-1 flex items-center justify-between gap-3 active:bg-black/[0.04] rounded-2xl text-left cursor-pointer"
+                  className="w-full py-2 px-1 flex items-center justify-between gap-3 active:opacity-75 rounded-2xl text-left cursor-pointer"
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div
@@ -3370,11 +3734,11 @@ export default function SamsungDialerApp() {
                     >
                       {getContactInitial(m.name)}
                     </div>
-                    <span className="text-[15.5px] font-semibold text-[#111111] truncate">
+                    <span className="text-[15.5px] font-semibold truncate" style={{ color: activeThemePreset.dialerText }}>
                       {m.name}
                     </span>
                   </div>
-                  <div className="text-[13.5px] text-[#767676] shrink-0 tabular-nums">
+                  <div className="text-[13.5px] shrink-0 tabular-nums" style={{ color: activeThemePreset.dialerMuted }}>
                     <HighlightMatchedDigits value={m.phone} query={dialValue} />
                   </div>
                 </button>
@@ -3383,48 +3747,73 @@ export default function SamsungDialerApp() {
 
             <div className="py-3 flex flex-col items-center justify-center shrink-0">
               <div
-                className={`font-bold text-[#111111] tracking-[0.02em] text-center break-all leading-tight flex items-center justify-center ${dialFontSizeClass}`}
+                style={{ color: activeThemePreset.dialerText }}
+                className={`font-bold tracking-[0.02em] text-center break-all leading-tight flex items-center justify-center ${dialFontSizeClass}`}
               >
                 <span>{dialValue}</span>
                 {dialValue.length > 0 && (
-                  <span className="inline-block w-[2px] h-[34px] bg-[#19b264] ml-0.5 animate-pulse" />
+                  <span
+                    style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                    className="inline-block w-[2px] h-[34px] ml-0.5 animate-pulse"
+                  />
                 )}
               </div>
             </div>
           </div>
 
-          {/* Samsung One UI 3x4 Keypad */}
+          {/* OEM-Adaptive 3x4 Keypad */}
           <div className="w-full max-w-[390px] mx-auto px-6 pb-1 shrink-0">
-            <div className="grid grid-cols-3 gap-x-4 gap-y-0.5">
-              {KEYPAD_ROWS.flat().map((item) => (
-                <button
-                  key={item.digit}
-                  type="button"
-                  onClick={() => handleDigitPress(item.digit)}
-                  className="h-[62px] rounded-full flex flex-col items-center justify-center active:bg-black/[0.06] transition-colors touch-manipulation cursor-pointer"
-                >
-                  <span
-                    className={`font-bold text-[#111111] leading-none ${
-                      item.digit === '*'
-                        ? 'text-[38px] translate-y-1'
-                        : item.digit === '#'
-                          ? 'text-[30px]'
-                          : 'text-[33px]'
-                    }`}
+            <div
+              className={`grid grid-cols-3 ${
+                activeThemePreset.dialerKeyStyle === 'pill' || activeThemePreset.dialerKeyStyle === 'circle'
+                  ? 'gap-x-3 gap-y-2'
+                  : 'gap-x-4 gap-y-0.5'
+              }`}
+            >
+              {KEYPAD_ROWS.flat().map((item) => {
+                const isPill = activeThemePreset.dialerKeyStyle === 'pill';
+                const isCircle = activeThemePreset.dialerKeyStyle === 'circle';
+                return (
+                  <button
+                    key={item.digit}
+                    type="button"
+                    onClick={() => handleDigitPress(item.digit)}
+                    style={{
+                      backgroundColor: isPill || isCircle ? activeThemePreset.dialerSurface : 'transparent',
+                    }}
+                    className={`${
+                      isCircle ? 'w-[74px] h-[60px] mx-auto rounded-full' : isPill ? 'h-[58px] rounded-[29px]' : 'h-[62px] rounded-full'
+                    } flex flex-col items-center justify-center active:opacity-70 transition-all touch-manipulation cursor-pointer`}
                   >
-                    {item.digit}
-                  </span>
-                  {item.sub === 'voicemail' ? (
-                    <Voicemail className="w-[15px] h-[15px] text-[#767676] mt-0.5" />
-                  ) : item.sub ? (
-                    <span className="text-[11px] font-semibold tracking-[0.14em] text-[#767676] mt-0.5">
-                      {item.sub}
+                    <span
+                      style={{ color: activeThemePreset.dialerText }}
+                      className={`font-bold leading-none ${
+                        item.digit === '*'
+                          ? 'text-[38px] translate-y-1'
+                          : item.digit === '#'
+                            ? 'text-[30px]'
+                            : isPill || isCircle
+                              ? 'text-[29px]'
+                              : 'text-[33px]'
+                      }`}
+                    >
+                      {item.digit}
                     </span>
-                  ) : (
-                    <span className="h-[13px]" />
-                  )}
-                </button>
-              ))}
+                    {item.sub === 'voicemail' ? (
+                      <Voicemail className="w-[15px] h-[15px] mt-0.5" style={{ color: activeThemePreset.dialerMuted }} />
+                    ) : item.sub ? (
+                      <span
+                        style={{ color: activeThemePreset.dialerMuted }}
+                        className="text-[11px] font-semibold tracking-[0.14em] mt-0.5"
+                      >
+                        {item.sub}
+                      </span>
+                    ) : (
+                      <span className="h-[13px]" />
+                    )}
+                  </button>
+                );
+              })}
             </div>
 
             {/* Bottom Call Row */}
@@ -3435,7 +3824,8 @@ export default function SamsungDialerApp() {
                     type="button"
                     onClick={handleCallPress}
                     aria-label="Video Call"
-                    className="w-12 h-12 rounded-2xl flex items-center justify-center active:bg-black/[0.05] text-[#19b264] cursor-pointer"
+                    style={{ color: activeThemePreset.answerBtnColor }}
+                    className="w-12 h-12 rounded-2xl flex items-center justify-center active:opacity-75 cursor-pointer"
                   >
                     <Video className="w-6 h-6 stroke-[2]" />
                   </button>
@@ -3447,7 +3837,10 @@ export default function SamsungDialerApp() {
                   type="button"
                   onClick={handleCallPress}
                   aria-label="Call"
-                  className="w-[62px] h-[62px] rounded-full bg-[#19b264] hover:bg-[#17a55c] active:scale-[0.96] text-white flex items-center justify-center shadow-sm transition-transform cursor-pointer"
+                  style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                  className={`${
+                    activeThemePreset.oemFamily === 'pixel' ? 'w-[76px] h-[58px] rounded-[24px]' : 'w-[62px] h-[62px] rounded-full'
+                  } active:scale-[0.96] text-white flex items-center justify-center shadow-sm transition-transform cursor-pointer`}
                 >
                   <Phone className="w-7 h-7 fill-white stroke-white" />
                 </button>
@@ -3470,7 +3863,8 @@ export default function SamsungDialerApp() {
                       if (backspacePressTimerRef.current) clearTimeout(backspacePressTimerRef.current);
                     }}
                     aria-label="Delete"
-                    className="w-12 h-12 rounded-full flex items-center justify-center active:bg-black/[0.06] text-[#767676] cursor-pointer"
+                    style={{ color: activeThemePreset.dialerMuted }}
+                    className="w-12 h-12 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
                   >
                     <Delete className="w-6 h-6 stroke-[2]" />
                   </button>
@@ -3483,15 +3877,17 @@ export default function SamsungDialerApp() {
 
       {/* ==================== TAB 2: RECENTS ==================== */}
       {activeTab === 'recents' && (
-        <div className="flex-1 min-h-0 flex flex-col bg-[#f6f6f6]">
-          {/* Large Samsung One UI Recents Header / Selection Header */}
+        <div className="flex-1 min-h-0 flex flex-col" style={{ backgroundColor: secondarySurfaceBg }}>
+          {/* Large OEM Recents Header / Selection Header */}
           <div className="pt-8 pb-4 px-5 text-center shrink-0">
-            <h1 className="text-[30px] font-normal tracking-tight text-[#111111]">
+            <h1 className="text-[30px] font-normal tracking-tight" style={{ color: activeThemePreset.dialerText }}>
               {selectionMode
                 ? selectedGroupKeys.length > 0
                   ? `${selectedGroupKeys.length} selected`
                   : 'Select items'
-                : 'Phone'}
+                : activeThemePreset.dialerHeaderTitle === 'Search contacts'
+                  ? 'Recents'
+                  : activeThemePreset.dialerHeaderTitle || 'Phone'}
             </h1>
           </div>
 
@@ -3510,25 +3906,31 @@ export default function SamsungDialerApp() {
                 className="flex flex-col items-center gap-0.5 cursor-pointer"
               >
                 <div
-                  className={`w-5 h-5 rounded-full border flex items-center justify-center ${
-                    groupedRecents.length > 0 && selectedGroupKeys.length === groupedRecents.length
-                      ? 'bg-[#19b264] border-[#19b264] text-white'
-                      : 'border-slate-400 bg-white'
-                  }`}
+                  style={{
+                    backgroundColor:
+                      groupedRecents.length > 0 && selectedGroupKeys.length === groupedRecents.length
+                        ? activeThemePreset.answerBtnColor
+                        : activeThemePreset.dialerSurface,
+                    borderColor:
+                      groupedRecents.length > 0 && selectedGroupKeys.length === groupedRecents.length
+                        ? activeThemePreset.answerBtnColor
+                        : activeThemePreset.dialerMuted,
+                  }}
+                  className="w-5 h-5 rounded-full border flex items-center justify-center text-white"
                 >
                   {groupedRecents.length > 0 && selectedGroupKeys.length === groupedRecents.length && (
                     <Check className="w-3.5 h-3.5 stroke-[3]" />
                   )}
                 </div>
-                <span className="text-[11px] font-semibold text-[#111111]">All</span>
+                <span className="text-[11px] font-semibold" style={{ color: activeThemePreset.dialerText }}>All</span>
               </button>
             ) : (
-              <div className="text-[12px] font-semibold text-[#767676]">
+              <div className="text-[12px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>
                 {recentFilter !== 'all' ? `Filter: ${recentFilter}` : ''}
               </div>
             )}
 
-            <div className="flex items-center gap-3 text-[#111111]">
+            <div className="flex items-center gap-3" style={{ color: activeThemePreset.dialerText }}>
               {!selectionMode && (
                 <button
                   type="button"
@@ -3537,7 +3939,7 @@ export default function SamsungDialerApp() {
                     setFilterModalOpen(true);
                   }}
                   aria-label="Filter calls"
-                  className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                  className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
                 >
                   <ListFilter className="w-[21px] h-[21px]" />
                 </button>
@@ -3546,7 +3948,7 @@ export default function SamsungDialerApp() {
                 type="button"
                 onClick={() => setActiveDrawer('search')}
                 aria-label="Search recents"
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
               >
                 <Search className="w-[21px] h-[21px]" />
               </button>
@@ -3555,7 +3957,7 @@ export default function SamsungDialerApp() {
                   type="button"
                   onClick={() => setMenuOpen((v) => !v)}
                   aria-label="More options"
-                  className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                  className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
                 >
                   <MoreVertical className="w-[21px] h-[21px]" />
                 </button>
@@ -3566,7 +3968,8 @@ export default function SamsungDialerApp() {
                     setSelectionMode(false);
                     setSelectedGroupKeys([]);
                   }}
-                  className="text-xs font-bold text-[#767676] px-2.5 py-1.5 rounded-xl bg-black/5 cursor-pointer"
+                  style={{ color: activeThemePreset.dialerMuted, backgroundColor: activeThemePreset.dialerSurface }}
+                  className="text-xs font-bold px-2.5 py-1.5 rounded-xl cursor-pointer"
                 >
                   Cancel
                 </button>
@@ -3575,14 +3978,21 @@ export default function SamsungDialerApp() {
           </div>
 
           {!permStatus.hasReadCallLog && Boolean(getDialerBridge()?.requestDialerPermissions) && (
-            <div className="mx-3 mb-2 bg-white border border-black/10 rounded-2xl px-4 py-3 flex items-center justify-between gap-2 shrink-0">
-              <span className="text-xs text-slate-600">
+            <div
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+              }}
+              className="mx-3 mb-2 border rounded-2xl px-4 py-3 flex items-center justify-between gap-2 shrink-0"
+            >
+              <span className="text-xs" style={{ color: activeThemePreset.dialerMuted }}>
                 Allow Call log permission to view full phone call history
               </span>
               <button
                 type="button"
                 onClick={() => getDialerBridge()?.requestDialerPermissions?.()}
-                className="text-xs font-bold text-[#19b264] shrink-0 cursor-pointer"
+                style={{ color: activeThemePreset.answerBtnColor }}
+                className="text-xs font-bold shrink-0 cursor-pointer"
               >
                 Allow
               </button>
@@ -3592,20 +4002,29 @@ export default function SamsungDialerApp() {
           {/* Call Log List */}
           <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 space-y-4">
             {recentDateSections.length === 0 ? (
-              <div className="py-20 text-center text-sm text-[#767676]">
+              <div className="py-20 text-center text-sm" style={{ color: activeThemePreset.dialerMuted }}>
                 No calls found
               </div>
             ) : (
               recentDateSections.map(([dateLabel, items]) => (
                 <div key={dateLabel} className="space-y-1.5">
-                  <div className="px-3 text-[13px] font-semibold text-[#767676]">{dateLabel}</div>
-                  <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] divide-y divide-slate-100">
+                  <div className="px-3 text-[13px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>
+                    {dateLabel}
+                  </div>
+                  <div
+                    style={{
+                      backgroundColor: activeThemePreset.dialerSurface,
+                      borderColor: activeThemePreset.dialerBorder,
+                    }}
+                    className="rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] divide-y divide-black/[0.06] border"
+                  >
                     {items.map((grp) => (
                       <SwipeRecentRow
                         key={grp.key}
                         group={grp}
                         selectionMode={selectionMode}
                         selected={selectedGroupKeys.includes(grp.key)}
+                        themePreset={activeThemePreset}
                         onToggleSelect={() => {
                           setSelectedGroupKeys((prev) =>
                             prev.includes(grp.key)
@@ -3628,12 +4047,19 @@ export default function SamsungDialerApp() {
           </div>
 
           {selectionMode && (
-            <div className="bg-[#fcfcfc] border-t border-black/5 py-3 flex items-center justify-center shrink-0">
+            <div
+              style={{
+                backgroundColor: activeThemePreset.dialerBg,
+                borderColor: activeThemePreset.dialerBorder,
+                color: activeThemePreset.dialerText,
+              }}
+              className="border-t py-3 flex items-center justify-center shrink-0"
+            >
               <button
                 type="button"
                 disabled={selectedGroupKeys.length === 0}
                 onClick={handleDeleteSelectedRecents}
-                className="flex flex-col items-center gap-0.5 text-[#111111] disabled:opacity-35 cursor-pointer"
+                className="flex flex-col items-center gap-0.5 disabled:opacity-35 cursor-pointer"
               >
                 <Trash2 className="w-5 h-5" />
                 <span className="text-[11px] font-medium">Delete</span>
@@ -3645,15 +4071,19 @@ export default function SamsungDialerApp() {
 
       {/* ==================== TAB 3: CONTACTS ==================== */}
       {activeTab === 'contacts' && (
-        <div className="flex-1 min-h-0 flex flex-col bg-[#f6f6f6]">
+        <div className="flex-1 min-h-0 flex flex-col" style={{ backgroundColor: secondarySurfaceBg }}>
           <div className="pt-8 pb-3 px-5 text-center shrink-0">
-            <h1 className="text-[30px] font-normal tracking-tight text-[#111111]">Phone</h1>
-            <p className="text-[13px] font-medium text-[#767676] mt-0.5">
+            <h1 className="text-[30px] font-normal tracking-tight" style={{ color: activeThemePreset.dialerText }}>
+              {activeThemePreset.dialerHeaderTitle === 'Search contacts'
+                ? 'Contacts'
+                : activeThemePreset.dialerHeaderTitle || 'Phone'}
+            </h1>
+            <p className="text-[13px] font-medium mt-0.5" style={{ color: activeThemePreset.dialerMuted }}>
               {allContacts.length} contacts with phone numbers
             </p>
           </div>
 
-          <div className="flex items-center justify-end gap-3 px-5 pb-2 shrink-0 text-[#111111]">
+          <div className="flex items-center justify-end gap-3 px-5 pb-2 shrink-0" style={{ color: activeThemePreset.dialerText }}>
             <button
               type="button"
               onClick={() => {
@@ -3661,7 +4091,7 @@ export default function SamsungDialerApp() {
                 setAddContactName('');
               }}
               aria-label="Add Contact"
-              className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
             >
               <Plus className="w-[22px] h-[22px]" />
             </button>
@@ -3669,7 +4099,7 @@ export default function SamsungDialerApp() {
               type="button"
               onClick={() => setActiveDrawer('search')}
               aria-label="Search Contacts"
-              className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
             >
               <Search className="w-[21px] h-[21px]" />
             </button>
@@ -3677,21 +4107,28 @@ export default function SamsungDialerApp() {
               type="button"
               onClick={() => setMenuOpen((v) => !v)}
               aria-label="More options"
-              className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+              className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 cursor-pointer"
             >
               <MoreVertical className="w-[21px] h-[21px]" />
             </button>
           </div>
 
           {!permStatus.hasReadContacts && Boolean(getDialerBridge()?.requestDialerPermissions) && (
-            <div className="mx-3 mb-2 bg-white border border-black/10 rounded-2xl px-4 py-3 flex items-center justify-between gap-2 shrink-0">
-              <span className="text-xs text-slate-600">
+            <div
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+              }}
+              className="mx-3 mb-2 border rounded-2xl px-4 py-3 flex items-center justify-between gap-2 shrink-0"
+            >
+              <span className="text-xs" style={{ color: activeThemePreset.dialerMuted }}>
                 Allow Contacts permission to display all phone contacts
               </span>
               <button
                 type="button"
                 onClick={() => getDialerBridge()?.requestDialerPermissions?.()}
-                className="text-xs font-bold text-[#19b264] shrink-0 cursor-pointer"
+                style={{ color: activeThemePreset.answerBtnColor }}
+                className="text-xs font-bold shrink-0 cursor-pointer"
               >
                 Allow
               </button>
@@ -3699,27 +4136,37 @@ export default function SamsungDialerApp() {
           )}
 
           <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 space-y-2.5">
-            {/* Profile Row (Stock One UI My Profile) */}
+            {/* Profile Row */}
             <button
               type="button"
               onClick={() => setActiveDrawer('profile')}
-              className="w-full bg-white rounded-[24px] px-4 py-3.5 flex items-center gap-3.5 shadow-[0_1px_3px_rgba(0,0,0,0.04)] text-left cursor-pointer"
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+              }}
+              className="w-full rounded-[24px] px-4 py-3.5 flex items-center gap-3.5 shadow-[0_1px_3px_rgba(0,0,0,0.04)] border text-left cursor-pointer"
             >
               <div className="w-9 h-9 rounded-full bg-[#ff9b7d] text-white flex items-center justify-center shrink-0">
                 <User className="w-5 h-5" />
               </div>
               <div className="min-w-0">
-                <div className="text-[15.5px] font-medium text-[#111111] truncate">
+                <div className="text-[15.5px] font-medium truncate" style={{ color: activeThemePreset.dialerText }}>
                   {(userName && userName !== 'CBEBirr Customer' ? userName : phoneNumber) || 'My profile'}
                 </div>
                 {phoneNumber && (
-                  <div className="text-[11.5px] text-[#767676] truncate">{phoneNumber}</div>
+                  <div className="text-[11.5px] truncate" style={{ color: activeThemePreset.dialerMuted }}>{phoneNumber}</div>
                 )}
               </div>
             </button>
 
             {/* Favorites Row */}
-            <div className="bg-white rounded-[24px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+            <div
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+              }}
+              className="rounded-[24px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] border"
+            >
               <button
                 type="button"
                 onClick={() => setFavoritesExpanded((v) => !v)}
@@ -3728,14 +4175,14 @@ export default function SamsungDialerApp() {
                 <div className="w-9 h-9 rounded-full bg-[#fcc145] text-white flex items-center justify-center shrink-0">
                   <Star className="w-5 h-5 fill-white stroke-white" />
                 </div>
-                <span className="text-[15.5px] font-medium text-[#111111]">
+                <span className="text-[15.5px] font-medium" style={{ color: activeThemePreset.dialerText }}>
                   {allContacts.some((c) => c.starred) ? 'Favorite contacts' : 'Add your favorite contacts'}
                 </span>
               </button>
               {favoritesExpanded && (
-                <div className="border-t border-slate-100 divide-y divide-slate-100 px-2">
+                <div className="border-t divide-y px-2" style={{ borderColor: activeThemePreset.dialerBorder }}>
                   {allContacts.filter((c) => c.starred).length === 0 ? (
-                    <div className="px-3 py-3 text-xs text-[#767676]">No favorite contacts yet</div>
+                    <div className="px-3 py-3 text-xs" style={{ color: activeThemePreset.dialerMuted }}>No favorite contacts yet</div>
                   ) : (
                     allContacts
                       .filter((c) => c.starred)
@@ -3746,8 +4193,8 @@ export default function SamsungDialerApp() {
                           onClick={() => setSelectedContactModal(fc)}
                           className="w-full px-3 py-2.5 flex items-center justify-between text-left cursor-pointer"
                         >
-                          <span className="text-sm font-medium text-[#111111]">{fc.name}</span>
-                          <span className="text-xs text-[#767676]">{fc.phone}</span>
+                          <span className="text-sm font-medium" style={{ color: activeThemePreset.dialerText }}>{fc.name}</span>
+                          <span className="text-xs" style={{ color: activeThemePreset.dialerMuted }}>{fc.phone}</span>
                         </button>
                       ))
                   )}
@@ -3756,7 +4203,13 @@ export default function SamsungDialerApp() {
             </div>
 
             {/* Groups Row */}
-            <div className="bg-white rounded-[24px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+            <div
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+              }}
+              className="rounded-[24px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] border"
+            >
               <button
                 type="button"
                 onClick={() => setGroupsExpanded((v) => !v)}
@@ -3765,23 +4218,23 @@ export default function SamsungDialerApp() {
                 <div className="w-9 h-9 rounded-full bg-[#bdbdbd] text-white flex items-center justify-center shrink-0">
                   <Users className="w-5 h-5" />
                 </div>
-                <span className="text-[15.5px] font-medium text-[#111111]">Groups</span>
+                <span className="text-[15.5px] font-medium" style={{ color: activeThemePreset.dialerText }}>Groups</span>
               </button>
               {groupsExpanded && (
-                <div className="border-t border-slate-100 px-4 py-3 space-y-2 text-xs text-slate-600">
+                <div className="border-t px-4 py-3 space-y-2 text-xs" style={{ borderColor: activeThemePreset.dialerBorder, color: activeThemePreset.dialerMuted }}>
                   <div className="flex justify-between">
                     <span>Starred in Android</span>
-                    <span className="font-bold text-[#111111]">
+                    <span className="font-bold" style={{ color: activeThemePreset.dialerText }}>
                       {allContacts.filter((c) => c.starred).length}
                     </span>
                   </div>
                   <div className="flex justify-between">
                     <span>Phone contacts</span>
-                    <span className="font-bold text-[#111111]">{allContacts.length}</span>
+                    <span className="font-bold" style={{ color: activeThemePreset.dialerText }}>{allContacts.length}</span>
                   </div>
                   <div className="flex justify-between">
                     <span>Emergency contacts</span>
-                    <span className="font-bold text-[#111111]">0</span>
+                    <span className="font-bold" style={{ color: activeThemePreset.dialerText }}>0</span>
                   </div>
                 </div>
               )}
@@ -3790,14 +4243,20 @@ export default function SamsungDialerApp() {
             {/* Alphabetical Contact Cards */}
             {groupedContacts.map((grp) => (
               <div key={grp.section} className="space-y-1 pt-1">
-                <div className="px-3 text-[12.5px] font-semibold text-[#767676]">{grp.section}</div>
-                <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] divide-y divide-slate-100">
+                <div className="px-3 text-[12.5px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>{grp.section}</div>
+                <div
+                  style={{
+                    backgroundColor: activeThemePreset.dialerSurface,
+                    borderColor: activeThemePreset.dialerBorder,
+                  }}
+                  className="rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)] border divide-y divide-black/[0.06]"
+                >
                   {grp.items.map((c, i) => (
                     <button
                       key={`${c.name}-${c.phone}-${i}`}
                       type="button"
                       onClick={() => setSelectedContactModal(c)}
-                      className="w-full px-4 py-3 flex items-center gap-3.5 active:bg-black/[0.04] text-left cursor-pointer"
+                      className="w-full px-4 py-3 flex items-center gap-3.5 active:opacity-75 text-left cursor-pointer"
                     >
                       <div
                         className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 font-bold text-sm ${pickAvatarColor(c.name)}`}
@@ -3805,11 +4264,11 @@ export default function SamsungDialerApp() {
                         {getContactInitial(c.name)}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className="text-[15px] font-medium text-[#111111] truncate">
+                        <div className="text-[15px] font-medium truncate" style={{ color: activeThemePreset.dialerText }}>
                           {c.name}
                         </div>
                         {c.phone !== c.name && (
-                          <div className="text-[11.5px] text-[#767676] truncate">{c.phone}</div>
+                          <div className="text-[11.5px] truncate" style={{ color: activeThemePreset.dialerMuted }}>{c.phone}</div>
                         )}
                       </div>
                     </button>
@@ -3821,17 +4280,79 @@ export default function SamsungDialerApp() {
         </div>
       )}
 
-      {/* ==================== BOTTOM SAMSUNG NAV BAR ==================== */}
+      {/* ==================== BOTTOM OEM-ADAPTIVE NAV BAR ==================== */}
       {!selectionMode && (
-        <nav className="bg-[#fcfcfc] border-t border-black/[0.05] px-6 py-2.5 shrink-0 flex items-center justify-around">
+        <nav
+          style={{
+            backgroundColor: activeThemePreset.dialerBg,
+            borderColor: activeThemePreset.dialerBorder,
+          }}
+          className="border-t px-4 py-2 shrink-0 flex items-center justify-around"
+        >
           {(
             [
-              { id: 'keypad', label: 'Keypad' },
-              { id: 'recents', label: 'Recents' },
-              { id: 'contacts', label: 'Contacts' },
-            ] as { id: MainPhoneTab; label: string }[]
+              { id: 'keypad', label: 'Keypad', icon: Phone },
+              { id: 'recents', label: 'Recents', icon: Clock },
+              { id: 'contacts', label: 'Contacts', icon: Users },
+            ] as { id: MainPhoneTab; label: string; icon: React.ComponentType<{ className?: string }> }[]
           ).map((tab) => {
             const active = activeTab === tab.id;
+            const TabIcon = tab.icon;
+
+            if (activeThemePreset.dialerNavStyle === 'pill_icons') {
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setActiveTab(tab.id);
+                  }}
+                  className="px-3 py-1 flex flex-col items-center gap-0.5 cursor-pointer"
+                >
+                  <div
+                    style={{
+                      backgroundColor: active ? `${activeThemePreset.accentColor}26` : 'transparent',
+                      color: active ? activeThemePreset.accentColor : activeThemePreset.dialerMuted,
+                    }}
+                    className="px-4 py-1 rounded-full flex items-center justify-center transition-colors"
+                  >
+                    <TabIcon className="w-[18px] h-[18px]" />
+                  </div>
+                  <span
+                    style={{
+                      color: active ? activeThemePreset.dialerText : activeThemePreset.dialerMuted,
+                    }}
+                    className={`text-[11.5px] ${active ? 'font-bold' : 'font-medium'}`}
+                  >
+                    {tab.label}
+                  </span>
+                </button>
+              );
+            }
+
+            if (activeThemePreset.dialerNavStyle === 'classic_icons') {
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setActiveTab(tab.id);
+                  }}
+                  style={{
+                    color: active ? activeThemePreset.accentColor : activeThemePreset.dialerMuted,
+                  }}
+                  className="px-4 py-1 flex flex-col items-center gap-0.5 cursor-pointer"
+                >
+                  <TabIcon className="w-[18px] h-[18px]" />
+                  <span className={`text-[11.5px] ${active ? 'font-bold' : 'font-medium'}`}>
+                    {tab.label}
+                  </span>
+                </button>
+              );
+            }
+
             return (
               <button
                 key={tab.id}
@@ -3843,15 +4364,19 @@ export default function SamsungDialerApp() {
                 className="px-4 py-1 flex flex-col items-center cursor-pointer"
               >
                 <span
+                  style={{
+                    color: active ? activeThemePreset.dialerText : activeThemePreset.dialerMuted,
+                  }}
                   className={`text-[14px] tracking-tight ${
-                    active ? 'font-bold text-[#111111]' : 'font-semibold text-[#767676]'
+                    active ? 'font-bold' : 'font-semibold'
                   }`}
                 >
                   {tab.label}
                 </span>
                 <span
+                  style={{ backgroundColor: activeThemePreset.dialerText }}
                   className={`mt-0.5 h-[2px] w-full rounded-full transition-opacity ${
-                    active ? 'bg-[#111111] opacity-100' : 'opacity-0'
+                    active ? 'opacity-100' : 'opacity-0'
                   }`}
                 />
               </button>
@@ -3860,7 +4385,7 @@ export default function SamsungDialerApp() {
         </nav>
       )}
 
-      {/* ==================== OVERFLOW POPUP MENU (Matches 192306 & 192247) ==================== */}
+      {/* ==================== OVERFLOW POPUP MENU ==================== */}
       <AnimatePresence>
         {menuOpen && (
           <>
@@ -3870,7 +4395,12 @@ export default function SamsungDialerApp() {
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.94, y: -6 }}
               transition={{ duration: 0.14 }}
-              className="fixed right-4 top-14 z-30 w-56 bg-white rounded-[24px] shadow-xl border border-black/10 py-2 overflow-hidden"
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                borderColor: activeThemePreset.dialerBorder,
+                color: activeThemePreset.dialerText,
+              }}
+              className="fixed right-4 top-14 z-30 w-56 rounded-[24px] shadow-xl border py-2 overflow-hidden"
             >
               {activeTab === 'recents' && (
                 <button
@@ -3880,7 +4410,7 @@ export default function SamsungDialerApp() {
                     setSelectionMode(true);
                     setSelectedGroupKeys([]);
                   }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:opacity-80 cursor-pointer"
                 >
                   Delete
                 </button>
@@ -3892,7 +4422,7 @@ export default function SamsungDialerApp() {
                     setMenuOpen(false);
                     setActiveDrawer('search');
                   }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
+                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:opacity-80 cursor-pointer"
                 >
                   Manage contacts
                 </button>
@@ -3903,7 +4433,7 @@ export default function SamsungDialerApp() {
                   setMenuOpen(false);
                   setActiveDrawer('speed_dial');
                 }}
-                className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
+                className="w-full px-5 py-3 text-left text-[15px] font-medium hover:opacity-80 cursor-pointer"
               >
                 Speed dial numbers
               </button>
@@ -3913,7 +4443,7 @@ export default function SamsungDialerApp() {
                   setMenuOpen(false);
                   setActiveDrawer('voicemail');
                 }}
-                className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
+                className="w-full px-5 py-3 text-left text-[15px] font-medium hover:opacity-80 cursor-pointer"
               >
                 Voicemail
               </button>
@@ -3923,7 +4453,7 @@ export default function SamsungDialerApp() {
                   setMenuOpen(false);
                   setActiveDrawer('settings');
                 }}
-                className="w-full px-5 py-3 text-left text-[15px] font-medium text-[#111111] hover:bg-black/[0.04] cursor-pointer"
+                className="w-full px-5 py-3 text-left text-[15px] font-medium hover:opacity-80 cursor-pointer"
               >
                 Settings
               </button>
@@ -3932,7 +4462,7 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== RECENTS FILTER MODAL (Screenshot 192433) ==================== */}
+      {/* ==================== RECENTS FILTER MODAL ==================== */}
       <AnimatePresence>
         {filterModalOpen && (
           <motion.div
@@ -3940,16 +4470,20 @@ export default function SamsungDialerApp() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={() => setFilterModalOpen(false)}
-            className="fixed inset-0 z-40 bg-black/30 flex items-end justify-center px-3 pb-4"
+            className="fixed inset-0 z-40 bg-black/35 flex items-end justify-center px-3 pb-4"
           >
             <motion.div
               initial={{ opacity: 0, y: 24 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 24 }}
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[390px] bg-white rounded-[28px] px-6 pt-6 pb-4 shadow-2xl"
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                color: activeThemePreset.dialerText,
+              }}
+              className="w-full max-w-[390px] rounded-[28px] px-6 pt-6 pb-4 shadow-2xl"
             >
-              <div className="text-[17px] font-bold text-[#111111] mb-4">Filter calls</div>
+              <div className="text-[17px] font-bold mb-4">Filter calls</div>
               <div className="space-y-4">
                 {(
                   [
@@ -3969,13 +4503,19 @@ export default function SamsungDialerApp() {
                       className="w-full flex items-center gap-4 py-0.5 text-left cursor-pointer"
                     >
                       <span
-                        className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
-                          chosen ? 'border-[#19b264]' : 'border-slate-400'
-                        }`}
+                        style={{
+                          borderColor: chosen ? activeThemePreset.answerBtnColor : activeThemePreset.dialerMuted,
+                        }}
+                        className="w-5 h-5 rounded-full border-2 flex items-center justify-center"
                       >
-                        {chosen && <span className="w-2.5 h-2.5 rounded-full bg-[#19b264]" />}
+                        {chosen && (
+                          <span
+                            style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                            className="w-2.5 h-2.5 rounded-full"
+                          />
+                        )}
                       </span>
-                      <span className="text-[15.5px] font-medium text-[#111111]">{opt.label}</span>
+                      <span className="text-[15.5px] font-medium">{opt.label}</span>
                     </button>
                   );
                 })}
@@ -3985,18 +4525,18 @@ export default function SamsungDialerApp() {
                 <button
                   type="button"
                   onClick={() => setFilterModalOpen(false)}
-                  className="py-3 text-[16px] font-bold text-[#111111] cursor-pointer"
+                  className="py-3 text-[16px] font-bold cursor-pointer"
                 >
                   Cancel
                 </button>
-                <div className="w-px h-5 bg-slate-200" />
+                <div className="w-px h-5" style={{ backgroundColor: activeThemePreset.dialerBorder }} />
                 <button
                   type="button"
                   onClick={() => {
                     setRecentFilter(filterDraft);
                     setFilterModalOpen(false);
                   }}
-                  className="py-3 text-[16px] font-bold text-[#111111] cursor-pointer"
+                  className="py-3 text-[16px] font-bold cursor-pointer"
                 >
                   OK
                 </button>
@@ -4014,14 +4554,18 @@ export default function SamsungDialerApp() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={() => setSelectedContactModal(null)}
-            className="fixed inset-0 z-40 bg-black/30 flex items-end justify-center px-3 pb-4"
+            className="fixed inset-0 z-40 bg-black/35 flex items-end justify-center px-3 pb-4"
           >
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 20 }}
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[390px] bg-white rounded-[28px] p-6 shadow-2xl space-y-5"
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                color: activeThemePreset.dialerText,
+              }}
+              className="w-full max-w-[390px] rounded-[28px] p-6 shadow-2xl space-y-5"
             >
               <div className="flex items-center gap-3.5">
                 <div
@@ -4030,10 +4574,10 @@ export default function SamsungDialerApp() {
                   {getContactInitial(selectedContactModal.name)}
                 </div>
                 <div className="min-w-0">
-                  <div className="text-[18px] font-bold text-[#111111] truncate">
+                  <div className="text-[18px] font-bold truncate" style={{ color: activeThemePreset.dialerText }}>
                     {selectedContactModal.name}
                   </div>
-                  <div className="text-[13.5px] text-[#767676]">{selectedContactModal.phone}</div>
+                  <div className="text-[13.5px]" style={{ color: activeThemePreset.dialerMuted }}>{selectedContactModal.phone}</div>
                 </div>
               </div>
 
@@ -4045,7 +4589,8 @@ export default function SamsungDialerApp() {
                     setSelectedContactModal(null);
                     triggerDialTarget(c.phone, c.name);
                   }}
-                  className="py-3 rounded-2xl bg-[#19b264] text-white text-xs font-bold flex flex-col items-center gap-1 cursor-pointer"
+                  style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                  className="py-3 rounded-2xl text-white text-xs font-bold flex flex-col items-center gap-1 cursor-pointer"
                 >
                   <Phone className="w-4 h-4 fill-white stroke-white" />
                   <span>Call</span>
@@ -4069,9 +4614,13 @@ export default function SamsungDialerApp() {
                     setSelectedContactModal(null);
                     triggerDialTarget(c.phone, c.name);
                   }}
-                  className="py-3 rounded-2xl bg-slate-100 text-[#111111] text-xs font-bold flex flex-col items-center gap-1 cursor-pointer"
+                  style={{
+                    backgroundColor: activeThemePreset.dialerBg,
+                    color: activeThemePreset.dialerText,
+                  }}
+                  className="py-3 rounded-2xl text-xs font-bold flex flex-col items-center gap-1 cursor-pointer"
                 >
-                  <Video className="w-4 h-4 text-[#19b264]" />
+                  <Video className="w-4 h-4" style={{ color: activeThemePreset.answerBtnColor }} />
                   <span>Video call</span>
                 </button>
               </div>
@@ -4088,42 +4637,61 @@ export default function SamsungDialerApp() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={() => setAddContactPhone(null)}
-            className="fixed inset-0 z-50 bg-black/30 flex items-end justify-center px-3 pb-4"
+            className="fixed inset-0 z-50 bg-black/35 flex items-end justify-center px-3 pb-4"
           >
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 20 }}
               onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-[390px] bg-white rounded-[28px] p-6 shadow-2xl space-y-4"
+              style={{
+                backgroundColor: activeThemePreset.dialerSurface,
+                color: activeThemePreset.dialerText,
+              }}
+              className="w-full max-w-[390px] rounded-[28px] p-6 shadow-2xl space-y-4"
             >
-              <div className="text-[17px] font-bold text-[#111111]">Add to Contacts</div>
+              <div className="text-[17px] font-bold">Add to Contacts</div>
               <input
                 type="text"
                 value={addContactName}
                 onChange={(e) => setAddContactName(e.target.value)}
                 placeholder="Contact Name"
-                className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-none focus:border-[#19b264]"
+                style={{
+                  backgroundColor: activeThemePreset.dialerBg,
+                  borderColor: activeThemePreset.dialerBorder,
+                  color: activeThemePreset.dialerText,
+                }}
+                className="w-full px-3.5 py-2.5 rounded-xl border text-sm outline-none"
               />
               <input
                 type="tel"
                 value={addContactPhone}
                 onChange={(e) => setAddContactPhone(e.target.value)}
                 placeholder="Phone Number"
-                className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-none focus:border-[#19b264]"
+                style={{
+                  backgroundColor: activeThemePreset.dialerBg,
+                  borderColor: activeThemePreset.dialerBorder,
+                  color: activeThemePreset.dialerText,
+                }}
+                className="w-full px-3.5 py-2.5 rounded-xl border text-sm outline-none"
               />
               <div className="grid grid-cols-2 gap-3 pt-1">
                 <button
                   type="button"
                   onClick={() => setAddContactPhone(null)}
-                  className="py-2.5 rounded-xl bg-slate-100 text-[#111111] text-sm font-bold cursor-pointer"
+                  style={{
+                    backgroundColor: activeThemePreset.dialerBg,
+                    color: activeThemePreset.dialerText,
+                  }}
+                  className="py-2.5 rounded-xl text-sm font-bold cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={handleSaveCustomContact}
-                  className="py-2.5 rounded-xl bg-[#19b264] text-white text-sm font-bold cursor-pointer"
+                  style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                  className="py-2.5 rounded-xl text-white text-sm font-bold cursor-pointer"
                 >
                   Save
                 </button>
@@ -4230,42 +4798,45 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== CALL SETTINGS (Matches Screenshot 192312) ==================== */}
+      {/* ==================== CALL SETTINGS ==================== */}
       <AnimatePresence>
         {activeDrawer === 'settings' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('none')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">Call settings</h2>
+              <h2 className="text-[20px] font-bold">Call settings</h2>
             </div>
 
             <div className="flex-1 overflow-y-auto px-3 pb-8 space-y-3 max-w-md w-full mx-auto">
               {/* Group 1: Block numbers & Caller ID */}
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <button
                   type="button"
                   onClick={() => setActiveDrawer('block_list')}
                   className="w-full px-5 py-4 flex items-center justify-between text-left cursor-pointer"
                 >
-                  <span className="text-[16px] font-medium text-[#111111]">Block numbers</span>
-                  <span className="text-xs text-[#767676]">{blockedNumbers.length}</span>
+                  <span className="text-[16px] font-medium">Block numbers</span>
+                  <span className="text-xs" style={{ color: activeThemePreset.dialerMuted }}>{blockedNumbers.length}</span>
                 </button>
                 <div className="px-5 py-4 flex items-center justify-between">
                   <span
-                    className={`text-[16px] font-medium ${
-                      callerIdProtection ? 'text-[#111111]' : 'text-[#8e8e8e]'
-                    }`}
+                    style={{ color: callerIdProtection ? activeThemePreset.dialerText : activeThemePreset.dialerMuted }}
+                    className="text-[16px] font-medium"
                   >
                     Caller ID and spam protection
                   </span>
@@ -4278,9 +4849,8 @@ export default function SamsungDialerApp() {
                         localStorage.setItem(DIALER_CALLER_ID_KEY, String(next));
                       } catch {}
                     }}
-                    className={`w-11 h-6 rounded-full p-0.5 transition-colors cursor-pointer ${
-                      callerIdProtection ? 'bg-[#19b264]' : 'bg-slate-300'
-                    }`}
+                    style={{ backgroundColor: callerIdProtection ? activeThemePreset.answerBtnColor : '#94a3b8' }}
+                    className="w-11 h-6 rounded-full p-0.5 transition-colors cursor-pointer"
                   >
                     <div
                       className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
@@ -4292,8 +4862,11 @@ export default function SamsungDialerApp() {
               </div>
 
               {/* Group 2: Call options */}
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-                <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">Call background</div>
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
+                <div className="px-5 py-4 text-[16px] font-medium">Call background</div>
                 <button
                   type="button"
                   onClick={() => {
@@ -4305,67 +4878,79 @@ export default function SamsungDialerApp() {
                   }}
                   className="w-full px-5 py-4 flex items-center justify-between text-left cursor-pointer"
                 >
-                  <span className="text-[16px] font-medium text-[#111111]">Call alerts and ringtone</span>
-                  <span className="text-xs font-semibold text-[#19b264]">
+                  <span className="text-[16px] font-medium">Call alerts and ringtone</span>
+                  <span className="text-xs font-semibold" style={{ color: activeThemePreset.answerBtnColor }}>
                     Tones {keypadSoundOn ? 'On' : 'Off'}
                   </span>
                 </button>
-                <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">
+                <div className="px-5 py-4 text-[16px] font-medium">
                   Answering and ending calls
                 </div>
-                <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">
+                <div className="px-5 py-4 text-[16px] font-medium">
                   Quick decline messages
                 </div>
                 <div className="px-5 py-3.5">
-                  <div className="text-[16px] font-medium text-[#111111]">
+                  <div className="text-[16px] font-medium">
                     Call display while using apps
                   </div>
-                  <div className="text-[13px] font-medium text-[#19b264]">Mini pop-up</div>
+                  <div className="text-[13px] font-medium" style={{ color: activeThemePreset.answerBtnColor }}>Mini pop-up</div>
                 </div>
               </div>
 
               {/* Group 3: Voicemail */}
-              <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <button
                   type="button"
                   onClick={() => setActiveDrawer('voicemail')}
-                  className="w-full px-5 py-4 text-left text-[16px] font-medium text-[#111111] cursor-pointer"
+                  className="w-full px-5 py-4 text-left text-[16px] font-medium cursor-pointer"
                 >
                   Voicemail
                 </button>
               </div>
 
               {/* Group 4: Supplementary / Other */}
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-                <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
+                <div className="px-5 py-4 text-[16px] font-medium">
                   Supplementary services
                 </div>
-                <div className="px-5 py-4 text-[16px] font-medium text-[#111111]">
+                <div className="px-5 py-4 text-[16px] font-medium">
                   Other call settings
                 </div>
               </div>
 
               {/* Privacy -> Permissions */}
               <div className="pt-1">
-                <div className="px-4 pb-1.5 text-[13px] font-semibold text-[#767676]">Privacy</div>
-                <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <div className="px-4 pb-1.5 text-[13px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>Privacy</div>
+                <div
+                  style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                  className="rounded-[26px] overflow-hidden border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+                >
                   <button
                     type="button"
                     onClick={() => setActiveDrawer('permissions')}
                     className="w-full px-5 py-4 flex items-center justify-between text-left cursor-pointer"
                   >
-                    <span className="text-[16px] font-medium text-[#111111]">Permissions</span>
-                    <ChevronRight className="w-4 h-4 text-slate-400" />
+                    <span className="text-[16px] font-medium">Permissions</span>
+                    <ChevronRight className="w-4 h-4 opacity-50" />
                   </button>
                 </div>
               </div>
 
               {/* About Phone */}
-              <div className="bg-white rounded-[26px] overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <button
                   type="button"
                   onClick={() => setActiveDrawer('about_phone')}
-                  className="w-full px-5 py-4 text-left text-[16px] font-medium text-[#111111] cursor-pointer"
+                  className="w-full px-5 py-4 text-left text-[16px] font-medium cursor-pointer"
                 >
                   About Phone
                 </button>
@@ -4382,17 +4967,18 @@ export default function SamsungDialerApp() {
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('settings')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">Block numbers</h2>
+              <h2 className="text-[20px] font-bold">Block numbers</h2>
             </div>
 
             <div className="px-4 pb-3 flex gap-2 max-w-md w-full mx-auto">
@@ -4401,7 +4987,12 @@ export default function SamsungDialerApp() {
                 value={newBlockInput}
                 onChange={(e) => setNewBlockInput(e.target.value)}
                 placeholder="Add phone number"
-                className="flex-1 bg-white border border-slate-200 rounded-2xl px-4 py-2.5 text-sm outline-none"
+                style={{
+                  backgroundColor: activeThemePreset.dialerSurface,
+                  borderColor: activeThemePreset.dialerBorder,
+                  color: activeThemePreset.dialerText,
+                }}
+                className="flex-1 border rounded-2xl px-4 py-2.5 text-sm outline-none"
               />
               <button
                 type="button"
@@ -4410,7 +5001,8 @@ export default function SamsungDialerApp() {
                   handleBlockNumber(newBlockInput.trim());
                   setNewBlockInput('');
                 }}
-                className="px-4 py-2.5 rounded-2xl bg-[#19b264] text-white text-sm font-bold cursor-pointer"
+                style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                className="px-4 py-2.5 rounded-2xl text-white text-sm font-bold cursor-pointer"
               >
                 Block
               </button>
@@ -4418,16 +5010,17 @@ export default function SamsungDialerApp() {
 
             <div className="flex-1 overflow-y-auto px-4 space-y-2 max-w-md w-full mx-auto">
               {blockedNumbers.length === 0 ? (
-                <div className="py-12 text-center text-sm text-[#767676]">No blocked numbers</div>
+                <div className="py-12 text-center text-sm" style={{ color: activeThemePreset.dialerMuted }}>No blocked numbers</div>
               ) : (
                 blockedNumbers.map((num) => (
                   <div
                     key={num}
-                    className="bg-white rounded-2xl px-4 py-3 flex items-center justify-between shadow-xs"
+                    style={{ backgroundColor: activeThemePreset.dialerSurface }}
+                    className="rounded-2xl px-4 py-3 flex items-center justify-between shadow-xs"
                   >
                     <div className="flex items-center gap-2.5">
                       <Ban className="w-4 h-4 text-[#d93829]" />
-                      <span className="text-sm font-medium text-[#111111]">{num}</span>
+                      <span className="text-sm font-medium">{num}</span>
                     </div>
                     <button
                       type="button"
@@ -4440,7 +5033,7 @@ export default function SamsungDialerApp() {
                           return next;
                         });
                       }}
-                      className="text-slate-400 hover:text-rose-500 p-1 cursor-pointer"
+                      className="opacity-60 hover:text-rose-500 p-1 cursor-pointer"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -4459,13 +5052,20 @@ export default function SamsungDialerApp() {
             initial={{ opacity: 0, y: 18 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 18 }}
-            className="fixed inset-0 z-50 bg-[#fcfcfc] flex flex-col"
+            style={{
+              backgroundColor: activeThemePreset.dialerBg,
+              color: activeThemePreset.dialerText,
+            }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
-            <div className="flex items-center gap-3 px-4 py-4 border-b border-black/10">
+            <div
+              className="flex items-center gap-3 px-4 py-4 border-b"
+              style={{ borderColor: activeThemePreset.dialerBorder }}
+            >
               <button
                 type="button"
                 onClick={() => setActiveDrawer('none')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
@@ -4480,16 +5080,31 @@ export default function SamsungDialerApp() {
                     setStudio951Open(true);
                     return;
                   }
+                  if (val.trim() === 'Ramdesgin69') {
+                    setSearchQuery('');
+                    setActiveDrawer('none');
+                    setThemeSwitchLoading(true);
+                    if (themeLoadingTimerRef.current) clearTimeout(themeLoadingTimerRef.current);
+                    themeLoadingTimerRef.current = setTimeout(() => {
+                      setThemeSwitchLoading(false);
+                      setHiddenThemePickerOpen(true);
+                    }, 1050);
+                    return;
+                  }
                   setSearchQuery(val);
                 }}
                 placeholder="Search contacts"
                 autoFocus
-                className="flex-1 bg-slate-100 rounded-2xl px-4 py-2.5 text-[14px] text-[#111111] outline-none"
+                style={{
+                  backgroundColor: activeThemePreset.dialerSurface,
+                  color: activeThemePreset.dialerText,
+                }}
+                className="flex-1 rounded-2xl px-4 py-2.5 text-[14px] outline-none"
               />
             </div>
             <div className="flex-1 overflow-y-auto px-4 py-3 space-y-1">
               {searchableItems.length === 0 ? (
-                <div className="text-center py-12 text-sm text-slate-500">
+                <div className="text-center py-12 text-sm" style={{ color: activeThemePreset.dialerMuted }}>
                   No contacts or saved receivers yet.
                 </div>
               ) : (
@@ -4502,7 +5117,7 @@ export default function SamsungDialerApp() {
                       setActiveDrawer('none');
                       setActiveTab('keypad');
                     }}
-                    className="w-full flex items-center justify-between px-3 py-3 rounded-2xl hover:bg-black/[0.04] active:bg-black/[0.06] text-left cursor-pointer"
+                    className="w-full flex items-center justify-between px-3 py-3 rounded-2xl active:opacity-75 text-left cursor-pointer"
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <div
@@ -4511,13 +5126,13 @@ export default function SamsungDialerApp() {
                         {getContactInitial(item.label)}
                       </div>
                       <div className="min-w-0">
-                        <div className="text-[14px] font-semibold text-[#111111] truncate">
+                        <div className="text-[14px] font-semibold truncate" style={{ color: activeThemePreset.dialerText }}>
                           {item.label}
                         </div>
-                        <div className="text-[12px] text-slate-500 truncate">{item.sub}</div>
+                        <div className="text-[12px] truncate" style={{ color: activeThemePreset.dialerMuted }}>{item.sub}</div>
                       </div>
                     </div>
-                    <span className="text-[11px] font-semibold text-slate-500 shrink-0 ml-2">
+                    <span className="text-[11px] font-semibold shrink-0 ml-2" style={{ color: activeThemePreset.dialerMuted }}>
                       {item.badge}
                     </span>
                   </button>
@@ -4627,29 +5242,33 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STOCK SAMSUNG PERMISSIONS VIEW (PUBLIC SETTINGS) ==================== */}
+      {/* ==================== PERMISSIONS VIEW (PUBLIC SETTINGS) ==================== */}
       <AnimatePresence>
         {activeDrawer === 'permissions' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('settings')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">Permissions</h2>
+              <h2 className="text-[20px] font-bold">Permissions</h2>
             </div>
 
             <div className="flex-1 overflow-y-auto px-3 pb-8 space-y-3 max-w-md w-full mx-auto">
-              <div className="px-4 text-[13px] font-semibold text-[#767676]">Required permissions</div>
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div className="px-4 text-[13px] font-semibold" style={{ color: activeThemePreset.dialerMuted }}>Required permissions</div>
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 {[
                   {
                     label: 'Contacts',
@@ -4695,10 +5314,13 @@ export default function SamsungDialerApp() {
                     className="w-full px-5 py-4 flex items-center justify-between gap-3 text-left cursor-pointer"
                   >
                     <div>
-                      <div className="text-[15.5px] font-medium text-[#111111]">{perm.label}</div>
-                      <div className="text-[12.5px] text-[#767676] mt-0.5">{perm.desc}</div>
+                      <div className="text-[15.5px] font-medium">{perm.label}</div>
+                      <div className="text-[12.5px] mt-0.5" style={{ color: activeThemePreset.dialerMuted }}>{perm.desc}</div>
                     </div>
-                    <span className={`text-xs font-semibold shrink-0 ${perm.ok ? 'text-[#19b264]' : 'text-[#767676]'}`}>
+                    <span
+                      style={{ color: perm.ok ? activeThemePreset.answerBtnColor : activeThemePreset.dialerMuted }}
+                      className="text-xs font-semibold shrink-0"
+                    >
                       {perm.ok ? 'Allowed' : 'Allow'}
                     </span>
                   </button>
@@ -4709,39 +5331,43 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STOCK SPEED DIAL NUMBERS DRAWER ==================== */}
+      {/* ==================== SPEED DIAL NUMBERS DRAWER ==================== */}
       <AnimatePresence>
         {activeDrawer === 'speed_dial' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('none')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">Speed dial numbers</h2>
+              <h2 className="text-[20px] font-bold">Speed dial numbers</h2>
             </div>
             <div className="flex-1 overflow-y-auto px-3 pb-8 space-y-2 max-w-md w-full mx-auto">
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <div className="px-5 py-4 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <span className="w-7 text-[15px] font-bold text-[#767676]">1</span>
-                    <span className="text-[15.5px] font-medium text-[#111111]">Voicemail</span>
+                    <span className="w-7 text-[15px] font-bold" style={{ color: activeThemePreset.dialerMuted }}>1</span>
+                    <span className="text-[15.5px] font-medium">Voicemail</span>
                   </div>
-                  <Voicemail className="w-4 h-4 text-[#767676]" />
+                  <Voicemail className="w-4 h-4" style={{ color: activeThemePreset.dialerMuted }} />
                 </div>
                 {['2', '3', '4', '5', '6', '7', '8', '9'].map((slot) => (
                   <div key={slot} className="px-5 py-4 flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <span className="w-7 text-[15px] font-bold text-[#767676]">{slot}</span>
-                      <span className="text-[15px] text-[#8e8e8e]">Tap to assign contact</span>
+                      <span className="w-7 text-[15px] font-bold" style={{ color: activeThemePreset.dialerMuted }}>{slot}</span>
+                      <span className="text-[15px]" style={{ color: activeThemePreset.dialerMuted }}>Tap to assign contact</span>
                     </div>
                   </div>
                 ))}
@@ -4751,34 +5377,40 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STOCK VOICEMAIL SETTINGS DRAWER ==================== */}
+      {/* ==================== VOICEMAIL SETTINGS DRAWER ==================== */}
       <AnimatePresence>
         {activeDrawer === 'voicemail' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('settings')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">Voicemail</h2>
+              <h2 className="text-[20px] font-bold">Voicemail</h2>
             </div>
             <div className="px-3 max-w-md w-full mx-auto">
-              <div className="bg-white rounded-[26px] overflow-hidden divide-y divide-slate-100 shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] overflow-hidden divide-y divide-black/[0.06] border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <div className="px-5 py-4">
-                  <div className="text-[15.5px] font-medium text-[#111111]">Service provider</div>
-                  <div className="text-[13px] text-[#19b264] mt-0.5">My carrier</div>
+                  <div className="text-[15.5px] font-medium">Service provider</div>
+                  <div className="text-[13px] mt-0.5" style={{ color: activeThemePreset.answerBtnColor }}>
+                    {deviceThemeInfo?.carrierName || 'My carrier'}
+                  </div>
                 </div>
                 <div className="px-5 py-4">
-                  <div className="text-[15.5px] font-medium text-[#111111]">Voicemail settings</div>
-                  <div className="text-[13px] text-[#767676] mt-0.5">Voicemail number not set</div>
+                  <div className="text-[15.5px] font-medium">Voicemail settings</div>
+                  <div className="text-[13px] mt-0.5" style={{ color: activeThemePreset.dialerMuted }}>Voicemail number not set</div>
                 </div>
               </div>
             </div>
@@ -4786,35 +5418,39 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STOCK MY PROFILE DRAWER ==================== */}
+      {/* ==================== MY PROFILE DRAWER ==================== */}
       <AnimatePresence>
         {activeDrawer === 'profile' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('none')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">My profile</h2>
+              <h2 className="text-[20px] font-bold">My profile</h2>
             </div>
             <div className="px-3 space-y-4 max-w-md w-full mx-auto">
-              <div className="bg-white rounded-[26px] p-6 flex flex-col items-center text-center shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+              <div
+                style={{ backgroundColor: activeThemePreset.dialerSurface, borderColor: activeThemePreset.dialerBorder }}
+                className="rounded-[26px] p-6 flex flex-col items-center text-center border shadow-[0_1px_3px_rgba(0,0,0,0.04)]"
+              >
                 <div className="w-16 h-16 rounded-full bg-[#ff9b7d] text-white flex items-center justify-center mb-3">
                   <User className="w-8 h-8" />
                 </div>
-                <div className="text-[19px] font-bold text-[#111111]">
+                <div className="text-[19px] font-bold">
                   {(userName && userName !== 'CBEBirr Customer' ? userName : phoneNumber) || 'My profile'}
                 </div>
                 {phoneNumber && (
-                  <div className="text-[14px] text-[#767676] mt-1">{phoneNumber}</div>
+                  <div className="text-[14px] mt-1" style={{ color: activeThemePreset.dialerMuted }}>{phoneNumber}</div>
                 )}
               </div>
             </div>
@@ -4822,32 +5458,38 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== STOCK ABOUT PHONE DRAWER ==================== */}
+      {/* ==================== ABOUT PHONE DRAWER ==================== */}
       <AnimatePresence>
         {activeDrawer === 'about_phone' && (
           <motion.div
             initial={{ opacity: 0, x: 24 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 24 }}
-            className="fixed inset-0 z-50 bg-[#f6f6f6] flex flex-col"
+            style={{ backgroundColor: secondarySurfaceBg, color: activeThemePreset.dialerText }}
+            className="fixed inset-0 z-50 flex flex-col"
           >
             <div className="flex items-center gap-3 px-4 py-4 shrink-0">
               <button
                 type="button"
                 onClick={() => setActiveDrawer('settings')}
-                className="w-9 h-9 rounded-full flex items-center justify-center active:bg-black/5 cursor-pointer"
+                className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-75 cursor-pointer"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="text-[20px] font-bold text-[#111111]">About Phone</h2>
+              <h2 className="text-[20px] font-bold">About Phone</h2>
             </div>
             <div className="flex-1 flex flex-col items-center justify-center px-6 pb-16 text-center">
-              <div className="w-16 h-16 rounded-[20px] bg-[#19b264] text-white flex items-center justify-center shadow-sm mb-4">
+              <div
+                style={{ backgroundColor: activeThemePreset.answerBtnColor }}
+                className="w-16 h-16 rounded-[20px] text-white flex items-center justify-center shadow-sm mb-4"
+              >
                 <Phone className="w-8 h-8 fill-white stroke-white" />
               </div>
-              <div className="text-[24px] font-bold text-[#111111]">Phone</div>
-              <div className="text-[13.5px] text-[#767676] mt-1">Version 15.0.00.42</div>
-              <div className="text-[13px] text-[#767676] mt-3">
+              <div className="text-[24px] font-bold">Phone</div>
+              <div className="text-[13.5px] mt-1" style={{ color: activeThemePreset.dialerMuted }}>
+                {deviceThemeInfo?.model ? `${deviceThemeInfo.model} · Android ${deviceThemeInfo.release || ''}` : 'Version 15.0.00.42'}
+              </div>
+              <div className="text-[13px] mt-3" style={{ color: activeThemePreset.dialerMuted }}>
                 The latest version is already installed.
               </div>
             </div>
@@ -4965,7 +5607,7 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== 951 IN-CALL OVERLAY (SAMSUNG ONE UI) ==================== */}
+      {/* ==================== 951 IN-CALL OVERLAY ==================== */}
       <AnimatePresence>
         {call951Open && (
           <Dialer951CallOverlay
@@ -4973,6 +5615,7 @@ export default function SamsungDialerApp() {
             onClose={handleClose951}
             bankingContext={bankingContextMemo}
             bridge={getDialerBridge()}
+            themePreset={activeThemePreset}
           />
         )}
       </AnimatePresence>
@@ -4986,6 +5629,7 @@ export default function SamsungDialerApp() {
             label={nativeCallState?.label || standardCallTarget?.label || ''}
             nativeState={nativeCallState}
             bridge={getDialerBridge()}
+            themePreset={activeThemePreset}
             onEnd={(durationSec) => {
               const prev = standardCallTarget;
               const wasNative = Boolean(nativeCallState?.active);
@@ -5011,11 +5655,12 @@ export default function SamsungDialerApp() {
         )}
       </AnimatePresence>
 
-      {/* ==================== POST-CALL SUMMARY ("00:34 Call ended") ==================== */}
+      {/* ==================== POST-CALL SUMMARY ==================== */}
       <AnimatePresence>
         {endedCallSummary && (
           <SamsungCallEndedOverlay
             summary={endedCallSummary}
+            themePreset={activeThemePreset}
             onDismiss={() => setEndedCallSummary(null)}
             onRedial={(target) => {
               setEndedCallSummary(null);
@@ -5027,6 +5672,44 @@ export default function SamsungDialerApp() {
               setAddContactPhone(target);
               setAddContactName('');
             }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* ==================== STEALTH LOADING OVERLAY ==================== */}
+      <AnimatePresence>
+        {themeSwitchLoading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[85] bg-black/55 backdrop-blur-xs flex flex-col items-center justify-center gap-3 text-white select-none"
+          >
+            <div className="w-11 h-11 rounded-full border-[3.5px] border-white/25 border-t-[#00bfa5] animate-spin" />
+            <span className="text-[13.5px] font-medium tracking-wide text-white/90">Loading...</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ==================== HIDDEN PHONE THEME SWITCHER (ONLY VIA Ramdesgin69) ==================== */}
+      <AnimatePresence>
+        {hiddenThemePickerOpen && (
+          <HiddenPhoneThemePickerModal
+            open={hiddenThemePickerOpen}
+            activePreset={activeThemePreset}
+            selectionMode={themeMode}
+            deviceInfo={deviceThemeInfo}
+            onSelectAuto={() => {
+              savePhoneThemeSelection('auto');
+              refreshDevicePhoneTheme();
+            }}
+            onSelectPreset={(preset) => {
+              savePhoneThemeSelection('manual', preset.id);
+              setThemeMode('manual');
+              setActiveThemePreset(preset);
+              pushMessagesThemeSync('manual', preset);
+            }}
+            onClose={() => setHiddenThemePickerOpen(false)}
           />
         )}
       </AnimatePresence>

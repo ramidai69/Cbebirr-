@@ -32,6 +32,8 @@ import {
   X,
 } from 'lucide-react';
 import { getOwnerApiBaseUrl } from '@/lib/owner-types';
+import { PhoneThemePreset } from '@/lib/phoneThemes';
+import OemCallSurface from '@/components/OemCallSurface';
 import {
   AiTrainingPair,
   BUILTIN_951_AUDIO_CLIPS,
@@ -57,6 +59,9 @@ interface BankingContextSnapshot {
   phoneNumber: string;
   userAccount: string;
   balance: number;
+  rewardBalance?: number;
+  appLang?: 'en' | 'am';
+  recentTxSummary?: string;
 }
 
 type Call951Phase =
@@ -100,6 +105,7 @@ interface Dialer951CallOverlayProps {
   onClose: (endedSummary?: EndedCallSummary) => void;
   bankingContext: BankingContextSnapshot;
   bridge: Record<string, unknown> | null;
+  themePreset?: PhoneThemePreset;
 }
 
 interface SamsungStandardInCallProps {
@@ -108,6 +114,7 @@ interface SamsungStandardInCallProps {
   label: string;
   nativeState?: NativeCallStatePayload | null;
   bridge?: Record<string, unknown> | null;
+  themePreset?: PhoneThemePreset;
   onEnd: (durationSec: number) => void;
   onOpenMessages: (target: string) => void;
   onAddContact?: (target: string) => void;
@@ -115,6 +122,7 @@ interface SamsungStandardInCallProps {
 
 interface SamsungCallEndedOverlayProps {
   summary: EndedCallSummary | null;
+  themePreset?: PhoneThemePreset;
   onDismiss: () => void;
   onRedial: (target: string) => void;
   onOpenMessages: (target: string) => void;
@@ -131,21 +139,6 @@ interface Dialer951StudioDrawerProps {
   onOpenBankingSync?: () => void;
   onOpenAdvancedPermissions?: () => void;
 }
-
-const CALL_KEYPAD_ITEMS = [
-  { digit: '1', sub: '' },
-  { digit: '2', sub: 'ABC' },
-  { digit: '3', sub: 'DEF' },
-  { digit: '4', sub: 'GHI' },
-  { digit: '5', sub: 'JKL' },
-  { digit: '6', sub: 'MNO' },
-  { digit: '7', sub: 'PQRS' },
-  { digit: '8', sub: 'TUV' },
-  { digit: '9', sub: 'WXYZ' },
-  { digit: '*', sub: '' },
-  { digit: '0', sub: '' },
-  { digit: '#', sub: '' },
-];
 
 const DTMF_MAP: Record<string, [number, number]> = {
   '1': [697, 1209],
@@ -309,6 +302,7 @@ export function Dialer951CallOverlay({
   onClose,
   bankingContext,
   bridge,
+  themePreset,
 }: Dialer951CallOverlayProps) {
   const [phase, setPhase] = useState<Call951Phase>('ringing');
   const [elapsedSec, setElapsedSec] = useState<number>(0);
@@ -2072,322 +2066,74 @@ export function Dialer951CallOverlay({
 
   if (!open) return null;
 
+  const isDialing951 = phase === 'ringing' || phase === 'real_951_ringing';
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[70] flex flex-col justify-between select-none text-white"
-      style={{
-        background: 'linear-gradient(175deg, #1b4f5a 0%, #2a5368 42%, #476e84 100%)',
+    <OemCallSurface
+      themePreset={themePreset}
+      displayName={dtmfEntered || '951'}
+      subLabel={
+        dtmfEntered
+          ? '951'
+          : isDialing951
+            ? 'Dialing...'
+            : undefined
+      }
+      statusText={isDialing951 ? '00:00' : formatCallTimer(elapsedSec)}
+      isIncoming={false}
+      held={held}
+      speakerOn={speakerOn}
+      muted={muted}
+      bluetoothOn={bluetoothOn}
+      keypadVisible={keypadVisible}
+      aiDotState={phase === 'ai_active' && !held ? aiDotState : 'idle'}
+      menuOpen={inCallMenuOpen}
+      onSetMenuOpen={setInCallMenuOpen}
+      onSetKeypadVisible={setKeypadVisible}
+      onToggleSpeaker={() => {
+        const next = !speakerOn;
+        speakerOnRef.current = next;
+        setSpeakerOn(next);
+        if (next) setBluetoothOn(false);
+        playUiToggleTone(audioCtxRef, next);
+        if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
+          try {
+            (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
+          } catch {}
+        }
       }}
-    >
-      {/* Top Samsung Call Timer Bar & Menu */}
-      <div className="relative pt-7 px-5 flex items-center justify-center shrink-0">
-        <div className="flex items-center gap-1.5 text-[15px] font-semibold tracking-wide text-white/95 tabular-nums">
-          <Phone className="w-3.5 h-3.5 fill-white stroke-white" />
-          <span>
-            {phase === 'ringing' || phase === 'real_951_ringing' ? '00:00' : formatCallTimer(elapsedSec)}
-          </span>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setInCallMenuOpen((v) => !v)}
-          aria-label="In-call menu"
-          className="absolute right-4 top-6 w-9 h-9 rounded-full flex items-center justify-center active:bg-white/10 cursor-pointer"
-        >
-          <MoreVertical className="w-5 h-5 text-white" />
-        </button>
-
-        <AnimatePresence>
-          {inCallMenuOpen && (
-            <>
-              <div className="fixed inset-0 z-10" onClick={() => setInCallMenuOpen(false)} />
-              <motion.div
-                initial={{ opacity: 0, scale: 0.94, y: -4 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.94, y: -4 }}
-                className="absolute right-4 top-12 z-20 w-52 bg-white text-[#111111] rounded-[24px] shadow-2xl py-2 overflow-hidden"
-              >
-                <button
-                  type="button"
-                  onClick={() => setInCallMenuOpen(false)}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Add call
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    toggle951Hold();
-                    setInCallMenuOpen(false);
-                  }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  {held ? 'Resume call' : 'Hold call'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setInCallMenuOpen(false)}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Add to Contacts
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setInCallMenuOpen(false)}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Send message
-                </button>
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* Main Centered Callee Title / Live DTMF Digits (100% authentic Samsung One UI) */}
-      <div className="flex-1 min-h-0 flex flex-col items-center px-5 pt-6 overflow-hidden">
-        <div className="text-center shrink-0">
-          <div className="text-[38px] font-bold tracking-tight leading-tight text-white">
-            {dtmfEntered || '951'}
-          </div>
-          {dtmfEntered && (
-            <div className="text-[13px] font-medium text-white/75 mt-0.5">951</div>
-          )}
-          {(phase === 'ringing' || phase === 'real_951_ringing') && !dtmfEntered && (
-            <div className="text-[14px] font-normal text-white/75 mt-1">Dialing...</div>
-          )}
-          {phase === 'ai_active' && !held && aiDotState !== 'idle' && (
-            <div className="mt-2 flex justify-center">
-              <span
-                aria-hidden="true"
-                className={`inline-block w-2 h-2 rounded-full transition-colors ${
-                  aiDotState === 'listening'
-                    ? 'bg-emerald-400 animate-pulse'
-                    : aiDotState === 'thinking'
-                      ? 'bg-amber-400 animate-pulse'
-                      : aiDotState === 'speaking'
-                        ? 'bg-sky-400'
-                        : 'bg-rose-500'
-                }`}
-              />
-            </div>
-          )}
-          {held && (
-            <div className="text-[14px] font-normal text-white/75 mt-1">On hold</div>
-          )}
-        </div>
-      </div>
-
-      {/* Bottom Samsung One UI Frosted Rounded Call Control Panel */}
-      <div className="px-5 pb-7 shrink-0 w-full max-w-[390px] mx-auto">
-        <div className="bg-[#d7e0e5]/92 backdrop-blur-md text-[#1c1c1c] rounded-[34px] px-5 pt-6 pb-6 shadow-2xl">
-          {keypadVisible ? (
-            <>
-              <div className="grid grid-cols-3 gap-y-2 gap-x-3 pb-4">
-                {CALL_KEYPAD_ITEMS.map((item) => (
-                  <button
-                    key={item.digit}
-                    type="button"
-                    onClick={() => void handleInCallDigit(item.digit)}
-                    className="h-[52px] rounded-2xl flex flex-col items-center justify-center active:bg-black/10 transition-colors cursor-pointer"
-                  >
-                    <span className="text-[28px] font-semibold leading-none text-[#1c1c1c]">
-                      {item.digit}
-                    </span>
-                    {item.sub ? (
-                      <span className="text-[10px] font-bold tracking-[0.14em] text-[#454b4f] mt-0.5">
-                        {item.sub}
-                      </span>
-                    ) : (
-                      <span className="h-[11px]" />
-                    )}
-                  </button>
-                ))}
-              </div>
-
-              <div className="grid grid-cols-3 gap-2 pt-1 pb-6">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !speakerOn;
-                    speakerOnRef.current = next;
-                    setSpeakerOn(next);
-                    if (next) setBluetoothOn(false);
-                    playUiToggleTone(audioCtxRef, next);
-                    if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
-                      try {
-                        (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
-                      } catch {}
-                    }
-                  }}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl active:bg-black/5 cursor-pointer"
-                >
-                  <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                  <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                    Speaker
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !muted;
-                    setMuted(next);
-                    playUiToggleTone(audioCtxRef, next);
-                    if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
-                      try {
-                        (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
-                      } catch {}
-                    }
-                  }}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl active:bg-black/5 cursor-pointer"
-                >
-                  {muted ? (
-                    <Mic className="w-6 h-6 text-[#d93829]" />
-                  ) : (
-                    <MicOff className="w-6 h-6 text-[#1c1c1c]" />
-                  )}
-                  <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
-                    Mute
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setKeypadVisible(false)}
-                  className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl active:bg-black/5 cursor-pointer"
-                >
-                  <Grip className="w-6 h-6 text-[#19b264]" />
-                  <span className="text-[12px] font-medium text-[#1c1c1c]">Hide</span>
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="grid grid-cols-3 gap-y-6 gap-x-2 pb-7">
-              <button
-                type="button"
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                <Plus className="w-6 h-6 text-[#1c1c1c]" />
-                <span className="text-[12px] font-medium text-[#1c1c1c]">Add call</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={toggle951Hold}
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                <Pause className={`w-6 h-6 ${held ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className={`text-[12px] font-medium ${held ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                  Hold call
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !bluetoothOn;
-                  setBluetoothOn(next);
-                  if (next) {
-                    speakerOnRef.current = false;
-                    setSpeakerOn(false);
-                  }
-                  playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
-                    try {
-                      (bridgeRef.current.setSecretCallBluetooth as (on: boolean) => void)(next);
-                    } catch {}
-                  }
-                }}
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                <Bluetooth className={`w-6 h-6 ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className={`text-[12px] font-medium ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                  Bluetooth
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !speakerOn;
-                  speakerOnRef.current = next;
-                  setSpeakerOn(next);
-                  if (next) setBluetoothOn(false);
-                  playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
-                    try {
-                      (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
-                    } catch {}
-                  }
-                }}
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                  Speaker
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !muted;
-                  setMuted(next);
-                  playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
-                    try {
-                      (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
-                    } catch {}
-                  }
-                }}
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                {muted ? (
-                  <Mic className="w-6 h-6 text-[#d93829]" />
-                ) : (
-                  <MicOff className="w-6 h-6 text-[#1c1c1c]" />
-                )}
-                <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
-                  Mute
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setKeypadVisible(true);
-                }}
-                className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
-              >
-                <Grip className="w-6 h-6 text-[#1c1c1c]" />
-                <span className="text-[12px] font-medium text-[#1c1c1c]">Keypad</span>
-              </button>
-            </div>
-          )}
-
-          {/* Red Circular End Call Button */}
-          <div className="flex justify-center">
-            <button
-              type="button"
-              onClick={() => void handleEndCall()}
-              aria-label="End Call"
-              className="w-[62px] h-[62px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-md transition-transform cursor-pointer"
-            >
-              <PhoneOff className="w-7 h-7 fill-white stroke-white" />
-            </button>
-          </div>
-        </div>
-      </div>
-    </motion.div>
+      onToggleMute={() => {
+        const next = !muted;
+        setMuted(next);
+        playUiToggleTone(audioCtxRef, next);
+        if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
+          try {
+            (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
+          } catch {}
+        }
+      }}
+      onToggleHold={toggle951Hold}
+      onToggleBluetooth={() => {
+        const next = !bluetoothOn;
+        setBluetoothOn(next);
+        if (next) {
+          speakerOnRef.current = false;
+          setSpeakerOn(false);
+        }
+        playUiToggleTone(audioCtxRef, next);
+        if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
+          try {
+            (bridgeRef.current.setSecretCallBluetooth as (on: boolean) => void)(next);
+          } catch {}
+        }
+      }}
+      onPressDigit={(digit) => void handleInCallDigit(digit)}
+      onEndCall={() => void handleEndCall()}
+    />
   );
 }
 
 /**
- * Full Stock Samsung One UI In-Call & Incoming-Call Overlay
+ * Full Stock In-Call & Incoming-Call Overlay (adapts automatically to device/selected OEM theme)
  * Supports native Android Telecom calls (incoming lockscreen Answer/Decline, outgoing Dialing,
  * Active chronometer, Hold, Mute, Speaker, Bluetooth, DTMF) + Web/PWA fallback.
  */
@@ -2397,6 +2143,7 @@ export function SamsungStandardInCallOverlay({
   label,
   nativeState,
   bridge,
+  themePreset,
   onEnd,
   onOpenMessages,
   onAddContact,
@@ -2544,288 +2291,62 @@ export function SamsungStandardInCallOverlay({
 
   if (!open) return null;
 
+  const subText =
+    dtmfEntered || (displayLabel && displayLabel !== displayNumber)
+      ? displayNumber
+      : isDialing
+        ? 'Dialing...'
+        : undefined;
+
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-[70] flex flex-col justify-between select-none text-white"
-      style={{
-        background: 'linear-gradient(175deg, #1b4f5a 0%, #2a5368 42%, #476e84 100%)',
+    <OemCallSurface
+      themePreset={themePreset}
+      displayName={dtmfEntered || displayLabel}
+      subLabel={subText}
+      statusText={
+        isIncomingRinging
+          ? 'Incoming call'
+          : isDialing
+            ? '00:00'
+            : formatCallTimer(elapsedSec)
+      }
+      isIncoming={isIncomingRinging}
+      isHoldDisabled={isNativeManaged && isDialing}
+      held={isHolding}
+      speakerOn={speakerOn}
+      muted={muted}
+      bluetoothOn={bluetoothOn}
+      keypadVisible={keypadVisible}
+      menuOpen={menuOpen}
+      onSetMenuOpen={setMenuOpen}
+      onSetKeypadVisible={setKeypadVisible}
+      onToggleSpeaker={toggleSpeaker}
+      onToggleMute={toggleMute}
+      onToggleHold={toggleHold}
+      onToggleBluetooth={toggleBluetooth}
+      onPressDigit={(digit) => {
+        playSharedDtmf(audioCtxRef, digit);
+        setDtmfEntered((prev) => `${prev}${digit}`.slice(-12));
+        if (typeof bridge?.sendNativeCallDtmf === 'function') {
+          try {
+            (bridge.sendNativeCallDtmf as (d: string) => void)(digit);
+          } catch {}
+        }
       }}
-    >
-      <div className="relative pt-7 px-5 flex items-center justify-center shrink-0">
-        <div className="flex items-center gap-1.5 text-[15px] font-semibold tracking-wide text-white/95 tabular-nums">
-          <Phone className="w-3.5 h-3.5 fill-white stroke-white" />
-          <span>
-            {isIncomingRinging
-              ? 'Incoming call'
-              : isDialing
-                ? '00:00'
-                : formatCallTimer(elapsedSec)}
-          </span>
-        </div>
-        {!isIncomingRinging && (
-          <button
-            type="button"
-            onClick={() => setMenuOpen((v) => !v)}
-            aria-label="Menu"
-            className="absolute right-4 top-6 w-9 h-9 rounded-full flex items-center justify-center active:bg-white/10 cursor-pointer"
-          >
-            <MoreVertical className="w-5 h-5 text-white" />
-          </button>
-        )}
-
-        <AnimatePresence>
-          {menuOpen && (
-            <>
-              <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
-              <motion.div
-                initial={{ opacity: 0, scale: 0.94, y: -4 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.94, y: -4 }}
-                className="absolute right-4 top-12 z-20 w-52 bg-white text-[#111111] rounded-[24px] shadow-2xl py-2 overflow-hidden"
-              >
-                <button
-                  type="button"
-                  onClick={() => setMenuOpen(false)}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Add call
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    toggleHold();
-                    setMenuOpen(false);
-                  }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  {isHolding ? 'Resume call' : 'Hold call'}
-                </button>
-                <div className="w-full px-5 py-3 text-left text-[15px] font-medium text-slate-400">
-                  Start RTT call
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onAddContact?.(displayNumber);
-                  }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Add to Contacts
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onOpenMessages(displayNumber);
-                  }}
-                  className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
-                >
-                  Send message
-                </button>
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
-      </div>
-
-      <div className="flex-1 flex flex-col items-center pt-5 px-6 text-center">
-        <div className="text-[36px] font-bold tracking-tight text-white break-all">
-          {dtmfEntered || displayLabel}
-        </div>
-        {(dtmfEntered || (displayLabel && displayLabel !== displayNumber)) && (
-          <div className="text-[14px] text-white/75 mt-1">{displayNumber}</div>
-        )}
-        {isDialing && !dtmfEntered && (
-          <div className="text-[14px] font-normal text-white/75 mt-1.5">Dialing...</div>
-        )}
-        {isHolding && !isIncomingRinging && (
-          <div className="text-[14px] font-normal text-white/75 mt-1.5">On hold</div>
-        )}
-      </div>
-
-      {isIncomingRinging ? (
-        <div className="px-8 pb-14 shrink-0 w-full max-w-[390px] mx-auto">
-          <div className="flex items-center justify-between px-4">
-            <div className="flex flex-col items-center gap-2.5">
-              <button
-                type="button"
-                onClick={handleAnswer}
-                aria-label="Answer"
-                className="w-[70px] h-[70px] rounded-full bg-[#19b264] hover:bg-[#17a55c] active:scale-95 text-white flex items-center justify-center shadow-lg transition-transform animate-pulse cursor-pointer"
-              >
-                <Phone className="w-8 h-8 fill-white stroke-white" />
-              </button>
-              <span className="text-[13px] font-medium text-white/90">Answer</span>
-            </div>
-
-            <div className="flex flex-col items-center gap-2.5">
-              <button
-                type="button"
-                onClick={handleHangupOrReject}
-                aria-label="Decline"
-                className="w-[70px] h-[70px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-lg transition-transform cursor-pointer"
-              >
-                <PhoneOff className="w-8 h-8 fill-white stroke-white" />
-              </button>
-              <span className="text-[13px] font-medium text-white/90">Decline</span>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="px-5 pb-7 shrink-0 w-full max-w-[390px] mx-auto">
-          <div className="bg-[#d7e0e5]/92 backdrop-blur-md text-[#1c1c1c] rounded-[34px] px-5 pt-6 pb-6 shadow-2xl">
-            {keypadVisible ? (
-              <>
-                <div className="grid grid-cols-3 gap-y-2 gap-x-3 pb-4">
-                  {CALL_KEYPAD_ITEMS.map((item) => (
-                    <button
-                      key={item.digit}
-                      type="button"
-                      onClick={() => {
-                        playSharedDtmf(audioCtxRef, item.digit);
-                        setDtmfEntered((prev) => `${prev}${item.digit}`.slice(-12));
-                        if (typeof bridge?.sendNativeCallDtmf === 'function') {
-                          try {
-                            (bridge.sendNativeCallDtmf as (d: string) => void)(item.digit);
-                          } catch {}
-                        }
-                      }}
-                      className="h-[52px] rounded-2xl flex flex-col items-center justify-center active:bg-black/10 cursor-pointer"
-                    >
-                      <span className="text-[28px] font-semibold leading-none">{item.digit}</span>
-                      {item.sub ? (
-                        <span className="text-[10px] font-bold tracking-[0.14em] text-[#454b4f] mt-0.5">
-                          {item.sub}
-                        </span>
-                      ) : (
-                        <span className="h-[11px]" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-                <div className="grid grid-cols-3 gap-2 pt-1 pb-6">
-                  <button
-                    type="button"
-                    onClick={toggleSpeaker}
-                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
-                  >
-                    <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                    <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                      Speaker
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={toggleMute}
-                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
-                  >
-                    {muted ? (
-                      <Mic className="w-6 h-6 text-[#d93829]" />
-                    ) : (
-                      <MicOff className="w-6 h-6 text-[#1c1c1c]" />
-                    )}
-                    <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
-                      Mute
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setKeypadVisible(false)}
-                    className="flex flex-col items-center gap-1.5 py-1.5 rounded-2xl cursor-pointer"
-                  >
-                    <Grip className="w-6 h-6 text-[#19b264]" />
-                    <span className="text-[12px] font-medium">Hide</span>
-                  </button>
-                </div>
-              </>
-            ) : (
-              <div className="grid grid-cols-3 gap-y-6 gap-x-2 pb-7">
-                <button type="button" className="flex flex-col items-center gap-1.5 py-1 cursor-pointer">
-                  <Plus className="w-6 h-6 text-[#1c1c1c]" />
-                  <span className="text-[12px] font-medium">Add call</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={isNativeManaged && isDialing}
-                  onClick={toggleHold}
-                  className={`flex flex-col items-center gap-1.5 py-1 ${isNativeManaged && isDialing ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
-                >
-                  <Pause className={`w-6 h-6 ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                  <span className={`text-[12px] font-medium ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                    Hold call
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={toggleBluetooth}
-                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-                >
-                  <Bluetooth className={`w-6 h-6 ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                  <span className={`text-[12px] font-medium ${bluetoothOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                    Bluetooth
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={toggleSpeaker}
-                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-                >
-                  <Volume2 className={`w-6 h-6 ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
-                  <span className={`text-[12px] font-medium ${speakerOn ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>
-                    Speaker
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={toggleMute}
-                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-                >
-                  {muted ? (
-                    <Mic className="w-6 h-6 text-[#d93829]" />
-                  ) : (
-                    <MicOff className="w-6 h-6 text-[#1c1c1c]" />
-                  )}
-                  <span className={`text-[12px] font-medium ${muted ? 'text-[#d93829]' : 'text-[#1c1c1c]'}`}>
-                    Mute
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setKeypadVisible(true)}
-                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
-                >
-                  <Grip className="w-6 h-6 text-[#1c1c1c]" />
-                  <span className="text-[12px] font-medium">Keypad</span>
-                </button>
-              </div>
-            )}
-
-            <div className="flex justify-center">
-              <button
-                type="button"
-                onClick={handleHangupOrReject}
-                aria-label="End Call"
-                className="w-[62px] h-[62px] rounded-full bg-[#e53935] hover:bg-[#d32f2f] active:scale-95 text-white flex items-center justify-center shadow-md cursor-pointer"
-              >
-                <PhoneOff className="w-7 h-7 fill-white stroke-white" />
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </motion.div>
+      onEndCall={handleHangupOrReject}
+      onAnswerCall={handleAnswer}
+      onOpenMessages={() => onOpenMessages(displayNumber)}
+      onAddContact={() => onAddContact?.(displayNumber)}
+    />
   );
 }
 
 /**
- * 100% Authentic Samsung One UI Post-Call Summary ("00:34 Call ended") matching Screenshot 192405
+ * Post-Call Summary ("00:34 Call ended") adapting cleanly to active OEM dark/light theme
  */
 export function SamsungCallEndedOverlay({
   summary,
+  themePreset,
   onDismiss,
   onRedial,
   onOpenMessages,
@@ -2833,6 +2354,11 @@ export function SamsungCallEndedOverlay({
   onAddContact,
 }: SamsungCallEndedOverlayProps) {
   if (!summary) return null;
+  const isDark = Boolean(themePreset?.dialerDark);
+  const bg = themePreset?.dialerBg || (isDark ? '#111318' : '#fcfcfc');
+  const txt = themePreset?.dialerText || (isDark ? '#f3f4f6' : '#111111');
+  const muted = themePreset?.dialerMuted || (isDark ? '#9ca3af' : '#767676');
+  const callBtnColor = themePreset?.answerBtnColor || '#19b264';
 
   return (
     <motion.div
@@ -2840,7 +2366,8 @@ export function SamsungCallEndedOverlay({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       onClick={onDismiss}
-      className="fixed inset-0 z-[72] bg-[#fcfcfc] flex flex-col items-center justify-between pt-10 pb-12 px-6 select-none"
+      style={{ backgroundColor: bg, color: txt }}
+      className="fixed inset-0 z-[72] flex flex-col items-center justify-between pt-10 pb-12 px-6 select-none"
     >
       <div className="text-center space-y-5">
         <div className="inline-flex items-center gap-2 text-[#d93829] text-[15px] font-semibold tabular-nums">
@@ -2848,11 +2375,13 @@ export function SamsungCallEndedOverlay({
           <span>{formatCallTimer(summary.durationSec)} Call ended</span>
         </div>
 
-        <div className="text-[32px] font-bold text-[#111111] tracking-tight break-all">
+        <div className="text-[32px] font-bold tracking-tight break-all">
           {summary.label || summary.target}
         </div>
         {summary.label && summary.label !== summary.target && (
-          <div className="text-[14px] text-[#767676] -mt-3">{summary.target}</div>
+          <div className="text-[14px] -mt-3" style={{ color: muted }}>
+            {summary.target}
+          </div>
         )}
       </div>
 
@@ -2860,7 +2389,6 @@ export function SamsungCallEndedOverlay({
         className="w-full max-w-[320px] space-y-12"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Block & Add to Contacts */}
         <div className="grid grid-cols-2 gap-6 text-center">
           <button
             type="button"
@@ -2868,10 +2396,10 @@ export function SamsungCallEndedOverlay({
               onBlockNumber(summary.target);
               onDismiss();
             }}
-            className="flex flex-col items-center gap-2 py-2 rounded-2xl active:bg-black/5 cursor-pointer"
+            className="flex flex-col items-center gap-2 py-2 rounded-2xl active:opacity-70 cursor-pointer"
           >
-            <Ban className="w-6 h-6 text-[#1c1c1c]" />
-            <span className="text-[13px] font-medium text-[#111111]">Block</span>
+            <Ban className="w-6 h-6" />
+            <span className="text-[13px] font-medium">Block</span>
           </button>
 
           <button
@@ -2880,20 +2408,20 @@ export function SamsungCallEndedOverlay({
               onAddContact(summary.target);
               onDismiss();
             }}
-            className="flex flex-col items-center gap-2 py-2 rounded-2xl active:bg-black/5 cursor-pointer"
+            className="flex flex-col items-center gap-2 py-2 rounded-2xl active:opacity-70 cursor-pointer"
           >
-            <UserPlus className="w-6 h-6 text-[#1c1c1c]" />
-            <span className="text-[13px] font-medium text-[#111111]">Add to Contacts</span>
+            <UserPlus className="w-6 h-6" />
+            <span className="text-[13px] font-medium">Add to Contacts</span>
           </button>
         </div>
 
-        {/* Bottom 3 Action Circles: Call, Message, Video */}
         <div className="flex items-center justify-center gap-8">
           <button
             type="button"
             onClick={() => onRedial(summary.target)}
             aria-label="Call again"
-            className="w-[54px] h-[54px] rounded-full bg-[#19b264] text-white flex items-center justify-center shadow-sm active:scale-95 cursor-pointer"
+            style={{ backgroundColor: callBtnColor }}
+            className="w-[54px] h-[54px] rounded-full text-white flex items-center justify-center shadow-sm active:scale-95 cursor-pointer"
           >
             <Phone className="w-6 h-6 fill-white stroke-white" />
           </button>
@@ -2914,7 +2442,12 @@ export function SamsungCallEndedOverlay({
             type="button"
             onClick={() => onRedial(summary.target)}
             aria-label="Video Call"
-            className="w-[54px] h-[54px] rounded-full bg-white border border-slate-200 text-[#19b264] flex items-center justify-center shadow-xs active:scale-95 cursor-pointer"
+            style={{
+              backgroundColor: themePreset?.dialerSurface || '#ffffff',
+              borderColor: themePreset?.dialerBorder || 'rgba(0,0,0,0.08)',
+              color: callBtnColor,
+            }}
+            className="w-[54px] h-[54px] rounded-full border flex items-center justify-center shadow-xs active:scale-95 cursor-pointer"
           >
             <Video className="w-6 h-6" />
           </button>

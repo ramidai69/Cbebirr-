@@ -51,6 +51,11 @@ import QRCode from 'qrcode';
 import { downloadReceiptPdfUniversally } from '@/lib/client-receipt-pdf';
 import OfficialReceiptView, { OfficialReceiptData } from './OfficialReceiptView';
 import { repairTransferLabelInSmsText } from '@/lib/sms-webhook';
+import {
+  DeviceThemeInfo,
+  PhoneThemePreset,
+  resolveActivePhoneTheme,
+} from '@/lib/phoneThemes';
 
 interface SamsungMessagesAppProps {
   onClose?: () => void;
@@ -213,6 +218,8 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
   const [isTopMenuOpen, setIsTopMenuOpen] = useState(false);
   const [isChatMenuOpen, setIsChatMenuOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
+  const [phoneTheme, setPhoneTheme] = useState<PhoneThemePreset>(() => resolveActivePhoneTheme(null).preset);
+  const [detectedDeviceInfo, setDetectedDeviceInfo] = useState<DeviceThemeInfo | null>(null);
   const [copiedCurl, setCopiedCurl] = useState(false);
 
   // Hidden Developer Settings ("Hide Setting")
@@ -322,6 +329,67 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
 
   useEffect(() => {
     let active = true;
+    const syncMessagesThemeFromDevice = () => {
+      try {
+        const w = window as unknown as {
+          AndroidSMSBridge?: {
+            getDeviceThemeInfoJson?: () => string;
+            getSyncedThemeOverrideJson?: () => string;
+            applySystemBarsTheme?: (bg: string, dark: boolean) => void;
+          };
+          DialerBridge?: {
+            getDeviceThemeInfoJson?: () => string;
+          };
+          onNativeThemeChanged?: () => void;
+        };
+
+        let devInfo: DeviceThemeInfo | null = null;
+        const rawDev =
+          w.AndroidSMSBridge?.getDeviceThemeInfoJson?.() ||
+          w.DialerBridge?.getDeviceThemeInfoJson?.();
+        if (rawDev) {
+          try {
+            devInfo = JSON.parse(rawDev) as DeviceThemeInfo;
+          } catch {}
+        }
+
+        let resolved = resolveActivePhoneTheme(devInfo).preset;
+        const rawOverride = w.AndroidSMSBridge?.getSyncedThemeOverrideJson?.();
+        if (rawOverride) {
+          try {
+            const ov = JSON.parse(rawOverride) as {
+              mode?: 'auto' | 'manual';
+              id?: string;
+              messagesSkin?: PhoneThemePreset['messagesSkin'];
+              accentColor?: string;
+              darkMode?: boolean;
+            };
+            if (ov?.mode === 'manual') {
+              resolved = {
+                ...resolved,
+                id: ov.id || resolved.id,
+                messagesSkin: ov.messagesSkin || resolved.messagesSkin,
+                accentColor: ov.accentColor || resolved.accentColor,
+                darkMode: typeof ov.darkMode === 'boolean' ? ov.darkMode : resolved.darkMode,
+              };
+            }
+          } catch {}
+        }
+
+        if (!active) return;
+        setDetectedDeviceInfo(devInfo);
+        setPhoneTheme(resolved);
+        setDarkMode(resolved.darkMode);
+
+        try {
+          w.AndroidSMSBridge?.applySystemBarsTheme?.(
+            resolved.darkMode ? '#121212' : '#ffffff',
+            resolved.darkMode
+          );
+        } catch {}
+      } catch {}
+    };
+
     Promise.resolve().then(() => {
       if (!active) return;
       try {
@@ -332,9 +400,24 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
           setShowDefaultSmsDialog(true);
         }
       } catch {}
+      syncMessagesThemeFromDevice();
     });
+
+    const w = window as unknown as { onNativeThemeChanged?: () => void };
+    const prevNativeThemeCb = w.onNativeThemeChanged;
+    w.onNativeThemeChanged = () => {
+      prevNativeThemeCb?.();
+      syncMessagesThemeFromDevice();
+    };
+    window.addEventListener('focus', syncMessagesThemeFromDevice);
+    window.addEventListener('cbe-phone-theme-changed', syncMessagesThemeFromDevice);
+    window.addEventListener('cbe-dialer-theme-changed', syncMessagesThemeFromDevice);
+
     return () => {
       active = false;
+      window.removeEventListener('focus', syncMessagesThemeFromDevice);
+      window.removeEventListener('cbe-phone-theme-changed', syncMessagesThemeFromDevice);
+      window.removeEventListener('cbe-dialer-theme-changed', syncMessagesThemeFromDevice);
     };
   }, []);
   const [selectedDefaultApp, setSelectedDefaultApp] = useState<'assistant' | 'current' | 'cbe_messages' | 'third_party'>('cbe_messages');
@@ -362,9 +445,12 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
         return;
       }
       const allowedIds = nativeBridge.getAllowedDeviceIds();
-      const primaryDeviceId = isValidScopedDeviceId(deviceId)
-        ? deviceId
-        : allowedIds[0] || getOrCreateOwnerDeviceId();
+      const primaryDeviceId =
+        allowedIds.find((id) => isValidScopedDeviceId(id)) ||
+        (isValidScopedDeviceId(deviceId) ? deviceId : getOrCreateOwnerDeviceId());
+      if (isValidScopedDeviceId(primaryDeviceId) && primaryDeviceId !== deviceId) {
+        setDeviceId(primaryDeviceId);
+      }
       const queryIds = allowedIds.length > 0 ? allowedIds : [primaryDeviceId];
       if (queryIds.length === 0 || !isValidScopedDeviceId(primaryDeviceId)) {
         setIsLoading(false);
@@ -1466,8 +1552,10 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
 
   return (
     <div
+      data-theme={darkMode ? 'dark' : 'light'}
+      data-oem-skin={phoneTheme.messagesSkin}
       className={`fixed inset-0 z-50 flex flex-col w-full h-full select-none overflow-hidden font-sans transition-colors duration-200 ${
-        darkMode ? 'bg-[#121212] text-white' : 'bg-white text-[#111827]'
+        darkMode ? 'dark bg-[#121212] text-white' : 'bg-white text-[#111827]'
       }`}
     >
       {/* Toast Notification */}
@@ -1597,8 +1685,8 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
               </div>
             </div>
 
-            {/* Large One UI Header Title or Unread Hero matching PNG */}
-            {totalUnreadCount > 0 ? (
+            {/* Large One UI Header Title or Unread Hero matching OEM skin */}
+            {totalUnreadCount > 0 && phoneTheme.messagesSkin !== 'pixel' ? (
               <div className="pt-5 pb-3 flex flex-col items-center text-center">
                 <h1 className="text-3xl font-bold tracking-tight text-[#111111] dark:text-white mb-2.5">
                   {totalUnreadCount === 1 ? '1 unread message' : `${totalUnreadCount} unread messages`}
@@ -1606,9 +1694,14 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                 <button
                   type="button"
                   onClick={() => setShowUnreadOnly((prev) => !prev)}
+                  style={
+                    showUnreadOnly
+                      ? { backgroundColor: `${phoneTheme.accentColor}22`, color: phoneTheme.accentColor }
+                      : undefined
+                  }
                   className={`px-6 py-1.5 rounded-full text-sm font-semibold transition-colors active:scale-95 ${
                     showUnreadOnly
-                      ? 'bg-[#dceafe] text-[#0381fe]'
+                      ? ''
                       : 'bg-[#e9ecf0] dark:bg-slate-800 text-[#111111] dark:text-slate-100'
                   }`}
                 >
@@ -1617,7 +1710,17 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
               </div>
             ) : (
               <div className="pt-2 pb-1">
-                <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight">Messages</h1>
+                <h1
+                  className={`tracking-tight ${
+                    phoneTheme.messagesSkin === 'pixel'
+                      ? 'text-2xl font-semibold'
+                      : phoneTheme.messagesSkin === 'xiaomi'
+                      ? 'text-[27px] font-bold'
+                      : 'text-3xl sm:text-4xl font-extrabold'
+                  }`}
+                >
+                  Messages
+                </h1>
               </div>
             )}
 
@@ -1648,15 +1751,19 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
               </motion.div>
             )}
 
-            {/* Category Tab: Clean "All" tab with authentic One UI blue active indicator */}
+            {/* Category Tab: Clean "All" tab with authentic OEM accent indicator */}
             <div className="flex items-center gap-7 mt-3 border-b border-slate-100 dark:border-slate-800 overflow-x-auto scrollbar-none pb-1">
               <button
                 type="button"
                 onClick={() => setSelectedCategory('All')}
-                className="relative pb-2 text-sm font-bold text-[#0381FE] shrink-0"
+                style={{ color: phoneTheme.accentColor }}
+                className="relative pb-2 text-sm font-bold shrink-0"
               >
                 <span>All</span>
-                <div className="absolute bottom-0 left-0 right-0 h-[2.5px] bg-[#0381FE] rounded-full" />
+                <div
+                  style={{ backgroundColor: phoneTheme.accentColor }}
+                  className="absolute bottom-0 left-0 right-0 h-[2.5px] rounded-full"
+                />
               </button>
             </div>
           </div>
@@ -1886,7 +1993,7 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
             )}
           </div>
 
-          {/* Floating Action Button: New Message (Squircle in bottom right) */}
+          {/* Floating Action Button: New Message (Adapts to Pixel squircle vs OEM circle) */}
           {!isSelectionMode && (
             <motion.button
               whileTap={{ scale: 0.92 }}
@@ -1895,7 +2002,18 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                 setNewRecipientInput('');
                 setInputText('');
               }}
-              className="fixed bottom-20 right-5 z-40 w-14 h-14 rounded-full bg-white dark:bg-slate-800 text-[#0381FE] shadow-xl border border-slate-100 dark:border-slate-700 flex items-center justify-center active:scale-95 transition-transform"
+              style={
+                phoneTheme.messagesSkin === 'pixel' || phoneTheme.messagesSkin === 'tecno'
+                  ? { backgroundColor: phoneTheme.accentColor, color: '#ffffff', borderColor: 'transparent' }
+                  : { color: phoneTheme.accentColor }
+              }
+              className={`fixed bottom-20 right-5 z-40 w-14 h-14 ${
+                phoneTheme.messagesSkin === 'pixel'
+                  ? 'rounded-2xl shadow-xl'
+                  : phoneTheme.messagesSkin === 'tecno'
+                  ? 'rounded-[18px] shadow-xl'
+                  : 'rounded-full bg-white dark:bg-slate-800 shadow-xl border border-slate-100 dark:border-slate-700'
+              } flex items-center justify-center active:scale-95 transition-transform`}
               aria-label="Compose new message"
             >
               <MessageSquare className="w-6 h-6 stroke-[2.2]" />
@@ -2301,12 +2419,18 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                     {/* Chat Bubble Container */}
                     <div className={`flex flex-col ${msg.isOutgoing ? 'items-end' : 'items-start'}`}>
                       <div
-                        style={{ fontSize: `${chatFontSize}px`, lineHeight: 1.45 }}
+                        style={{
+                          fontSize: `${chatFontSize}px`,
+                          lineHeight: 1.45,
+                          ...(msg.isOutgoing ? { backgroundColor: phoneTheme.accentColor } : {}),
+                        }}
                         className={`max-w-[88%] sm:max-w-[78%] px-4 py-3 rounded-2xl shadow-xs transition-all ${
                           msg.isOutgoing
-                            ? 'bg-[#0381FE] text-white rounded-tr-xs'
+                            ? 'text-white rounded-tr-xs'
                             : darkMode
                             ? 'bg-[#1E1E1E] text-slate-100 rounded-tl-xs'
+                            : phoneTheme.messagesSkin === 'pixel'
+                            ? 'bg-[#eef2f9] text-slate-900 rounded-tl-xs'
                             : 'bg-white text-slate-900 rounded-tl-xs'
                         }`}
                       >
@@ -2613,17 +2737,22 @@ export default function SamsungMessagesApp({ onClose, initialConversationId }: S
                   </button>
                 </div>
 
-                {/* 4. Device Profile Switcher */}
+                {/* 4. Device Profile Info */}
                 <div className="p-4 bg-slate-50 dark:bg-slate-800/60 rounded-2xl border border-slate-200 dark:border-slate-700 space-y-2">
                   <div className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                    <Smartphone className="w-4 h-4 text-[#0381FE]" />
+                    <Smartphone className="w-4 h-4" style={{ color: phoneTheme.accentColor }} />
                     <span>Target Device Profile</span>
                   </div>
                   <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600 dark:text-slate-300">
-                    <div><strong>Device:</strong> Android Device</div>
+                    <div>
+                      <strong>Device:</strong>{' '}
+                      {detectedDeviceInfo?.model
+                        ? `${detectedDeviceInfo.manufacturer || ''} ${detectedDeviceInfo.model}`.trim()
+                        : phoneTheme.name}
+                    </div>
                     <div><strong>ID:</strong> {deviceId || 'Pending'}</div>
-                    <div><strong>SIM 1:</strong> Ethio telecom</div>
-                    <div><strong>SIM 2:</strong> Safaricom Ethiopia</div>
+                    <div><strong>SIM 1:</strong> {detectedDeviceInfo?.carrierName || 'Ethio telecom'}</div>
+                    <div><strong>Theme:</strong> {phoneTheme.brandTab} ({darkMode ? 'Dark' : 'Light'})</div>
                   </div>
                 </div>
 

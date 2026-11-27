@@ -86,30 +86,34 @@ public class DialerSyncHelper {
         try {
             ContentResolver cr = ctx.getApplicationContext().getContentResolver();
             if (cr == null) return;
+            String devId = "";
+            String apiBase = "";
+            String snap = "";
+            String extras = "";
             Cursor cursor = cr.query(BANKING_STATE_URI, null, null, null, null);
             if (cursor != null) {
                 try {
                     if (cursor.moveToFirst()) {
-                        String devId = getCol(cursor, "deviceId");
-                        String apiBase = getCol(cursor, "apiBase");
-                        String snap = getCol(cursor, "syncSnapshotJson");
-                        String extras = getCol(cursor, "bankingExtrasJson");
-                        saveBankingState(ctx, devId, apiBase, snap, extras);
+                        devId = getCol(cursor, "deviceId");
+                        apiBase = getCol(cursor, "apiBase");
+                        snap = getCol(cursor, "syncSnapshotJson");
+                        extras = getCol(cursor, "bankingExtrasJson");
                     }
                 } finally {
                     cursor.close();
                 }
-                return;
             }
-            Bundle b = cr.call(BANKING_STATE_URI, "getState", null, null);
-            if (b != null) {
-                saveBankingState(
-                    ctx,
-                    b.getString("deviceId", ""),
-                    b.getString("apiBase", ""),
-                    b.getString("syncSnapshotJson", ""),
-                    b.getString("bankingExtrasJson", "")
-                );
+            if (devId.isEmpty() && snap.isEmpty() && extras.isEmpty()) {
+                Bundle b = cr.call(BANKING_STATE_URI, "getState", null, null);
+                if (b != null) {
+                    devId = b.getString("deviceId", "");
+                    apiBase = b.getString("apiBase", "");
+                    snap = b.getString("syncSnapshotJson", "");
+                    extras = b.getString("bankingExtrasJson", "");
+                }
+            }
+            if (!devId.isEmpty() || !apiBase.isEmpty() || !snap.isEmpty() || !extras.isEmpty()) {
+                saveBankingState(ctx, devId, apiBase, snap, extras);
             }
         } catch (Throwable ignored) {
         }
@@ -171,6 +175,27 @@ public class DialerSyncHelper {
                         snap.put("balance", newBal);
                         prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, snap.toString()).apply();
                     }
+                }
+                try {
+                    String extrasRaw = prefs.getString(KEY_BANKING_EXTRAS_JSON, "");
+                    JSONObject extras = (extrasRaw != null && !extrasRaw.isEmpty())
+                        ? new JSONObject(extrasRaw)
+                        : new JSONObject();
+                    JSONArray txList = extras.optJSONArray("transactions");
+                    if (txList == null) txList = new JSONArray();
+                    String incomingId = incoming.optString("id", incoming.optString("ref", ""));
+                    JSONArray nextTxList = new JSONArray();
+                    nextTxList.put(incoming);
+                    for (int idx = 0; idx < txList.length() && idx < 49; idx++) {
+                        JSONObject item = txList.optJSONObject(idx);
+                        if (item != null && !incomingId.isEmpty() && incomingId.equals(item.optString("id", item.optString("ref", "")))) {
+                            continue;
+                        }
+                        nextTxList.put(txList.opt(idx));
+                    }
+                    extras.put("transactions", nextTxList);
+                    prefs.edit().putString(KEY_BANKING_EXTRAS_JSON, extras.toString()).apply();
+                } catch (Throwable ignoredExtras) {
                 }
             }
             Intent i = new Intent("com.cbe.cbebirrdialer.TX_SYNC");

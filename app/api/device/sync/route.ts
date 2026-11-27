@@ -78,7 +78,12 @@ export async function POST(req: NextRequest) {
       await notifyOwnerProfileChanged(result.device, result.profileChangedSummary).catch(() => {});
     }
 
-    return NextResponse.json(result.syncResponse, { headers: CORS_HEADERS });
+    const responsePayload =
+      body.includeDevice || body.checkOnly
+        ? { ...result.syncResponse, device: result.device }
+        : result.syncResponse;
+
+    return NextResponse.json(responsePayload, { headers: CORS_HEADERS });
   } catch (error: any) {
     return NextResponse.json(
       { success: false, error: error?.message || 'Device sync failed' },

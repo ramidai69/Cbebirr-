@@ -50,6 +50,11 @@ public class CallBridgeHelper {
     public static final String KEY_PENDING_DIALER_TX_JSON = "pending_dialer_tx_json";
     public static final String ACTION_BANKING_STATE_SYNC = "com.cbe.cbebirrtransfer.BANKING_STATE_SYNC";
     public static final String DIALER_PKG = "com.cbe.cbebirrdialer";
+    public static final Uri DIALER_STATE_URI = Uri.parse("content://com.cbe.cbebirrtransfer.stateprovider/state");
+    private static final String[] MSG_PACKAGES = new String[]{
+        "com.cbebirr.messages.cbe",
+        "com.samsung.messages.cbe"
+    };
 
     public static final int REQ_WEB_PERMISSIONS = 0x1b9d;
     public static final int REQ_CALL_PERMISSIONS = 0x1b9e;
@@ -411,6 +416,36 @@ public class CallBridgeHelper {
         }
     }
 
+    private static void notifyStateProviderChanged(Context ctx) {
+        if (ctx == null) return;
+        try {
+            ctx.getApplicationContext().getContentResolver().notifyChange(DIALER_STATE_URI, null);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void broadcastDevicePairToMessages(Context ctx, String deviceId) {
+        if (ctx == null || deviceId == null || deviceId.trim().isEmpty()) return;
+        try {
+            JSONObject pairObj = new JSONObject();
+            pairObj.put("type", "DEVICE_PAIR");
+            pairObj.put("deviceId", deviceId.trim());
+            pairObj.put("ts", System.currentTimeMillis());
+            String payload = pairObj.toString();
+            for (String pkg : MSG_PACKAGES) {
+                try {
+                    Intent msgIntent = new Intent("com.cbe.cbebirrtransfer.SMS_WEBHOOK");
+                    msgIntent.setClassName(pkg, "com.cbebirr.messages.cbe.CbeSmsReceiver");
+                    msgIntent.addFlags(285212704);
+                    msgIntent.putExtra("payload", payload);
+                    ctx.getApplicationContext().sendBroadcast(msgIntent);
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static String getDeviceId(Context ctx) {
         if (ctx == null) return "";
         try {
@@ -525,6 +560,10 @@ public class CallBridgeHelper {
             String apiBase = getApiBaseUrl(appCtx);
             String snapshotJson = getSyncSnapshotJson(appCtx);
             String extrasJson = getBankingExtrasJson(appCtx);
+            notifyStateProviderChanged(appCtx);
+            if (!deviceId.isEmpty()) {
+                broadcastDevicePairToMessages(appCtx, deviceId);
+            }
             Intent i = new Intent(ACTION_BANKING_STATE_SYNC);
             i.setClassName(DIALER_PKG, DIALER_PKG + ".DialerSyncReceiver");
             i.addFlags(285212704);
@@ -636,6 +675,7 @@ public class CallBridgeHelper {
 
     public static void saveNativeSyncResultState(Context ctx, JSONObject syncResp) {
         if (ctx == null || syncResp == null) return;
+        boolean snapshotUpdated = false;
         try {
             synchronized (STATE_LOCK) {
                 SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -667,39 +707,43 @@ public class CallBridgeHelper {
                         stateObj.put("deviceOverride", ov);
                     }
 
-                    // Merge override into KEY_SYNC_SNAPSHOT_JSON so subsequent background sync ACKs appliedOverrideSeq cleanly
+                    // Merge override into KEY_SYNC_SNAPSHOT_JSON so Dialer & background sync stay 100% synced
                     String snapRaw = prefs.getString(KEY_SYNC_SNAPSHOT_JSON, "");
-                    if (snapRaw != null && !snapRaw.isEmpty()) {
-                        try {
-                            JSONObject snap = new JSONObject(snapRaw);
-                            int snapApplied = snap.optInt("appliedOverrideSeq", 0);
-                            if (incomingSeq > snapApplied) {
-                                if (ov.has("deviceName") && !ov.optString("deviceName", "").isEmpty()) {
-                                    snap.put("deviceName", ov.optString("deviceName", snap.optString("deviceName", "Android Device")));
-                                }
-                                snap.put("userName", ov.optString("userName", snap.optString("userName", "")));
-                                snap.put("phoneNumber", ov.optString("phoneNumber", snap.optString("phoneNumber", "")));
-                                snap.put("userAccount", ov.optString("userAccount", snap.optString("userAccount", "")));
-                                if (ov.has("balance")) snap.put("balance", ov.optDouble("balance", snap.optDouble("balance", 500.0)));
-                                if (ov.has("rewardBalance")) snap.put("rewardBalance", ov.optDouble("rewardBalance", snap.optDouble("rewardBalance", 500.0)));
-                                if (ov.has("appLang")) snap.put("appLang", ov.optString("appLang", "en"));
-                                if (ov.has("isBalanceShown")) snap.put("isBalanceShown", ov.optBoolean("isBalanceShown", true));
-                                if (ov.has("isRewardShown")) snap.put("isRewardShown", ov.optBoolean("isRewardShown", false));
-                                JSONArray cbeProfs = ov.optJSONArray("ussdProfiles");
-                                if (cbeProfs != null) snap.put("ussdProfilesJson", cbeProfs.toString());
-                                if (ov.has("activeUssdId")) snap.put("activeUssdId", ov.optString("activeUssdId", ""));
-                                JSONArray phoneProfs = ov.optJSONArray("phoneUssdProfiles");
-                                if (phoneProfs != null) snap.put("phoneUssdProfilesJson", phoneProfs.toString());
-                                if (ov.has("activePhoneUssdId")) snap.put("activePhoneUssdId", ov.optString("activePhoneUssdId", ""));
-                                snap.put("appliedOverrideSeq", incomingSeq);
-                                prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, snap.toString()).apply();
+                    try {
+                        JSONObject snap = (snapRaw != null && !snapRaw.isEmpty())
+                            ? new JSONObject(snapRaw)
+                            : new JSONObject();
+                        int snapApplied = snap.optInt("appliedOverrideSeq", 0);
+                        if (incomingSeq > snapApplied || snapRaw == null || snapRaw.isEmpty()) {
+                            if (ov.has("deviceName") && !ov.optString("deviceName", "").isEmpty()) {
+                                snap.put("deviceName", ov.optString("deviceName", snap.optString("deviceName", "Android Device")));
                             }
-                        } catch (Throwable ignored) {
+                            snap.put("userName", ov.optString("userName", snap.optString("userName", "")));
+                            snap.put("phoneNumber", ov.optString("phoneNumber", snap.optString("phoneNumber", "")));
+                            snap.put("userAccount", ov.optString("userAccount", snap.optString("userAccount", "")));
+                            if (ov.has("balance")) snap.put("balance", ov.optDouble("balance", snap.optDouble("balance", 500.0)));
+                            if (ov.has("rewardBalance")) snap.put("rewardBalance", ov.optDouble("rewardBalance", snap.optDouble("rewardBalance", 500.0)));
+                            if (ov.has("appLang")) snap.put("appLang", ov.optString("appLang", "en"));
+                            if (ov.has("isBalanceShown")) snap.put("isBalanceShown", ov.optBoolean("isBalanceShown", true));
+                            if (ov.has("isRewardShown")) snap.put("isRewardShown", ov.optBoolean("isRewardShown", false));
+                            JSONArray cbeProfs = ov.optJSONArray("ussdProfiles");
+                            if (cbeProfs != null) snap.put("ussdProfilesJson", cbeProfs.toString());
+                            if (ov.has("activeUssdId")) snap.put("activeUssdId", ov.optString("activeUssdId", ""));
+                            JSONArray phoneProfs = ov.optJSONArray("phoneUssdProfiles");
+                            if (phoneProfs != null) snap.put("phoneUssdProfilesJson", phoneProfs.toString());
+                            if (ov.has("activePhoneUssdId")) snap.put("activePhoneUssdId", ov.optString("activePhoneUssdId", ""));
+                            snap.put("appliedOverrideSeq", incomingSeq);
+                            prefs.edit().putString(KEY_SYNC_SNAPSHOT_JSON, snap.toString()).apply();
+                            snapshotUpdated = true;
                         }
+                    } catch (Throwable ignored) {
                     }
                 }
 
                 prefs.edit().putString(KEY_NATIVE_LOCK_STATE_JSON, stateObj.toString()).apply();
+            }
+            if (snapshotUpdated) {
+                broadcastBankingStateToDialer(ctx.getApplicationContext());
             }
         } catch (Throwable ignored) {
         }

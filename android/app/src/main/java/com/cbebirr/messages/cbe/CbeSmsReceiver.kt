@@ -8,7 +8,19 @@ import org.json.JSONObject
 
 class CbeSmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != "com.cbe.cbebirrtransfer.SMS_WEBHOOK") return
+        val action = intent?.action ?: return
+        if (action == "com.cbebirr.messages.cbe.ACTION_THEME_SYNC") {
+            val themeJson = intent.getStringExtra("themeJson")?.trim() ?: return
+            if (themeJson.isNotEmpty()) {
+                context.getSharedPreferences("cbe_msg_theme_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putString("synced_theme_json", themeJson)
+                    .apply()
+                MainActivity.dispatchThemeChanged()
+            }
+            return
+        }
+        if (action != "com.cbe.cbebirrtransfer.SMS_WEBHOOK") return
         val rawPayload = intent.getStringExtra("payload")?.trim() ?: return
         if (rawPayload.isEmpty()) return
 
