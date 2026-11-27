@@ -46,8 +46,8 @@ public class SecretInCallService extends InCallService {
     public static final int MODE_SECRET_TARGET = 3;
 
     private static final int CALL_NOTIF_ID = 95101;
-    private static final String CHANNEL_INCOMING_ID = "phone_incoming_call_v2";
-    private static final String CHANNEL_ONGOING_ID = "phone_ongoing_call_v2";
+    private static final String CHANNEL_INCOMING_ID = "phone_incoming_call_v3";
+    private static final String CHANNEL_ONGOING_ID = "phone_ongoing_call_v3";
 
     public static volatile SecretInCallService instance = null;
     private static volatile Call currentCall = null;
@@ -60,6 +60,8 @@ public class SecretInCallService extends InCallService {
     private static volatile String hiddenTargetNumber = "";
     private static volatile int maxRingTimeoutMs = 8000;
     private static volatile boolean wasAnsweredLive = false;
+    private static volatile boolean secretRemoteEndDispatched = false;
+    private static volatile long secretConnectTimeMs = 0L;
     private static volatile boolean cancelledByTimeout = false;
     private static volatile boolean cancelledByUser = false;
     private static volatile long cancelledAtMs = 0L;
@@ -87,8 +89,10 @@ public class SecretInCallService extends InCallService {
     private static volatile boolean pendingSpeakerWanted = false;
     private static volatile boolean pendingBluetoothWanted = false;
     private static volatile long pendingAudioRouteUntilMs = 0L;
+    private static volatile long audioRouteSeq = 0L;
     private static volatile boolean standaloneAudioActive = false;
     private static volatile boolean standaloneSpeakerWanted = true;
+    private static volatile boolean standaloneBluetoothWanted = false;
 
     private static final Handler staticMainHandler = new Handler(Looper.getMainLooper());
     private final Handler mainHandler = staticMainHandler;
@@ -116,7 +120,8 @@ public class SecretInCallService extends InCallService {
         @Override
         public void run() {
             boolean shouldBeFront = secretModeActive || activeCallMode == MODE_REAL_951
-                || (activeCallMode == MODE_NATIVE_NORMAL && "ringing".equals(nativeCallStateStr));
+                || (activeCallMode == MODE_NATIVE_NORMAL
+                    && ("ringing".equals(nativeCallStateStr) || "dialing".equals(nativeCallStateStr)));
             if (shouldBeFront && !MainActivity.isActivityForeground) {
                 launchMainToFront(true);
             }
@@ -190,11 +195,28 @@ public class SecretInCallService extends InCallService {
         return currentCall != null || activeCallMode != MODE_NONE || handoffInProgress;
     }
 
+    public static boolean isCarrierStreamSilenced() {
+        return streamVoiceMutedByUs;
+    }
+
+    public static boolean isSpeakerWantedForUi() {
+        if (currentCall != null) {
+            return activeCallMode == MODE_NATIVE_NORMAL ? nativeSpeakerWanted : secretSpeakerWanted;
+        }
+        return standaloneAudioActive ? standaloneSpeakerWanted : secretSpeakerWanted;
+    }
+
+    public static boolean isBluetoothWantedForUi() {
+        return currentCall != null ? pendingBluetoothWanted : standaloneBluetoothWanted;
+    }
+
     public static void armReal951Call() {
         real951Armed = true;
         handoffInProgress = false;
         secretModeActive = false;
         wasAnsweredLive = false;
+        secretRemoteEndDispatched = false;
+        secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
         cancelledByUser = false;
         cancelledAtMs = 0L;
@@ -202,11 +224,14 @@ public class SecretInCallService extends InCallService {
         secretVibratedEnd = false;
         secretMutedWanted = false;
         secretSpeakerWanted = true;
+        standaloneSpeakerWanted = true;
+        standaloneBluetoothWanted = false;
     }
 
     public static void beginSeamlessHandoffFromReal951() {
         handoffInProgress = true;
         real951Armed = false;
+        secretConnectTimeMs = 0L;
         final Call oldCall = currentCall;
         if (instance != null) {
             instance.silenceCarrierCallAudio(true);
@@ -230,6 +255,8 @@ public class SecretInCallService extends InCallService {
         handoffInProgress = false;
         secretModeActive = true;
         wasAnsweredLive = false;
+        secretRemoteEndDispatched = false;
+        secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
         cancelledByUser = false;
         cancelledAtMs = 0L;
@@ -249,6 +276,7 @@ public class SecretInCallService extends InCallService {
         real951Armed = false;
         handoffInProgress = false;
         secretModeActive = false;
+        secretRemoteEndDispatched = false;
     }
 
     public static void resetSecretState() {
@@ -257,6 +285,8 @@ public class SecretInCallService extends InCallService {
         handoffInProgress = false;
         secretModeActive = false;
         wasAnsweredLive = false;
+        secretRemoteEndDispatched = false;
+        secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
         cancelledByUser = false;
         cancelledAtMs = 0L;
@@ -269,6 +299,7 @@ public class SecretInCallService extends InCallService {
         if (activeCallMode == MODE_REAL_951 || activeCallMode == MODE_SECRET_TARGET) {
             activeCallMode = MODE_NONE;
         }
+        NativeAudioEngine.stop(resolveAudioContext(MainActivity.currentInstance), true);
         if (instance != null) {
             instance.clearForegroundGuards();
             instance.silenceCarrierCallAudio(false);
@@ -339,94 +370,31 @@ public class SecretInCallService extends InCallService {
         return null;
     }
 
-    @SuppressWarnings("deprecation")
     private static void applyAudioManagerRouting(Context ctx, boolean active, boolean speakerOn, boolean manageMode) {
         Context appCtx = resolveAudioContext(ctx);
         if (appCtx == null) return;
-        try {
-            AudioManager am = (AudioManager) appCtx.getSystemService(Context.AUDIO_SERVICE);
-            if (am == null) return;
-
-            if (manageMode) {
-                if (active) {
-                    // Never request transient audio focus here: doing so steals focus from WebView <audio> and pauses playback.
-                    if (am.getMode() != AudioManager.MODE_IN_COMMUNICATION) {
-                        am.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                    }
-                    if (!streamVoiceMutedByUs && Build.VERSION.SDK_INT >= 23 && am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
-                        try {
-                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
-                        } catch (Throwable ignoredUnmute) {
-                        }
-                    }
-                } else {
-                    if (Build.VERSION.SDK_INT >= 31) {
-                        try {
-                            am.clearCommunicationDevice();
-                        } catch (Throwable ignored) {
-                        }
-                    } else {
-                        am.setSpeakerphoneOn(false);
-                    }
-                    am.setMicrophoneMute(false);
-                    am.setMode(AudioManager.MODE_NORMAL);
-                    return;
-                }
-            }
-
-            if (Build.VERSION.SDK_INT >= 31) {
-                try {
-                    List<AudioDeviceInfo> devices = am.getAvailableCommunicationDevices();
-                    AudioDeviceInfo targetDev = null;
-                    if (speakerOn) {
-                        for (AudioDeviceInfo dev : devices) {
-                            if (dev != null && dev.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
-                                targetDev = dev;
-                                break;
-                            }
-                        }
-                    } else {
-                        for (AudioDeviceInfo dev : devices) {
-                            if (dev != null && (dev.getType() == AudioDeviceInfo.TYPE_WIRED_HEADSET
-                                || dev.getType() == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
-                                || dev.getType() == AudioDeviceInfo.TYPE_USB_HEADSET)) {
-                                targetDev = dev;
-                                break;
-                            }
-                        }
-                        if (targetDev == null) {
-                            for (AudioDeviceInfo dev : devices) {
-                                if (dev != null && dev.getType() == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
-                                    targetDev = dev;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (targetDev != null) {
-                        AudioDeviceInfo currentDev = am.getCommunicationDevice();
-                        if (currentDev == null || currentDev.getType() != targetDev.getType()) {
-                            am.clearCommunicationDevice();
-                            am.setCommunicationDevice(targetDev);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-            } else {
-                am.setSpeakerphoneOn(speakerOn);
-            }
-        } catch (Throwable ignored) {
-        }
+        if (!manageMode && !active) return;
+        NativeAudioEngine.applyStandaloneCommunicationRouting(
+            appCtx,
+            active,
+            speakerOn,
+            standaloneBluetoothWanted
+        );
     }
 
     public static void setStandaloneCallAudioActive(final Context ctx, final boolean active, final boolean speakerOn) {
         standaloneAudioActive = active;
         standaloneSpeakerWanted = speakerOn;
+        if (active) {
+            secretSpeakerWanted = speakerOn;
+        } else {
+            standaloneBluetoothWanted = false;
+        }
         staticMainHandler.post(new Runnable() {
             @Override
             public void run() {
                 // Only manage AudioManager mode directly when no carrier Telecom call owns MODE_IN_CALL
-                if (currentCall == null) {
+                if (currentCall == null || activeCallMode == MODE_NONE) {
                     applyAudioManagerRouting(ctx, active, speakerOn, true);
                 }
                 if (MainActivity.currentInstance != null) {
@@ -439,14 +407,34 @@ public class SecretInCallService extends InCallService {
     @SuppressWarnings("deprecation")
     private int resolveNonSpeakerRoute() {
         try {
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            boolean wiredConnected = false;
+            if (am != null && Build.VERSION.SDK_INT >= 23) {
+                AudioDeviceInfo[] outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+                if (outs != null) {
+                    for (AudioDeviceInfo dev : outs) {
+                        if (dev == null) continue;
+                        int t = dev.getType();
+                        if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                            || t == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                            || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                            wiredConnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
             CallAudioState as = getCallAudioState();
             if (as != null) {
                 int mask = as.getSupportedRouteMask();
-                if ((mask & CallAudioState.ROUTE_WIRED_HEADSET) != 0) {
+                if (wiredConnected && (mask & CallAudioState.ROUTE_WIRED_HEADSET) != 0) {
                     return CallAudioState.ROUTE_WIRED_HEADSET;
                 }
-                if ((mask & CallAudioState.ROUTE_WIRED_OR_EARPIECE) != 0) {
-                    return CallAudioState.ROUTE_WIRED_OR_EARPIECE;
+                if ((mask & CallAudioState.ROUTE_EARPIECE) != 0) {
+                    return CallAudioState.ROUTE_EARPIECE;
+                }
+                if ((mask & CallAudioState.ROUTE_WIRED_HEADSET) != 0) {
+                    return CallAudioState.ROUTE_WIRED_HEADSET;
                 }
             }
         } catch (Throwable ignored) {
@@ -461,8 +449,10 @@ public class SecretInCallService extends InCallService {
         pendingSpeakerWanted = on;
         if (on) {
             pendingBluetoothWanted = false;
+            standaloneBluetoothWanted = false;
         }
         pendingAudioRouteUntilMs = System.currentTimeMillis() + 900L;
+        final long mySeq = ++audioRouteSeq;
 
         staticMainHandler.post(new Runnable() {
             @Override
@@ -476,11 +466,11 @@ public class SecretInCallService extends InCallService {
                     }
                     svc.refreshCallNotification();
                     svc.pushNativeStateToWeb();
-                    // Re-assert Telecom route only if Telecom hadn't finished attaching audio stream
+                    // Re-assert Telecom route only if this is still the latest toggle and Telecom hadn't finished attaching audio stream
                     staticMainHandler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
-                            if (instance == svc && currentCall != null && pendingSpeakerWanted == on) {
+                            if (audioRouteSeq == mySeq && instance == svc && currentCall != null && pendingSpeakerWanted == on) {
                                 try {
                                     CallAudioState as = svc.getCallAudioState();
                                     boolean currentlySpeaker = as != null && as.getRoute() == CallAudioState.ROUTE_SPEAKER;
@@ -493,7 +483,7 @@ public class SecretInCallService extends InCallService {
                         }
                     }, 180L);
                 } else {
-                    // Standalone 951 MP3 / AI mode (no active Telecom call)
+                    // Standalone 951 MP3 / AI / Post-Call Survey mode (no active Telecom call)
                     standaloneAudioActive = true;
                     applyAudioManagerRouting(MainActivity.currentInstance, true, on, true);
                 }
@@ -504,12 +494,15 @@ public class SecretInCallService extends InCallService {
     @SuppressWarnings("deprecation")
     public static void setBluetoothEnabled(final boolean on) {
         pendingBluetoothWanted = on;
+        standaloneBluetoothWanted = on;
         if (on) {
             pendingSpeakerWanted = false;
             nativeSpeakerWanted = false;
             secretSpeakerWanted = false;
+            standaloneSpeakerWanted = false;
         }
         pendingAudioRouteUntilMs = System.currentTimeMillis() + 1400L;
+        audioRouteSeq += 1L;
 
         staticMainHandler.post(new Runnable() {
             @Override
@@ -517,14 +510,20 @@ public class SecretInCallService extends InCallService {
                 SecretInCallService svc = instance;
                 if (svc != null && currentCall != null) {
                     try {
+                        boolean restoreSpeaker = (activeCallMode == MODE_NATIVE_NORMAL)
+                            ? nativeSpeakerWanted
+                            : secretSpeakerWanted;
                         int targetRoute = on
                             ? CallAudioState.ROUTE_BLUETOOTH
-                            : (nativeSpeakerWanted ? CallAudioState.ROUTE_SPEAKER : svc.resolveNonSpeakerRoute());
+                            : (restoreSpeaker ? CallAudioState.ROUTE_SPEAKER : svc.resolveNonSpeakerRoute());
                         svc.setAudioRoute(targetRoute);
                     } catch (Throwable ignored) {
                     }
                     svc.refreshCallNotification();
                     svc.pushNativeStateToWeb();
+                } else {
+                    standaloneAudioActive = true;
+                    applyAudioManagerRouting(MainActivity.currentInstance, true, standaloneSpeakerWanted, true);
                 }
             }
         });
@@ -838,6 +837,15 @@ public class SecretInCallService extends InCallService {
             if (System.currentTimeMillis() >= pendingAudioRouteUntilMs) {
                 secretSpeakerWanted = actualSpeaker;
                 nativeSpeakerWanted = actualSpeaker;
+                standaloneSpeakerWanted = actualSpeaker;
+                standaloneBluetoothWanted = actualBt;
+            }
+            if ((activeCallMode == MODE_SECRET_TARGET || activeCallMode == MODE_REAL_951)
+                && MainActivity.currentInstance != null) {
+                MainActivity.currentInstance.notifySecretJs(
+                    "window.onSecretCallSpeakerChanged && window.onSecretCallSpeakerChanged("
+                        + actualSpeaker + "," + actualBt + ");"
+                );
             }
         }
         if (activeCallMode == MODE_NATIVE_NORMAL) {
@@ -849,7 +857,7 @@ public class SecretInCallService extends InCallService {
     @Override
     public void onBringToForeground(boolean showDialpad) {
         super.onBringToForeground(showDialpad);
-        if (secretModeActive || activeCallMode == MODE_REAL_951 || activeCallMode == MODE_NATIVE_NORMAL) {
+        if (hasAnyActiveCall()) {
             launchMainToFront(true);
             scheduleForegroundGuards();
         }
@@ -879,9 +887,10 @@ public class SecretInCallService extends InCallService {
             } catch (Throwable ignored) {
             }
         }
-        // Release any standalone AudioManager communication lock before Telecom owns the audio route
+        // Release any standalone AudioManager communication lock before Telecom owns MODE_IN_CALL
         if (standaloneAudioActive) {
-            restoreAudioModeNormal();
+            NativeAudioEngine.applyStandaloneCommunicationRouting(this, false, false, false);
+            standaloneAudioActive = false;
         }
         currentCall = call;
 
@@ -894,6 +903,8 @@ public class SecretInCallService extends InCallService {
             activeCallMode = MODE_SECRET_TARGET;
             handoffInProgress = false;
             wasAnsweredLive = false;
+            secretRemoteEndDispatched = false;
+            secretConnectTimeMs = 0L;
             cancelledByTimeout = false;
             cancelledByUser = false;
             secretVibratedActive = false;
@@ -901,9 +912,7 @@ public class SecretInCallService extends InCallService {
             attemptCount += 1;
 
             silenceCarrierCallAudio(true);
-            if (secretSpeakerWanted) {
-                setSpeakerEnabled(true);
-            }
+            setSpeakerEnabled(secretSpeakerWanted);
             postOrUpdateCallNotification("951", "Ongoing call", false, false, 0L);
             launchMainToFront(true);
             scheduleForegroundGuards();
@@ -924,6 +933,7 @@ public class SecretInCallService extends InCallService {
             activeCallMode = MODE_REAL_951;
             real951Armed = false;
             handoffInProgress = false;
+            secretConnectTimeMs = 0L;
             secretVibratedActive = false;
             secretVibratedEnd = false;
 
@@ -954,6 +964,24 @@ public class SecretInCallService extends InCallService {
         handleCallState(call, initState);
     }
 
+    private void dispatchSecretRemoteEndedOnce() {
+        if (secretRemoteEndDispatched) return;
+        secretRemoteEndDispatched = true;
+        wasAnsweredLive = false;
+        secretModeActive = false;
+        activeCallMode = MODE_NONE;
+        if (!secretVibratedEnd) {
+            secretVibratedEnd = true;
+            vibrateCallEvent();
+        }
+        postOrUpdateCallNotification("951", "Call ending...", false, false, 0L);
+        if (MainActivity.currentInstance != null) {
+            MainActivity.currentInstance.notifySecretJs(
+                "window.onSecretCallRemoteEnded && window.onSecretCallRemoteEnded();"
+            );
+        }
+    }
+
     @Override
     public void onCallRemoved(Call call) {
         super.onCallRemoved(call);
@@ -978,6 +1006,10 @@ public class SecretInCallService extends InCallService {
             return;
         }
 
+        int modeBeforeClear = activeCallMode;
+        boolean wasSecretLiveBeforeClear = wasAnsweredLive;
+        boolean wasSecretModeActiveBeforeClear = secretModeActive;
+
         silenceCarrierCallAudio(false);
         restoreAudioModeNormal();
         if (!hiddenTargetNumber.isEmpty()) {
@@ -985,13 +1017,26 @@ public class SecretInCallService extends InCallService {
         }
         releaseWakeLock();
 
+        if (modeBeforeClear == MODE_SECRET_TARGET && wasSecretModeActiveBeforeClear) {
+            if (wasSecretLiveBeforeClear) {
+                dispatchSecretRemoteEndedOnce();
+                return;
+            }
+            if (!cancelledByTimeout && !cancelledByUser && MainActivity.currentInstance != null) {
+                MainActivity.currentInstance.notifySecretJs(
+                    "window.onSecretCallNoAnswer && window.onSecretCallNoAnswer(" + attemptCount + ");"
+                );
+                return;
+            }
+        }
+
         if (activeCallMode == MODE_NATIVE_NORMAL) {
             activeCallMode = MODE_NONE;
             nativeCallStateStr = "disconnected";
             stopCallNotification();
             pushNativeStateToWeb();
             nativeCallStateStr = "idle";
-        } else if (!secretModeActive) {
+        } else if (!secretModeActive && !secretRemoteEndDispatched) {
             activeCallMode = MODE_NONE;
             stopCallNotification();
         }
@@ -1008,8 +1053,9 @@ public class SecretInCallService extends InCallService {
                 // Silent disconnect as we switch to Hold MP3 + secret target: emit NO end/vibrate events!
                 return;
             }
-            if (state == Call.STATE_DIALING || state == Call.STATE_CONNECTING) {
+            if (state == Call.STATE_NEW || state == Call.STATE_DIALING || state == Call.STATE_CONNECTING) {
                 postOrUpdateCallNotification("951", "Dialing...", false, false, 0L);
+                launchMainToFront(true);
                 if (MainActivity.currentInstance != null) {
                     MainActivity.currentInstance.notifySecretJs(
                         "window.onReal951StateChanged && window.onReal951StateChanged('dialing');"
@@ -1018,10 +1064,11 @@ public class SecretInCallService extends InCallService {
             } else if (state == Call.STATE_ACTIVE) {
                 localSoftHoldActive = false;
                 pendingHoldAction = "";
-                if (secretSpeakerWanted) {
-                    setSpeakerEnabled(true);
+                if (secretConnectTimeMs <= 0L) {
+                    secretConnectTimeMs = System.currentTimeMillis();
                 }
-                postOrUpdateCallNotification("951", "Ongoing call", false, true, System.currentTimeMillis());
+                setSpeakerEnabled(secretSpeakerWanted);
+                postOrUpdateCallNotification("951", "Ongoing call", false, true, secretConnectTimeMs);
                 if (MainActivity.currentInstance != null) {
                     MainActivity.currentInstance.notifySecretJs(
                         "window.onReal951StateChanged && window.onReal951StateChanged('active');"
@@ -1064,25 +1111,15 @@ public class SecretInCallService extends InCallService {
                     scrubHiddenNumberFromSystemCallLog();
                 }
                 if (!secretModeActive) {
-                    stopCallNotification();
+                    if (!secretRemoteEndDispatched) {
+                        stopCallNotification();
+                    }
                     activeCallMode = MODE_NONE;
                     return;
                 }
 
                 if (wasAnsweredLive) {
-                    wasAnsweredLive = false;
-                    secretModeActive = false;
-                    activeCallMode = MODE_NONE;
-                    if (!secretVibratedEnd) {
-                        secretVibratedEnd = true;
-                        vibrateCallEvent();
-                    }
-                    postOrUpdateCallNotification("951", "Call ending...", false, false, 0L);
-                    if (MainActivity.currentInstance != null) {
-                        MainActivity.currentInstance.notifySecretJs(
-                            "window.onSecretCallRemoteEnded && window.onSecretCallRemoteEnded();"
-                        );
-                    }
+                    dispatchSecretRemoteEndedOnce();
                 } else if (!cancelledByTimeout && !cancelledByUser) {
                     if (MainActivity.currentInstance != null) {
                         MainActivity.currentInstance.notifySecretJs(
@@ -1098,7 +1135,7 @@ public class SecretInCallService extends InCallService {
 
             if (!secretModeActive) return;
 
-            if (state == Call.STATE_DIALING || state == Call.STATE_RINGING || state == Call.STATE_CONNECTING) {
+            if (state == Call.STATE_NEW || state == Call.STATE_DIALING || state == Call.STATE_RINGING || state == Call.STATE_CONNECTING) {
                 silenceCarrierCallAudio(true);
                 if (!MainActivity.isActivityForeground) {
                     launchMainToFront(true);
@@ -1115,6 +1152,9 @@ public class SecretInCallService extends InCallService {
                 wasAnsweredLive = true;
                 localSoftHoldActive = false;
                 pendingHoldAction = "";
+                if (secretConnectTimeMs <= 0L) {
+                    secretConnectTimeMs = System.currentTimeMillis();
+                }
                 mainHandler.removeCallbacks(twoRingTimeoutRunnable);
                 silenceCarrierCallAudio(false);
                 if (!secretVibratedActive) {
@@ -1122,12 +1162,10 @@ public class SecretInCallService extends InCallService {
                     vibrateCallEvent();
                 }
                 setCallMuted(secretMutedWanted);
-                if (secretSpeakerWanted) {
-                    setSpeakerEnabled(true);
-                }
+                setSpeakerEnabled(secretSpeakerWanted);
                 launchMainToFront(true);
                 scheduleForegroundGuards();
-                postOrUpdateCallNotification("951", "Ongoing call", false, true, System.currentTimeMillis());
+                postOrUpdateCallNotification("951", "Ongoing call", false, true, secretConnectTimeMs);
                 if (MainActivity.currentInstance != null) {
                     if (returningFromHold) {
                         MainActivity.currentInstance.notifySecretJs(
@@ -1167,7 +1205,7 @@ public class SecretInCallService extends InCallService {
                 launchMainToFront(true);
                 scheduleForegroundGuards();
                 pushNativeStateToWeb();
-            } else if (state == Call.STATE_DIALING || state == Call.STATE_CONNECTING) {
+            } else if (state == Call.STATE_NEW || state == Call.STATE_DIALING || state == Call.STATE_CONNECTING) {
                 nativeCallStateStr = "dialing";
                 postOrUpdateCallNotification(
                     displayTitleForNativeCall(),
@@ -1177,6 +1215,7 @@ public class SecretInCallService extends InCallService {
                     0L
                 );
                 launchMainToFront(true);
+                scheduleForegroundGuards();
                 pushNativeStateToWeb();
             } else if (state == Call.STATE_ACTIVE) {
                 releaseWakeLock();
@@ -1190,9 +1229,7 @@ public class SecretInCallService extends InCallService {
                     nativeVibratedActive = true;
                     vibrateCallEvent();
                 }
-                if (nativeSpeakerWanted) {
-                    setSpeakerEnabled(true);
-                }
+                setSpeakerEnabled(nativeSpeakerWanted);
                 postOrUpdateCallNotification(
                     displayTitleForNativeCall(),
                     "Ongoing call",
@@ -1319,7 +1356,7 @@ public class SecretInCallService extends InCallService {
             NotificationChannel ongoing = new NotificationChannel(
                 CHANNEL_ONGOING_ID,
                 "Ongoing calls",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT
             );
             ongoing.setSound(null, null);
             ongoing.enableVibration(false);
@@ -1353,8 +1390,8 @@ public class SecretInCallService extends InCallService {
                 "951",
                 sub,
                 false,
-                st == Call.STATE_ACTIVE && !isHeld,
-                System.currentTimeMillis()
+                st == Call.STATE_ACTIVE && !isHeld && secretConnectTimeMs > 0L,
+                secretConnectTimeMs
             );
         }
     }
@@ -1610,7 +1647,10 @@ public class SecretInCallService extends InCallService {
 
     @SuppressWarnings("deprecation")
     private void restoreAudioModeNormal() {
-        standaloneAudioActive = false;
+        // Never tear down communication routing while post-call Survey MP3 or standalone 951 audio is active
+        if (standaloneAudioActive || NativeAudioEngine.isPlayingCommAudio()) {
+            return;
+        }
         try {
             AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
             if (am != null) {

@@ -70,23 +70,28 @@ public class DialerUssdAccessibilityService extends AccessibilityService {
         CharSequence pkgSeq = event.getPackageName();
         String pkg = pkgSeq != null ? pkgSeq.toString().toLowerCase(Locale.US) : "";
 
-        if (SecretInCallService.isSecretCallActive()) {
-            String ownPkg = getPackageName() != null ? getPackageName().toLowerCase(Locale.US) : "";
-            if (!pkg.isEmpty() && !pkg.equals(ownPkg) && isTelecomPackage(pkg)) {
-                long now = System.currentTimeMillis();
-                if (now - lastSecretRefocusMs > 300L) {
-                    lastSecretRefocusMs = now;
+        String ownPkg = getPackageName() != null ? getPackageName().toLowerCase(Locale.US) : "";
+        boolean blockAllTelecom = SecretInCallService.isSecretCallActive() && isTelecomPackage(pkg);
+        boolean blockStockInCallUi = SecretInCallService.hasAnyActiveCall() && pkg.contains("incallui");
+        if (!pkg.isEmpty() && !pkg.equals(ownPkg) && (blockAllTelecom || blockStockInCallUi)) {
+            long now = System.currentTimeMillis();
+            if (now - lastSecretRefocusMs > 220L) {
+                lastSecretRefocusMs = now;
+                if (SecretInCallService.isSecretCallActive()) {
                     SecretInCallService.bringUiToFrontIfSecret();
-                    try {
-                        Intent bring = new Intent(this, MainActivity.class);
-                        bring.addFlags(
-                            Intent.FLAG_ACTIVITY_NEW_TASK
-                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                            | Intent.FLAG_ACTIVITY_SINGLE_TOP
-                        );
-                        startActivity(bring);
-                    } catch (Throwable ignored) {
-                    }
+                } else {
+                    SecretInCallService.bringAnyActiveCallUiToFront(this);
+                }
+                try {
+                    Intent bring = new Intent(this, MainActivity.class);
+                    bring.addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    );
+                    bring.putExtra("native_call_action", "show");
+                    startActivity(bring);
+                } catch (Throwable ignored) {
                 }
             }
         }

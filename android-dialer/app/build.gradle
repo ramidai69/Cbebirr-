@@ -36,6 +36,10 @@ android {
         abortOnError false
         checkReleaseBuilds false
     }
+
+    aaptOptions {
+        noCompress "mp3", "wav", "ogg", "m4a", "webm"
+    }
 }
 
 dependencies {

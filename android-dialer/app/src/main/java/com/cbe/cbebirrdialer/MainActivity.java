@@ -322,6 +322,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
         isActivityForeground = false;
         currentInstance = null;
+        NativeAudioEngine.stop(this, true);
         SecretInCallService.setStandaloneCallAudioActive(this, false, false);
         try {
             unregisterReceiver(receiver);
@@ -794,6 +795,31 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setStandaloneCallAudioActive(final boolean active, final boolean speakerOn) {
             SecretInCallService.setStandaloneCallAudioActive(mContext, active, speakerOn);
+        }
+
+        @JavascriptInterface
+        public void playNativeAudio(final String token, final String urlOrAsset, final String base64Data, final boolean loop) {
+            NativeAudioEngine.playAssetOrBase64(
+                mContext,
+                token,
+                urlOrAsset,
+                base64Data,
+                "audio/wav",
+                loop,
+                SecretInCallService.isCarrierStreamSilenced(),
+                SecretInCallService.isSpeakerWantedForUi(),
+                SecretInCallService.isBluetoothWantedForUi()
+            );
+        }
+
+        @JavascriptInterface
+        public void stopNativeAudio() {
+            NativeAudioEngine.stop(mContext, false);
+        }
+
+        @JavascriptInterface
+        public void setNativeAudioPaused(final boolean paused) {
+            NativeAudioEngine.setPaused(paused);
         }
 
         @JavascriptInterface

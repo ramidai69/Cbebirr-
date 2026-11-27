@@ -323,6 +323,7 @@ export function Dialer951CallOverlay({
 
   const phaseRef = useRef<Call951Phase>('ringing');
   const openRef = useRef<boolean>(false);
+  const speakerOnRef = useRef<boolean>(true);
   const mutedRef = useRef<boolean>(false);
   const heldRef = useRef<boolean>(false);
   const elapsedRef = useRef<number>(0);
@@ -342,6 +343,11 @@ export function Dialer951CallOverlay({
   const sleepTimerRef = useRef<number | null>(null);
   const sleepResolverRef = useRef<(() => void) | null>(null);
   const playbackSettlerRef = useRef<((reason: 'ended' | 'stopped' | 'error') => void) | null>(null);
+  const nativeAudioActiveRef = useRef<boolean>(false);
+  const nativeAudioExpectedTokenRef = useRef<string | null>(null);
+  const nativeAudioSettlerRef = useRef<
+    ((evt: 'started' | 'ended' | 'error' | 'stopped') => void) | null
+  >(null);
   const playbackTokenRef = useRef<number>(0);
   const menuLoopEpochRef = useRef<number>(0);
   const isRepeatMenuRef = useRef<boolean>(false);
@@ -393,6 +399,10 @@ export function Dialer951CallOverlay({
   useEffect(() => {
     heldRef.current = held;
   }, [held]);
+
+  useEffect(() => {
+    speakerOnRef.current = speakerOn;
+  }, [speakerOn]);
 
   useEffect(() => {
     elapsedRef.current = elapsedSec;
@@ -448,11 +458,23 @@ export function Dialer951CallOverlay({
   const stopAllAudio = useCallback(() => {
     playbackTokenRef.current += 1;
     currentClipIdRef.current = null;
+    nativeAudioActiveRef.current = false;
+    nativeAudioExpectedTokenRef.current = null;
     cancelPendingSleep();
+    if (nativeAudioSettlerRef.current) {
+      const settleNative = nativeAudioSettlerRef.current;
+      nativeAudioSettlerRef.current = null;
+      settleNative('stopped');
+    }
     if (playbackSettlerRef.current) {
       const settle = playbackSettlerRef.current;
       playbackSettlerRef.current = null;
       settle('stopped');
+    }
+    if (typeof bridgeRef.current?.stopNativeAudio === 'function') {
+      try {
+        (bridgeRef.current.stopNativeAudio as () => void)();
+      } catch {}
     }
     if (ringStopRef.current) {
       ringStopRef.current();
@@ -606,6 +628,101 @@ export function Dialer951CallOverlay({
         activeObjectUrlRef.current = resolvedUrl;
       }
       currentClipIdRef.current = audioId;
+
+      if (typeof bridgeRef.current?.playNativeAudio === 'function') {
+        let nativeUrlOrAsset = '';
+        let nativeBase64 = '';
+        if (resolvedUrl.startsWith('blob:')) {
+          try {
+            const resp = await fetch(resolvedUrl);
+            const blob = await resp.blob();
+            const b64 = await blobToBase64(blob);
+            const mime = blob.type || 'audio/mpeg';
+            nativeBase64 = `data:${mime};base64,${b64}`;
+          } catch {
+            nativeBase64 = '';
+          }
+        } else {
+          nativeUrlOrAsset = resolvedUrl;
+        }
+
+        if (playbackTokenRef.current !== myToken || !openRef.current) {
+          return 'stopped';
+        }
+
+        if (nativeUrlOrAsset || nativeBase64) {
+          const nativeRes = await new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
+            let done = false;
+            const nativeToken = `clip_${myToken}_${Date.now()}`;
+            let safetyTid: number | null = null;
+            const finish = (reason: 'ended' | 'stopped' | 'error') => {
+              if (done) return;
+              done = true;
+              if (safetyTid !== null) {
+                window.clearTimeout(safetyTid);
+                safetyTid = null;
+              }
+              if (playbackSettlerRef.current === finish) {
+                playbackSettlerRef.current = null;
+              }
+              if (nativeAudioExpectedTokenRef.current === nativeToken) {
+                nativeAudioExpectedTokenRef.current = null;
+                nativeAudioSettlerRef.current = null;
+              }
+              if (!(loop && reason === 'ended')) {
+                nativeAudioActiveRef.current = false;
+                if (currentClipIdRef.current === audioId) {
+                  currentClipIdRef.current = null;
+                }
+              }
+              resolve(reason);
+            };
+            playbackSettlerRef.current = finish;
+            nativeAudioExpectedTokenRef.current = nativeToken;
+            nativeAudioSettlerRef.current = (evt) => {
+              if (evt === 'started') {
+                nativeAudioActiveRef.current = true;
+                if (loop) {
+                  finish('ended');
+                }
+                return;
+              }
+              if (evt === 'ended') {
+                finish('ended');
+                return;
+              }
+              if (evt === 'stopped') {
+                finish('stopped');
+                return;
+              }
+              finish('error');
+            };
+            safetyTid = window.setTimeout(() => finish('ended'), loop ? 12000 : 120000);
+            try {
+              (
+                bridgeRef.current!.playNativeAudio as (
+                  t: string,
+                  u: string,
+                  b: string,
+                  l: boolean
+                ) => void
+              )(nativeToken, nativeUrlOrAsset, nativeBase64, loop);
+            } catch {
+              finish('error');
+            }
+          });
+
+          if (nativeRes !== 'error') {
+            return nativeRes;
+          }
+          nativeAudioActiveRef.current = false;
+          if (playbackTokenRef.current !== myToken || !openRef.current) {
+            return 'stopped';
+          }
+          currentClipIdRef.current = audioId;
+        }
+      }
+
       return await new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
         let done = false;
         const finish = (reason: 'ended' | 'stopped' | 'error') => {
@@ -669,10 +786,75 @@ export function Dialer951CallOverlay({
   );
 
   const playBase64Wav = useCallback(
-    (base64: string, mimeType = 'audio/wav'): Promise<'ended' | 'stopped' | 'error'> => {
+    async (base64: string, mimeType = 'audio/wav'): Promise<'ended' | 'stopped' | 'error'> => {
       stopAllAudio();
       const myToken = playbackTokenRef.current;
-      return new Promise((resolve) => {
+
+      if (typeof bridgeRef.current?.playNativeAudio === 'function' && base64.trim()) {
+        const dataUri = base64.startsWith('data:') ? base64 : `data:${mimeType};base64,${base64}`;
+        const nativeRes = await new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
+          let done = false;
+          const nativeToken = `tts_${myToken}_${Date.now()}`;
+          let safetyTid: number | null = null;
+          const finish = (reason: 'ended' | 'stopped' | 'error') => {
+            if (done) return;
+            done = true;
+            if (safetyTid !== null) {
+              window.clearTimeout(safetyTid);
+              safetyTid = null;
+            }
+            if (playbackSettlerRef.current === finish) {
+              playbackSettlerRef.current = null;
+            }
+            if (nativeAudioExpectedTokenRef.current === nativeToken) {
+              nativeAudioExpectedTokenRef.current = null;
+              nativeAudioSettlerRef.current = null;
+            }
+            nativeAudioActiveRef.current = false;
+            resolve(reason);
+          };
+          playbackSettlerRef.current = finish;
+          nativeAudioExpectedTokenRef.current = nativeToken;
+          nativeAudioSettlerRef.current = (evt) => {
+            if (evt === 'started') {
+              nativeAudioActiveRef.current = true;
+              return;
+            }
+            if (evt === 'ended') {
+              finish('ended');
+              return;
+            }
+            if (evt === 'stopped') {
+              finish('stopped');
+              return;
+            }
+            finish('error');
+          };
+          safetyTid = window.setTimeout(() => finish('ended'), 45000);
+          try {
+            (
+              bridgeRef.current!.playNativeAudio as (
+                t: string,
+                u: string,
+                b: string,
+                l: boolean
+              ) => void
+            )(nativeToken, '', dataUri, false);
+          } catch {
+            finish('error');
+          }
+        });
+
+        if (nativeRes !== 'error') {
+          return nativeRes;
+        }
+        nativeAudioActiveRef.current = false;
+        if (playbackTokenRef.current !== myToken || !openRef.current) {
+          return 'stopped';
+        }
+      }
+
+      return await new Promise((resolve) => {
         try {
           const { url, isObjectUrl } = base64ToAudioPlaybackUrl(base64, mimeType);
           if (isObjectUrl) {
@@ -1241,9 +1423,18 @@ export function Dialer951CallOverlay({
     updatePhase('survey_closing');
     setKeypadVisible(true);
 
-    // Give AudioManager ~200ms after MODE_IN_CALL teardown so Stage 3 Survey MP3 plays at full clarity
-    const settled = await waitInterruptibly(200, loopEpoch);
+    // Give AudioManager ~200ms after MODE_IN_CALL teardown then re-engage native communication audio route for Stage 3 Survey MP3
+    const settled = await waitInterruptibly(220, loopEpoch);
     if (!settled || !openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
+
+    if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+      try {
+        (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(
+          true,
+          speakerOnRef.current
+        );
+      } catch {}
+    }
 
     const fallbackMsg =
       'በጥሪ ማዕከል ሰራተኛው አገልግሎት በደንብ ከረኩ አንድን ይጫኑ፣ በመጠኑ ከረኩ ሁለትን ይጫኑ፣ ካልረኩ ሶስትን ይጫኑ፣ እንደገና ለማዳመጥ ዘጠኝን ይጫኑ።';
@@ -1415,6 +1606,11 @@ export function Dialer951CallOverlay({
         (bridgeRef.current.setSecretCallHeld as (h: boolean) => void)(next);
       } catch {}
     }
+    if (typeof bridgeRef.current?.setNativeAudioPaused === 'function') {
+      try {
+        (bridgeRef.current.setNativeAudioPaused as (p: boolean) => void)(next);
+      } catch {}
+    }
     if (next) {
       if (audioElRef.current && !audioElRef.current.paused) {
         try {
@@ -1582,6 +1778,24 @@ export function Dialer951CallOverlay({
       onSecretCallHoldChanged?: (isHeld: boolean) => void;
       onSecretCallRemoteEnded?: () => void;
       onSecretCallError?: (msg: string) => void;
+      onNativeAudioEvent?: (token: string, evt: string) => void;
+      onSecretCallSpeakerChanged?: (actualSpeaker: boolean, actualBt: boolean) => void;
+    };
+
+    winAny.onNativeAudioEvent = (token: string, evt: string) => {
+      if (!active || !openRef.current) return;
+      if (nativeAudioExpectedTokenRef.current === token && nativeAudioSettlerRef.current) {
+        const mapped =
+          evt === 'started' || evt === 'ended' || evt === 'stopped' ? evt : 'error';
+        nativeAudioSettlerRef.current(mapped);
+      }
+    };
+
+    winAny.onSecretCallSpeakerChanged = (actualSpeaker: boolean, actualBt: boolean) => {
+      if (!active || !openRef.current) return;
+      speakerOnRef.current = Boolean(actualSpeaker);
+      setSpeakerOn(Boolean(actualSpeaker));
+      setBluetoothOn(Boolean(actualBt));
     };
 
     winAny.onReal951StateChanged = (stateStr: string) => {
@@ -1630,8 +1844,7 @@ export function Dialer951CallOverlay({
       updatePhase('secret_busy_retry');
       const holdAlreadyPlaying =
         currentClipIdRef.current === cfg.holdClipId &&
-        audioElRef.current &&
-        !audioElRef.current.paused;
+        (nativeAudioActiveRef.current || Boolean(audioElRef.current && !audioElRef.current.paused));
       if (cfg.backgroundCall.playHoldOnBusy && !holdAlreadyPlaying) {
         void playAudioClipById(cfg.holdClipId, true);
       }
@@ -1707,6 +1920,7 @@ export function Dialer951CallOverlay({
       setInCallMenuOpen(false);
       setHeld(false);
       setBluetoothOn(false);
+      speakerOnRef.current = true;
       setSpeakerOn(true);
       setMuted(false);
       setAiDotState('idle');
@@ -1811,6 +2025,8 @@ export function Dialer951CallOverlay({
       delete winAny.onSecretCallHoldChanged;
       delete winAny.onSecretCallRemoteEnded;
       delete winAny.onSecretCallError;
+      delete winAny.onNativeAudioEvent;
+      delete winAny.onSecretCallSpeakerChanged;
     };
   }, [
     open,
@@ -1979,6 +2195,7 @@ export function Dialer951CallOverlay({
                   type="button"
                   onClick={() => {
                     const next = !speakerOn;
+                    speakerOnRef.current = next;
                     setSpeakerOn(next);
                     if (next) setBluetoothOn(false);
                     playUiToggleTone(audioCtxRef, next);
@@ -2056,7 +2273,10 @@ export function Dialer951CallOverlay({
                 onClick={() => {
                   const next = !bluetoothOn;
                   setBluetoothOn(next);
-                  if (next) setSpeakerOn(false);
+                  if (next) {
+                    speakerOnRef.current = false;
+                    setSpeakerOn(false);
+                  }
                   playUiToggleTone(audioCtxRef, next);
                   if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
                     try {
@@ -2076,6 +2296,7 @@ export function Dialer951CallOverlay({
                 type="button"
                 onClick={() => {
                   const next = !speakerOn;
+                  speakerOnRef.current = next;
                   setSpeakerOn(next);
                   if (next) setBluetoothOn(false);
                   playUiToggleTone(audioCtxRef, next);
