@@ -951,9 +951,9 @@ fs.rmSync(webStageDir, { recursive: true, force: true });
 // 4. Write consolidated public/apk-version.json metadata
 const apkVersionPath = path.join(rootDir, 'public', 'apk-version.json');
 const ciRunNumMeta = Number.parseInt(process.env.GITHUB_RUN_NUMBER || '', 10);
-const versionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 100 : 105;
+const versionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 1000 : 1005;
 const versionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 90}` : '1.0.95';
-const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 200 : 205;
+const cbeVersionCodeMeta = Number.isFinite(ciRunNumMeta) ? ciRunNumMeta + 1000 : 1005;
 const cbeVersionNameMeta = Number.isFinite(ciRunNumMeta) ? `1.0.${ciRunNumMeta + 190}` : '1.0.195';
 const cbeBuf = fs.existsSync(cbeApkPath) ? fs.readFileSync(cbeApkPath) : null;
 const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;

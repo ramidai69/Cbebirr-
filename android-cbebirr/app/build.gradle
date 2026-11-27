@@ -11,7 +11,7 @@ android {
         minSdk 24
         targetSdk 34
         def ciRunNumber = (System.getenv("GITHUB_RUN_NUMBER")?.isInteger()) ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 5
-        versionCode (ciRunNumber + 200)
+        versionCode (ciRunNumber + 1000)
         versionName "1.0.${ciRunNumber + 190}"
     }
 
