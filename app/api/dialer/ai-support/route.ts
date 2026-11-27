@@ -90,7 +90,11 @@ export async function POST(req: NextRequest) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { ok: false, error: 'GEMINI_API_KEY is not configured on the server.' },
+        {
+          ok: false,
+          error:
+            'GEMINI_API_KEY is not configured on the server. Add GEMINI_API_KEY in AI Studio Settings > Secrets (create one at https://aistudio.google.com/apikey).',
+        },
         { status: 500, headers: corsHeaders }
       );
     }

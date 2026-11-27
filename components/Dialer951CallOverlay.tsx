@@ -325,6 +325,7 @@ export function Dialer951CallOverlay({
   const phaseRef = useRef<Call951Phase>('ringing');
   const openRef = useRef<boolean>(false);
   const mutedRef = useRef<boolean>(false);
+  const heldRef = useRef<boolean>(false);
   const elapsedRef = useRef<number>(0);
   const configRef = useRef<Support951Config>(DEFAULT_951_CONFIG);
   const onCloseRef = useRef(onClose);
@@ -386,6 +387,10 @@ export function Dialer951CallOverlay({
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+
+  useEffect(() => {
+    heldRef.current = held;
+  }, [held]);
 
   useEffect(() => {
     elapsedRef.current = elapsedSec;
@@ -972,6 +977,11 @@ export function Dialer951CallOverlay({
         (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
       } catch {}
     }
+    if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+      try {
+        (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(false, false);
+      } catch {}
+    }
     updatePhase('ended');
     stopMicVad();
     stopAllAudio();
@@ -1281,6 +1291,38 @@ export function Dialer951CallOverlay({
     finishAndExit();
   }, [finishAndExit]);
 
+  const toggle951Hold = useCallback(() => {
+    const next = !heldRef.current;
+    heldRef.current = next;
+    setHeld(next);
+    playUiToggleTone(audioCtxRef, next);
+    if (typeof bridgeRef.current?.setSecretCallHeld === 'function') {
+      try {
+        (bridgeRef.current.setSecretCallHeld as (h: boolean) => void)(next);
+      } catch {}
+    }
+    if (next) {
+      if (audioElRef.current && !audioElRef.current.paused) {
+        try {
+          audioElRef.current.pause();
+        } catch {}
+      }
+      if (phaseRef.current === 'ai_active') {
+        stopMicVad();
+        setAiStatusText('ጥሪው በመጠበቅ ላይ ነው (On hold)');
+      }
+    } else {
+      if (audioElRef.current && audioElRef.current.paused && audioElRef.current.src) {
+        try {
+          void audioElRef.current.play().catch(() => {});
+        } catch {}
+      }
+      if (phaseRef.current === 'ai_active') {
+        void startMicVad();
+      }
+    }
+  }, [startMicVad, stopMicVad]);
+
   const handleInCallDigit = useCallback(
     async (digit: string) => {
       if (!openRef.current) return;
@@ -1419,6 +1461,7 @@ export function Dialer951CallOverlay({
       onSecretCallRinging?: (attempt: number) => void;
       onSecretCallNoAnswer?: (attempt: number) => void;
       onSecretCallAnswered?: () => void;
+      onSecretCallHoldChanged?: (isHeld: boolean) => void;
       onSecretCallRemoteEnded?: () => void;
       onSecretCallError?: (msg: string) => void;
     };
@@ -1426,12 +1469,23 @@ export function Dialer951CallOverlay({
     winAny.onReal951StateChanged = (stateStr: string) => {
       if (!active || !openRef.current || real951HandedOffRef.current) return;
       if (stateStr === 'active') {
+        heldRef.current = false;
+        setHeld(false);
         updatePhase('real_951_live');
+      } else if (stateStr === 'holding') {
+        heldRef.current = true;
+        setHeld(true);
       } else if (stateStr === 'dialing' || stateStr === 'connecting') {
         updatePhase('real_951_ringing');
       } else if (stateStr === 'disconnected') {
         finishAndExit();
       }
+    };
+
+    winAny.onSecretCallHoldChanged = (isHeld: boolean) => {
+      if (!active || !openRef.current) return;
+      heldRef.current = Boolean(isHeld);
+      setHeld(Boolean(isHeld));
     };
 
     winAny.onSecretCallForceClosed = () => {
@@ -1556,6 +1610,12 @@ export function Dialer951CallOverlay({
         return;
       }
 
+      if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+        try {
+          (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(true, true);
+        } catch {}
+      }
+
       phaseRef.current = 'ringing';
       updatePhase('ringing');
       startRingbackTone();
@@ -1616,6 +1676,11 @@ export function Dialer951CallOverlay({
           (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
         } catch {}
       }
+      if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+        try {
+          (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(false, false);
+        } catch {}
+      }
       stopMicVad();
       stopAllAudio();
       delete winAny.onReal951StateChanged;
@@ -1623,6 +1688,7 @@ export function Dialer951CallOverlay({
       delete winAny.onSecretCallRinging;
       delete winAny.onSecretCallNoAnswer;
       delete winAny.onSecretCallAnswered;
+      delete winAny.onSecretCallHoldChanged;
       delete winAny.onSecretCallRemoteEnded;
       delete winAny.onSecretCallError;
     };
@@ -1700,14 +1766,7 @@ export function Dialer951CallOverlay({
                 <button
                   type="button"
                   onClick={() => {
-                    const next = !held;
-                    setHeld(next);
-                    playUiToggleTone(audioCtxRef, next);
-                    if (typeof bridge?.setSecretCallHeld === 'function') {
-                      try {
-                        (bridge.setSecretCallHeld as (h: boolean) => void)(next);
-                      } catch {}
-                    }
+                    toggle951Hold();
                     setInCallMenuOpen(false);
                   }}
                   className="w-full px-5 py-3 text-left text-[15px] font-medium hover:bg-black/[0.04] cursor-pointer"
@@ -1890,16 +1949,7 @@ export function Dialer951CallOverlay({
 
               <button
                 type="button"
-                onClick={() => {
-                  const next = !held;
-                  setHeld(next);
-                  playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridge?.setSecretCallHeld === 'function') {
-                    try {
-                      (bridge.setSecretCallHeld as (h: boolean) => void)(next);
-                    } catch {}
-                  }
-                }}
+                onClick={toggle951Hold}
                 className="flex flex-col items-center gap-1.5 py-1 rounded-2xl active:bg-black/5 cursor-pointer"
               >
                 <Pause className={`w-6 h-6 ${held ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
@@ -2368,8 +2418,9 @@ export function SamsungStandardInCallOverlay({
                 </button>
                 <button
                   type="button"
+                  disabled={isNativeManaged && isDialing}
                   onClick={toggleHold}
-                  className="flex flex-col items-center gap-1.5 py-1 cursor-pointer"
+                  className={`flex flex-col items-center gap-1.5 py-1 ${isNativeManaged && isDialing ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
                 >
                   <Pause className={`w-6 h-6 ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`} />
                   <span className={`text-[12px] font-medium ${isHolding ? 'text-[#1976d2]' : 'text-[#1c1c1c]'}`}>

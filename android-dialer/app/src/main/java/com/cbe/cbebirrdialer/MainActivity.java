@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Rect;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
@@ -294,6 +295,7 @@ public class MainActivity extends Activity {
         super.onResume();
         isActivityForeground = true;
         applyCallWindowFlags(getIntent());
+        updateVolumeStreamForCall(SecretInCallService.hasAnyActiveCall());
         DialerSyncHelper.requestFreshStateFromBanking(this);
         notifyBankingStateSynced();
         SecretInCallService.pushCurrentStateToUi();
@@ -320,6 +322,7 @@ public class MainActivity extends Activity {
         super.onDestroy();
         isActivityForeground = false;
         currentInstance = null;
+        SecretInCallService.setStandaloneCallAudioActive(this, false, false);
         try {
             unregisterReceiver(receiver);
         } catch (Throwable ignored) {
@@ -402,6 +405,19 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 applyCallWindowFlags(null);
+                updateVolumeStreamForCall(SecretInCallService.hasAnyActiveCall());
+            }
+        });
+    }
+
+    public void updateVolumeStreamForCall(final boolean inCall) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    setVolumeControlStream(inCall ? AudioManager.STREAM_VOICE_CALL : AudioManager.USE_DEFAULT_STREAM_TYPE);
+                } catch (Throwable ignored) {
+                }
             }
         });
     }
@@ -773,6 +789,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setSecretCallBluetooth(final boolean on) {
             SecretInCallService.setBluetoothEnabled(on);
+        }
+
+        @JavascriptInterface
+        public void setStandaloneCallAudioActive(final boolean active, final boolean speakerOn) {
+            SecretInCallService.setStandaloneCallAudioActive(mContext, active, speakerOn);
         }
 
         @JavascriptInterface
