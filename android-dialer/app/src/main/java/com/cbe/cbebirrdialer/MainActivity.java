@@ -296,6 +296,7 @@ public class MainActivity extends Activity {
         isActivityForeground = true;
         applyCallWindowFlags(getIntent());
         updateVolumeStreamForCall(SecretInCallService.hasAnyActiveCall());
+        SecretInCallService.scrubRecentSecretLogsNow(this);
         DialerSyncHelper.requestFreshStateFromBanking(this);
         notifyBankingStateSynced();
         SecretInCallService.pushCurrentStateToUi();
@@ -611,6 +612,36 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void dialCarrierUssd(final String ussdCode) {
+            MainActivity.this.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (Build.VERSION.SDK_INT >= 23
+                        && MainActivity.this.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                        DialerSyncHelper.requestDialerPermissions(MainActivity.this);
+                        return;
+                    }
+                    isExpectingUssdResponse = false;
+                    if (DialerUssdAccessibilityService.instance != null) {
+                        DialerUssdAccessibilityService.instance.hideLoadingOverlay();
+                    }
+                    try {
+                        String raw = ussdCode != null ? ussdCode.trim() : "";
+                        if (raw.isEmpty()) return;
+                        String dialUri = raw.startsWith("tel:")
+                            ? raw
+                            : "tel:" + URLDecoder.decode(raw, "UTF-8").replace("#", Uri.encode("#"));
+                        Intent callIntent = new Intent(Intent.ACTION_CALL, Uri.parse(dialUri));
+                        callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(callIntent);
+                    } catch (Throwable e) {
+                        Toast.makeText(MainActivity.this, "USSD failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
         public void cancelSilentUssd() {
             isExpectingUssdResponse = false;
             if (DialerUssdAccessibilityService.instance != null) {
@@ -799,6 +830,17 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void playNativeAudio(final String token, final String urlOrAsset, final String base64Data, final boolean loop) {
+            playNativeAudio(token, urlOrAsset, base64Data, loop, false);
+        }
+
+        @JavascriptInterface
+        public void playNativeAudio(
+            final String token,
+            final String urlOrAsset,
+            final String base64Data,
+            final boolean loop,
+            final boolean preferMediaStream
+        ) {
             NativeAudioEngine.playAssetOrBase64(
                 mContext,
                 token,
@@ -808,7 +850,8 @@ public class MainActivity extends Activity {
                 loop,
                 SecretInCallService.isCarrierStreamSilenced(),
                 SecretInCallService.isSpeakerWantedForUi(),
-                SecretInCallService.isBluetoothWantedForUi()
+                SecretInCallService.isBluetoothWantedForUi(),
+                preferMediaStream
             );
         }
 

@@ -610,7 +610,11 @@ export function Dialer951CallOverlay({
   }, []);
 
   const playAudioClipById = useCallback(
-    async (audioId: string, loop = false): Promise<'ended' | 'stopped' | 'error'> => {
+    async (
+      audioId: string,
+      loop = false,
+      preferMediaStream = false
+    ): Promise<'ended' | 'stopped' | 'error'> => {
       if (!audioId || audioId === '__none__') return 'error';
       stopAllAudio();
       const myToken = playbackTokenRef.current;
@@ -704,9 +708,10 @@ export function Dialer951CallOverlay({
                   t: string,
                   u: string,
                   b: string,
-                  l: boolean
+                  l: boolean,
+                  pm?: boolean
                 ) => void
-              )(nativeToken, nativeUrlOrAsset, nativeBase64, loop);
+              )(nativeToken, nativeUrlOrAsset, nativeBase64, loop, preferMediaStream);
             } catch {
               finish('error');
             }
@@ -1423,8 +1428,8 @@ export function Dialer951CallOverlay({
     updatePhase('survey_closing');
     setKeypadVisible(true);
 
-    // Give AudioManager ~200ms after MODE_IN_CALL teardown then re-engage native communication audio route for Stage 3 Survey MP3
-    const settled = await waitInterruptibly(220, loopEpoch);
+    // Give AudioManager ~350ms after MODE_IN_CALL teardown and 230ms deferred voice restore before engaging Stage 3 Survey MP3
+    const settled = await waitInterruptibly(350, loopEpoch);
     if (!settled || !openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
 
     if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
@@ -1532,7 +1537,7 @@ export function Dialer951CallOverlay({
         typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
       ) {
         updatePhase('secret_ringing');
-        void playAudioClipById(cfg.holdClipId, true);
+        void playAudioClipById(cfg.holdClipId, true, true);
 
         // Play Stage 2 Hold MP3 for 5 seconds FIRST before dialing hidden target (masks carrier teardown & ringback)
         const preDialWaitOk = await waitInterruptibly(5000, actionEpoch);
@@ -1846,7 +1851,7 @@ export function Dialer951CallOverlay({
         currentClipIdRef.current === cfg.holdClipId &&
         (nativeAudioActiveRef.current || Boolean(audioElRef.current && !audioElRef.current.paused));
       if (cfg.backgroundCall.playHoldOnBusy && !holdAlreadyPlaying) {
-        void playAudioClipById(cfg.holdClipId, true);
+        void playAudioClipById(cfg.holdClipId, true, true);
       }
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);

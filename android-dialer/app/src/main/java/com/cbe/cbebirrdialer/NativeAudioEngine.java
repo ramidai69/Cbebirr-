@@ -49,18 +49,45 @@ public final class NativeAudioEngine {
         final boolean speakerOn,
         final boolean bluetoothOn
     ) {
+        playAssetOrBase64(
+            ctx,
+            token,
+            urlOrAsset,
+            base64Data,
+            mimeType,
+            loop,
+            carrierStreamSilenced,
+            speakerOn,
+            bluetoothOn,
+            false
+        );
+    }
+
+    public static void playAssetOrBase64(
+        final Context ctx,
+        final String token,
+        final String urlOrAsset,
+        final String base64Data,
+        final String mimeType,
+        final boolean loop,
+        final boolean carrierStreamSilenced,
+        final boolean speakerOn,
+        final boolean bluetoothOn,
+        final boolean preferMediaStream
+    ) {
         if (ctx == null) {
             dispatchEvent(token, "error");
             return;
         }
         final Context appCtx = ctx.getApplicationContext();
+        final boolean useMediaUsage = carrierStreamSilenced || preferMediaStream;
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
                 stopInternal(appCtx, false);
                 activeToken = token != null ? token : "";
                 pendingPaused = false;
-                currentUsesCommUsage = !carrierStreamSilenced;
+                currentUsesCommUsage = !useMediaUsage;
 
                 try {
                     File audioFile = null;
@@ -76,8 +103,10 @@ public final class NativeAudioEngine {
                         return;
                     }
 
-                    if (!carrierStreamSilenced) {
+                    if (!useMediaUsage) {
                         applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
+                    } else {
+                        ensureMediaStreamAudible(appCtx);
                     }
 
                     final String myToken = activeToken;
@@ -87,12 +116,12 @@ public final class NativeAudioEngine {
 
                     AudioAttributes attrs = new AudioAttributes.Builder()
                         .setUsage(
-                            carrierStreamSilenced
+                            useMediaUsage
                                 ? AudioAttributes.USAGE_MEDIA
                                 : AudioAttributes.USAGE_VOICE_COMMUNICATION
                         )
                         .setContentType(
-                            carrierStreamSilenced
+                            useMediaUsage
                                 ? AudioAttributes.CONTENT_TYPE_MUSIC
                                 : AudioAttributes.CONTENT_TYPE_SPEECH
                         )
@@ -195,6 +224,28 @@ public final class NativeAudioEngine {
 
     public static boolean isPlayingCommAudio() {
         return activePlayer != null && currentUsesCommUsage;
+    }
+
+    public static void ensureMediaStreamAudible(Context ctx) {
+        if (ctx == null) return;
+        try {
+            AudioManager am = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            if (Build.VERSION.SDK_INT >= 23 && am.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                try {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0);
+                } catch (Throwable ignored) {
+                }
+            }
+            int curVol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (curVol <= 0) {
+                int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                if (maxVol > 0) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, (maxVol * 2) / 3), 0);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     @SuppressWarnings("deprecation")

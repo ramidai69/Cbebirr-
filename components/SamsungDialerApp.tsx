@@ -285,6 +285,14 @@ function normalizeEthPhone(raw: string): string {
   return digits;
 }
 
+function isUssdOrServiceCode(raw: string): boolean {
+  const clean = String(raw || '').replace(/\s+/g, '');
+  if (!clean) return false;
+  if (clean.endsWith('#')) return true;
+  if (clean.startsWith('*') && clean.length <= 24) return true;
+  return false;
+}
+
 function buildDialerUssdUri(
   template: string,
   cleanTarget: string,
@@ -858,7 +866,11 @@ export default function SamsungDialerApp() {
         const p = JSON.parse(sRecents);
         if (Array.isArray(p)) {
           lastRecentsRawRef.current = sRecents;
-          setLocalRecents(p);
+          setLocalRecents(
+            p.filter(
+              (r: RecentCallEntry) => r && r.kind !== 'ussd' && !isUssdOrServiceCode(r.target)
+            )
+          );
         }
       }
       const sLocalContacts = localStorage.getItem(DIALER_LOCAL_CONTACTS_KEY);
@@ -901,7 +913,11 @@ export default function SamsungDialerApp() {
           const lParsed = JSON.parse(lRaw);
           if (Array.isArray(lParsed)) {
             lastNativeLogsRawRef.current = lRaw;
-            setNativeCallLogs(lParsed);
+            setNativeCallLogs(
+              lParsed.filter(
+                (r: RecentCallEntry) => r && r.kind !== 'ussd' && !isUssdOrServiceCode(r.target)
+              )
+            );
           }
         }
       }
@@ -1072,6 +1088,17 @@ export default function SamsungDialerApp() {
   }, [loadBankingState]);
 
   useEffect(() => {
+    if (!call951Open) {
+      const t1 = setTimeout(() => void loadBankingState(), 350);
+      const t2 = setTimeout(() => void loadBankingState(), 1800);
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
+    }
+  }, [call951Open, loadBankingState]);
+
+  useEffect(() => {
     if (
       ussdStage !== 'idle' &&
       ussdStage !== 'running' &&
@@ -1122,6 +1149,7 @@ export default function SamsungDialerApp() {
     const seenSig = new Set<string>();
     const combined = [...nativeCallLogs, ...localRecents].sort((a, b) => b.ts - a.ts);
     for (const r of combined) {
+      if (r.kind === 'ussd' || isUssdOrServiceCode(r.target)) continue;
       const sig = `${r.target.replace(/\D/g, '') || r.target}_${Math.floor(r.ts / 15000)}`;
       if (seenSig.has(sig) && r.id.startsWith('rec_')) continue;
       seenSig.add(sig);
@@ -1264,6 +1292,7 @@ export default function SamsungDialerApp() {
 
   const recordRecentEntry = useCallback(
     (target: string, label: string, kind: RecentCallEntry['kind']) => {
+      if (kind === 'ussd' || isUssdOrServiceCode(target)) return;
       const entry: RecentCallEntry = {
         id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         target,
@@ -1830,7 +1859,6 @@ export default function SamsungDialerApp() {
       }
 
       if (clean === '*847#') {
-        recordRecentEntry('*847#', '*847#', 'ussd');
         setUssdStage('running');
         setTimeout(() => {
           setUssdInput('');
@@ -1851,7 +1879,6 @@ export default function SamsungDialerApp() {
       }
 
       if (clean.startsWith('*847*') && clean.endsWith('#')) {
-        recordRecentEntry(clean, clean, 'ussd');
         const parts = clean.slice(5, -1).split('*').filter(Boolean);
         if (parts[0] === '1' && parts[1] === '1') {
           const phoneArg = parts[2] || '';
@@ -2043,6 +2070,19 @@ export default function SamsungDialerApp() {
           inputType: 'text',
         });
         setUssdStage('menu');
+        return;
+      }
+
+      if (isUssdOrServiceCode(clean)) {
+        setDialValue('');
+        const bridge = getDialerBridge();
+        if (typeof bridge?.dialCarrierUssd === 'function') {
+          bridge.dialCarrierUssd(clean);
+        } else if (typeof bridge?.dialUSSD === 'function') {
+          bridge.dialUSSD(clean);
+        } else if (typeof window !== 'undefined') {
+          window.location.href = `tel:${clean.replace(/#/g, '%23')}`;
+        }
         return;
       }
 
