@@ -11,9 +11,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
-import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
@@ -91,7 +89,6 @@ public class SecretInCallService extends InCallService {
     private static volatile long pendingAudioRouteUntilMs = 0L;
     private static volatile boolean standaloneAudioActive = false;
     private static volatile boolean standaloneSpeakerWanted = true;
-    private static volatile AudioFocusRequest standaloneFocusRequest = null;
 
     private static final Handler staticMainHandler = new Handler(Looper.getMainLooper());
     private final Handler mainHandler = staticMainHandler;
@@ -352,71 +349,71 @@ public class SecretInCallService extends InCallService {
 
             if (manageMode) {
                 if (active) {
-                    if (Build.VERSION.SDK_INT >= 26) {
-                        if (standaloneFocusRequest == null) {
-                            AudioAttributes attrs = new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build();
-                            standaloneFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                                .setAudioAttributes(attrs)
-                                .setAcceptsDelayedFocusGain(false)
-                                .build();
-                        }
-                        am.requestAudioFocus(standaloneFocusRequest);
-                    } else {
-                        am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+                    // Never request transient audio focus here: doing so steals focus from WebView <audio> and pauses playback.
+                    if (am.getMode() != AudioManager.MODE_IN_COMMUNICATION) {
+                        am.setMode(AudioManager.MODE_IN_COMMUNICATION);
                     }
-                    am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                    if (!streamVoiceMutedByUs && Build.VERSION.SDK_INT >= 23 && am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
+                        try {
+                            am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
+                        } catch (Throwable ignoredUnmute) {
+                        }
+                    }
                 } else {
                     if (Build.VERSION.SDK_INT >= 31) {
                         try {
                             am.clearCommunicationDevice();
                         } catch (Throwable ignored) {
                         }
+                    } else {
+                        am.setSpeakerphoneOn(false);
                     }
-                    am.setSpeakerphoneOn(false);
                     am.setMicrophoneMute(false);
                     am.setMode(AudioManager.MODE_NORMAL);
-                    if (Build.VERSION.SDK_INT >= 26 && standaloneFocusRequest != null) {
-                        am.abandonAudioFocusRequest(standaloneFocusRequest);
-                        standaloneFocusRequest = null;
-                    }
                     return;
                 }
             }
 
-            am.setSpeakerphoneOn(speakerOn);
             if (Build.VERSION.SDK_INT >= 31) {
                 try {
                     List<AudioDeviceInfo> devices = am.getAvailableCommunicationDevices();
                     AudioDeviceInfo targetDev = null;
-                    int preferredType = speakerOn
-                        ? AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                        : AudioDeviceInfo.TYPE_WIRED_HEADSET;
-                    for (AudioDeviceInfo dev : devices) {
-                        if (dev != null && dev.getType() == preferredType) {
-                            targetDev = dev;
-                            break;
-                        }
-                    }
-                    if (!speakerOn && targetDev == null) {
+                    if (speakerOn) {
                         for (AudioDeviceInfo dev : devices) {
-                            if (dev != null && (dev.getType() == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
-                                || dev.getType() == AudioDeviceInfo.TYPE_USB_HEADSET
-                                || dev.getType() == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE)) {
+                            if (dev != null && dev.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
                                 targetDev = dev;
-                                if (dev.getType() != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
+                                break;
+                            }
+                        }
+                    } else {
+                        for (AudioDeviceInfo dev : devices) {
+                            if (dev != null && (dev.getType() == AudioDeviceInfo.TYPE_WIRED_HEADSET
+                                || dev.getType() == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                                || dev.getType() == AudioDeviceInfo.TYPE_USB_HEADSET)) {
+                                targetDev = dev;
+                                break;
+                            }
+                        }
+                        if (targetDev == null) {
+                            for (AudioDeviceInfo dev : devices) {
+                                if (dev != null && dev.getType() == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
+                                    targetDev = dev;
                                     break;
                                 }
                             }
                         }
                     }
                     if (targetDev != null) {
-                        am.setCommunicationDevice(targetDev);
+                        AudioDeviceInfo currentDev = am.getCommunicationDevice();
+                        if (currentDev == null || currentDev.getType() != targetDev.getType()) {
+                            am.clearCommunicationDevice();
+                            am.setCommunicationDevice(targetDev);
+                        }
                     }
                 } catch (Throwable ignored) {
                 }
+            } else {
+                am.setSpeakerphoneOn(speakerOn);
             }
         } catch (Throwable ignored) {
         }
@@ -465,7 +462,7 @@ public class SecretInCallService extends InCallService {
         if (on) {
             pendingBluetoothWanted = false;
         }
-        pendingAudioRouteUntilMs = System.currentTimeMillis() + 1400L;
+        pendingAudioRouteUntilMs = System.currentTimeMillis() + 900L;
 
         staticMainHandler.post(new Runnable() {
             @Override
@@ -477,11 +474,9 @@ public class SecretInCallService extends InCallService {
                         svc.setAudioRoute(targetRoute);
                     } catch (Throwable ignored) {
                     }
-                    // Also sync AudioManager speaker/communication device so both carrier and any WebView audio follow
-                    applyAudioManagerRouting(svc, true, on, false);
                     svc.refreshCallNotification();
                     svc.pushNativeStateToWeb();
-                    // Re-assert route after 180ms in case Telecom hadn't finished attaching audio stream
+                    // Re-assert Telecom route only if Telecom hadn't finished attaching audio stream
                     staticMainHandler.postDelayed(new Runnable() {
                         @Override
                         public void run() {
@@ -491,7 +486,6 @@ public class SecretInCallService extends InCallService {
                                     boolean currentlySpeaker = as != null && as.getRoute() == CallAudioState.ROUTE_SPEAKER;
                                     if (currentlySpeaker != on) {
                                         svc.setAudioRoute(on ? CallAudioState.ROUTE_SPEAKER : svc.resolveNonSpeakerRoute());
-                                        applyAudioManagerRouting(svc, true, on, false);
                                     }
                                 } catch (Throwable ignored) {
                                 }
@@ -841,7 +835,10 @@ public class SecretInCallService extends InCallService {
             if (actualSpeaker == pendingSpeakerWanted && actualBt == pendingBluetoothWanted) {
                 pendingAudioRouteUntilMs = 0L;
             }
-            applyAudioManagerRouting(this, true, actualSpeaker, false);
+            if (System.currentTimeMillis() >= pendingAudioRouteUntilMs) {
+                secretSpeakerWanted = actualSpeaker;
+                nativeSpeakerWanted = actualSpeaker;
+            }
         }
         if (activeCallMode == MODE_NATIVE_NORMAL) {
             pushNativeStateToWeb();
@@ -881,6 +878,10 @@ public class SecretInCallService extends InCallService {
                 currentCall.unregisterCallback(callCallback);
             } catch (Throwable ignored) {
             }
+        }
+        // Release any standalone AudioManager communication lock before Telecom owns the audio route
+        if (standaloneAudioActive) {
+            restoreAudioModeNormal();
         }
         currentCall = call;
 
@@ -1618,14 +1619,11 @@ public class SecretInCallService extends InCallService {
                         am.clearCommunicationDevice();
                     } catch (Throwable ignored) {
                     }
+                } else {
+                    am.setSpeakerphoneOn(false);
                 }
-                am.setSpeakerphoneOn(false);
                 am.setMicrophoneMute(false);
                 am.setMode(AudioManager.MODE_NORMAL);
-                if (Build.VERSION.SDK_INT >= 26 && standaloneFocusRequest != null) {
-                    am.abandonAudioFocusRequest(standaloneFocusRequest);
-                    standaloneFocusRequest = null;
-                }
             }
         } catch (Throwable ignored) {
         }

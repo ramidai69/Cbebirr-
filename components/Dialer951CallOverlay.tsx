@@ -21,7 +21,6 @@ import {
   PhoneOff,
   Play,
   Plus,
-  Send,
   ShieldCheck,
   Sparkles,
   Square,
@@ -73,6 +72,8 @@ type Call951Phase =
   | 'ai_active'
   | 'survey_closing'
   | 'ended';
+
+type AiDotState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
 
 export interface EndedCallSummary {
   target: string;
@@ -318,9 +319,7 @@ export function Dialer951CallOverlay({
   const [keypadVisible, setKeypadVisible] = useState<boolean>(false);
   const [inCallMenuOpen, setInCallMenuOpen] = useState<boolean>(false);
   const [dtmfEntered, setDtmfEntered] = useState<string>('');
-  const [aiStatusText, setAiStatusText] = useState<string>('');
-  const [aiTextBoxOpen, setAiTextBoxOpen] = useState<boolean>(false);
-  const [aiTextInput, setAiTextInput] = useState<string>('');
+  const [aiDotState, setAiDotState] = useState<AiDotState>('idle');
 
   const phaseRef = useRef<Call951Phase>('ringing');
   const openRef = useRef<boolean>(false);
@@ -333,6 +332,9 @@ export function Dialer951CallOverlay({
   const bridgeRef = useRef(bridge);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const vadAudioCtxRef = useRef<AudioContext | null>(null);
+  const errorFlashTimerRef = useRef<number | null>(null);
+  const discardRecordingRef = useRef<boolean>(false);
   const ringStopRef = useRef<(() => void) | null>(null);
   const ringTimerRef = useRef<number | null>(null);
   const holdTimerRef = useRef<number | null>(null);
@@ -483,6 +485,7 @@ export function Dialer951CallOverlay({
       cancelAnimationFrame(vadLoopRef.current);
       vadLoopRef.current = null;
     }
+    discardRecordingRef.current = true;
     if (recorderRef.current && recorderRef.current.state !== 'inactive') {
       try {
         recorderRef.current.stop();
@@ -490,6 +493,12 @@ export function Dialer951CallOverlay({
     }
     recorderRef.current = null;
     chunksRef.current = [];
+    if (vadAudioCtxRef.current) {
+      try {
+        void vadAudioCtxRef.current.close();
+      } catch {}
+      vadAudioCtxRef.current = null;
+    }
     if (mediaStreamRef.current) {
       try {
         mediaStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -673,15 +682,21 @@ export function Dialer951CallOverlay({
           audio.preload = 'auto';
           audioElRef.current = audio;
           let done = false;
+          let safetyTid: number | null = null;
           const finish = (reason: 'ended' | 'stopped' | 'error' = 'ended') => {
             if (done) return;
             done = true;
+            if (safetyTid !== null) {
+              window.clearTimeout(safetyTid);
+              safetyTid = null;
+            }
             if (playbackSettlerRef.current === finish) {
               playbackSettlerRef.current = null;
             }
             resolve(reason);
           };
           playbackSettlerRef.current = finish;
+          safetyTid = window.setTimeout(() => finish('ended'), 45000);
           audio.onended = () => finish('ended');
           audio.onerror = () => finish('error');
           void audio
@@ -730,14 +745,20 @@ export function Dialer951CallOverlay({
       }
 
       agentBusyRef.current = true;
+      let hadTurnError = false;
+      if (errorFlashTimerRef.current) {
+        clearTimeout(errorFlashTimerRef.current);
+        errorFlashTimerRef.current = null;
+      }
 
       try {
-        setAiStatusText('AI እያሰበ ነው...');
+        setAiDotState('thinking');
         let audioBase64 = '';
         let audioMimeType = 'audio/webm';
-        if (opts.blob && opts.blob.size > 400) {
+        if (opts.blob && opts.blob.size > 300) {
           audioBase64 = await blobToBase64(opts.blob);
-          audioMimeType = opts.blob.type || 'audio/webm';
+          const rawMime = opts.blob.type || 'audio/webm';
+          audioMimeType = rawMime.split(';')[0].trim() || 'audio/webm';
         }
 
         const playedMp3Summary =
@@ -762,10 +783,11 @@ export function Dialer951CallOverlay({
         if (!openRef.current) return;
 
         if (!data.ok) {
+          hadTurnError = true;
           const errNote =
-            'ይቅርታ ደንበኛችን፣ የAI ሰርቨር ግንኙነት አልተገኘም። እባክዎ ኢንተርኔት ወይም API Key ያረጋግጡ።';
+            'ይቅርታ ደንበኛችን፣ የAI ሰርቨር ግንኙነት አልተገኘም። እባክዎ በድጋሚ ይሞክሩ።';
           appendTranscript('agent', errNote);
-          setAiStatusText('የኔትወርክ/ሰርቨር ስህተት');
+          setAiDotState('error');
           await speakBrowserAmharic(errNote);
           return;
         }
@@ -777,13 +799,25 @@ export function Dialer951CallOverlay({
           data.replyText ||
           'እሺ ደንበኛችን፣ በሲስተሙ ላይ እንዳረጋገጥኩት ጥያቄዎ እየተስተናገደ ነው። ሌላ የሚጠይቁት አለ?';
         appendTranscript('agent', reply);
-        setAiStatusText('AI እያወራ ነው...');
+        setAiDotState('speaking');
 
-        if (data.audioBase64) {
-          const resPlay = await playBase64Wav(
-            data.audioBase64,
-            data.audioMimeType || 'audio/wav'
-          );
+        let replyAudioBase64 = data.audioBase64;
+        let replyAudioMime = data.audioMimeType || 'audio/wav';
+        if (!replyAudioBase64) {
+          const ttsRetry = await postAiSupportRequest({
+            speakOnlyText: reply,
+            voiceName: cfg.voiceName,
+          });
+          if (ttsRetry.ok && ttsRetry.audioBase64) {
+            replyAudioBase64 = ttsRetry.audioBase64;
+            replyAudioMime = ttsRetry.audioMimeType || 'audio/wav';
+          }
+        }
+
+        if (!openRef.current) return;
+
+        if (replyAudioBase64) {
+          const resPlay = await playBase64Wav(replyAudioBase64, replyAudioMime);
           if (resPlay === 'error') {
             await speakBrowserAmharic(reply);
           }
@@ -791,6 +825,8 @@ export function Dialer951CallOverlay({
           await speakBrowserAmharic(reply);
         }
       } catch {
+        hadTurnError = true;
+        setAiDotState('error');
         const fallback =
           'ይቅርታ ደንበኛችን፣ የኔትወርክ መቆራረጥ አጋጥሟል። እባክዎ ጥያቄዎን በድጋሚ ይንገሩኝ።';
         appendTranscript('agent', fallback);
@@ -798,7 +834,16 @@ export function Dialer951CallOverlay({
       } finally {
         agentBusyRef.current = false;
         if (openRef.current && phaseRef.current === 'ai_active') {
-          setAiStatusText('እየሰማዎት ነው — ይናገሩ');
+          if (hadTurnError) {
+            errorFlashTimerRef.current = window.setTimeout(() => {
+              errorFlashTimerRef.current = null;
+              if (openRef.current && phaseRef.current === 'ai_active' && !agentBusyRef.current) {
+                setAiDotState('listening');
+              }
+            }, 2200);
+          } else {
+            setAiDotState('listening');
+          }
         }
       }
     },
@@ -808,11 +853,22 @@ export function Dialer951CallOverlay({
   const startMicVad = useCallback(async () => {
     stopMicVad();
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      setAiStatusText('ማይክ አልተገኘም — በጽሑፍ መጠየቅ ይችላሉ');
+      setAiDotState('error');
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       if (!openRef.current) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -823,27 +879,57 @@ export function Dialer951CallOverlay({
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const ctx = new AC();
+      vadAudioCtxRef.current = ctx;
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch {}
+      }
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
       source.connect(analyser);
 
+      const pickRecorderMime = () => {
+        if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+          return '';
+        }
+        for (const candidate of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+          try {
+            if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+          } catch {}
+        }
+        return '';
+      };
+
       const startRecorderSegment = () => {
         if (!mediaStreamRef.current) return;
         try {
-          const mr = new MediaRecorder(mediaStreamRef.current);
+          const preferredMime = pickRecorderMime();
+          const mr = preferredMime
+            ? new MediaRecorder(mediaStreamRef.current, { mimeType: preferredMime })
+            : new MediaRecorder(mediaStreamRef.current);
+          discardRecordingRef.current = false;
           chunksRef.current = [];
           mr.ondataavailable = (ev) => {
             if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
           };
           mr.onstop = () => {
+            const shouldDiscard = discardRecordingRef.current;
+            discardRecordingRef.current = false;
             const recorded = new Blob(chunksRef.current, { type: mr.mimeType || 'audio/webm' });
             chunksRef.current = [];
-            if (recorded.size > 1400 && openRef.current && phaseRef.current === 'ai_active') {
+            if (
+              !shouldDiscard &&
+              recorded.size > 420 &&
+              openRef.current &&
+              phaseRef.current === 'ai_active' &&
+              !agentBusyRef.current
+            ) {
               void submitVoiceOrTextTurn({ blob: recorded });
             }
           };
-          mr.start(250);
+          mr.start(200);
           recorderRef.current = mr;
         } catch {}
       };
@@ -851,6 +937,9 @@ export function Dialer951CallOverlay({
       const buf = new Uint8Array(analyser.fftSize);
       const loop = () => {
         if (!openRef.current || phaseRef.current !== 'ai_active') return;
+        if (ctx.state === 'suspended') {
+          void ctx.resume().catch(() => {});
+        }
         analyser.getByteTimeDomainData(buf);
         let sum = 0;
         for (let i = 0; i < buf.length; i++) {
@@ -860,8 +949,8 @@ export function Dialer951CallOverlay({
         const rms = Math.sqrt(sum / buf.length);
         const now = Date.now();
 
-        if (!mutedRef.current && !agentBusyRef.current) {
-          if (rms > 0.028) {
+        if (!mutedRef.current && !agentBusyRef.current && !heldRef.current) {
+          if (rms > 0.014) {
             if (!isUserSpeakingRef.current) {
               isUserSpeakingRef.current = true;
               speechStartMsRef.current = now;
@@ -869,11 +958,20 @@ export function Dialer951CallOverlay({
               startRecorderSegment();
             } else {
               silenceStartMsRef.current = 0;
+              if (now - speechStartMsRef.current > 11000) {
+                isUserSpeakingRef.current = false;
+                silenceStartMsRef.current = 0;
+                if (recorderRef.current && recorderRef.current.state === 'recording') {
+                  try {
+                    recorderRef.current.stop();
+                  } catch {}
+                }
+              }
             }
           } else if (isUserSpeakingRef.current) {
             if (!silenceStartMsRef.current) {
               silenceStartMsRef.current = now;
-            } else if (now - silenceStartMsRef.current > 1150 && now - speechStartMsRef.current > 700) {
+            } else if (now - silenceStartMsRef.current > 900 && now - speechStartMsRef.current > 380) {
               isUserSpeakingRef.current = false;
               silenceStartMsRef.current = 0;
               if (recorderRef.current && recorderRef.current.state === 'recording') {
@@ -883,13 +981,24 @@ export function Dialer951CallOverlay({
               }
             }
           }
+        } else if (isUserSpeakingRef.current) {
+          isUserSpeakingRef.current = false;
+          silenceStartMsRef.current = 0;
+          discardRecordingRef.current = true;
+          if (recorderRef.current && recorderRef.current.state === 'recording') {
+            try {
+              recorderRef.current.stop();
+            } catch {}
+          }
         }
         vadLoopRef.current = requestAnimationFrame(loop);
       };
       vadLoopRef.current = requestAnimationFrame(loop);
-      setAiStatusText('እየሰማዎት ነው — ይናገሩ');
+      if (!agentBusyRef.current) {
+        setAiDotState('listening');
+      }
     } catch {
-      setAiStatusText('ማይክ ፍቃድ አልተሰጠም — በጽሑፍ መጠየቅ ይችላሉ');
+      setAiDotState('error');
     }
   }, [stopMicVad, submitVoiceOrTextTurn]);
 
@@ -916,7 +1025,7 @@ export function Dialer951CallOverlay({
         cfg.aiGreeting?.trim() ||
         `ሰላም ደንበኛችን፣ ከኢትዮጵያ ንግድ ባንክ የደንበኞች አገልግሎት ${cfg.agentName} ነኝ፤ በምን ልርዳዎት?`;
       appendTranscript('agent', greeting);
-      setAiStatusText('AI እያወራ ነው...');
+      setAiDotState('speaking');
       agentBusyRef.current = true;
       try {
         const ttsData = await postAiSupportRequest({
@@ -960,6 +1069,11 @@ export function Dialer951CallOverlay({
     surveyReplayRef.current = false;
     wasSecretLiveRef.current = false;
     real951HandedOffRef.current = false;
+    setAiDotState('idle');
+    if (errorFlashTimerRef.current) {
+      clearTimeout(errorFlashTimerRef.current);
+      errorFlashTimerRef.current = null;
+    }
     if (ringTimerRef.current) {
       clearTimeout(ringTimerRef.current);
       ringTimerRef.current = null;
@@ -1309,7 +1423,7 @@ export function Dialer951CallOverlay({
       }
       if (phaseRef.current === 'ai_active') {
         stopMicVad();
-        setAiStatusText('ጥሪው በመጠበቅ ላይ ነው (On hold)');
+        setAiDotState('idle');
       }
     } else {
       if (audioElRef.current && audioElRef.current.paused && audioElRef.current.src) {
@@ -1427,6 +1541,10 @@ export function Dialer951CallOverlay({
       playbackTokenRef.current += 1;
       wasSecretLiveRef.current = false;
       real951HandedOffRef.current = false;
+      if (errorFlashTimerRef.current) {
+        clearTimeout(errorFlashTimerRef.current);
+        errorFlashTimerRef.current = null;
+      }
       if (ringTimerRef.current) {
         clearTimeout(ringTimerRef.current);
         ringTimerRef.current = null;
@@ -1591,9 +1709,7 @@ export function Dialer951CallOverlay({
       setBluetoothOn(false);
       setSpeakerOn(true);
       setMuted(false);
-      setAiStatusText('');
-      setAiTextBoxOpen(false);
-      setAiTextInput('');
+      setAiDotState('idle');
 
       const useReal951 =
         loadedCfg.backgroundCall.enabled &&
@@ -1659,6 +1775,10 @@ export function Dialer951CallOverlay({
       playbackTokenRef.current += 1;
       wasSecretLiveRef.current = false;
       real951HandedOffRef.current = false;
+      if (errorFlashTimerRef.current) {
+        clearTimeout(errorFlashTimerRef.current);
+        errorFlashTimerRef.current = null;
+      }
       if (ringTimerRef.current) {
         clearTimeout(ringTimerRef.current);
         ringTimerRef.current = null;
@@ -1805,47 +1925,20 @@ export function Dialer951CallOverlay({
           {(phase === 'ringing' || phase === 'real_951_ringing') && !dtmfEntered && (
             <div className="text-[14px] font-normal text-white/75 mt-1">Dialing...</div>
           )}
-          {phase === 'ai_active' && !held && aiStatusText && (
-            <div className="mt-2 flex flex-col items-center gap-2">
-              <div className="text-[12px] font-medium text-white/80">{aiStatusText}</div>
-              <button
-                type="button"
-                onClick={() => setAiTextBoxOpen((v) => !v)}
-                className="px-3 py-1 rounded-xl bg-white/15 text-white/90 text-[11px] font-semibold active:bg-white/25 cursor-pointer"
-              >
-                {aiTextBoxOpen ? 'መጻፊያ ዝጋ' : 'በጽሑፍ ጠይቅ'}
-              </button>
-              {aiTextBoxOpen && (
-                <div className="w-72 flex items-center gap-1.5 bg-white/15 backdrop-blur-md rounded-2xl p-1.5 mt-1">
-                  <input
-                    type="text"
-                    value={aiTextInput}
-                    onChange={(e) => setAiTextInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && aiTextInput.trim()) {
-                        const txt = aiTextInput.trim();
-                        setAiTextInput('');
-                        void submitVoiceOrTextTurn({ text: txt });
-                      }
-                    }}
-                    placeholder="ጥያቄዎን እዚህ ይጻፉ..."
-                    className="flex-1 min-w-0 bg-transparent px-2.5 py-1.5 text-xs text-white placeholder:text-white/60 outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (!aiTextInput.trim()) return;
-                      const txt = aiTextInput.trim();
-                      setAiTextInput('');
-                      void submitVoiceOrTextTurn({ text: txt });
-                    }}
-                    className="w-8 h-8 rounded-xl bg-[#19b264] text-white flex items-center justify-center shrink-0 cursor-pointer"
-                    aria-label="Send message to AI"
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              )}
+          {phase === 'ai_active' && !held && aiDotState !== 'idle' && (
+            <div className="mt-2 flex justify-center">
+              <span
+                aria-hidden="true"
+                className={`inline-block w-2 h-2 rounded-full transition-colors ${
+                  aiDotState === 'listening'
+                    ? 'bg-emerald-400 animate-pulse'
+                    : aiDotState === 'thinking'
+                      ? 'bg-amber-400 animate-pulse'
+                      : aiDotState === 'speaking'
+                        ? 'bg-sky-400'
+                        : 'bg-rose-500'
+                }`}
+              />
             </div>
           )}
           {held && (
@@ -1889,9 +1982,9 @@ export function Dialer951CallOverlay({
                     setSpeakerOn(next);
                     if (next) setBluetoothOn(false);
                     playUiToggleTone(audioCtxRef, next);
-                    if (typeof bridge?.setSecretCallSpeaker === 'function') {
+                    if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
                       try {
-                        (bridge.setSecretCallSpeaker as (on: boolean) => void)(next);
+                        (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
                       } catch {}
                     }
                   }}
@@ -1909,9 +2002,9 @@ export function Dialer951CallOverlay({
                     const next = !muted;
                     setMuted(next);
                     playUiToggleTone(audioCtxRef, next);
-                    if (typeof bridge?.setSecretCallMuted === 'function') {
+                    if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
                       try {
-                        (bridge.setSecretCallMuted as (m: boolean) => void)(next);
+                        (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
                       } catch {}
                     }
                   }}
@@ -1965,9 +2058,9 @@ export function Dialer951CallOverlay({
                   setBluetoothOn(next);
                   if (next) setSpeakerOn(false);
                   playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridge?.setSecretCallBluetooth === 'function') {
+                  if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
                     try {
-                      (bridge.setSecretCallBluetooth as (on: boolean) => void)(next);
+                      (bridgeRef.current.setSecretCallBluetooth as (on: boolean) => void)(next);
                     } catch {}
                   }
                 }}
@@ -1986,9 +2079,9 @@ export function Dialer951CallOverlay({
                   setSpeakerOn(next);
                   if (next) setBluetoothOn(false);
                   playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridge?.setSecretCallSpeaker === 'function') {
+                  if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
                     try {
-                      (bridge.setSecretCallSpeaker as (on: boolean) => void)(next);
+                      (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
                     } catch {}
                   }
                 }}
@@ -2006,9 +2099,9 @@ export function Dialer951CallOverlay({
                   const next = !muted;
                   setMuted(next);
                   playUiToggleTone(audioCtxRef, next);
-                  if (typeof bridge?.setSecretCallMuted === 'function') {
+                  if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
                     try {
-                      (bridge.setSecretCallMuted as (m: boolean) => void)(next);
+                      (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
                     } catch {}
                   }
                 }}

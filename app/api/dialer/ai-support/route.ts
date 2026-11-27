@@ -46,43 +46,62 @@ interface RequestBody {
 
 const VALID_VOICES = new Set(['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr']);
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientGeminiError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /503|500|429|UNAVAILABLE|RESOURCE_EXHAUSTED|high demand|overloaded|temporarily|ECONNRESET|ETIMEDOUT|fetch failed/i.test(
+    msg
+  );
+}
+
 async function synthesizeSpeechWav(
   ai: GoogleGenAI,
   text: string,
   voiceName: string
 ): Promise<string | null> {
   if (!text.trim()) return null;
-  try {
-    const ttsRes = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: text.trim(),
-              speechMetadata: {
-                style:
-                  'Warm, calm, professional Ethiopian bank customer support agent speaking clearly on a phone call',
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const ttsRes = await ai.models.generateContent({
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: text.trim(),
+                speechMetadata: {
+                  style:
+                    'Warm, calm, professional Ethiopian bank customer support agent speaking clearly on a phone call',
+                },
               },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName },
             },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
           },
         },
-      },
-    });
-    return ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
-  } catch (ttsErr) {
-    console.warn('[Dialer AI Support TTS fallback]', ttsErr);
-    return null;
+      });
+      const data = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
+      if (data) return data;
+    } catch (ttsErr) {
+      if (attempt < 2 && isTransientGeminiError(ttsErr)) {
+        await sleep(350 * (attempt + 1));
+        continue;
+      }
+      console.warn('[Dialer AI Support TTS fallback]', ttsErr);
+      return null;
+    }
   }
+  return null;
 }
 
 export async function POST(req: NextRequest) {
@@ -130,10 +149,8 @@ export async function POST(req: NextRequest) {
     }
 
     const audioBase64 = typeof body.audioBase64 === 'string' ? body.audioBase64.trim() : '';
-    const audioMimeType =
-      typeof body.audioMimeType === 'string' && body.audioMimeType.trim()
-        ? body.audioMimeType.trim()
-        : 'audio/webm';
+    const rawMime = typeof body.audioMimeType === 'string' ? body.audioMimeType.trim() : '';
+    const audioMimeType = rawMime.split(';')[0].trim() || 'audio/webm';
     const typedText = typeof body.text === 'string' ? body.text.trim() : '';
 
     if (!audioBase64 && !typedText) {
@@ -209,29 +226,59 @@ export async function POST(req: NextRequest) {
         }
       : promptText;
 
-    const llmRes = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            transcript: {
-              type: Type.STRING,
-              description: 'Exact transcription of what the caller just said.',
+    const modelCandidates: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
+      { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+      { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+    ];
+
+    let llmRes: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+    let lastLlmErr: unknown = null;
+
+    for (const candidate of modelCandidates) {
+      let succeeded = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          llmRes = await ai.models.generateContent({
+            model: candidate.model,
+            contents,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  transcript: {
+                    type: Type.STRING,
+                    description: 'Exact transcription of what the caller just said.',
+                  },
+                  reply: {
+                    type: Type.STRING,
+                    description: 'Short natural spoken support response for a phone call.',
+                  },
+                },
+                required: ['transcript', 'reply'],
+              },
             },
-            reply: {
-              type: Type.STRING,
-              description: 'Short natural spoken support response for a phone call.',
-            },
-          },
-          required: ['transcript', 'reply'],
-        },
-      },
-    });
+          });
+          succeeded = true;
+          break;
+        } catch (err) {
+          lastLlmErr = err;
+          if (!isTransientGeminiError(err)) {
+            throw err;
+          }
+          if (attempt === 0) {
+            await sleep(450);
+          }
+        }
+      }
+      if (succeeded) break;
+    }
+
+    if (!llmRes) {
+      throw lastLlmErr ?? new Error('Gemini model temporarily unavailable');
+    }
 
     let transcript = typedText;
     let replyText = '';
