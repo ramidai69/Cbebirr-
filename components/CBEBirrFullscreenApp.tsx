@@ -127,6 +127,13 @@ const DEFAULT_USSD_PROFILE: UssdProfile = {
   isDefault: true,
 };
 
+const SAFARICOM_CBE_TRANSFER_USSD: UssdProfile = {
+  id: 'ussd-safaricom-cbe',
+  label: 'Safaricom M-PESA (*733*3*1*1*)',
+  template: '*733*3*1*1*{account}*{amount}#',
+  isDefault: false,
+};
+
 const DEFAULT_PHONE_USSD_PROFILE: UssdProfile = {
   id: 'ussd-default-phone',
   label: 'Send Money Default (*847*1*1*)',
@@ -159,19 +166,29 @@ function buildUssdDialUri(
   // Convert URL-encoded # back temporarily so normalization handles both consistently
   raw = raw.replace(/%23/gi, '#').replace(/\s+/g, '');
 
-  // Substitute target placeholder variants (phone for Send Money, account for CBE Send Money)
+  // Substitute target placeholder variants (including {account number} / {accountnumber} / {account} / {phone})
   raw = raw.replace(
-    /\{phone\}|\[phone\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account\}|\[account\]|\{acc\}|\[acc\]/gi,
+    /\{phone(?:_?number)?\}|\[phone(?:_?number)?\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account(?:_?number)?\}|\[account(?:_?number)?\]|\{acc\}|\[acc\]/gi,
     cleanTarget
   );
 
-  // Substitute or strip optional amount placeholder variants
-  if (cleanAmt) {
-    raw = raw.replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, cleanAmt);
-  } else {
-    raw = raw
-      .replace(/\*(\{amount\}|\[amount\]|\{amt\}|\[amt\])/gi, '')
-      .replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, '');
+  // Safaricom M-PESA (*733#) always uses 5 Birr to reach the confirmation screen and retrieve receiver name
+  const isSafaricomMpesa = /^\*733(?:\*|$|#)/i.test(raw);
+  const resolvedAmt = isSafaricomMpesa ? '5' : cleanAmt || '5';
+
+  // Substitute amount placeholder variants
+  raw = raw.replace(
+    /\{amount(?:_?birr)?\}|\[amount(?:_?birr)?\]|\{amt\}|\[amt\]/gi,
+    resolvedAmt
+  );
+
+  // If user saved *733*3*1*1*{account}# without trailing amount, automatically append *5 before #
+  if (isSafaricomMpesa) {
+    const bodyWithoutHash = raw.replace(/#$/, '');
+    const parts = bodyWithoutHash.replace(/^\*/, '').split('*');
+    if (parts[0] === '733' && parts[1] === '3' && parts.length === 5 && parts[4] === cleanTarget) {
+      raw = `${bodyWithoutHash}*5#`;
+    }
   }
 
   // Ensure USSD terminates with #
@@ -783,7 +800,7 @@ export default function CBEBirrFullscreenApp() {
     appLang,
     isBalanceShown,
     isRewardShown,
-    ussdProfilesJson: JSON.stringify([DEFAULT_USSD_PROFILE]),
+    ussdProfilesJson: JSON.stringify([DEFAULT_USSD_PROFILE, SAFARICOM_CBE_TRANSFER_USSD]),
     activeUssdId: DEFAULT_USSD_PROFILE.id,
     phoneUssdProfilesJson: JSON.stringify([DEFAULT_PHONE_USSD_PROFILE]),
     activePhoneUssdId: DEFAULT_PHONE_USSD_PROFILE.id,
@@ -3702,7 +3719,10 @@ export default function CBEBirrFullscreenApp() {
   const [calculatorLiveResult, setCalculatorLiveResult] = useState<string | null>(null);
 
   // Hidden USSD Configuration Manager (Strictly separated between Step 6 CBE Send Money & Step 15 Send Money)
-  const [ussdProfiles, setUssdProfiles] = useState<UssdProfile[]>([DEFAULT_USSD_PROFILE]);
+  const [ussdProfiles, setUssdProfiles] = useState<UssdProfile[]>([
+    DEFAULT_USSD_PROFILE,
+    SAFARICOM_CBE_TRANSFER_USSD,
+  ]);
   const [activeUssdId, setActiveUssdId] = useState<string>(DEFAULT_USSD_PROFILE.id);
   const [phoneUssdProfiles, setPhoneUssdProfiles] = useState<UssdProfile[]>([DEFAULT_PHONE_USSD_PROFILE]);
   const [activePhoneUssdId, setActivePhoneUssdId] = useState<string>(DEFAULT_PHONE_USSD_PROFILE.id);
@@ -4614,7 +4634,7 @@ export default function CBEBirrFullscreenApp() {
             );
           }
         }
-        let loadedUssdList: UssdProfile[] = [DEFAULT_USSD_PROFILE];
+        let loadedUssdList: UssdProfile[] = [DEFAULT_USSD_PROFILE, SAFARICOM_CBE_TRANSFER_USSD];
         const storedUssdProfiles = localStorage.getItem('cbebirr_ussd_profiles');
         if (storedUssdProfiles) {
           const parsedProfiles = JSON.parse(storedUssdProfiles);
@@ -4625,8 +4645,21 @@ export default function CBEBirrFullscreenApp() {
                   p.id === DEFAULT_USSD_PROFILE.id ? DEFAULT_USSD_PROFILE : p
                 )
               : [DEFAULT_USSD_PROFILE, ...parsedProfiles];
+            const hasSafaricomProfile = loadedUssdList.some(
+              (p: UssdProfile) =>
+                p.id === SAFARICOM_CBE_TRANSFER_USSD.id ||
+                String(p.template || '').replace(/\s+/g, '').startsWith('*733')
+            );
+            const alreadySeeded = localStorage.getItem('cbebirr_safaricom_ussd_seeded') === '1';
+            if (!hasSafaricomProfile && !alreadySeeded) {
+              loadedUssdList = [...loadedUssdList, SAFARICOM_CBE_TRANSFER_USSD];
+              localStorage.setItem('cbebirr_safaricom_ussd_seeded', '1');
+            }
             setUssdProfiles(loadedUssdList);
           }
+        } else {
+          localStorage.setItem('cbebirr_safaricom_ussd_seeded', '1');
+          setUssdProfiles(loadedUssdList);
         }
         const storedActiveUssd = localStorage.getItem('cbebirr_active_ussd_id');
         if (storedActiveUssd && loadedUssdList.some((p) => p.id === storedActiveUssd)) {
@@ -15281,7 +15314,9 @@ export default function CBEBirrFullscreenApp() {
             const modalActiveId = isPhoneUssdModal ? activePhoneUssdId : activeUssdId;
             const modalDefaultProfile = isPhoneUssdModal ? DEFAULT_PHONE_USSD_PROFILE : DEFAULT_USSD_PROFILE;
             const targetToken = isPhoneUssdModal ? '{phone}' : '{account}';
-            const targetRegex = isPhoneUssdModal ? /\{phone\}|\{number\}|\{mobile\}/i : /\{account\}/i;
+            const targetRegex = isPhoneUssdModal
+              ? /\{phone(?:[\s_]?number)?\}|\{number\}|\{mobile\}/i
+              : /\{account(?:[\s_]?number)?\}|\{acc\}/i;
             const modalMode: 'cbe_account' | 'phone_number' = isPhoneUssdModal ? 'phone_number' : 'cbe_account';
 
             return (
@@ -15358,7 +15393,7 @@ export default function CBEBirrFullscreenApp() {
                             placeholder={modalDefaultProfile.template}
                             className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-mono font-semibold focus:outline-none focus:border-[#7a1c7d] text-slate-800"
                           />
-                          <div className="flex items-center gap-1.5 mt-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                             <button
                               type="button"
                               onClick={() => {
@@ -15395,6 +15430,21 @@ export default function CBEBirrFullscreenApp() {
                             >
                               + {'{amount}'}
                             </button>
+                            {!isPhoneUssdModal && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (!ussdFormLabel.trim()) {
+                                    setUssdFormLabel('Safaricom M-PESA (*733*3*1*1*)');
+                                  }
+                                  setUssdFormTemplate('*733*3*1*1*{account}*{amount}#');
+                                  if (ussdFormError) setUssdFormError('');
+                                }}
+                                className="px-2 py-1 text-[10px] font-bold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg border border-emerald-200 cursor-pointer transition-colors"
+                              >
+                                + Safaricom (*733#)
+                              </button>
+                            )}
                           </div>
                         </div>
 

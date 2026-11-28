@@ -20,6 +20,13 @@ export const DEFAULT_CBE_TRANSFER_USSD: TransferUssdProfile = {
   isDefault: true,
 };
 
+export const SAFARICOM_CBE_TRANSFER_USSD: TransferUssdProfile = {
+  id: 'ussd-safaricom-cbe',
+  label: 'Safaricom M-PESA (*733*3*1*1*)',
+  template: '*733*3*1*1*{account}*{amount}#',
+  isDefault: false,
+};
+
 export const DEFAULT_PHONE_TRANSFER_USSD: TransferUssdProfile = {
   id: 'ussd-default-phone',
   label: 'Send Money Default (*847*1*1*)',

@@ -264,6 +264,7 @@ public class MainActivity extends Activity {
         isExpectingUssdResponse = true;
         ussdRequestTimestamp = System.currentTimeMillis();
         if (UssdAccessibilityService.instance != null) {
+            UssdAccessibilityService.instance.resetLocalUssdPaginationState();
             UssdAccessibilityService.instance.showLoadingOverlay();
         }
         if (ussdCode != null && !ussdCode.contains("*1*2*") && ussdCode.startsWith("*847*")) {
@@ -633,6 +634,7 @@ public class MainActivity extends Activity {
             MainActivity.ussdRequestTimestamp = System.currentTimeMillis();
             UssdAccessibilityService svc = UssdAccessibilityService.instance;
             if (svc != null) {
+                svc.resetLocalUssdPaginationState();
                 svc.showLoadingOverlay();
             }
         }
@@ -642,6 +644,7 @@ public class MainActivity extends Activity {
             MainActivity.isExpectingUssdResponse = false;
             UssdAccessibilityService svc = UssdAccessibilityService.instance;
             if (svc != null) {
+                svc.resetLocalUssdPaginationState();
                 svc.hideLoadingOverlay();
             }
         }

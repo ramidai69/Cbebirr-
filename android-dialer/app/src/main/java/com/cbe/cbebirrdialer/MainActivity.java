@@ -430,6 +430,7 @@ public class MainActivity extends Activity {
         }
         isExpectingUssdResponse = true;
         if (DialerUssdAccessibilityService.instance != null) {
+            DialerUssdAccessibilityService.instance.resetLocalUssdPaginationState();
             DialerUssdAccessibilityService.instance.showLoadingOverlay();
         }
         try {

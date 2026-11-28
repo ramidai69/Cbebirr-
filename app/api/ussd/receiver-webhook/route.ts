@@ -48,24 +48,43 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Extract receiver name from CBEBirr USSD text (e.g. "AccountName : FOZIA MOSSA  MOHAMMED")
+    // Extract receiver name from CBEBirr (*847#) or Safaricom M-PESA (*733#) USSD text
     let resolvedName = name;
     if (!resolvedName && rawText) {
+      const mpesaMatch =
+        rawText.match(
+          /(?:ቁጥር|account(?:\s*number)?|acc\.?\s*no\.?)\s*:?\s*\d{6,18}\s*[-–—−\u2010-\u2015]\s*([A-Za-z\u1200-\u137F][A-Za-z\u1200-\u137F\s.'-]{1,80}?)(?=\s*(?:99\s*(?:ቀጣይ|Next)|ይላኩ|1\.?\s*(?:ያረጋግጡ|Confirm)|2\.?\s*የአካውንት|0\.?\s*(?:ለመሰረዝ|Cancel)|00\s*ለመመለስ|Cancel|Send|OK|Reply|ላክ|ይቅር|\r?\n\s*(?:99|1\.|0\.|00|Cancel|Send)|$))/i
+        ) ||
+        rawText.match(
+          /\b\d{6,18}\s*[-–—−\u2010-\u2015]\s*([A-Za-z\u1200-\u137F][A-Za-z\u1200-\u137F\s.'-]{1,80}?)(?=\s*(?:99\s*(?:ቀጣይ|Next)|ይላኩ|1\.?\s*(?:ያረጋግጡ|Confirm)|2\.?\s*የአካውንት|0\.?\s*(?:ለመሰረዝ|Cancel)|00\s*ለመመለስ|Cancel|Send|OK|Reply|ላክ|ይቅር|$))/i
+        );
+
       const match =
         rawText.match(/Account\s*Name\s*:\s*([A-Za-z\u1200-\u137F\s]+?)(?:\r?\n|Bank\s*Account|1\s*OK|0\s*Cancel|$)/i) ||
+        mpesaMatch ||
         rawText.match(/(?:Transfer\s+to|ወደ|ለ)\s+([A-Za-z\u1200-\u137F\s]+?)(?:\?|\.|\r?\n|\s*\d:|$)/i) ||
         rawText.match(/\b([A-Z]{3,15}\s+[A-Z]{3,15}(?:\s+[A-Z]{3,15})?)\b/);
 
       if (match && match[1]) {
-        const candidate = match[1].replace(/\s+/g, ' ').trim();
-        if (!candidate.toLowerCase().includes('bank account') && !candidate.toLowerCase().includes('accountname')) {
+        const candidate = match[1]
+          .replace(/\b99\s*(?:ቀጣይ(?:\s*ገጽ)?|Next(?:\s*Page)?).*$/i, '')
+          .replace(/\s*ይላኩ.*$/i, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (
+          candidate &&
+          !candidate.toLowerCase().includes('bank account') &&
+          !candidate.toLowerCase().includes('accountname')
+        ) {
           resolvedName = candidate;
         }
       }
     }
 
     if (!account && rawText) {
-      const accMatch = rawText.match(/(?:Bank\s*Account|Mobile\s*No|Phone)\s*:\s*(\d{9,16})/i);
+      const accMatch = rawText.match(
+        /(?:Bank\s*Account|Mobile\s*No|Phone|ቁጥር|Account(?:\s*Number)?)\s*:?\s*(\d{9,16})/i
+      );
       if (accMatch && accMatch[1]) {
         account = accMatch[1];
       }

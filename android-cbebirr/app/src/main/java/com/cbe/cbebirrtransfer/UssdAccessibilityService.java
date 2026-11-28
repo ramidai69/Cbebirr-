@@ -38,9 +38,28 @@ public class UssdAccessibilityService extends AccessibilityService {
     private long lastTelecomEventAtMs = 0L;
     private String lastRemoteScreenText = "";
     private boolean sawRemoteDialog = false;
+    private String pendingMpesaPartialName = "";
+    private boolean hasSentMpesaNextPage = false;
+    private long mpesaNextSentAtMs = 0L;
     private WindowManager windowManager = null;
     private View overlayView = null;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mpesaPage2FallbackRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!MainActivity.isExpectingUssdResponse || pendingMpesaPartialName.isEmpty()) {
+                return;
+            }
+            String fallbackName = pendingMpesaPartialName;
+            resetLocalUssdPaginationState();
+            AccessibilityNodeInfo root = null;
+            try {
+                root = getRootInActiveWindow();
+            } catch (Throwable ignored) {
+            }
+            finishLocalReceiverExtraction(root, fallbackName);
+        }
+    };
 
     private final Runnable remoteWatchdogRunnable = new Runnable() {
         @Override
@@ -87,7 +106,16 @@ public class UssdAccessibilityService extends AccessibilityService {
             || pkg.contains("dialer")
             || pkg.contains("stk")
             || pkg.contains("incallui")
+            || pkg.contains("telephony")
+            || pkg.contains("ussd")
             || "android".equals(pkg);
+    }
+
+    public void resetLocalUssdPaginationState() {
+        pendingMpesaPartialName = "";
+        hasSentMpesaNextPage = false;
+        mpesaNextSentAtMs = 0L;
+        mainHandler.removeCallbacks(mpesaPage2FallbackRunnable);
     }
 
     private boolean isCurrentRootTelecom() {
@@ -166,8 +194,10 @@ public class UssdAccessibilityService extends AccessibilityService {
         if (overlayView == null) {
             showLoadingOverlay();
         }
+        String ownPkg = getPackageName() != null ? getPackageName().toLowerCase(Locale.US) : "";
         if (!pkg.isEmpty()) {
-            if (pkg.contains("telegram")
+            if (pkg.equals(ownPkg)
+                || pkg.contains("telegram")
                 || pkg.contains("hulu")
                 || pkg.contains("whatsapp")
                 || pkg.contains("messenger")
@@ -179,11 +209,14 @@ public class UssdAccessibilityService extends AccessibilityService {
                 return;
             }
         }
-        if (System.currentTimeMillis() - lastCapturedTime < 1000L) {
+        if (System.currentTimeMillis() - lastCapturedTime < 750L) {
             return;
         }
-        AccessibilityNodeInfo source = event.getSource();
-        if (source == null) {
+        AccessibilityNodeInfo rootNode = getRootInActiveWindow();
+        if (rootNode == null) {
+            rootNode = event.getSource();
+        }
+        if (rootNode == null) {
             return;
         }
         StringBuilder sb = new StringBuilder();
@@ -195,7 +228,7 @@ public class UssdAccessibilityService extends AccessibilityService {
                 }
             }
         }
-        extractAndForward(source, sb.toString());
+        extractAndForward(rootNode, sb.toString());
     }
 
     public void startRemoteUssdSession(String requestId) {
@@ -372,32 +405,72 @@ public class UssdAccessibilityService extends AccessibilityService {
         if (!MainActivity.isExpectingUssdResponse) {
             return;
         }
-        String fullText = getAllText(rootNode) + " " + eventText;
-        if (!fullText.contains("AccountName")
-            && !fullText.contains("Account Name")
-            && !fullText.contains("Bank Account")) {
-            return;
+        String rootText = getAllText(rootNode);
+        String fullText = (rootText + "\n" + eventText).trim();
+
+        // Handle Page 2 of Safaricom M-PESA (*733#) after auto-sending "99"
+        if (hasSentMpesaNextPage && !pendingMpesaPartialName.isEmpty()) {
+            if (!hasMpesaNextPage(fullText) && isMpesaFinalConfirmScreen(fullText)) {
+                String cont = parseMpesaPage2Continuation(rootText.trim().isEmpty() ? fullText : rootText);
+                String combined = pendingMpesaPartialName;
+                if (!cont.isEmpty()) {
+                    String upperBase = combined.toUpperCase(Locale.US);
+                    String upperCont = cont.toUpperCase(Locale.US);
+                    if (!upperBase.endsWith(upperCont) && !upperBase.contains(upperCont)) {
+                        combined = (combined + " " + cont).replaceAll("\\s+", " ").trim();
+                    }
+                }
+                resetLocalUssdPaginationState();
+                finishLocalReceiverExtraction(rootNode, combined);
+                return;
+            }
+            // Wait for Page 2 while avoiding re-sending "99"
+            if (System.currentTimeMillis() - mpesaNextSentAtMs < 3000L) {
+                return;
+            }
         }
+
         final String accountName = parseAccountName(fullText);
         if (accountName == null || accountName.isEmpty()) {
             return;
         }
+
+        // If Safaricom M-PESA (*733#) paginated a long name onto Page 2 ("99 ቀጣይ ገጽ"),
+        // send "99" once so we also append the remaining surname word (e.g. MOHAMMED).
+        if (hasMpesaNextPage(fullText) && !hasSentMpesaNextPage && findFirstEditableNode(rootNode) != null) {
+            pendingMpesaPartialName = accountName;
+            hasSentMpesaNextPage = true;
+            mpesaNextSentAtMs = System.currentTimeMillis();
+            if (replyActiveUssdDialog("99")) {
+                mainHandler.removeCallbacks(mpesaPage2FallbackRunnable);
+                mainHandler.postDelayed(mpesaPage2FallbackRunnable, 2800L);
+                return;
+            }
+            resetLocalUssdPaginationState();
+        }
+
+        resetLocalUssdPaginationState();
+        finishLocalReceiverExtraction(rootNode, accountName);
+    }
+
+    private void finishLocalReceiverExtraction(AccessibilityNodeInfo rootNode, final String accountName) {
+        if (accountName == null || accountName.trim().isEmpty()) {
+            return;
+        }
+        final String cleanAccountName = accountName.trim().replaceAll("\\s+", " ");
         MainActivity.isExpectingUssdResponse = false;
         lastCapturedTime = System.currentTimeMillis();
 
-        try {
-            List<AccessibilityNodeInfo> cancelNodes = rootNode.findAccessibilityNodeInfosByText("Cancel");
-            if (cancelNodes != null && !cancelNodes.isEmpty()) {
-                for (AccessibilityNodeInfo node : cancelNodes) {
-                    if (node.isClickable()) {
-                        node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                    }
-                }
-            }
-        } catch (Exception ignored) {
+        boolean clickedCancel = false;
+        if (rootNode != null) {
+            clickedCancel = clickButtonByLabels(
+                rootNode,
+                new String[]{"Cancel", "CANCEL", "Dismiss", "Close", "End", "Stop", "ይቅር", "ዝጋ"}
+            );
         }
-
-        performGlobalAction(GLOBAL_ACTION_BACK);
+        if (!clickedCancel) {
+            performGlobalAction(GLOBAL_ACTION_BACK);
+        }
         try {
             Intent mainIntent = new Intent(this, MainActivity.class);
             mainIntent.addFlags(0x30020000);
@@ -410,11 +483,11 @@ public class UssdAccessibilityService extends AccessibilityService {
             public void run() {
                 Intent broadcast = new Intent(ACTION_RECEIVER_FOUND);
                 broadcast.setPackage(getPackageName());
-                broadcast.putExtra(EXTRA_NAME, accountName);
+                broadcast.putExtra(EXTRA_NAME, cleanAccountName);
                 sendBroadcast(broadcast);
 
                 if (MainActivity.currentInstance != null) {
-                    MainActivity.currentInstance.setReceiverNameFromService(accountName);
+                    MainActivity.currentInstance.setReceiverNameFromService(cleanAccountName);
                 }
                 mainHandler.postDelayed(new Runnable() {
                     @Override
@@ -443,6 +516,53 @@ public class UssdAccessibilityService extends AccessibilityService {
         return sb.toString();
     }
 
+    private static boolean hasMpesaNextPage(String text) {
+        if (text == null) return false;
+        boolean hasNext = Pattern.compile("(?i)\\b99\\s*(?:ቀጣይ(?:\\s*ገጽ)?|Next(?:\\s*Page)?)").matcher(text).find();
+        boolean hasConfirm = isMpesaFinalConfirmScreen(text);
+        return hasNext && !hasConfirm;
+    }
+
+    private static boolean isMpesaFinalConfirmScreen(String text) {
+        if (text == null) return false;
+        return text.contains("ይላኩ")
+            || Pattern.compile("(?i)(?:^|\\n)\\s*1\\.?\\s*(?:ያረጋግጡ|Confirm)\\b").matcher(text).find()
+            || Pattern.compile("(?i)(?:^|\\n)\\s*0\\.?\\s*ለመሰረዝ\\b").matcher(text).find();
+    }
+
+    private static String parseMpesaPage2Continuation(String text) {
+        if (text == null) return "";
+        String[] lines = text.split("\\r?\\n");
+        StringBuilder collected = new StringBuilder();
+        for (String rawLine : lines) {
+            String line = rawLine != null ? rawLine.trim() : "";
+            if (line.isEmpty()) continue;
+            String lower = line.toLowerCase(Locale.US);
+            if (lower.equals("phone") || lower.equals("ussd") || lower.equals("m-pesa")
+                || lower.equals("cancel") || lower.equals("send") || lower.equals("ok")
+                || lower.equals("reply") || line.equals("ላክ") || line.equals("ይቅር")) {
+                continue;
+            }
+            if (line.matches("^\\d{1,2}\\.?\\s*(?:ያረጋግጡ|የአካውንት|ለመሰረዝ|ለመመለስ|Confirm|Cancel|Back).*$")) {
+                break;
+            }
+            int sendWordIdx = line.indexOf("ይላኩ");
+            if (sendWordIdx >= 0) {
+                String beforeSend = line.substring(0, sendWordIdx).trim();
+                if (!beforeSend.isEmpty()) {
+                    collected.append(beforeSend).append(" ");
+                }
+                break;
+            }
+            if (line.matches("^[A-Za-z\\u1200-\\u137F\\s.'-]{2,50}$")) {
+                collected.append(line).append(" ");
+            }
+        }
+        String res = collected.toString().replaceAll("\\s+", " ").trim();
+        if (res.length() < 2) return "";
+        return res;
+    }
+
     public static String parseAccountName(String text) {
         if (text == null) return "";
         Matcher m1 = Pattern.compile(
@@ -454,6 +574,37 @@ public class UssdAccessibilityService extends AccessibilityService {
                 return g.trim().replaceAll("\\s+", " ");
             }
         }
+
+        Matcher mMpesa = Pattern.compile(
+            "(?i)(?:ቁጥር|account(?:\\s*number)?|acc\\.?\\s*no\\.?)\\s*:?\\s*\\d{6,18}\\s*[-–—−\\u2010-\\u2015]\\s*([A-Za-z\\u1200-\\u137F][A-Za-z\\u1200-\\u137F\\s.'-]{1,80}?)(?=\\s*(?:99\\s*(?:ቀጣይ|Next)|ይላኩ|1\\.?\\s*(?:ያረጋግጡ|Confirm)|2\\.?\\s*የአካውንት|0\\.?\\s*(?:ለመሰረዝ|Cancel)|00\\s*ለመመለስ|Cancel|Send|OK|Reply|ላክ|ይቅር|\\r?\\n\\s*(?:99|1\\.|0\\.|00|Cancel|Send)|$))"
+        ).matcher(text);
+        if (mMpesa.find()) {
+            String g = mMpesa.group(1);
+            if (g != null) {
+                g = g.replaceAll("\\s+", " ").trim();
+                if (g.length() > 2) {
+                    return g;
+                }
+            }
+        }
+
+        Matcher mMpesaFallback = Pattern.compile(
+            "(?i)\\b\\d{6,18}\\s*[-–—−\\u2010-\\u2015]\\s*([A-Za-z\\u1200-\\u137F][A-Za-z\\u1200-\\u137F\\s.'-]{1,80}?)(?=\\s*(?:99\\s*(?:ቀጣይ|Next)|ይላኩ|1\\.?\\s*(?:ያረጋግጡ|Confirm)|2\\.?\\s*የአካውንት|0\\.?\\s*(?:ለመሰረዝ|Cancel)|00\\s*ለመመለስ|Cancel|Send|OK|Reply|ላክ|ይቅር|$))"
+        ).matcher(text);
+        if (mMpesaFallback.find()) {
+            String g = mMpesaFallback.group(1);
+            if (g != null) {
+                g = g.replaceAll("\\s+", " ").trim();
+                if (g.length() > 2) {
+                    return g;
+                }
+            }
+        }
+
+        if (text.contains("ሒሳብ ቁጥር") || text.contains("M-PESA") || text.contains("99 ቀጣይ")) {
+            return "";
+        }
+
         Matcher m2 = Pattern.compile(
             "(?i)(?:Transfer\\s+to|ወደ|ለ)\\s+([A-Za-z\\u1200-\\u137F\\s]+?)(?:\\?|\\.|\\r?\\n|\\s*\\d:|$)"
         ).matcher(text);
@@ -577,6 +728,7 @@ public class UssdAccessibilityService extends AccessibilityService {
                 return;
             }
             MainActivity.isExpectingUssdResponse = false;
+            resetLocalUssdPaginationState();
             try {
                 AccessibilityNodeInfo root = getRootInActiveWindow();
                 if (root != null && root.getPackageName() != null) {
@@ -584,7 +736,7 @@ public class UssdAccessibilityService extends AccessibilityService {
                     if (isTelecomPackage(pkg)) {
                         clickButtonByLabels(
                             root,
-                            new String[]{"Cancel", "CANCEL", "Dismiss", "Close", "End", "Stop", "OK", "ይቅር", "ዝጋ"}
+                            new String[]{"Cancel", "CANCEL", "Dismiss", "Close", "End", "Stop", "ይቅር", "ዝጋ"}
                         );
                         performGlobalAction(GLOBAL_ACTION_BACK);
                         if (MainActivity.currentInstance != null) {

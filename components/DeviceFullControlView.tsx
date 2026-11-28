@@ -114,10 +114,18 @@ function buildPreviewUssd(
     return mode === 'phone' ? `*847*1*1*${sampleTarget}#` : `*847*1*2*${sampleTarget}#`;
   }
   raw = raw.replace(
-    /\{phone\}|\[phone\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account\}|\[account\]|\{acc\}|\[acc\]/gi,
+    /\{phone(?:_?number)?\}|\[phone(?:_?number)?\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account(?:_?number)?\}|\[account(?:_?number)?\]|\{acc\}|\[acc\]/gi,
     sampleTarget
   );
-  raw = raw.replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, '500');
+  const isSafaricom = /^\*733(?:\*|$|#)/i.test(raw);
+  raw = raw.replace(/\{amount(?:_?birr)?\}|\[amount(?:_?birr)?\]|\{amt\}|\[amt\]/gi, '5');
+  if (isSafaricom) {
+    const bodyWithoutHash = raw.replace(/#$/, '');
+    const parts = bodyWithoutHash.replace(/^\*/, '').split('*');
+    if (parts[0] === '733' && parts[1] === '3' && parts.length === 5 && parts[4] === sampleTarget) {
+      raw = `${bodyWithoutHash}*5#`;
+    }
+  }
   if (!raw.endsWith('#')) raw = `${raw}#`;
   return raw;
 }
@@ -1518,6 +1526,18 @@ export default function DeviceFullControlView({
                       + {tok}
                     </button>
                   ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!cbeLabelInput.trim()) {
+                        setCbeLabelInput('Safaricom M-PESA (*733*3*1*1*)');
+                      }
+                      setCbeTplInput('*733*3*1*1*{account}*{amount}#');
+                    }}
+                    className="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-[10px] font-semibold text-emerald-300 cursor-pointer"
+                  >
+                    + Safaricom (*733#)
+                  </button>
                 </div>
                 {cbeTplInput.trim() && (
                   <p className="text-[10px] font-mono text-slate-400 break-all">

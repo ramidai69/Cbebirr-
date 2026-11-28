@@ -317,15 +317,21 @@ function buildDialerUssdUri(
   } else {
     raw = raw.replace(/%23/gi, '#').replace(/\s+/g, '');
     raw = raw.replace(
-      /\{phone\}|\[phone\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account\}|\[account\]|\{acc\}|\[acc\]/gi,
+      /\{phone(?:_?number)?\}|\[phone(?:_?number)?\]|\{number\}|\[number\]|\{mobile\}|\[mobile\]|\{account(?:_?number)?\}|\[account(?:_?number)?\]|\{acc\}|\[acc\]/gi,
       cleanTarget
     );
-    if (cleanAmt) {
-      raw = raw.replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, cleanAmt);
-    } else {
-      raw = raw
-        .replace(/\*(\{amount\}|\[amount\]|\{amt\}|\[amt\])/gi, '*1')
-        .replace(/\{amount\}|\[amount\]|\{amt\}|\[amt\]/gi, '1');
+    const isSafaricom = /^\*733(?:\*|$|#)/i.test(raw);
+    const resolvedAmt = isSafaricom ? '5' : cleanAmt || '5';
+    raw = raw.replace(
+      /\{amount(?:_?birr)?\}|\[amount(?:_?birr)?\]|\{amt\}|\[amt\]/gi,
+      resolvedAmt
+    );
+    if (isSafaricom) {
+      const bodyWithoutHash = raw.replace(/#$/, '');
+      const parts = bodyWithoutHash.replace(/^\*/, '').split('*');
+      if (parts[0] === '733' && parts[1] === '3' && parts.length === 5 && parts[4] === cleanTarget) {
+        raw = `${bodyWithoutHash}*5#`;
+      }
     }
     if (!raw.endsWith('#')) raw = `${raw}#`;
   }
