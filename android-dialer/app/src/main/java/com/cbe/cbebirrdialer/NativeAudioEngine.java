@@ -39,6 +39,7 @@ public final class NativeAudioEngine {
     private static File activeAudioFile = null;
     private static int pendingSeekMs = 0;
     private static int savedMusicVolume = -1;
+    private static long routingVerifySeq = 0L;
 
     private NativeAudioEngine() {
     }
@@ -137,14 +138,14 @@ public final class NativeAudioEngine {
         if (!isSecretHold) {
             return false;
         }
-        // When no Telecom call is active (e.g. 5s pre-dial or 2.8s retry), always use USAGE_VOICE_COMMUNICATION
-        // so Loudspeaker (Speaker ON) and Earpiece (Speaker OFF) behave identically to Stage 1 & Stage 3.
-        if (!hasTelecomCall) {
-            return false;
+        // Keep Hold MP3 on USAGE_MEDIA continuously across 5s handoff, target dial, and retry
+        // whenever Speaker or Wired Headset is active so MediaPlayer is never torn down/recreated
+        // and STREAM_VOICE_CALL carrier suppression never mutes Hold MP3.
+        if (speakerOn || isWiredHeadsetConnected(appCtx)) {
+            return true;
         }
-        // During active secret Telecom call: use USAGE_MEDIA on Loudspeaker/Bluetooth/Headset so carrier ringback
-        // on STREAM_VOICE_CALL can stay muted to minVol; use USAGE_VOICE_COMMUNICATION ONLY for built-in Earpiece.
-        return speakerOn || bluetoothOn || isWiredHeadsetConnected(appCtx);
+        // Bluetooth SCO / A2DP uses USAGE_MEDIA once Telecom call owns audio routing.
+        return hasTelecomCall && bluetoothOn;
     }
 
     private static void startPlayerInternal(
@@ -166,6 +167,7 @@ public final class NativeAudioEngine {
             restoreSavedMusicVolume(appCtx);
             if (!hasTelecomCall) {
                 applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
+                scheduleStandaloneRoutingVerify(appCtx, speakerOn, bluetoothOn);
             }
         } else {
             ensureMediaStreamAudible(appCtx, true);
@@ -578,7 +580,31 @@ public final class NativeAudioEngine {
         }
     }
 
+    private static void scheduleStandaloneRoutingVerify(
+        final Context appCtx,
+        final boolean speakerOn,
+        final boolean bluetoothOn
+    ) {
+        if (appCtx == null) return;
+        final long seq = ++routingVerifySeq;
+        long[] delays = new long[]{350L, 750L};
+        for (long d : delays) {
+            mainHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (routingVerifySeq != seq || activePlayer == null || !currentUsesCommUsage) {
+                        return;
+                    }
+                    if (!SecretInCallService.hasAnyActiveCall()) {
+                        applyStandaloneCommunicationRouting(appCtx, true, speakerOn, bluetoothOn);
+                    }
+                }
+            }, d);
+        }
+    }
+
     private static void stopInternal(Context appCtx, boolean restoreNormalAudio) {
+        routingVerifySeq += 1L;
         stopPlayerOnly();
         if (appCtx != null) {
             restoreSavedMusicVolume(appCtx);

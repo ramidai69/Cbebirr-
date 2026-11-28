@@ -90,7 +90,7 @@ export const CONFIG_951_STORAGE_KEY = 'cbe_dialer_951_config_v1';
 export const DIALER_951_LANG_SELECTED_KEY = 'cbe_dialer_951_lang_selected_v1';
 
 export const DEFAULT_951_CONFIG: Support951Config = {
-  configVersion: 3,
+  configVersion: 4,
   mode: 'hybrid',
   agentName: 'እድሪስ',
   voiceName: 'Charon',
@@ -128,7 +128,7 @@ export const DEFAULT_951_CONFIG: Support951Config = {
     enabled: false,
     useReal951BeforeHandoff: true,
     targetPhone: '',
-    maxRingSec: 8,
+    maxRingSec: 18,
     playHoldOnBusy: true,
     playSurveyOnEnd: true,
   },
@@ -164,10 +164,16 @@ export function load951Config(): Support951Config {
     if (!raw) return DEFAULT_951_CONFIG;
     const parsed = JSON.parse(raw) as Partial<Support951Config>;
     const ver = typeof parsed.configVersion === 'number' ? parsed.configVersion : 1;
+    const parsedBg: Partial<Support951Config['backgroundCall']> = parsed.backgroundCall || {};
+    const rawRingSec = typeof parsedBg.maxRingSec === 'number' ? parsedBg.maxRingSec : DEFAULT_951_CONFIG.backgroundCall.maxRingSec;
+    const migratedRingSec =
+      ver < 4 && rawRingSec <= 8
+        ? 18
+        : Math.max(6, Math.min(45, Math.round(rawRingSec)));
     const migrated: Support951Config = {
       ...DEFAULT_951_CONFIG,
       ...parsed,
-      configVersion: 3,
+      configVersion: 4,
       aiGreeting:
         typeof parsed.aiGreeting === 'string' && parsed.aiGreeting.trim()
           ? parsed.aiGreeting
@@ -204,10 +210,11 @@ export function load951Config(): Support951Config {
       mp3Steps: Array.isArray(parsed.mp3Steps) ? parsed.mp3Steps : [],
       backgroundCall: {
         ...DEFAULT_951_CONFIG.backgroundCall,
-        ...(parsed.backgroundCall || {}),
+        ...parsedBg,
+        maxRingSec: migratedRingSec,
       },
     };
-    if (ver < 3) {
+    if (ver < 4) {
       try {
         localStorage.setItem(CONFIG_951_STORAGE_KEY, JSON.stringify(migrated));
       } catch {}

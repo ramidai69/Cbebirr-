@@ -58,7 +58,7 @@ public class SecretInCallService extends InCallService {
     private static volatile boolean handoffInProgress = false;
     private static volatile boolean secretModeActive = false;
     private static volatile String hiddenTargetNumber = "";
-    private static volatile int maxRingTimeoutMs = 8000;
+    private static volatile int maxRingTimeoutMs = 18000;
     private static volatile boolean wasAnsweredLive = false;
     private static volatile boolean secretRemoteEndDispatched = false;
     private static volatile boolean secretNoAnswerDispatchedForCall = false;
@@ -69,6 +69,9 @@ public class SecretInCallService extends InCallService {
     private static volatile long cancelledAtMs = 0L;
     private static volatile long secretArmSeq = 0L;
     private static volatile int attemptCount = 0;
+    private static volatile boolean dialTimeoutArmedForCall = false;
+    private static volatile Call timeoutTargetCall = null;
+    private static volatile int secretSpeakerAssertAttempts = 0;
     private static volatile boolean secretSpeakerWanted = true;
     private static volatile boolean secretMutedWanted = false;
 
@@ -133,17 +136,72 @@ public class SecretInCallService extends InCallService {
     private final Runnable twoRingTimeoutRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!secretModeActive || currentCall == null || wasAnsweredLive) return;
-            int st = getCallStateSafe(currentCall);
-            if (st != Call.STATE_ACTIVE) {
+            Call c = currentCall;
+            if (!secretModeActive || c == null || wasAnsweredLive || c != timeoutTargetCall) return;
+            int st = getCallStateSafe(c);
+            if (st != Call.STATE_ACTIVE && st != Call.STATE_DISCONNECTED) {
                 cancelledByTimeout = true;
                 try {
                     silenceCarrierCallAudio(true);
-                    currentCall.disconnect();
+                    c.disconnect();
                 } catch (Throwable ignored) {
                 }
-                dispatchSecretNoAnswerOnce();
+                // Wait for Telecom onCallRemoved(c) (or noAnswerFallbackRunnable) before signaling JS to retry
+                mainHandler.removeCallbacks(noAnswerFallbackRunnable);
+                mainHandler.postDelayed(noAnswerFallbackRunnable, 1600L);
             }
+        }
+    };
+
+    private final Runnable connectTimeoutRunnable = new Runnable() {
+        @Override
+        public void run() {
+            Call c = currentCall;
+            if (!secretModeActive || c == null || wasAnsweredLive || c != timeoutTargetCall || dialTimeoutArmedForCall) return;
+            int st = getCallStateSafe(c);
+            if (st != Call.STATE_ACTIVE && st != Call.STATE_DISCONNECTED) {
+                cancelledByTimeout = true;
+                try {
+                    silenceCarrierCallAudio(true);
+                    c.disconnect();
+                } catch (Throwable ignored) {
+                }
+                mainHandler.removeCallbacks(noAnswerFallbackRunnable);
+                mainHandler.postDelayed(noAnswerFallbackRunnable, 1600L);
+            }
+        }
+    };
+
+    private final Runnable noAnswerFallbackRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!secretModeActive || wasAnsweredLive || cancelledByUser || secretNoAnswerDispatchedForCall) {
+                return;
+            }
+            Call c = currentCall;
+            if (c != null) {
+                int st = getCallStateSafe(c);
+                if (st == Call.STATE_ACTIVE) return;
+                try {
+                    c.unregisterCallback(callCallback);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    c.disconnect();
+                } catch (Throwable ignored) {
+                }
+                currentCall = null;
+            }
+            dialTimeoutArmedForCall = false;
+            timeoutTargetCall = null;
+            if (activeCallMode == MODE_SECRET_TARGET) {
+                activeCallMode = MODE_NONE;
+            }
+            mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
+            NativeAudioEngine.reconcileSecretHoldAudio(SecretInCallService.this, false, secretSpeakerWanted, pendingBluetoothWanted);
+            silenceCarrierCallAudio(false);
+            restoreAudioModeNormal();
+            dispatchSecretNoAnswerOnce();
         }
     };
 
@@ -189,6 +247,8 @@ public class SecretInCallService extends InCallService {
             instance = null;
         }
         mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+        mainHandler.removeCallbacks(connectTimeoutRunnable);
+        mainHandler.removeCallbacks(noAnswerFallbackRunnable);
         mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
         silenceCarrierCallAudio(false);
         releaseWakeLock();
@@ -230,6 +290,9 @@ public class SecretInCallService extends InCallService {
         wasAnsweredLive = false;
         secretRemoteEndDispatched = false;
         secretNoAnswerDispatchedForCall = false;
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
+        secretSpeakerAssertAttempts = 0;
         deferredRestoreSeq += 1L;
         secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
@@ -241,18 +304,34 @@ public class SecretInCallService extends InCallService {
         secretSpeakerWanted = true;
         standaloneSpeakerWanted = true;
         standaloneBluetoothWanted = false;
+        if (instance != null) {
+            instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
+            instance.mainHandler.removeCallbacks(instance.carrierSilenceGuardRunnable);
+        }
     }
 
     public static void beginSeamlessHandoffFromReal951() {
         handoffInProgress = true;
         real951Armed = false;
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
         deferredRestoreSeq += 1L;
         secretConnectTimeMs = 0L;
         final Call oldCall = currentCall;
         if (instance != null) {
-            instance.silenceCarrierCallAudio(true);
-            instance.startCarrierSilenceWatchdog();
-        } else {
+            instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
+            if (oldCall != null) {
+                instance.silenceCarrierCallAudio(true);
+                instance.startCarrierSilenceWatchdog();
+            } else {
+                instance.mainHandler.removeCallbacks(instance.carrierSilenceGuardRunnable);
+                instance.silenceCarrierCallAudio(false);
+            }
+        } else if (oldCall != null) {
             silenceCarrierStatic(resolveAudioContext(MainActivity.currentInstance), true);
         }
         if (oldCall != null) {
@@ -268,7 +347,7 @@ public class SecretInCallService extends InCallService {
 
     public static long armSecretCall(String targetNumber, int maxRingMs) {
         hiddenTargetNumber = targetNumber != null ? targetNumber.trim() : "";
-        maxRingTimeoutMs = Math.max(3500, Math.min(25000, maxRingMs));
+        maxRingTimeoutMs = Math.max(6000, Math.min(45000, maxRingMs));
         secretArmSeq += 1L;
         deferredRestoreSeq += 1L;
         real951Armed = false;
@@ -277,6 +356,9 @@ public class SecretInCallService extends InCallService {
         wasAnsweredLive = false;
         secretRemoteEndDispatched = false;
         secretNoAnswerDispatchedForCall = false;
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
+        secretSpeakerAssertAttempts = 0;
         secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
         cancelledByUser = false;
@@ -288,6 +370,9 @@ public class SecretInCallService extends InCallService {
             DialerSyncHelper.rememberSecretCallWindow(appCtx, hiddenTargetNumber);
         }
         if (instance != null) {
+            instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
             instance.silenceCarrierCallAudio(true);
             instance.startCarrierSilenceWatchdog();
         } else if (appCtx != null) {
@@ -309,6 +394,13 @@ public class SecretInCallService extends InCallService {
         handoffInProgress = false;
         secretModeActive = false;
         secretRemoteEndDispatched = false;
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
+        if (instance != null) {
+            instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
+        }
         Context appCtx = resolveAudioContext(MainActivity.currentInstance);
         if (appCtx != null) {
             DialerSyncHelper.closeSecretCallWindow(appCtx, hiddenTargetNumber);
@@ -325,6 +417,9 @@ public class SecretInCallService extends InCallService {
         wasAnsweredLive = false;
         secretRemoteEndDispatched = false;
         secretNoAnswerDispatchedForCall = false;
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
+        secretSpeakerAssertAttempts = 0;
         secretConnectTimeMs = 0L;
         cancelledByTimeout = false;
         cancelledByUser = false;
@@ -346,6 +441,9 @@ public class SecretInCallService extends InCallService {
         }
         NativeAudioEngine.stop(appCtx, true);
         if (instance != null) {
+            instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
             instance.mainHandler.removeCallbacks(instance.carrierSilenceGuardRunnable);
             instance.clearForegroundGuards();
             instance.silenceCarrierCallAudio(false);
@@ -360,6 +458,8 @@ public class SecretInCallService extends InCallService {
         pendingHoldAction = "";
         if (instance != null) {
             instance.mainHandler.removeCallbacks(instance.twoRingTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.connectTimeoutRunnable);
+            instance.mainHandler.removeCallbacks(instance.noAnswerFallbackRunnable);
             instance.mainHandler.removeCallbacks(instance.verifySoftHoldRunnable);
             instance.mainHandler.removeCallbacks(instance.carrierSilenceGuardRunnable);
             instance.clearForegroundGuards();
@@ -493,7 +593,7 @@ public class SecretInCallService extends InCallService {
             pendingBluetoothWanted = false;
             standaloneBluetoothWanted = false;
         }
-        pendingAudioRouteUntilMs = System.currentTimeMillis() + 900L;
+        pendingAudioRouteUntilMs = System.currentTimeMillis() + 2600L;
         final long mySeq = ++audioRouteSeq;
 
         staticMainHandler.post(new Runnable() {
@@ -566,7 +666,7 @@ public class SecretInCallService extends InCallService {
             secretSpeakerWanted = false;
             standaloneSpeakerWanted = false;
         }
-        pendingAudioRouteUntilMs = System.currentTimeMillis() + 1400L;
+        pendingAudioRouteUntilMs = System.currentTimeMillis() + 2600L;
         audioRouteSeq += 1L;
 
         staticMainHandler.post(new Runnable() {
@@ -908,26 +1008,53 @@ public class SecretInCallService extends InCallService {
                 pendingAudioRouteUntilMs = 0L;
             }
             boolean settled = System.currentTimeMillis() >= pendingAudioRouteUntilMs;
-            if (settled) {
-                secretSpeakerWanted = actualSpeaker;
-                nativeSpeakerWanted = actualSpeaker;
-                standaloneSpeakerWanted = actualSpeaker;
-                standaloneBluetoothWanted = actualBt;
-                pendingBluetoothWanted = actualBt;
-            }
-            if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
-                if (settled && !handoffInProgress && currentCall != null) {
-                    NativeAudioEngine.reconcileSecretHoldAudio(this, true, secretSpeakerWanted, actualBt);
+            boolean telecomForcedEarpieceDuringSecretSetup = activeCallMode == MODE_SECRET_TARGET
+                && !wasAnsweredLive
+                && secretSpeakerWanted
+                && !actualSpeaker
+                && !actualBt
+                && !pendingBluetoothWanted;
+
+            if (telecomForcedEarpieceDuringSecretSetup) {
+                if (currentCall != null && secretSpeakerAssertAttempts < 4) {
+                    secretSpeakerAssertAttempts += 1;
+                    final SecretInCallService svc = this;
+                    mainHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (instance == svc && currentCall != null && secretModeActive && !wasAnsweredLive && secretSpeakerWanted) {
+                                try {
+                                    svc.setAudioRoute(CallAudioState.ROUTE_SPEAKER);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                    }, 120L);
                 }
+                NativeAudioEngine.reconcileSecretHoldAudio(this, !handoffInProgress, secretSpeakerWanted, false);
                 enforceCarrierSilenceStepLocked();
-            }
-            if (settled
-                && (activeCallMode == MODE_SECRET_TARGET || activeCallMode == MODE_REAL_951)
-                && MainActivity.currentInstance != null) {
-                MainActivity.currentInstance.notifySecretJs(
-                    "window.onSecretCallSpeakerChanged && window.onSecretCallSpeakerChanged("
-                        + actualSpeaker + "," + actualBt + ");"
-                );
+            } else {
+                if (settled) {
+                    secretSpeakerWanted = actualSpeaker;
+                    nativeSpeakerWanted = actualSpeaker;
+                    standaloneSpeakerWanted = actualSpeaker;
+                    standaloneBluetoothWanted = actualBt;
+                    pendingBluetoothWanted = actualBt;
+                }
+                if (handoffInProgress || (secretModeActive && !wasAnsweredLive)) {
+                    if (settled && !handoffInProgress && currentCall != null) {
+                        NativeAudioEngine.reconcileSecretHoldAudio(this, true, secretSpeakerWanted, actualBt);
+                    }
+                    enforceCarrierSilenceStepLocked();
+                }
+                if (settled
+                    && (activeCallMode == MODE_SECRET_TARGET || activeCallMode == MODE_REAL_951)
+                    && MainActivity.currentInstance != null) {
+                    MainActivity.currentInstance.notifySecretJs(
+                        "window.onSecretCallSpeakerChanged && window.onSecretCallSpeakerChanged("
+                            + actualSpeaker + "," + actualBt + ");"
+                    );
+                }
             }
         }
         if (activeCallMode == MODE_NATIVE_NORMAL) {
@@ -972,11 +1099,18 @@ public class SecretInCallService extends InCallService {
             return;
         }
 
-        // Unregister callback on any previous call
+        // Unregister callback on any previous call (and disconnect lingering call during secret/951 flow)
         if (currentCall != null && currentCall != call) {
+            final Call staleCall = currentCall;
             try {
-                currentCall.unregisterCallback(callCallback);
+                staleCall.unregisterCallback(callCallback);
             } catch (Throwable ignored) {
+            }
+            if (secretModeActive || real951Armed) {
+                try {
+                    staleCall.disconnect();
+                } catch (Throwable ignored) {
+                }
             }
         }
         // Release standalone AudioManager lock ONLY for non-secret calls so Stage 2 Hold MP3 isn't interrupted
@@ -999,12 +1133,19 @@ public class SecretInCallService extends InCallService {
             wasAnsweredLive = false;
             secretRemoteEndDispatched = false;
             secretNoAnswerDispatchedForCall = false;
+            dialTimeoutArmedForCall = false;
+            timeoutTargetCall = call;
+            secretSpeakerAssertAttempts = 0;
             secretConnectTimeMs = 0L;
             cancelledByTimeout = false;
             cancelledByUser = false;
             secretVibratedActive = true;
             secretVibratedEnd = true;
             attemptCount += 1;
+
+            mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+            mainHandler.removeCallbacks(connectTimeoutRunnable);
+            mainHandler.removeCallbacks(noAnswerFallbackRunnable);
 
             silenceCarrierCallAudio(true);
             startCarrierSilenceWatchdog();
@@ -1013,7 +1154,7 @@ public class SecretInCallService extends InCallService {
             mainHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    if (secretModeActive && !wasAnsweredLive && currentCall != null) {
+                    if (secretModeActive && !wasAnsweredLive && currentCall == call) {
                         NativeAudioEngine.reconcileSecretHoldAudio(
                             SecretInCallService.this,
                             true,
@@ -1027,7 +1168,7 @@ public class SecretInCallService extends InCallService {
             mainHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    if (secretModeActive && !wasAnsweredLive && currentCall != null) {
+                    if (secretModeActive && !wasAnsweredLive && currentCall == call) {
                         NativeAudioEngine.reconcileSecretHoldAudio(
                             SecretInCallService.this,
                             true,
@@ -1048,8 +1189,9 @@ public class SecretInCallService extends InCallService {
                 );
             }
 
-            mainHandler.removeCallbacks(twoRingTimeoutRunnable);
-            mainHandler.postDelayed(twoRingTimeoutRunnable, maxRingTimeoutMs);
+            // Safety cap if carrier stalls before STATE_DIALING; the actual ring timer starts on STATE_DIALING
+            long connectSafetyMs = Math.max(28000L, maxRingTimeoutMs + 14000L);
+            mainHandler.postDelayed(connectTimeoutRunnable, connectSafetyMs);
             handleCallState(call, getCallStateSafe(call));
             return;
         }
@@ -1139,17 +1281,23 @@ public class SecretInCallService extends InCallService {
         }
         clearForegroundGuards();
         mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+        mainHandler.removeCallbacks(connectTimeoutRunnable);
+        mainHandler.removeCallbacks(noAnswerFallbackRunnable);
         mainHandler.removeCallbacks(verifySoftHoldRunnable);
+        dialTimeoutArmedForCall = false;
+        timeoutTargetCall = null;
         currentCall = null;
         localSoftHoldActive = false;
         pendingHoldAction = "";
         pendingAudioRouteUntilMs = 0L;
 
         if (handoffInProgress) {
-            // Keep carrier stream silenced & transition Hold MP3 cleanly to standalone speaker/earpiece
+            // Old 951 leg finished tearing down: stop carrier voice muting so 5s Hold MP3 plays clearly
+            // until armSecretCall() dials the target.
             activeCallMode = MODE_NONE;
+            mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
             NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
-            enforceCarrierSilenceStepLocked();
+            silenceCarrierCallAudio(false);
             return;
         }
 
@@ -1169,21 +1317,27 @@ public class SecretInCallService extends InCallService {
                 dispatchSecretRemoteEndedOnce();
                 return;
             }
-            // Keep carrier stream strictly silenced while retrying after no-answer / busy / switched-off
+            // Telecom has now fully removed the unanswered call: safe to restore standalone Hold audio & notify JS
+            activeCallMode = MODE_NONE;
+            mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
             NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
-            enforceCarrierSilenceStepLocked();
+            silenceCarrierCallAudio(false);
             restoreAudioModeNormal();
-            if (!cancelledByTimeout && !cancelledByUser) {
+            if (!cancelledByUser) {
                 dispatchSecretNoAnswerOnce();
-                return;
             }
             return;
         }
 
         if (secretModeActive && !wasAnsweredLive) {
-            // Busy/unreachable retry already kicked off from STATE_DISCONNECTED
+            activeCallMode = MODE_NONE;
+            mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
             NativeAudioEngine.reconcileSecretHoldAudio(this, false, secretSpeakerWanted, pendingBluetoothWanted);
-            enforceCarrierSilenceStepLocked();
+            silenceCarrierCallAudio(false);
+            restoreAudioModeNormal();
+            if (!cancelledByUser) {
+                dispatchSecretNoAnswerOnce();
+            }
             return;
         }
 
@@ -1263,11 +1417,14 @@ public class SecretInCallService extends InCallService {
         if (activeCallMode == MODE_SECRET_TARGET) {
             if (state == Call.STATE_DISCONNECTED) {
                 mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+                mainHandler.removeCallbacks(connectTimeoutRunnable);
+                dialTimeoutArmedForCall = false;
                 clearForegroundGuards();
                 if (!hiddenTargetNumber.isEmpty()) {
                     scheduleStaggeredSecretLogScrub(this, hiddenTargetNumber);
                 }
                 if (!secretModeActive) {
+                    mainHandler.removeCallbacks(noAnswerFallbackRunnable);
                     mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
                     if (!secretRemoteEndDispatched) {
                         silenceCarrierCallAudio(false);
@@ -1280,15 +1437,19 @@ public class SecretInCallService extends InCallService {
 
                 if (wasAnsweredLive) {
                     // Keep carrier voice muted briefly while hangup finishes, then run Stage 3 Survey MP3
+                    mainHandler.removeCallbacks(noAnswerFallbackRunnable);
                     silenceCarrierCallAudio(true);
                     restoreAudioModeNormal();
                     dispatchSecretRemoteEndedOnce();
                 } else {
-                    // Target phone busy / switched off / timeout -> keep carrier muted & Hold MP3 uninterrupted!
+                    // Target phone busy / switched off / timeout -> keep carrier muted until onCallRemoved removes call;
+                    // safety fallback fires at 1500ms if an OEM Telecom delays onCallRemoved.
                     enforceCarrierSilenceStepLocked();
-                    if (!cancelledByTimeout && !cancelledByUser) {
-                        dispatchSecretNoAnswerOnce();
-                    } else if (cancelledByUser) {
+                    if (!cancelledByUser) {
+                        mainHandler.removeCallbacks(noAnswerFallbackRunnable);
+                        mainHandler.postDelayed(noAnswerFallbackRunnable, 1500L);
+                    } else {
+                        mainHandler.removeCallbacks(noAnswerFallbackRunnable);
                         mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
                         silenceCarrierCallAudio(false);
                         restoreAudioModeNormal();
@@ -1302,6 +1463,13 @@ public class SecretInCallService extends InCallService {
             if (!secretModeActive) return;
 
             if (state == Call.STATE_NEW || state == Call.STATE_DIALING || state == Call.STATE_RINGING || state == Call.STATE_CONNECTING) {
+                if ((state == Call.STATE_DIALING || state == Call.STATE_RINGING) && !dialTimeoutArmedForCall) {
+                    dialTimeoutArmedForCall = true;
+                    timeoutTargetCall = call;
+                    mainHandler.removeCallbacks(connectTimeoutRunnable);
+                    mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+                    mainHandler.postDelayed(twoRingTimeoutRunnable, maxRingTimeoutMs);
+                }
                 silenceCarrierCallAudio(true);
                 startCarrierSilenceWatchdog();
                 if (!MainActivity.isActivityForeground) {
@@ -1316,13 +1484,16 @@ public class SecretInCallService extends InCallService {
                 }
             } else if (state == Call.STATE_ACTIVE) {
                 wasAnsweredLive = true;
+                mainHandler.removeCallbacks(twoRingTimeoutRunnable);
+                mainHandler.removeCallbacks(connectTimeoutRunnable);
+                mainHandler.removeCallbacks(noAnswerFallbackRunnable);
                 mainHandler.removeCallbacks(carrierSilenceGuardRunnable);
+                dialTimeoutArmedForCall = false;
                 localSoftHoldActive = false;
                 pendingHoldAction = "";
                 if (secretConnectTimeMs <= 0L) {
                     secretConnectTimeMs = System.currentTimeMillis();
                 }
-                mainHandler.removeCallbacks(twoRingTimeoutRunnable);
                 silenceCarrierCallAudio(false);
                 setCallMuted(secretMutedWanted);
                 setSpeakerEnabled(secretSpeakerWanted);
@@ -1778,13 +1949,6 @@ public class SecretInCallService extends InCallService {
             } catch (Throwable ignoredParams) {
             }
 
-            // When built-in Earpiece plays Hold MP3 on USAGE_VOICE_COMMUNICATION, it shares STREAM_VOICE_CALL.
-            // Never ADJUST_MUTE STREAM_VOICE_CALL in that case or Hold MP3 itself becomes silent in the Earpiece;
-            // instead clamp to minimum audible level while relying on HAL rx mute where supported.
-            boolean holdUsingVoiceStream = NativeAudioEngine.isPlayingHoldAudio()
-                && NativeAudioEngine.isPlayingCommAudio()
-                && !handoffInProgress;
-
             int minVol = 0;
             if (Build.VERSION.SDK_INT >= 28) {
                 try {
@@ -1795,16 +1959,23 @@ public class SecretInCallService extends InCallService {
             }
             int maxVol = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
 
-            if (holdUsingVoiceStream) {
+            // Never mute STREAM_VOICE_CALL when no carrier call is active and Hold/Comm audio is playing,
+            // nor when built-in Earpiece plays Hold MP3 on USAGE_VOICE_COMMUNICATION.
+            boolean noCarrierCallPlayingComm = currentCall == null
+                && (NativeAudioEngine.isPlayingHoldAudio() || NativeAudioEngine.isPlayingCommAudio());
+            boolean holdUsingVoiceStream = NativeAudioEngine.isPlayingHoldAudio()
+                && NativeAudioEngine.isPlayingCommAudio();
+
+            if (noCarrierCallPlayingComm || holdUsingVoiceStream) {
                 if (Build.VERSION.SDK_INT >= 23 && am.isStreamMute(AudioManager.STREAM_VOICE_CALL)) {
                     try {
                         am.adjustStreamVolume(AudioManager.STREAM_VOICE_CALL, AudioManager.ADJUST_UNMUTE, 0);
                     } catch (Throwable ignoredUnmute) {
                     }
                 }
-                int earpieceVol = Math.max(1, minVol);
+                int earpieceVol = Math.max(2, (maxVol * 2) / 3);
                 try {
-                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, earpieceVol, 0);
+                    am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, Math.max(minVol, earpieceVol), 0);
                 } catch (Throwable ignoredVol) {
                 }
                 return;
