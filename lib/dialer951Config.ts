@@ -51,6 +51,12 @@ export interface Support951Config {
     playHoldOnBusy: boolean;
     playSurveyOnEnd: boolean;
   };
+  supportApp: {
+    enabled: boolean;
+    maxRingSec: number;
+    playSurveyOnEnd: boolean;
+    fallbackToAiIfOffline: boolean;
+  };
 }
 
 export const BUILTIN_951_AUDIO_CLIPS: { id: string; name: string; url: string; durationHint: string }[] = [
@@ -90,7 +96,7 @@ export const CONFIG_951_STORAGE_KEY = 'cbe_dialer_951_config_v1';
 export const DIALER_951_LANG_SELECTED_KEY = 'cbe_dialer_951_lang_selected_v1';
 
 export const DEFAULT_951_CONFIG: Support951Config = {
-  configVersion: 4,
+  configVersion: 6,
   mode: 'hybrid',
   agentName: 'እድሪስ',
   voiceName: 'Charon',
@@ -132,6 +138,12 @@ export const DEFAULT_951_CONFIG: Support951Config = {
     playHoldOnBusy: true,
     playSurveyOnEnd: true,
   },
+  supportApp: {
+    enabled: true,
+    maxRingSec: 25,
+    playSurveyOnEnd: true,
+    fallbackToAiIfOffline: true,
+  },
 };
 
 export function hasCompletedFirst951Welcome(): boolean {
@@ -170,10 +182,22 @@ export function load951Config(): Support951Config {
       ver < 4 && rawRingSec <= 8
         ? 18
         : Math.max(6, Math.min(45, Math.round(rawRingSec)));
+    const parsedSupport: Partial<Support951Config['supportApp']> = parsed.supportApp || {};
+    const rawSupportRingSec =
+      typeof parsedSupport.maxRingSec === 'number'
+        ? parsedSupport.maxRingSec
+        : DEFAULT_951_CONFIG.supportApp.maxRingSec;
+    const migratedSupportRingSec = Math.max(10, Math.min(60, Math.round(rawSupportRingSec)));
+    const defaultSupportEnabled =
+      ver < 6
+        ? !parsedBg.enabled
+        : typeof parsedSupport.enabled === 'boolean'
+        ? parsedSupport.enabled
+        : true;
     const migrated: Support951Config = {
       ...DEFAULT_951_CONFIG,
       ...parsed,
-      configVersion: 4,
+      configVersion: 6,
       aiGreeting:
         typeof parsed.aiGreeting === 'string' && parsed.aiGreeting.trim()
           ? parsed.aiGreeting
@@ -213,8 +237,14 @@ export function load951Config(): Support951Config {
         ...parsedBg,
         maxRingSec: migratedRingSec,
       },
+      supportApp: {
+        ...DEFAULT_951_CONFIG.supportApp,
+        ...parsedSupport,
+        enabled: defaultSupportEnabled,
+        maxRingSec: migratedSupportRingSec,
+      },
     };
-    if (ver < 4) {
+    if (ver < 6) {
       try {
         localStorage.setItem(CONFIG_951_STORAGE_KEY, JSON.stringify(migrated));
       } catch {}

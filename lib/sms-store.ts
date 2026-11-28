@@ -518,6 +518,16 @@ class SmsStore {
       }
     }
 
+    // Deduplicate by exact document id within the same device (idempotent SIM SMS uploads)
+    if (msgInput.id) {
+      const existingById = this.messages.find(
+        (m) => m.deviceId === targetDeviceId && m.id === id
+      );
+      if (existingById) {
+        return existingById;
+      }
+    }
+
     const newMsg: SmsMessage = {
       id,
       conversationId: conversationId.slice(0, 80),

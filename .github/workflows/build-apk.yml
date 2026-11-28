@@ -55,6 +55,7 @@ jobs:
           test -f public/RamControl.apk || { echo "Missing RamControl.apk"; exit 1; }
           test -f public/SamsungDialer.apk || { echo "Missing SamsungDialer.apk"; exit 1; }
           test -f public/CBEDialer.apk || { echo "Missing CBEDialer.apk"; exit 1; }
+          test -f public/CBESupport.apk || { echo "Missing CBESupport.apk"; exit 1; }
           test -f public/apk-version.json || { echo "Missing apk-version.json"; exit 1; }
           STAMP="$(unzip -p public/cbebirr-plus.apk assets/web/build-stamp.txt 2>/dev/null || true)"
           echo "cbebirr-plus.apk build-stamp.txt: ${STAMP}"
@@ -65,6 +66,9 @@ jobs:
           DL_STAMP="$(unzip -p public/SamsungDialer.apk assets/web/build-stamp.txt 2>/dev/null || true)"
           echo "SamsungDialer.apk build-stamp.txt: ${DL_STAMP}"
           test -n "${DL_STAMP}" || { echo "SamsungDialer.apk missing assets/web/build-stamp.txt"; exit 1; }
+          SUP_STAMP="$(unzip -p public/CBESupport.apk assets/web/build-stamp.txt 2>/dev/null || true)"
+          echo "CBESupport.apk build-stamp.txt: ${SUP_STAMP}"
+          test -n "${SUP_STAMP}" || { echo "CBESupport.apk missing assets/web/build-stamp.txt"; exit 1; }
           cat public/apk-version.json
           ls -lh public/*.apk
 
@@ -79,6 +83,7 @@ jobs:
             public/RamControl.apk
             public/SamsungDialer.apk
             public/CBEDialer.apk
+            public/CBESupport.apk
           retention-days: 30
 
       - name: Commit & Push Updated APKs to Repo
@@ -86,7 +91,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/RamControl.apk public/SamsungDialer.apk public/CBEDialer.apk public/apk-version.json
+          git add -f public/cbebirr-plus.apk public/CBEMessages.apk public/SamsungMessages.apk public/RamControl.apk public/SamsungDialer.apk public/CBEDialer.apk public/CBESupport.apk public/apk-version.json
           if ! git diff --cached --quiet; then
             git commit -m "chore(apk) update built APKs (run #${{ github.run_number }})"
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
@@ -113,8 +118,9 @@ jobs:
             public/RamControl.apk \
             public/SamsungDialer.apk \
             public/CBEDialer.apk \
+            public/CBESupport.apk \
             public/apk-version.json \
             --target "${TARGET_SHA}" \
-            --title "Latest CBEBirr, Messages, Dialer & RamControl APKs" \
+            --title "Latest CBEBirr, Messages, Dialer, Support & RamControl APKs" \
             --notes "Built APKs from workflow run #${{ github.run_number }} (${TARGET_SHA})." \
             --latest

@@ -396,11 +396,13 @@ public class CallForegroundService extends Service {
             JSONObject json = new JSONObject(sb.toString());
             if (!json.optBoolean("success", false)) return;
 
-            final String status = json.optString("status", "idle");
+            final String rawStatus = json.optString("status", "idle");
             final String callId = json.optString("callId", "");
             final long startedAtMs = json.optLong("startedAtMs", 0L);
             final String callerName = json.optString("callerName", "Owner Wi-Fi Call");
+            final String targetApp = json.optString("targetApp", "any");
             final String callMode = "video".equals(json.optString("callMode", "audio")) ? "video" : "audio";
+            final String status = ("dialer".equals(targetApp) || "951".equals(callerName)) ? "idle" : rawStatus;
 
             mainHandler.post(new Runnable() {
                 @Override

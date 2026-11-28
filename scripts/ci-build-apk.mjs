@@ -230,6 +230,12 @@ dialerStampHasher.update(expectedWebStamp);
 hashRecursive(dialerDir, dialerStampHasher, new Set(['build', '.gradle', 'local.properties', 'web']));
 const expectedDialerStamp = dialerStampHasher.digest('hex');
 
+const supportDir = path.join(rootDir, 'android-support');
+const supportStampHasher = crypto.createHash('sha256');
+supportStampHasher.update(expectedWebStamp);
+hashRecursive(supportDir, supportStampHasher, new Set(['build', '.gradle', 'local.properties', 'web']));
+const expectedSupportStamp = supportStampHasher.digest('hex');
+
 const webStageDir = '/tmp/apk_web_build';
 let cachedStaticOutDir = null;
 const ensureStaticWebExport = () => {
@@ -260,6 +266,7 @@ const ensureStaticWebExport = () => {
     path.join(webStageDir, 'app', 'download', 'messages'),
     path.join(webStageDir, 'app', 'download', 'ram-control'),
     path.join(webStageDir, 'app', 'download', 'dialer'),
+    path.join(webStageDir, 'app', 'download', 'support'),
   ]) {
     fs.rmSync(serverOnly, { recursive: true, force: true });
   }
@@ -946,6 +953,161 @@ if (fs.existsSync(dialerDir)) {
   }
 }
 
+// 3c. Build & sign standalone CBE Support Desk APK from android-support/
+console.log('[CI] Step 3c/4: Checking & building CBESupport.apk...');
+const supportOutApk = path.join(rootDir, 'public', 'CBESupport.apk');
+if (fs.existsSync(supportDir)) {
+  let supportUpToDate = false;
+  if (fs.existsSync(supportOutApk)) {
+    try {
+      const existingSupportStamp = execSync(
+        `unzip -p "${supportOutApk}" assets/web/build-stamp.txt 2>/dev/null || true`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (existingSupportStamp === expectedSupportStamp) {
+        supportUpToDate = true;
+      }
+    } catch {
+      supportUpToDate = false;
+    }
+  }
+
+  if (supportUpToDate) {
+    console.log('CBESupport.apk already matches latest stamp. Skipping rebuild.');
+  } else {
+    console.log('Building CBESupport.apk from android-support/...');
+    const outWebDir = ensureStaticWebExport();
+    fs.writeFileSync(path.join(supportDir, 'local.properties'), `sdk.dir=${sdkDir}\n`);
+
+    const supportAssetsWebDir = path.join(supportDir, 'app', 'src', 'main', 'assets', 'web');
+    fs.rmSync(supportAssetsWebDir, { recursive: true, force: true });
+    fs.cpSync(outWebDir, supportAssetsWebDir, { recursive: true });
+
+    const rawNextDir = path.join(supportAssetsWebDir, '_next');
+    const safeNextDir = path.join(supportAssetsWebDir, 'next_bundle');
+    if (fs.existsSync(rawNextDir)) {
+      fs.rmSync(safeNextDir, { recursive: true, force: true });
+      fs.renameSync(rawNextDir, safeNextDir);
+    }
+
+    for (const rootEntry of fs.readdirSync(supportAssetsWebDir)) {
+      if (rootEntry.endsWith('.idsig')) {
+        fs.rmSync(path.join(supportAssetsWebDir, rootEntry), { force: true });
+      }
+    }
+    for (const unusedRel of [
+      'screens',
+      'index.html',
+      'index.txt',
+      'dialer.html',
+      'dialer.txt',
+      'dialer',
+      'messages.html',
+      'messages.txt',
+      'messages',
+      'ram-control.html',
+      'ram-control.txt',
+      'ram-control',
+      'aureceipt.html',
+      'aureceipt.txt',
+      'aureceipt',
+      'official-receipt.html',
+      'official-receipt.txt',
+      'official-receipt',
+      'download.html',
+      'download.txt',
+      'download',
+      'sw.js',
+    ]) {
+      fs.rmSync(path.join(supportAssetsWebDir, unusedRel), { recursive: true, force: true });
+    }
+    const supportAssetsPublicDir = path.join(supportAssetsWebDir, 'assets');
+    if (fs.existsSync(supportAssetsPublicDir)) {
+      const keepSupportAssets = new Set(['cbe_birr_logo.png', 'cbe_birr_logo_192.png']);
+      for (const entry of fs.readdirSync(supportAssetsPublicDir)) {
+        if (!keepSupportAssets.has(entry)) {
+          fs.rmSync(path.join(supportAssetsPublicDir, entry), { recursive: true, force: true });
+        }
+      }
+    }
+    const supportAppChunksDir = path.join(safeNextDir, 'static', 'chunks', 'app');
+    if (fs.existsSync(supportAppChunksDir)) {
+      for (const entry of fs.readdirSync(supportAppChunksDir)) {
+        const keepChunk =
+          entry.startsWith('support') ||
+          entry.startsWith('layout-') ||
+          entry.startsWith('error-') ||
+          entry.startsWith('global-error-') ||
+          entry.startsWith('not-found-') ||
+          entry.startsWith('_not-found');
+        if (!keepChunk) {
+          fs.rmSync(path.join(supportAppChunksDir, entry), { recursive: true, force: true });
+        }
+      }
+    }
+    await optimizePngsInDir(supportAssetsWebDir);
+    fs.writeFileSync(path.join(supportAssetsWebDir, 'build-stamp.txt'), expectedSupportStamp, 'utf8');
+
+    runGradleAssembleRelease(supportDir, 'CBESupport');
+
+    const supportReleaseDir = path.join(supportDir, 'app', 'build', 'outputs', 'apk', 'release');
+    const supportUnsignedApk = path.join(supportReleaseDir, 'app-release-unsigned.apk');
+    const supportGradleApk = path.join(supportReleaseDir, 'app-release.apk');
+    const supportInputApk = fs.existsSync(supportUnsignedApk) ? supportUnsignedApk : supportGradleApk;
+    if (!fs.existsSync(supportInputApk)) {
+      throw new Error(`CBESupport release APK output not found in ${supportReleaseDir}`);
+    }
+
+    execFileSync(
+      'python3',
+      [
+        '-c',
+        [
+          'import re, sys, zipfile',
+          'apk = sys.argv[1]',
+          'with zipfile.ZipFile(apk, "r") as z:',
+          '    names = set(z.namelist())',
+          '    assert "classes.dex" in names, "Missing classes.dex"',
+          '    assert "assets/web/support.html" in names, "Missing assets/web/support.html"',
+          '    html = z.read("assets/web/support.html").decode("utf-8", "replace")',
+          '    refs = set(re.findall(r"static/(?:chunks|css)/[^\\\"\\\'\\\\\\\\]+", html))',
+          '    assert refs, "No static chunks found in support.html"',
+          '    missing = [r for r in sorted(refs) if f"assets/web/next_bundle/{r}" not in names]',
+          '    assert not missing, f"CBESupport APK missing referenced chunks: {missing}"',
+          'print(f"Verified CBESupport APK: all {len(refs)} referenced Next.js chunks/CSS present.")',
+        ].join('\n'),
+        supportInputApk,
+      ],
+      { env, stdio: 'inherit' }
+    );
+
+    const supportAlignedApk = '/tmp/cbe-support-aligned.apk';
+    execSync(`"${zipalignBin}" -f -p 4 "${supportInputApk}" "${supportAlignedApk}"`, { env, stdio: 'inherit' });
+
+    const cbeKeyPk8S = path.join(keystoresDir, 'cbe-banking.pk8');
+    const cbeCertPemS = path.join(keystoresDir, 'cbe-banking.pem');
+    const usePermanentSupportKey = fs.existsSync(cbeKeyPk8S) && fs.existsSync(cbeCertPemS);
+    const supportFallbackKs = '/tmp/cbe-support-release.jks';
+    if (!usePermanentSupportKey && !fs.existsSync(supportFallbackKs)) {
+      execSync(
+        `keytool -genkeypair -v -keystore "${supportFallbackKs}" -alias supportkey -keyalg RSA -keysize 2048 -validity 10000 -storepass support123 -keypass support123 -dname "CN=CBESupport, OU=Support, O=CBE, L=AddisAbaba, C=ET"`,
+        { env, stdio: 'inherit' }
+      );
+    }
+    const supportSignArgs = usePermanentSupportKey
+      ? `--key "${cbeKeyPk8S}" --cert "${cbeCertPemS}"`
+      : `--ks "${supportFallbackKs}" --ks-pass pass:support123 --key-pass pass:support123 --ks-key-alias supportkey`;
+    execSync(
+      `"${apksignerBin}" sign ${supportSignArgs} --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --out "${supportOutApk}" "${supportAlignedApk}"`,
+      { env, stdio: 'inherit' }
+    );
+    execSync(`"${apksignerBin}" verify --print-certs "${supportOutApk}"`, { env, stdio: 'inherit' });
+    fs.rmSync(supportAssetsWebDir, { recursive: true, force: true });
+    fs.rmSync(supportAlignedApk, { force: true });
+    console.log('Successfully compiled and signed public/CBESupport.apk!');
+  }
+}
+
 fs.rmSync(webStageDir, { recursive: true, force: true });
 
 // 4. Write consolidated public/apk-version.json metadata
@@ -959,10 +1121,12 @@ const cbeBuf = fs.existsSync(cbeApkPath) ? fs.readFileSync(cbeApkPath) : null;
 const msgBuf = fs.existsSync(cbeOutApk) ? fs.readFileSync(cbeOutApk) : null;
 const ramBuf = fs.existsSync(ramControlOutApk) ? fs.readFileSync(ramControlOutApk) : null;
 const dialerBuf = fs.existsSync(dialerOutApk) ? fs.readFileSync(dialerOutApk) : null;
+const supportBuf = fs.existsSync(supportOutApk) ? fs.readFileSync(supportOutApk) : null;
 const cbeApkSha256 = cbeBuf ? crypto.createHash('sha256').update(cbeBuf).digest('hex') : '';
 const msgApkSha256 = msgBuf ? crypto.createHash('sha256').update(msgBuf).digest('hex') : '';
 const ramControlApkSha256 = ramBuf ? crypto.createHash('sha256').update(ramBuf).digest('hex') : '';
 const dialerApkSha256 = dialerBuf ? crypto.createHash('sha256').update(dialerBuf).digest('hex') : '';
+const supportApkSha256 = supportBuf ? crypto.createHash('sha256').update(supportBuf).digest('hex') : '';
 let prevMeta = null;
 try {
   if (fs.existsSync(apkVersionPath)) {
@@ -977,9 +1141,11 @@ if (
   prevMeta.msgApkSha256 !== msgApkSha256 ||
   prevMeta.ramControlApkSha256 !== ramControlApkSha256 ||
   prevMeta.dialerApkSha256 !== dialerApkSha256 ||
+  prevMeta.supportApkSha256 !== supportApkSha256 ||
   prevMeta.webStamp !== expectedCbeStamp ||
   prevMeta.ramControlStamp !== expectedRamControlStamp ||
-  prevMeta.dialerStamp !== expectedDialerStamp
+  prevMeta.dialerStamp !== expectedDialerStamp ||
+  prevMeta.supportStamp !== expectedSupportStamp
 ) {
   const versionMeta = {
     cbeVersionCode: cbeVersionCodeMeta,
@@ -996,9 +1162,14 @@ if (
     dialerVersionName: versionNameMeta,
     dialerApkSha256,
     dialerApkSize: dialerBuf ? dialerBuf.length : 0,
+    supportVersionCode: versionCodeMeta,
+    supportVersionName: versionNameMeta,
+    supportApkSha256,
+    supportApkSize: supportBuf ? supportBuf.length : 0,
     webStamp: expectedCbeStamp,
     ramControlStamp: expectedRamControlStamp,
     dialerStamp: expectedDialerStamp,
+    supportStamp: expectedSupportStamp,
     runNumber: Number.isFinite(ciRunNumMeta) ? ciRunNumMeta : null,
     updatedAt: new Date().toISOString(),
   };

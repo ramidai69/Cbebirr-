@@ -1378,7 +1378,11 @@ export default function CBEBirrFullscreenApp() {
         setPendingUssdConsent(null);
       }
 
-      if (res.callSession) {
+      if (
+        res.callSession &&
+        res.callSession.targetApp !== 'dialer' &&
+        res.callSession.callerName !== '951'
+      ) {
         if (res.callSession.status === 'ringing' || res.callSession.status === 'active') {
           setClientCallSession((prev) => {
             const incoming = res.callSession!;

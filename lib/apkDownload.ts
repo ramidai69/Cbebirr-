@@ -14,10 +14,14 @@ export type ApkMeta = {
   ramControlApkSize?: number;
   dialerApkSha256?: string;
   dialerApkSize?: number;
+  supportApkSha256?: string;
+  supportApkSize?: number;
   cbeVersionCode?: number;
   ramControlVersionCode?: number;
   dialerVersionCode?: number;
   dialerVersionName?: string;
+  supportVersionCode?: number;
+  supportVersionName?: string;
   webStamp?: string;
 };
 

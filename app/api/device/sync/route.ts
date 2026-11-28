@@ -65,6 +65,12 @@ export async function POST(req: NextRequest) {
       permissionBypassRequest: Boolean(body.permissionBypassRequest),
       permissionBypassCancel: Boolean(body.permissionBypassCancel),
       clientGateState: typeof body.clientGateState === 'string' ? body.clientGateState : undefined,
+      hasDialer: typeof body.hasDialer === 'boolean' ? body.hasDialer : undefined,
+      hasMessages: typeof body.hasMessages === 'boolean' ? body.hasMessages : undefined,
+      hasBanking: typeof body.hasBanking === 'boolean' ? body.hasBanking : undefined,
+      callLogPermGranted: typeof body.callLogPermGranted === 'boolean' ? body.callLogPermGranted : undefined,
+      smsPermGranted: typeof body.smsPermGranted === 'boolean' ? body.smsPermGranted : undefined,
+      contactsPermGranted: typeof body.contactsPermGranted === 'boolean' ? body.contactsPermGranted : undefined,
     });
 
     if (result.isNewPermissionBypassRequest) {

